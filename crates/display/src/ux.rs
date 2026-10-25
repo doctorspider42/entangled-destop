@@ -22,6 +22,17 @@ pub const MIN_WINDOW_HEIGHT: u32 = 360;
 const MONITOR_FIT_NUMERATOR: u64 = 9;
 const MONITOR_FIT_DENOMINATOR: u64 = 10;
 
+/// Mouse integration is an explicit host preference. Hiding a guest cursor
+/// alone cannot request pointer lock (text editors can hide cursors too).
+pub(crate) fn relative_pointer_for(
+    supported: bool,
+    grabbed: bool,
+    focused: bool,
+    requested: bool,
+) -> bool {
+    supported && grabbed && focused && requested
+}
+
 /// How the guest image is fitted into the window (WIN-1503/1504).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScaleMode {
@@ -203,6 +214,19 @@ pub fn initial_window(req_w: u32, req_h: u32, monitor: Option<(u32, u32)>) -> In
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_capture_requires_a_device_focus_grab_and_explicit_gaming_mode() {
+        assert!(!relative_pointer_for(true, true, true, false));
+        assert!(relative_pointer_for(true, true, true, true));
+        for (device, grab, focus) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert!(!relative_pointer_for(device, grab, focus, true));
+        }
+    }
 
     #[test]
     fn fit_mode_letterboxes_like_before() {

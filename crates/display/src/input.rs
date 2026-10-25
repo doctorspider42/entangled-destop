@@ -28,6 +28,7 @@
 //! | `Ctrl+Alt+S` | suspend the VM to its snapshot file ([`ControlEvent::SaveRequested`]) |
 //! | `F11` | toggle borderless fullscreen ([`WindowAction::ToggleFullscreen`]) |
 //! | `Ctrl+Alt+O` | toggle 1:1 pixel mode ([`WindowAction::ToggleScaleMode`]) |
+//! | `Ctrl+Alt+M` | toggle gaming mouse / desktop tablet integration |
 //! | `Ctrl+Alt+V` | type the host clipboard into the guest ([`WindowAction::TypeClipboard`]) |
 //!
 //! Every *other* `Ctrl+Alt+<key>` combination is forwarded verbatim, so the
@@ -47,16 +48,8 @@ use crate::keymap::linux_keycode;
 use crate::sync::lock;
 use crate::Viewport;
 
-/// Relative axes (`REL_*`), needed for the scroll wheel.
-///
-/// TODO(virtio-input): upstream these into `virtio_input::rel` — that crate is
-/// owned elsewhere, so the host keeps a local copy for now.
-pub mod rel {
-    /// `REL_HWHEEL` — horizontal scroll, in notches.
-    pub const HWHEEL: u16 = 0x06;
-    /// `REL_WHEEL` — vertical scroll, in notches.
-    pub const WHEEL: u16 = 0x08;
-}
+/// Relative motion and wheel axes shared with the device's capability table.
+pub use virtio_input::rel;
 
 /// Where the host's Back and Forward mouse buttons go.
 ///
@@ -155,6 +148,8 @@ pub enum WindowAction {
     ToggleFullscreen,
     /// `Ctrl+Alt+O`: switch between [`crate::ScaleMode`]s (WIN-1504).
     ToggleScaleMode,
+    /// `Ctrl+Alt+M`: switch desktop integration / relative gaming capture.
+    ToggleRelativePointer,
     /// `Ctrl+Alt+V`: type the host clipboard's text (`virtio_input::typing`).
     TypeClipboard,
 }
@@ -351,6 +346,10 @@ pub fn pointer_abs_events(viewport: &Viewport, x: f64, y: f64) -> [InputEvent; 2
 #[derive(Debug)]
 pub struct InputCapture {
     events: InputQueue,
+    relative_events: InputQueue,
+    relative_pointer: bool,
+    pointer_integration: bool,
+    relative_fraction: (f64, f64),
     control: ControlQueue,
     /// `EV_KEY` codes physically down — keyboard keys *and* mouse buttons, which
     /// share the `EV_KEY` code space in Linux.
@@ -384,6 +383,10 @@ impl InputCapture {
     pub fn new(events: InputQueue, control: ControlQueue) -> Self {
         Self {
             events,
+            relative_events: InputQueue::new(),
+            relative_pointer: false,
+            pointer_integration: true,
+            relative_fraction: (0.0, 0.0),
             control,
             held: BTreeSet::new(),
             guest_held: BTreeSet::new(),
@@ -403,6 +406,93 @@ impl InputCapture {
     /// The guest-facing event queue.
     pub fn events(&self) -> InputQueue {
         self.events.clone()
+    }
+
+    pub(crate) fn with_relative_events(mut self, events: InputQueue) -> Self {
+        self.relative_events = events;
+        self
+    }
+
+    /// The dedicated relative mouse stream; its deltas must never be replaced
+    /// by a newer absolute position or delivered to the tablet device.
+    pub fn relative_events(&self) -> InputQueue {
+        self.relative_events.clone()
+    }
+
+    /// Whether motion/buttons currently belong to the relative mouse device.
+    pub fn relative_pointer(&self) -> bool {
+        self.relative_pointer
+    }
+
+    /// Keep a gaming capture's initial click from sending an absolute warp
+    /// before its raw pointer lock is applied by the window event loop.
+    pub(crate) fn set_pointer_integration(&mut self, enabled: bool) {
+        self.pointer_integration = enabled;
+    }
+
+    /// Mode transitions release mouse buttons on their original device first.
+    /// Keyboard modifiers retain their existing routing and held-state rules.
+    pub fn set_relative_pointer(&mut self, relative: bool) {
+        if self.relative_pointer == relative {
+            return;
+        }
+        let buttons: Vec<_> = self
+            .guest_held
+            .iter()
+            .copied()
+            .filter(|code| (virtio_input::btn::LEFT..=virtio_input::btn::MIDDLE).contains(code))
+            .collect();
+        for code in buttons {
+            self.guest_held.remove(&code);
+            self.emit_key(code, KEY_UP);
+        }
+        self.relative_pointer = relative;
+        self.relative_fraction = (0.0, 0.0);
+    }
+
+    /// Raw mouse counts, independent of the host/guest resolution. Bound each
+    /// report, retain sub-count fractions and discard invalid host samples.
+    pub fn on_relative_motion(&mut self, dx: f64, dy: f64) -> bool {
+        if !self.grabbed
+            || !self.focused
+            || !self.relative_pointer
+            || !dx.is_finite()
+            || !dy.is_finite()
+        {
+            return false;
+        }
+        const MAX_RELATIVE_DELTA: f64 = 32767.0;
+        let mut batch = Vec::with_capacity(2);
+        for (delta, fraction, code) in [
+            (dx, &mut self.relative_fraction.0, rel::X),
+            (dy, &mut self.relative_fraction.1, rel::Y),
+        ] {
+            let accumulated = delta.clamp(-MAX_RELATIVE_DELTA, MAX_RELATIVE_DELTA) + *fraction;
+            let counts = accumulated
+                .trunc()
+                .clamp(-MAX_RELATIVE_DELTA, MAX_RELATIVE_DELTA);
+            *fraction = accumulated - counts;
+            if counts != 0.0 {
+                batch.push(InputEvent {
+                    event_type: ev::REL,
+                    code,
+                    value: (counts as i32) as u32,
+                });
+            }
+        }
+        let moved = !batch.is_empty();
+        self.push(batch);
+        moved
+    }
+
+    pub(crate) fn stats(&self) -> InputStats {
+        let a = self.events.stats();
+        let r = self.relative_events.stats();
+        InputStats {
+            batches: a.batches + r.batches,
+            events: a.events + r.events,
+            dropped: a.dropped + r.dropped,
+        }
     }
 
     /// The host-facing control queue.
@@ -718,6 +808,7 @@ impl InputCapture {
 
     /// Emits key-up for everything the guest believes is held, in one batch.
     pub fn release_all(&mut self) {
+        self.relative_fraction = (0.0, 0.0);
         self.vertical = WheelAccumulator::default();
         self.horizontal = WheelAccumulator::default();
         if self.guest_held.is_empty() {
@@ -773,6 +864,10 @@ impl InputCapture {
                 Some(WindowAction::Quit)
             }
             KeyCode::KeyO => Some(WindowAction::ToggleScaleMode),
+            KeyCode::KeyM => {
+                self.release_all();
+                Some(WindowAction::ToggleRelativePointer)
+            }
             // The modifiers go back first: typed text under a held Ctrl+Alt
             // would be a string of shortcuts.
             KeyCode::KeyV => {
@@ -819,6 +914,9 @@ impl InputCapture {
     /// Sends the last known pointer position to the guest, so its cursor sits
     /// under the host cursor the moment the grab starts.
     fn emit_pointer(&mut self) {
+        if self.relative_pointer || !self.pointer_integration {
+            return;
+        }
         let (Some((x, y)), Some(viewport)) = (self.pointer, self.viewport) else {
             return;
         };
@@ -835,12 +933,29 @@ impl InputCapture {
     }
 
     /// Terminates a batch with `SYN_REPORT` (MVP-905) and queues it.
-    fn push(&mut self, mut batch: Vec<InputEvent>) {
+    fn push(&mut self, batch: Vec<InputEvent>) {
         if batch.is_empty() {
             return;
         }
-        batch.push(InputEvent::SYN_REPORT);
-        self.events.push(batch);
+        if !self.relative_pointer {
+            let mut batch = batch;
+            batch.push(InputEvent::SYN_REPORT);
+            self.events.push(batch);
+            return;
+        }
+        let (mut mouse, mut ordinary): (Vec<_>, Vec<_>) = batch.into_iter().partition(|event| {
+            self.relative_pointer
+                && event.event_type != ev::SYN
+                && virtio_input::config::Profile::RelativePointer.accepts(*event)
+        });
+        if !ordinary.is_empty() {
+            ordinary.push(InputEvent::SYN_REPORT);
+            self.events.push(ordinary);
+        }
+        if !mouse.is_empty() {
+            mouse.push(InputEvent::SYN_REPORT);
+            self.relative_events.push(mouse);
+        }
     }
 }
 
@@ -899,6 +1014,150 @@ mod tests {
     fn hold_ctrl_alt(c: &mut InputCapture) {
         press(c, KeyCode::ControlLeft);
         press(c, KeyCode::AltLeft);
+    }
+
+    #[test]
+    fn gaming_mouse_shortcut_releases_guest_modifiers_without_releasing_input_capture() {
+        let mut c = grabbed_capture();
+        hold_ctrl_alt(&mut c);
+        assert_eq!(
+            press(&mut c, KeyCode::KeyM),
+            KeyOutcome::Reserved(WindowAction::ToggleRelativePointer)
+        );
+        assert_eq!(c.pressed_count(), 0);
+        release(&mut c, KeyCode::KeyM);
+        release(&mut c, KeyCode::AltLeft);
+        release(&mut c, KeyCode::ControlLeft);
+        assert!(c.grabbed());
+    }
+
+    #[test]
+    fn entering_a_gaming_capture_does_not_send_an_absolute_recenter_first() {
+        let mut c = capture();
+        c.set_pointer_integration(false);
+        c.on_focus(true);
+        c.on_pointer(Some(VIEW), 900.0, 500.0);
+        assert_eq!(
+            c.on_button(MouseButton::Left, ElementState::Pressed),
+            KeyOutcome::Reserved(WindowAction::SetGrab(true))
+        );
+        assert!(c.events().is_empty());
+        c.set_relative_pointer(true);
+        assert!(c.on_relative_motion(5.0, -4.0));
+        assert!(c.events().is_empty());
+        assert!(!c.relative_events().is_empty());
+    }
+
+    #[test]
+    fn relative_motion_preserves_signed_counts_and_never_warps_the_tablet() {
+        let mut c = grabbed_capture();
+        c.set_relative_pointer(true);
+        assert!(c.on_relative_motion(4.0, -3.0));
+        assert!(c.on_relative_motion(2.0, -1.0));
+        c.on_pointer(Some(VIEW), 900.0, 400.0);
+        assert!(c.events().is_empty());
+        let events = c.relative_events().drain();
+        let deltas: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == ev::REL)
+            .map(|event| (event.code, event.value as i32))
+            .collect();
+        assert_eq!(
+            deltas,
+            [(rel::X, 4), (rel::Y, -3), (rel::X, 2), (rel::Y, -1)]
+        );
+        assert_eq!(
+            events.iter().filter(|event| event.is_syn_report()).count(),
+            2
+        );
+        assert!(!c.on_relative_motion(f64::NAN, 1.0));
+        assert!(!c.on_relative_motion(1.0, f64::INFINITY));
+        assert!(c.relative_events().is_empty());
+    }
+
+    #[test]
+    fn relative_fractions_are_preserved_but_cleared_at_a_mode_boundary() {
+        let mut c = grabbed_capture();
+        c.set_relative_pointer(true);
+        assert!(!c.on_relative_motion(0.4, -0.4));
+        assert!(!c.on_relative_motion(0.4, -0.4));
+        assert!(c.on_relative_motion(0.4, -0.4));
+        let moved: Vec<_> = c
+            .relative_events()
+            .drain()
+            .into_iter()
+            .filter(|event| event.event_type == ev::REL)
+            .map(|event| event.value as i32)
+            .collect();
+        assert_eq!(moved, [1, -1]);
+        c.set_relative_pointer(false);
+        c.set_relative_pointer(true);
+        assert!(!c.on_relative_motion(0.7, -0.7));
+        assert!(c.on_relative_motion(1e100, -1e100));
+        let moved: Vec<_> = c
+            .relative_events()
+            .drain()
+            .into_iter()
+            .filter(|event| event.event_type == ev::REL)
+            .map(|event| event.value as i32)
+            .collect();
+        assert_eq!(moved, [32767, -32767]);
+    }
+
+    #[test]
+    fn relative_buttons_and_wheel_use_the_mouse_and_focus_loss_releases_both_devices() {
+        let mut c = grabbed_capture();
+        c.set_relative_pointer(true);
+        press(&mut c, KeyCode::KeyW);
+        c.on_button(MouseButton::Right, ElementState::Pressed);
+        c.on_wheel(MouseScrollDelta::LineDelta(0.0, -1.0));
+        c.on_focus(false);
+        let keyboard: Vec<_> = c
+            .events()
+            .drain()
+            .into_iter()
+            .filter(|e| e.event_type == ev::KEY)
+            .map(|e| (e.code, e.value))
+            .collect();
+        assert_eq!(keyboard, [(17, 1), (17, 0)]);
+        let mouse: Vec<_> = c
+            .relative_events()
+            .drain()
+            .into_iter()
+            .filter(|e| !e.is_syn_report())
+            .map(|e| (e.event_type, e.code, e.value as i32))
+            .collect();
+        assert_eq!(
+            mouse,
+            [
+                (ev::KEY, virtio_input::btn::RIGHT, 1),
+                (ev::REL, rel::WHEEL, -1),
+                (ev::KEY, virtio_input::btn::RIGHT, 0)
+            ]
+        );
+        assert!(!c.on_relative_motion(20.0, 10.0));
+        assert_eq!(c.pressed_count(), 0);
+    }
+
+    #[test]
+    fn changing_pointer_device_releases_buttons_on_the_original_device() {
+        let mut c = grabbed_capture();
+        c.on_button(MouseButton::Right, ElementState::Pressed);
+        c.set_relative_pointer(true);
+        let tablet: Vec<_> = c
+            .events()
+            .drain()
+            .into_iter()
+            .filter(|e| e.event_type == ev::KEY)
+            .map(|e| (e.code, e.value))
+            .collect();
+        assert_eq!(
+            tablet,
+            [(virtio_input::btn::RIGHT, 1), (virtio_input::btn::RIGHT, 0)]
+        );
+        c.on_button(MouseButton::Right, ElementState::Released);
+        assert!(c.relative_events().is_empty());
+        assert_eq!(c.pressed_count(), 0);
     }
 
     #[test]

@@ -1151,3 +1151,55 @@ windows again after Ctrl+Alt. The runtime log records F11 entering and leaving
 fullscreen without any further guest display-mode request or scanout resize.
 This is keyboard/fullscreen acceptance, not verification of relative mouse
 capture or of the reported Portal 2 community-map crash.
+
+## Amendment (2026-10-25): relative mouse input for games
+
+An absolute tablet cannot substitute for a mouse's unbounded relative motion.
+The accelerated PCI desktop now includes a separate virtio-input mouse
+(`RelativePointer`, product 4), appended after existing devices so their PCI
+addresses remain stable. It advertises REL_X/Y, both wheel axes and the three
+primary buttons, without absolute axes, and does not take js0 from the gamepad.
+Legacy MMIO guests retain their topology unless the device is explicitly enabled.
+The existing InputDevice owns its bounded queues, reset and snapshot positions;
+there is no new capture worker or lifecycle protocol in the device.
+
+The window has two explicit integration modes, selected with Ctrl+Alt+M.
+Desktop mode retains the tablet and its exact viewport mapping. Gaming mode
+uses raw DeviceEvent::MouseMotion and a dedicated relative report queue.
+Signed deltas accumulate rather than replacing previous positions, retain
+fractional counts, reject non-finite samples and are bounded per report.
+Buttons/wheels follow the active device; transitions and focus loss release
+buttons on their original device. A gaming grab's initial click emits no
+absolute recenter before raw capture becomes active. The existing pause gate
+covers both queues, and queued relative input is discarded while paused.
+
+Actual capture requires an available device, focus and an input grab. The
+preference survives Ctrl+Alt/focus loss, so clicking back into a game restores
+its mode. Guest cursor hiding does not request pointer lock: it is not a
+reliable application-mode signal. Windows uses winit's hidden+confined centre
+clip intentionally in gaming mode; other hosts request Locked and fall back
+to desktop integration on refusal. Raw input is enabled only while captured,
+and host pointer visibility/confinement is restored before the window exits.
+
+`display.relative_mouse = true` includes the mouse and starts in gaming mode;
+false omits it. Absent includes it for accelerated PCI desktops, initially in
+desktop mode. Both engine and manager must be rebuilt before writing this new
+strictly parsed profile key. The test VM uses 1920x1080 with follow_window=false:
+F11 fills its 16:9 monitor without changing the game's mode, stretching or cropping.
+
+Final workspace tests passed on Windows (2409, 18 ignored) and Linux
+(2425, 26 ignored), with Clippy denying warnings, format checks and cargo-deny.
+The first Linux run hit two existing TCP teardown tests; their isolated recheck
+and the complete parallel rerun passed without changes to networking.
+The installed WHP guest enumerates Entangled Mouse with REL=143, no ABS axes
+and the gamepad still at js0; its desktop is 1920x1080. Portal 2's first room
+was launched through the installed Steam Runtime for input acceptance after
+the Steam client's applaunch did not start it. No permanent game launcher or
+software-rendering override was installed.
+
+Live acceptance on the WHP machine: the guest received more than 19,000 signed
+REL_X/Y samples through Entangled Mouse, including both directions on both axes.
+The user confirmed unrestricted camera movement in Portal 2 and fullscreen
+without black bars. Ctrl+Alt releases capture and clicking back restores gaming
+mode. This confirms relative input/fullscreen behavior, not community-map crash
+handling or Vulkan snapshot support.

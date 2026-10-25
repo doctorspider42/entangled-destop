@@ -241,6 +241,32 @@ Ordinary window resizing still follows `follow_window`; pending resize requests
 are cancelled on F11 and checked again at debounce expiry. Never reintroduce a
 fullscreen mode switch without checking in-game mouse alignment.
 
+### Relative gaming mouse (2026-10-25)
+
+The accelerated PCI desktop includes a separate `RelativePointer` device.
+`[display] relative_mouse = true` additionally selects gaming capture on startup;
+absent keeps desktop tablet integration initially, with Ctrl+Alt+M switching
+modes during the session. `false` omits the relative device. Legacy MMIO guests
+only gain one when explicitly requested, preserving their existing slot budget.
+The preference survives focus/grab loss, but actual raw capture requires both;
+Ctrl+Alt always returns the pointer and keyboard to the host. Guest cursor hiding
+is not a reliable request for relative input and must not automatically lock it.
+
+Gaming uses raw `DeviceEvent::MouseMotion`, enabled with `WhenFocused` only
+while active; desktop mode keeps `DeviceEvents::Never`. On Windows the real
+hidden+confined winit state intentionally pins the host pointer to the client
+centre in this mode ONLY. Desktop mode still hides with a transparent image.
+Linux/macOS use `Locked`; refusal restores desktop mode. Window exit releases
+capture and restores the host cursor before disposing the window.
+
+Relative reports, buttons and wheels use a dedicated queue/device, never the
+tablet's last-position-wins coalescer. Fractional raw counts accumulate, signed
+deltas are bounded, mode/focus changes release buttons on their original device,
+and a gaming capture's initial click sends no absolute recenter. The paused pump
+drains both queues under the existing quiesce gate. For a borderless 16:9 game,
+set 1920x1080 and `follow_window = false` before launch: F11 then fills a 1920x1080
+monitor without changing the game's display mode, stretching it or cropping it.
+
 Nothing reaches the guest unless the **grab** is active — keyboard, pointer and
 wheel alike. The grab starts inactive so the window behaves like any other
 window on the desktop.
@@ -323,7 +349,8 @@ not move a real mouse over a grabbed window:
   millisecond — it simply was not asked. `user_event(HostEvent::Redraw)` now
   draws directly on Windows (Linux keeps `request_redraw`, which on Wayland is
   tied to the frame callback), and `listen_device_events(DeviceEvents::Never)`
-  drops raw input, which nothing here reads. After: 0.1 unshown frames a second
+  drops raw input outside gaming capture (which enables WhenFocused only while
+  active). After: 0.1 unshown frames a second
   while moving, the window drawing 100+ times a second.
 
 Diagnose either with `RUST_LOG=entangled::run_vm=trace,virtio_gpu::device=trace`:

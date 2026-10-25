@@ -708,13 +708,19 @@ pub struct DisplaySection {
     /// Not written when absent: an older engine denies unknown keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_boost: Option<bool>,
-    /// Whether the guest's resolution follows the window: resizing it,
-    /// maximising or going fullscreen asks the guest for a desktop of the
-    /// window's size. Absent means on; `false` keeps `width`×`height` whatever
+    /// Whether the guest's resolution follows ordinary window resizing and
+    /// maximising. F11 scales the current mode without changing it.
+    /// Absent means on; `false` keeps `width`×`height` whatever
     /// the window does. Not written when absent (older engines deny unknown
     /// keys).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_window: Option<bool>,
+    /// Add a relative mouse beside the tablet. Defaults on for accelerated PCI
+    /// desktops; off elsewhere so existing MMIO device-slot budgets stay valid.
+    /// Explicit true also selects gaming mouse capture at startup; Ctrl+Alt+M
+    /// switches between it and desktop tablet integration during the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_mouse: Option<bool>,
     /// The keyboard layout the guest is set to, for typing text into it
     /// (the window's "type the clipboard", the control channel's `paste`):
     /// `"us"` (absent) or `"pl"` (Polish programmers', whose letters with
@@ -749,6 +755,15 @@ pub const MAX_GPU_MEMORY_MIB: u32 = 1 << 20;
 /// `entangled` holds equal to this).
 pub const DEFAULT_HOST_VISIBLE_MIB: u32 = 4096;
 
+impl DisplaySection {
+    /// A relative mouse is automatic for the 3D PCI desktop, and may be
+    /// explicitly enabled/disabled without changing other machines' topology.
+    pub fn relative_mouse_enabled(&self, transport: VirtioTransport) -> bool {
+        self.relative_mouse
+            .unwrap_or(transport == VirtioTransport::Pci && (self.venus || self.virgl))
+    }
+}
+
 impl Default for DisplaySection {
     fn default() -> Self {
         Self {
@@ -764,6 +779,7 @@ impl Default for DisplaySection {
             gpu_memory_mib: None,
             gpu_boost: None,
             follow_window: None,
+            relative_mouse: None,
             typing_layout: None,
         }
     }
@@ -1239,6 +1255,24 @@ impl VmConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_mouse_defaults_to_accelerated_pci_and_explicit_overrides_preserve_legacy_topology()
+    {
+        let mut display = DisplaySection::default();
+        assert!(!display.relative_mouse_enabled(VirtioTransport::Mmio));
+        assert!(!display.relative_mouse_enabled(VirtioTransport::Pci));
+        display.venus = true;
+        assert!(display.relative_mouse_enabled(VirtioTransport::Pci));
+        assert!(!display.relative_mouse_enabled(VirtioTransport::Mmio));
+        display.relative_mouse = Some(false);
+        assert!(!display.relative_mouse_enabled(VirtioTransport::Pci));
+        display.relative_mouse = Some(true);
+        assert!(display.relative_mouse_enabled(VirtioTransport::Mmio));
+        let encoded = toml::to_string(&display).unwrap();
+        let decoded: DisplaySection = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.relative_mouse, Some(true));
+    }
 
     #[test]
     fn architecture_is_explicit_for_arm_and_legacy_x86_serializes_without_a_new_key() {

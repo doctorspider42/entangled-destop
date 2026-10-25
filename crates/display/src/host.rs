@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use winit::application::ApplicationHandler;
-use winit::event::{StartCause, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::monitor::MonitorHandle;
 #[cfg(any(target_os = "linux", windows))]
@@ -48,6 +48,9 @@ pub struct DisplayHost {
     title: String,
     scanout: SharedScanout,
     events: InputQueue,
+    relative_events: InputQueue,
+    relative_supported: bool,
+    relative_requested: bool,
     control: ControlQueue,
     waker: Waker,
     event_loop: EventLoop<HostEvent>,
@@ -151,6 +154,9 @@ impl DisplayHost {
             title: "Entangled Desktop".to_owned(),
             scanout,
             events: InputQueue::new(),
+            relative_events: InputQueue::new(),
+            relative_supported: false,
+            relative_requested: false,
             control: ControlQueue::new(),
             waker,
             event_loop,
@@ -237,6 +243,24 @@ impl DisplayHost {
         self.events.clone()
     }
 
+    /// Raw relative mouse reports, separate from the absolute tablet stream.
+    pub fn relative_input_queue(&self) -> InputQueue {
+        self.relative_events.clone()
+    }
+
+    /// Enables gaming mouse capture when the VM has a relative input device.
+    pub fn with_relative_mouse(mut self, enabled: bool) -> Self {
+        self.relative_supported = enabled;
+        self
+    }
+
+    /// Initial mouse integration preference; Ctrl+Alt+M changes it for this
+    /// session. Actual capture still requires a device, focus and an input grab.
+    pub fn with_gaming_mouse(mut self, enabled: bool) -> Self {
+        self.relative_requested = enabled;
+        self
+    }
+
     /// Host control events (grab toggle, quit request, window close).
     pub fn control_queue(&self) -> ControlQueue {
         self.control.clone()
@@ -255,6 +279,9 @@ impl DisplayHost {
             title,
             scanout,
             events,
+            relative_events,
+            relative_supported,
+            relative_requested,
             control,
             waker,
             event_loop,
@@ -273,13 +300,18 @@ impl DisplayHost {
             shared.clone(),
             resolution.clone(),
         );
+        let mut capture =
+            InputCapture::new(events, control.clone()).with_relative_events(relative_events);
+        capture.set_pointer_integration(!(relative_supported && relative_requested));
         let mut app = App {
             config,
             title,
             scanout,
             shared,
             share,
-            capture: InputCapture::new(events, control.clone()),
+            capture,
+            relative_supported,
+            relative_requested,
             control,
             waker,
             window: None,
@@ -310,10 +342,8 @@ impl DisplayHost {
             note: None,
             placement_file,
         };
-        // Nothing here reads `DeviceEvent`s (pointer input is the window's
-        // `CursorMoved`), and on Windows winit otherwise registers raw input for
-        // every mouse: a 1000 Hz mouse then posts a `WM_INPUT` per report into
-        // the queue the redraws have to get through (see `user_event`).
+        // Raw input is enabled only while gaming capture is active. The desktop
+        // tablet uses CursorMoved and avoids the extra WM_INPUT mouse traffic.
         event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
         event_loop.run_app(&mut app)?;
         match app.fatal.take() {
@@ -332,6 +362,8 @@ struct App {
     /// Whether to open a GPU for it.
     share: bool,
     capture: InputCapture,
+    relative_supported: bool,
+    relative_requested: bool,
     control: ControlQueue,
     waker: Waker,
     window: Option<Arc<Window>>,
@@ -525,13 +557,20 @@ impl App {
     /// The title the window should currently carry (WIN-1502): the VM's own
     /// title plus what the user needs to know about the input state.
     fn window_title(&self) -> String {
-        let title = ux::window_title(
+        let mut title = ux::window_title(
             &self.title,
             WindowStatus {
                 grabbed: self.grabbed,
                 mode: self.mode,
             },
         );
+        if self.relative_supported {
+            title.push_str(if self.relative_requested {
+                " — [gaming mouse, Ctrl+Alt+M toggles]"
+            } else {
+                " — [desktop mouse, Ctrl+Alt+M toggles]"
+            });
+        }
         match &self.note {
             Some((note, _)) => format!("{title} — {note}"),
             None => title,
@@ -655,7 +694,7 @@ impl App {
             return;
         }
         let stats = self.frame_stats();
-        let input = self.capture.events().stats();
+        let input = self.capture.stats();
         let boost = self
             .renderer
             .as_ref()
@@ -711,6 +750,12 @@ impl App {
             }
             WindowAction::ToggleFullscreen => self.toggle_fullscreen(),
             WindowAction::ToggleScaleMode => self.toggle_scale_mode(),
+            WindowAction::ToggleRelativePointer => {
+                self.relative_requested = !self.relative_requested;
+                self.capture
+                    .set_pointer_integration(!(self.relative_supported && self.relative_requested));
+                self.update_title();
+            }
             WindowAction::TypeClipboard => self.type_clipboard(),
         }
     }
@@ -895,13 +940,64 @@ impl App {
 
     /// Reapplies confinement to the current client rectangle, even when the
     /// logical grab state is unchanged after moving or resizing the window.
+    fn sync_relative_pointer(&mut self, event_loop: &ActiveEventLoop) {
+        let relative = ux::relative_pointer_for(
+            self.relative_supported,
+            self.capture.grabbed() && !self.toolbar.captures_pointer(),
+            self.capture.focused(),
+            self.relative_requested,
+        );
+        if relative == self.capture.relative_pointer() {
+            return;
+        }
+        self.capture.set_relative_pointer(relative);
+        if let Some(window) = self.window.as_ref() {
+            let mode = if relative {
+                if cfg!(windows) {
+                    CursorGrabMode::Confined
+                } else {
+                    CursorGrabMode::Locked
+                }
+            } else if self.grabbed && !cfg!(target_os = "macos") {
+                CursorGrabMode::Confined
+            } else {
+                CursorGrabMode::None
+            };
+            if let Err(error) = window.set_cursor_grab(mode) {
+                tracing::warn!(%error, "relative mouse capture was refused; retaining desktop pointer mode");
+                self.capture.set_relative_pointer(false);
+                self.relative_requested = false;
+                self.capture.set_pointer_integration(true);
+                self.sync_cursor_grab();
+            }
+            // On Windows winit's hidden+confined state clips to the client
+            // centre. This is intentional for RAW relative input, never for
+            // the desktop tablet (which uses a transparent cursor instead).
+            #[cfg(windows)]
+            window.set_cursor_visible(!self.capture.relative_pointer());
+        }
+        event_loop.listen_device_events(if self.capture.relative_pointer() {
+            winit::event_loop::DeviceEvents::WhenFocused
+        } else {
+            winit::event_loop::DeviceEvents::Never
+        });
+        tracing::info!(
+            relative = self.capture.relative_pointer(),
+            "relative mouse mode changed"
+        );
+        self.sync_cursor();
+        self.update_title();
+    }
+
     fn sync_cursor_grab(&self) {
         let Some(window) = self.window.as_ref() else {
             return;
         };
         // AppKit cannot confine a pointer. Keeping its absolute motion is
         // necessary for the guest tablet; locking it would freeze that input.
-        let mode = if self.grabbed && !cfg!(target_os = "macos") {
+        let mode = if self.grabbed && self.capture.relative_pointer() && !cfg!(windows) {
+            CursorGrabMode::Locked
+        } else if self.grabbed && !cfg!(target_os = "macos") {
             CursorGrabMode::Confined
         } else {
             CursorGrabMode::None
@@ -923,7 +1019,11 @@ impl App {
     /// visibility flag works and is kept.
     fn sync_cursor(&mut self) {
         // Over the toolbar the user needs the host arrow, grabbed or not.
-        let visible = self.capture.cursor_visible() || self.toolbar.captures_pointer();
+        let visible = if self.capture.relative_pointer() && self.grabbed {
+            false
+        } else {
+            self.capture.cursor_visible() || self.toolbar.captures_pointer()
+        };
         if visible == self.cursor_visible {
             return;
         }
@@ -1119,6 +1219,7 @@ impl ApplicationHandler<HostEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.sync_relative_pointer(event_loop);
         self.steer_boost(event_loop);
         if let Some((_, until)) = &self.note {
             let until = *until;
@@ -1183,6 +1284,17 @@ impl ApplicationHandler<HostEvent> for App {
                 tracing::info!("shutdown requested; closing the window");
                 event_loop.exit();
             }
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            self.capture.on_relative_motion(dx, dy);
         }
     }
 
@@ -1321,7 +1433,17 @@ impl ApplicationHandler<HostEvent> for App {
         }
     }
 
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+    fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+        self.capture.release_all();
+        self.capture.set_relative_pointer(false);
+        event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
+        if let Some(window) = &self.window {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            if let Some(cursors) = &self.cursors {
+                window.set_cursor(cursors.shown.clone());
+            }
+            window.set_cursor_visible(true);
+        }
         // Unhook and join before the HWND can be destroyed or reused.
         #[cfg(windows)]
         drop(self.keyboard_hook.take());

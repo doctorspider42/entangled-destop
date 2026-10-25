@@ -256,6 +256,8 @@ fn open_presentation(
                     .with_title(format!("Entangled Desktop — {}", cfg.name))
                     .with_guest_refresh(cfg.display.refresh_hz)
                     .with_follow_window(cfg.display.follow_window != Some(false))
+                    .with_relative_mouse(cfg.display.relative_mouse_enabled(cfg.transport))
+                    .with_gaming_mouse(cfg.display.relative_mouse == Some(true))
                     .with_typist(typist.clone());
                 let host = match placement {
                     Some(path) => host.with_placement_file(path),
@@ -401,6 +403,7 @@ fn build_devices(
     display_handle: display::DisplayHandle,
     keyboard_sink: &mut Option<virtio_input::InputHandle>,
     tablet_sink: &mut Option<virtio_input::InputHandle>,
+    mouse_sink: &mut Option<virtio_input::InputHandle>,
 ) -> Result<BuiltDevices, String> {
     let mut devices: Vec<Box<dyn VirtioDevice>> = Vec::with_capacity(cfg.disks.len() + 5);
     for disk in &cfg.disks {
@@ -804,6 +807,15 @@ fn build_devices(
     if cfg.reclaim_memory {
         tracing::info!("attaching virtio-balloon (the guest's free memory goes back to the host)");
         devices.push(Box::new(virtio_balloon::BalloonDevice::new()));
+    }
+
+    // Append after all existing devices: keyboard/tablet, sound, gamepad and
+    // shared-folder PCI addresses remain stable. The generic input device owns
+    // its reset, quiesce and save/load implementation, just like the tablet.
+    if cfg.display.relative_mouse_enabled(cfg.transport) {
+        let mouse = virtio_input::InputDevice::relative_pointer();
+        *mouse_sink = Some(mouse.handle());
+        devices.push(Box::new(mouse));
     }
 
     Ok(BuiltDevices {
@@ -1454,11 +1466,13 @@ pub fn run_with(
     };
     let mut keyboard_sink = None;
     let mut tablet_sink = None;
+    let mut mouse_sink = None;
     let built = build_devices(
         &cfg,
         display_handle.clone(),
         &mut keyboard_sink,
         &mut tablet_sink,
+        &mut mouse_sink,
     )?;
     let (keyboard_sink, tablet_sink) = match (keyboard_sink, tablet_sink) {
         (Some(k), Some(t)) => (k, t),
@@ -1612,6 +1626,7 @@ pub fn run_with(
             // and the input pump move to worker threads. Ctrl+Alt+Q and the
             // window close button request shutdown like SIGINT does.
             let input_queue = host.input_queue();
+            let relative_input_queue = host.relative_input_queue();
             let control_queue = host.control_queue();
             let pump_requests = Arc::clone(&requests);
             let pump_quiesce = Arc::clone(&quiesce);
@@ -1631,6 +1646,7 @@ pub fn run_with(
                     // they are how the VM gets un-paused.
                     let Some(pass) = pump_quiesce.try_enter() else {
                         input_queue.drain_batches();
+                        relative_input_queue.drain_batches();
                         for event in control_queue.drain() {
                             note_control_event(event, &pump_requests, pump_snapshot.as_deref());
                         }
@@ -1655,6 +1671,13 @@ pub fn run_with(
                     }
                     if let Err(e) = tablet_sink.push(&pointer) {
                         tracing::warn!(error = %e, "pointer event delivery failed");
+                    }
+                    // Relative deltas are additive. Never run these through the
+                    // tablet's last-position-wins coalescer.
+                    if let Some(mouse) = &mouse_sink {
+                        if let Err(e) = mouse.push(&relative_input_queue.drain()) {
+                            tracing::warn!(error = %e, "relative mouse event delivery failed");
+                        }
                     }
                     for event in control_queue.drain() {
                         note_control_event(event, &pump_requests, pump_snapshot.as_deref());

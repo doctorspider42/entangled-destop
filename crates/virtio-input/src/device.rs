@@ -695,6 +695,11 @@ impl InputDevice {
         Self::new(Profile::AbsolutePointer)
     }
 
+    /// Relative mouse, using the same bounded queues, reset and snapshot path.
+    pub fn relative_pointer() -> Self {
+        Self::new(Profile::RelativePointer)
+    }
+
     /// A gamepad with no host capture attached (GAME-2104): the guest gets a
     /// pad that enumerates and never moves unless something pushes events into
     /// its [`InputHandle`]. That is what the tests use, and what a headless run

@@ -10,6 +10,17 @@ transports and shared safety live in `crates/virtio-core`; one crate per device.
 
 ## Architecture contract
 
+Relative mouse input uses `virtio_input::Profile::RelativePointer` (product 4),
+with REL_X/Y, both wheel axes and the three primary buttons, and no ABS axes.
+It is distinct from the absolute tablet and must remain a mouse rather than
+binding joydev/taking js0 from the gamepad. `Profile::ALL` includes all four
+profiles. The CLI appends it after existing devices, preserving their PCI slots;
+it defaults on for accelerated PCI desktops and is optional elsewhere through
+`display.relative_mouse`. Its queues/reset/snapshot positions use the existing
+InputDevice implementation. The window's relative queue is drained under the
+same input-pump quiesce gate as keyboard/tablet, and discarded while paused.
+Never replace relative reports with the latest one: their deltas are additive.
+
 - Devices implement `virtio_core::VirtioDevice` and see **queues, features,
   config space** — never transport registers. A transport owns registers,
   status and queue plumbing. This is not aspirational: adding virtio-pci

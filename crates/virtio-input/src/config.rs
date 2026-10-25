@@ -90,6 +90,8 @@ pub const PRODUCT_KEYBOARD: u16 = 0x0001;
 pub const PRODUCT_TABLET: u16 = 0x0002;
 /// Product id of the gamepad (GAME-2104).
 pub const PRODUCT_GAMEPAD: u16 = 0x0003;
+/// Relative mouse, distinct from the absolute tablet and gamepad.
+pub const PRODUCT_MOUSE: u16 = 0x0004;
 /// Version reported by every device.
 pub const INPUT_VERSION: u16 = 0x0001;
 
@@ -233,16 +235,20 @@ pub enum Profile {
     /// `dpad_to_buttons` mode, which is off by default) and `INPUT_PROP_*`
     /// (`xpad` sets none either).
     Gamepad,
+    /// A conventional mouse for raw relative camera movement. No absolute axes,
+    /// so udev/libinput classify it as a mouse and joydev leaves it alone.
+    RelativePointer,
 }
 
 impl Profile {
     /// Every profile there is. Exhaustive tests iterate this, so a profile
     /// added without a matching arm somewhere fails a test rather than
     /// quietly answering `size = 0` to everything.
-    pub const ALL: [Profile; 3] = [
+    pub const ALL: [Profile; 4] = [
         Profile::Keyboard,
         Profile::AbsolutePointer,
         Profile::Gamepad,
+        Profile::RelativePointer,
     ];
 
     /// The `VIRTIO_INPUT_CFG_ID_NAME` string, as the guest shows it in
@@ -252,6 +258,7 @@ impl Profile {
             Profile::Keyboard => "Entangled Keyboard",
             Profile::AbsolutePointer => "Entangled Tablet",
             Profile::Gamepad => "Entangled Gamepad",
+            Profile::RelativePointer => "Entangled Mouse",
         }
     }
 
@@ -265,6 +272,7 @@ impl Profile {
                 Profile::Keyboard => PRODUCT_KEYBOARD,
                 Profile::AbsolutePointer => PRODUCT_TABLET,
                 Profile::Gamepad => PRODUCT_GAMEPAD,
+                Profile::RelativePointer => PRODUCT_MOUSE,
             },
             version: INPUT_VERSION,
         }
@@ -301,6 +309,12 @@ impl Profile {
             // `display` emits both wheel axes, so both are advertised —
             // otherwise the guest silently discards horizontal scrolling.
             (Profile::AbsolutePointer, ev::REL) => Selection::bitmap([rel::HWHEEL, rel::WHEEL]),
+            (Profile::RelativePointer, ev::KEY) => {
+                Selection::bitmap([btn::LEFT, btn::RIGHT, btn::MIDDLE])
+            }
+            (Profile::RelativePointer, ev::REL) => {
+                Selection::bitmap([rel::X, rel::Y, rel::HWHEEL, rel::WHEEL])
+            }
             (Profile::Gamepad, ev::KEY) => Selection::bitmap(btn::GAMEPAD),
             (Profile::Gamepad, ev::ABS) => Selection::bitmap([
                 abs::X,
@@ -577,6 +591,30 @@ pub fn selection_with_serial(
 mod tests {
     use super::*;
     use crate::InputEvent;
+
+    #[test]
+    fn relative_mouse_advertises_signed_motion_and_buttons_without_becoming_a_tablet_or_joystick() {
+        for code in [rel::X, rel::Y, rel::WHEEL, rel::HWHEEL] {
+            let event = InputEvent {
+                event_type: ev::REL,
+                code,
+                value: (-7i32) as u32,
+            };
+            assert!(Profile::RelativePointer.accepts(event));
+            if code == rel::X || code == rel::Y {
+                assert!(!Profile::AbsolutePointer.accepts(event));
+            }
+        }
+        for code in [btn::LEFT, btn::RIGHT, btn::MIDDLE] {
+            assert!(Profile::RelativePointer.accepts(InputEvent {
+                event_type: ev::KEY,
+                code,
+                value: 1
+            }));
+        }
+        assert!(Profile::RelativePointer.event_bits(ev::ABS).is_empty());
+        assert!(!joydev_would_bind(Profile::RelativePointer));
+    }
 
     /// Bit position of a code inside a bitmap payload, spelled out the way the
     /// spec does: byte `code / 8`, bit `code % 8`.
@@ -1047,16 +1085,25 @@ mod tests {
     }
 
     #[test]
-    fn the_three_devices_are_distinguishable_and_named() {
+    fn the_four_devices_are_distinguishable_and_named() {
         let ids: Vec<_> = Profile::ALL.map(|p| p.devids().product).to_vec();
-        assert_eq!(ids, vec![PRODUCT_KEYBOARD, PRODUCT_TABLET, PRODUCT_GAMEPAD]);
+        assert_eq!(
+            ids,
+            vec![
+                PRODUCT_KEYBOARD,
+                PRODUCT_TABLET,
+                PRODUCT_GAMEPAD,
+                PRODUCT_MOUSE
+            ]
+        );
         let names: Vec<_> = Profile::ALL.map(|p| p.name()).to_vec();
         assert_eq!(
             names,
             vec![
                 "Entangled Keyboard",
                 "Entangled Tablet",
-                "Entangled Gamepad"
+                "Entangled Gamepad",
+                "Entangled Mouse"
             ]
         );
         for profile in Profile::ALL {
@@ -1190,6 +1237,7 @@ mod tests {
                 ("Entangled Keyboard", false),
                 ("Entangled Tablet", false),
                 ("Entangled Gamepad", true),
+                ("Entangled Mouse", false),
             ]
         );
     }

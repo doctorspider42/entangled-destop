@@ -130,6 +130,10 @@ pub mod msc {
 
 /// Relative axes; the absolute pointer still needs them for the scroll wheel.
 pub mod rel {
+    /// Horizontal relative motion (signed counts, encoded as two's complement).
+    pub const X: u16 = 0x00;
+    /// Vertical relative motion.
+    pub const Y: u16 = 0x01;
     /// `REL_HWHEEL` — horizontal scroll, in notches.
     pub const HWHEEL: u16 = 0x06;
     /// `REL_WHEEL` — vertical scroll, in notches.
