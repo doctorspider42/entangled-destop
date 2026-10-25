@@ -1235,3 +1235,52 @@ with a frame timeout and could not deliver a grab shortcut, so physical
 Alt+Tab delivery and top-edge interaction remain pending user confirmation;
 the native hook lifetime/recovery tests passed. No Windows timeout diagnosis
 is inferred from the absence of that confirmation.
+
+
+### Native keyboard, firmware warning and mouse preference (2026-10-25)
+
+The raw-mouse fixture isolated the Alt+Tab failure without a hypervisor. Winit's
+DeviceEvents registration enables both mouse and keyboard raw input. The input
+pipeline uses only raw mouse motion; unused raw keyboard registration is now
+removed on Windows, with the low-level keyboard hook armed afterwards. Desktop
+keyboard events retain winit's layout handling. A native regression registers
+both device classes on an invisible message-only window and verifies that mouse
+registration survives while keyboard registration is removed. The native unit
+test does not inject keys into the desktop. The demo's --gaming-mouse fixture
+supports acceptance without a VM.
+
+A/B evidence: the old raw fixture lost its grab on Alt+Tab and reported zero
+hook callbacks; the corrected fixture kept capture and forwarded balanced Tab
+press/release. On the Ubuntu WHP machine the corrected debug engine changed the
+guest's active X11 window from Text Editor (0x800004) to Calculator (0x600004),
+then back on the next Alt+Tab, while the host window remained grabbed. Releasing
+Ctrl+Alt returned the host shortcut and did not change the guest's active editor
+on the following Alt+Tab. Evidence: F:/VMs/Entangled/local-build/input-before-alt-tab.txt,
+input-after-alt-tab.txt and input-after-release-alt-tab.txt. This supersedes the
+previous amendment's unconfirmed native keyboard acceptance.
+
+Ctrl+Alt+M and its title hint are removed. The per-VM Display & GPU preference
+Optimise mouse for games saves the existing relative_mouse field, applied at
+next start. Turning it off preserves automatic PCI device attachment and an
+existing explicit device-disable setting, rather than changing device topology
+unnecessarily. Shortcut forwarding and editor persistence are regression-tested.
+
+The manager's native run preflight now checks firmware declared in the profile
+and beside the selected engine before general host locations. It no longer
+warns about missing firmware while a valid profile-specific file boots the VM.
+The native preflight is skipped for WSL. Genuine missing-file notices provide a
+short reinstall instruction, with no terminal commands, hashes or checkout paths.
+A regression verifies that the explicit profile file wins, then that an engine
+installation supplies the fallback after that explicit file disappears.
+
+
+Final verification for this follow-up: Windows workspace 2417 passed / 18
+ignored; Linux workspace 2431 passed / 26 ignored, the latter with one test
+thread. Workspace Clippy with warnings denied and formatting passed on both;
+cargo-deny passed. The exact deployed release engine also switched the Ubuntu
+guest from Text Editor to Calculator while retaining capture, recorded in
+input-release-before-alt-tab.txt and input-release-after-alt-tab.txt under
+F:/VMs/Entangled/local-build. The manager's editor-display screenshot shows the
+new mouse preference and a fixed save footer without overlap. Skill twins were
+validated as matching UTF-8 with valid frontmatter; an older stray CP1252
+ellipsis in the GUI skill was normalized without changing its meaning.

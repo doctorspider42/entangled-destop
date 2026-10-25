@@ -27,7 +27,6 @@
 //! | `Ctrl+Alt+S` | suspend the VM to its snapshot file ([`ControlEvent::SaveRequested`]) |
 //! | `F11` | toggle borderless fullscreen ([`WindowAction::ToggleFullscreen`]) |
 //! | `Ctrl+Alt+O` | toggle 1:1 pixel mode ([`WindowAction::ToggleScaleMode`]) |
-//! | `Ctrl+Alt+M` | toggle gaming mouse / desktop tablet integration |
 //! | `Ctrl+Alt+V` | type the host clipboard into the guest ([`WindowAction::TypeClipboard`]) |
 //!
 //! Every *other* `Ctrl+Alt+<key>` combination is forwarded verbatim, so the
@@ -141,8 +140,6 @@ pub enum WindowAction {
     ToggleFullscreen,
     /// `Ctrl+Alt+O`: switch between [`crate::ScaleMode`]s (WIN-1504).
     ToggleScaleMode,
-    /// `Ctrl+Alt+M`: switch desktop integration / relative gaming capture.
-    ToggleRelativePointer,
     /// `Ctrl+Alt+V`: type the host clipboard's text (`virtio_input::typing`).
     TypeClipboard,
 }
@@ -857,10 +854,6 @@ impl InputCapture {
                 Some(WindowAction::Quit)
             }
             KeyCode::KeyO => Some(WindowAction::ToggleScaleMode),
-            KeyCode::KeyM => {
-                self.release_all();
-                Some(WindowAction::ToggleRelativePointer)
-            }
             // The modifiers go back first: typed text under a held Ctrl+Alt
             // would be a string of shortcuts.
             KeyCode::KeyV => {
@@ -1000,14 +993,13 @@ mod tests {
     }
 
     #[test]
-    fn gaming_mouse_shortcut_releases_guest_modifiers_without_releasing_input_capture() {
+    fn former_gaming_mouse_shortcut_is_forwarded_to_the_guest() {
         let mut c = grabbed_capture();
         hold_ctrl_alt(&mut c);
-        assert_eq!(
+        assert!(matches!(
             press(&mut c, KeyCode::KeyM),
-            KeyOutcome::Reserved(WindowAction::ToggleRelativePointer)
-        );
-        assert_eq!(c.pressed_count(), 0);
+            KeyOutcome::Forwarded(_)
+        ));
         release(&mut c, KeyCode::KeyM);
         release(&mut c, KeyCode::AltLeft);
         release(&mut c, KeyCode::ControlLeft);

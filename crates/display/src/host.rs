@@ -254,7 +254,7 @@ impl DisplayHost {
         self
     }
 
-    /// Initial mouse integration preference; Ctrl+Alt+M changes it for this
+    /// Mouse integration preference from the virtual machine settings for this
     /// session. Actual capture still requires a device, focus and an input grab.
     pub fn with_gaming_mouse(mut self, enabled: bool) -> Self {
         self.relative_requested = enabled;
@@ -561,9 +561,9 @@ impl App {
         );
         if self.relative_supported {
             title.push_str(if self.relative_requested {
-                " — [gaming mouse, Ctrl+Alt+M toggles]"
+                " — [gaming mouse]"
             } else {
-                " — [desktop mouse, Ctrl+Alt+M toggles]"
+                " — [desktop mouse]"
             });
         }
         match &self.note {
@@ -745,12 +745,6 @@ impl App {
             }
             WindowAction::ToggleFullscreen => self.toggle_fullscreen(),
             WindowAction::ToggleScaleMode => self.toggle_scale_mode(),
-            WindowAction::ToggleRelativePointer => {
-                self.relative_requested = !self.relative_requested;
-                self.capture
-                    .set_pointer_integration(!(self.relative_supported && self.relative_requested));
-                self.update_title();
-            }
             WindowAction::TypeClipboard => self.type_clipboard(),
         }
     }
@@ -923,32 +917,40 @@ impl App {
         }
         self.grabbed = grabbed;
         #[cfg(windows)]
-        {
-            // Windows can silently remove a low-level hook after a timeout.
-            // A new capture must not reuse a hook left idle since VM startup.
-            // Drop also disarms and joins it before the host regains ownership.
+        if !grabbed {
             drop(self.keyboard_hook.take());
-            if grabbed {
-                if let Some(window) = &self.window {
-                    match crate::windows_keyboard::KeyboardHook::new(window) {
-                        Ok(hook) => {
-                            hook.set_grab(true);
-                            self.keyboard_hook = Some(hook);
-                            tracing::info!("Windows shortcut capture armed for this grab");
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "cannot capture Windows system shortcuts");
-                            self.shot
-                                .notify("KEYBOARD CAPTURE FAILED - RELEASE INPUT AND RETRY");
-                        }
-                    }
-                }
-            }
         }
         self.update_title();
         self.sync_cursor();
         self.sync_cursor_grab();
         tracing::info!(grabbed, "pointer grab toggled");
+    }
+
+    /// Install only after raw input registration has settled for this grab.
+    /// Changing DeviceEvents re-registers both mouse AND keyboard in winit.
+    #[cfg(windows)]
+    fn sync_keyboard_capture(&mut self) {
+        if !self.grabbed || !self.capture.focused() {
+            drop(self.keyboard_hook.take());
+            return;
+        }
+        if self.keyboard_hook.is_some() {
+            return;
+        }
+        if let Some(window) = &self.window {
+            match crate::windows_keyboard::KeyboardHook::new(window) {
+                Ok(hook) => {
+                    hook.set_grab(true);
+                    self.keyboard_hook = Some(hook);
+                    tracing::info!("Windows shortcut capture armed after raw input registration");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot capture Windows system shortcuts");
+                    self.shot
+                        .notify("KEYBOARD CAPTURE FAILED - RELEASE INPUT AND RETRY");
+                }
+            }
+        }
     }
 
     /// Reapplies confinement to the current client rectangle, even when the
@@ -989,11 +991,20 @@ impl App {
             #[cfg(windows)]
             window.set_cursor_visible(!self.capture.relative_pointer());
         }
+        // Do not retain a hook across changes to raw keyboard registration.
+        #[cfg(windows)]
+        drop(self.keyboard_hook.take());
         event_loop.listen_device_events(if self.capture.relative_pointer() {
             winit::event_loop::DeviceEvents::WhenFocused
         } else {
             winit::event_loop::DeviceEvents::Never
         });
+        #[cfg(windows)]
+        if self.capture.relative_pointer() {
+            if let Err(error) = crate::windows_keyboard::retain_legacy_keyboard() {
+                tracing::warn!(%error, "cannot retain legacy keyboard input during mouse capture");
+            }
+        }
         tracing::info!(
             relative = self.capture.relative_pointer(),
             "relative mouse mode changed"
@@ -1233,6 +1244,8 @@ impl ApplicationHandler<HostEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.sync_relative_pointer(event_loop);
+        #[cfg(windows)]
+        self.sync_keyboard_capture();
         self.steer_boost(event_loop);
         if let Some((_, until)) = &self.note {
             let until = *until;

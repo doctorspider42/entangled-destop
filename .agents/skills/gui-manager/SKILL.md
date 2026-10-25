@@ -470,12 +470,12 @@ Health, Activity, Settings — with one line of host numbers, the version and th
 `MOCK DATA` chip. There is no top header.
 
 - **All machines** (`ui/cards.rs`): running machines large (screen well, live
-  meters, Pause · Shut down), everything else as a fixed-height tile with at
+  meters, Suspend · Shut down), everything else as a fixed-height tile with at
   most one action (Start or Resume), a dashed New-machine tile, and the
   first-launch page (`welcome`) when there are no machines at all.
 - **The machine page** (`ui/machine.rs`, `View::Machine(name)`) owns every
   lifecycle button: the state's buttons in the header, everything rarer under
-  the `…` menu (Restart, Suspend, Force stop, autostart, rename, clone,
+  the `…` menu (Restart, Force stop, autostart, rename, clone,
   delete), notices for a missing disk / a shared name / a saved session that
   cannot resume, the screen with "Right now" and "Connect" panels, and setup
   tiles. A tile opens the editor on its own section through
@@ -578,7 +578,7 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
 ## Suspend and Restart: the control channel (ADR-0005/0006)
 
 Running cards and the machine page have a primary **Suspend** action beside
-**Shut down**. **Restart** and **Force stop** remain in the `�` menu. Pause and
+**Shut down**. **Restart** and **Force stop** remain in the `…` menu. Pause and
 Continue have no product buttons, manager actions or Ctrl+Alt+P shortcut.
 
 `launcher::run_spec` starts `entangled run --control-stdin <profile>` and
@@ -738,3 +738,21 @@ Path fields and their Browse buttons share `BUTTON_H` (34 px). Allocate the
 button through the parent layout: a 22 px placeholder with a 34 px child painted
 outside it caused both vertical misalignment and drifting rows. Call
 `form_scope` again inside an indented/collapsing form such as Settings Advanced.
+
+
+## Firmware and mouse preferences follow-up (2026-10-25)
+
+Run preflight uses `launcher::locate_vm_firmware(profile, cwd, engine)`: honour
+an existing firmware declared by this VM first, then the selected engine's
+installation, then the usual host lookup. Do not warn from the manager's own
+installation alone: a VM with a correct absolute firmware path was starting
+successfully while receiving a false warning. Native host firmware checks are
+not applied to WSL launches. Missing-file notices are brief user-facing text;
+paths, download commands and digest details belong in diagnostic output.
+
+Display & GPU has **Optimise mouse for games** (`EditForm::gaming_mouse`). It
+loads from `[display] relative_mouse == Some(true)`. On writes Some(true);
+off writes None unless preserving an existing explicit Some(false). This avoids
+removing the automatic 3D PCI mouse just by changing the capture preference.
+The choice applies at next start. Ctrl+Alt+M no longer changes it or reserves
+that chord from the guest. Keep both skill copies valid UTF-8 and equivalent.

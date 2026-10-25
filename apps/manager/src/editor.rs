@@ -76,6 +76,8 @@ pub struct EditForm {
     /// `[display] follow_window`, as the checkbox shows it: on unless the
     /// profile says `false`.
     pub follow_window: bool,
+    /// Capture relative movement for games instead of integrating the pointer.
+    pub gaming_mouse: bool,
     /// `[display] typing_layout`; empty means US (absent).
     pub typing_layout: String,
     /// What "Match monitor" sets [`Self::refresh_hz`] to: this computer's
@@ -271,6 +273,7 @@ enabled = true
             gpu: cfg.display.gpu_renderer(),
             refresh_hz: cfg.display.refresh_hz,
             follow_window: cfg.display.follow_window != Some(false),
+            gaming_mouse: cfg.display.relative_mouse == Some(true),
             typing_layout: cfg.display.typing_layout.clone().unwrap_or_default(),
             monitor_refresh_hz: control_api::DEFAULT_REFRESH_HZ,
             gpu_boost: cfg.display.gpu_boost != Some(false),
@@ -344,6 +347,13 @@ enabled = true
         cfg.display.refresh_hz = self.refresh_hz;
         // On is the default and is not written (older engines deny the key).
         cfg.display.follow_window = (!self.follow_window).then_some(false);
+        cfg.display.relative_mouse = if self.gaming_mouse {
+            Some(true)
+        } else if self.base.display.relative_mouse == Some(false) {
+            Some(false)
+        } else {
+            None
+        };
         // US is the default and is not written (older engines deny the key).
         cfg.display.typing_layout = match self.typing_layout.as_str() {
             "" | "us" => None,
@@ -451,6 +461,17 @@ interface = "entangled0"
         assert_eq!(form.gpu, GpuRenderer::TwoD);
         assert_eq!(form.disks.len(), 1);
         assert!(!form.dirty(), "an untouched form is clean");
+    }
+
+    #[test]
+    fn mouse_preference_round_trips_without_removing_the_automatic_device() {
+        let path = temp_profile("gaming-mouse");
+        let mut form = EditForm::from_profile(&path).unwrap();
+        assert!(!form.gaming_mouse);
+        form.gaming_mouse = true;
+        assert_eq!(form.to_config().unwrap().display.relative_mouse, Some(true));
+        form.gaming_mouse = false;
+        assert_eq!(form.to_config().unwrap().display.relative_mouse, None);
     }
 
     #[test]

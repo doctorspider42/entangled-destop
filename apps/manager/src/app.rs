@@ -1626,10 +1626,11 @@ impl ManagerApp {
             // directory still starts if this computer has the firmware
             // anywhere, so complaining about the working directory alone was a
             // false alarm on every start of a perfectly good machine.
-            launcher::locate_firmware(&cwd).is_none().then(|| {
+            (chosen == Backend::Native
+                && launcher::locate_vm_firmware(&vm.profile_path, &cwd, &cli).is_none())
+            .then(|| {
                 format!(
-                    "no UEFI firmware on this computer — this machine cannot start without \
-                     it. {}",
+                    "The firmware needed to start this machine is unavailable. {}",
                     launcher::FIRMWARE_FIX
                 )
             })

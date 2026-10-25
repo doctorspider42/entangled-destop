@@ -717,8 +717,8 @@ pub struct DisplaySection {
     pub follow_window: Option<bool>,
     /// Add a relative mouse beside the tablet. Defaults on for accelerated PCI
     /// desktops; off elsewhere so existing MMIO device-slot budgets stay valid.
-    /// Explicit true also selects gaming mouse capture at startup; Ctrl+Alt+M
-    /// switches between it and desktop tablet integration during the session.
+    /// Explicit true also selects gaming mouse capture at startup. The VM editor
+    /// exposes this choice under Display & GPU, applied at the next start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_mouse: Option<bool>,
     /// The keyboard layout the guest is set to, for typing text into it

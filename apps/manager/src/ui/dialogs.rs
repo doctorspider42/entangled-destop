@@ -1248,6 +1248,15 @@ fn edit_display_gpu(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
                      whatever the window does, and scales the image instead.",
             );
     });
+    ui::form_row(
+        ui,
+        "MOUSE",
+        "Choose how the mouse behaves in this machine.",
+        |ui, _| {
+            ui.checkbox(&mut form.gaming_mouse, "Optimise mouse for games")
+            .on_hover_text("Use relative movement for free camera rotation in games. Ctrl+Alt releases the mouse. Turn off for desktop pointer integration.");
+        },
+    );
     ui.add_space(6.0);
     ui::form_row(
         ui,

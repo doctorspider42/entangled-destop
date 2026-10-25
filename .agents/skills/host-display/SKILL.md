@@ -225,7 +225,14 @@ GPU (`display::boost`, `display::latency`):
 ### Windows shell shortcuts and F11 (2026-10-25)
 
 `windows_keyboard` installs a fresh `WH_KEYBOARD_LL` hook on its own message
-thread at each new grab and drops/disarms/joins it on release or focus loss.
+thread at each new grab, after raw input registration, and drops/disarms/joins
+it on release or focus loss. Winit 0.30 registers BOTH raw mouse and raw keyboard
+for DeviceEvents::WhenFocused. We consume only MouseMotion: on Windows
+`retain_legacy_keyboard` removes the unused keyboard raw registration while
+retaining raw mouse, and the hook is armed afterwards. Do not remove this step:
+with raw keyboard still registered the native hook received no callbacks on this
+host and Alt+Tab escaped. `raw_mouse_is_retained_while_unused_raw_keyboard_is_removed`
+checks both registrations on an invisible message-only window.
 Do not reuse a hook left idle since window creation: Windows can silently remove
 a timed-out low-level hook. A failed install shows a window notice.
 It intercepts Alt+Tab/Esc/Space/F4, Ctrl+Esc and Windows-key chords only while
@@ -248,8 +255,11 @@ fullscreen mode switch without checking in-game mouse alignment.
 
 The accelerated PCI desktop includes a separate `RelativePointer` device.
 `[display] relative_mouse = true` additionally selects gaming capture on startup;
-absent keeps desktop tablet integration initially, with Ctrl+Alt+M switching
-modes during the session. `false` omits the relative device. Legacy MMIO guests
+absent keeps desktop tablet integration initially. The VM editor exposes this
+under Display & GPU as **Optimise mouse for games**, applied on the next start.
+Ctrl+Alt+M is not reserved and the title has no toggle hint. `false` omits the
+relative device; the editor preserves an existing explicit false. Turning gaming
+mode off normally writes None, preserving the automatic 3D PCI device. Legacy MMIO guests
 only gain one when explicitly requested, preserving their existing slot budget.
 The preference survives focus/grab loss, but actual raw capture requires both;
 Ctrl+Alt always returns the pointer and keyboard to the host. Guest cursor hiding
@@ -618,3 +628,12 @@ Manual regression: grab the image, F11 into fullscreen, reach all four edges,
 F11 back, and repeat after moving/resizing the window. `GetClipCursor` should
 match `GetClientRect` translated by `ClientToScreen` while the window is focused
 and grabbed. The display demo can check this without booting a guest.
+
+
+Native keyboard regression fixture: `cargo run -p display --example demo --
+--gaming-mouse`. Use Ctrl+Alt+G to grab, then Alt+Tab; input must remain grabbed.
+Ctrl+Alt releases it. `RUST_LOG=info,display::windows_keyboard=debug` emits only
+aggregate callback/forwarding counts at release, never text. Test the real VM
+with two guest windows as well: an armed title alone does not prove delivery.
+For native computer-use tests, explicit `Control_L`, `Alt_L` modifiers and the
+window's Raise action worked; generic modifier aliases were unreliable here.

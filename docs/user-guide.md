@@ -1227,6 +1227,11 @@ read/write will corrupt it. The manager's *Clone…* copies a whole machine safe
   entangled snapshot ~/entangled-vms/ubuntu.esnap   # just describe the file
   ```
 
+Choose **Optimise mouse for games** under the machine's **Display & GPU**
+settings for relative camera movement, or leave it off for desktop pointer
+integration. The preference takes effect at the next start. Ctrl+Alt+M is sent
+to the guest and does not change mouse mode.
+
 In gaming mouse mode the host pointer is locked at the centre. Release it with
 Ctrl+Alt, then move to the top edge to use the quick-actions bar; it works in a
 normal window too. Suspend is also a primary action on the manager's running

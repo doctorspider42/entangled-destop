@@ -58,8 +58,13 @@ fn main() -> Result<(), display::DisplayError> {
         )
         .init();
 
-    let host =
-        DisplayHost::new(DisplayConfig::default())?.with_title("Entangled Desktop display demo");
+    // Optional native-input fixture: exercise the same raw capture as a 3D VM
+    // without a hypervisor, disk, guest desktop or host Vulkan executor.
+    let gaming = std::env::args().any(|arg| arg == "--gaming-mouse");
+    let host = DisplayHost::new(DisplayConfig::default())?
+        .with_title("Entangled Desktop display demo")
+        .with_relative_mouse(gaming)
+        .with_gaming_mouse(gaming);
     tracing::info!(
         "click the image to grab input; Ctrl+Alt releases it, F11 fullscreen, \
          Ctrl+Alt+O 1:1, Ctrl+Alt+S / Ctrl+Alt+R are lifecycle requests (no VM here), \

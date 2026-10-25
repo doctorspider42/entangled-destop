@@ -495,15 +495,52 @@ const FIRMWARE_FILE: &str = "CLOUDHV.fd";
 /// Entangled Desktop from the Windows installer has neither. The firmware now
 /// ships *inside* that installer and is downloadable besides, so the fix is a
 /// command and a reinstall rather than an errand.
-pub const FIRMWARE_FIX: &str = if cfg!(windows) {
-    "The firmware normally ships with Entangled Desktop, in artifacts\\firmware next to the \
-     program. If it is not there, `entangled fetch firmware` downloads it (4 MiB, checked \
-     against a digest built into this program), or reinstalling puts it back."
-} else {
-    "The firmware normally ships with Entangled Desktop, in artifacts/firmware next to the \
-     program. If it is not there, `entangled fetch firmware` downloads it (4 MiB, digest \
-     checked), or build it with `bash guest/firmware/build-cloudhv.sh` (about 2.5 minutes)."
-};
+pub const FIRMWARE_FIX: &str = "Reinstall Entangled Desktop to restore it.";
+
+/// Run preflight must honour the profile and the selected engine, not only
+/// the manager's own installation. The engine remains the final authority.
+pub fn locate_vm_firmware(profile: &Path, cwd: &Path, engine: &Path) -> Option<PathBuf> {
+    let configured = std::fs::read_to_string(profile)
+        .ok()
+        .and_then(|text| control_api::VmConfig::from_toml(&text).ok())
+        .and_then(|cfg| cfg.boot.firmware)
+        .map(|path| cwd.join(path))
+        .filter(|path| path.is_file());
+    configured
+        .or_else(|| {
+            engine
+                .parent()
+                .map(|dir| dir.join("artifacts").join("firmware").join(FIRMWARE_FILE))
+                .filter(|path| path.is_file())
+        })
+        .or_else(|| locate_firmware(cwd).map(|(path, _)| path))
+}
+
+#[cfg(test)]
+#[test]
+fn run_firmware_preflight_honours_the_profile_before_engine_defaults() {
+    let dir =
+        std::env::temp_dir().join(format!("entangled-profile-firmware-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let firmware = dir.join("chosen.fd");
+    std::fs::write(&firmware, b"firmware presence probe").unwrap();
+    let profile = dir.join("machine.toml");
+    std::fs::write(&profile, format!("name = \"test\"\nmemory_mib = 256\nvcpus = 1\ntransport = \"pci\"\n[boot]\nmode = \"uefi\"\nfirmware = {:?}\n", firmware.to_str().unwrap())).unwrap();
+    let engine = dir.join("engine").join("entangled.exe");
+    assert_eq!(
+        locate_vm_firmware(&profile, &dir, &engine),
+        Some(firmware.clone())
+    );
+    std::fs::remove_file(&firmware).unwrap();
+    let installed = engine
+        .parent()
+        .unwrap()
+        .join("artifacts/firmware/CLOUDHV.fd");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::write(&installed, b"engine firmware probe").unwrap();
+    assert_eq!(locate_vm_firmware(&profile, &dir, &engine), Some(installed));
+    std::fs::remove_dir_all(dir).unwrap();
+}
 
 /// Where a firmware image was found, in the words the panel shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -601,9 +638,7 @@ fn missing_install_artifact_x86(cwd: &Path, family: GuestFamily) -> Option<Strin
                 return None;
             }
             Some(format!(
-                "no UEFI firmware ({FIRMWARE_FILE}) on this computer — not next to the \
-                 program, not in the verified cache, and not under {}. {FIRMWARE_FIX}",
-                cwd.display()
+                "A file needed to install this system is missing. {FIRMWARE_FIX}"
             ))
         }
         GuestFamily::Debian => {
@@ -847,10 +882,10 @@ mod tests {
             None
         );
         let ubuntu = missing_install_artifact_x86(&dir, GuestFamily::Ubuntu).expect("no firmware");
-        assert!(ubuntu.contains(FIRMWARE_FILE), "{ubuntu}");
+        assert!(ubuntu.contains("file needed"), "{ubuntu}");
         assert!(
-            ubuntu.contains("entangled fetch firmware"),
-            "the firmware pre-flight must name the way out: {ubuntu}"
+            ubuntu.contains("Reinstall Entangled Desktop"),
+            "the firmware pre-flight must offer a user-facing recovery: {ubuntu}"
         );
         assert!(
             !ubuntu.contains("Copy artifacts/firmware/CLOUDHV.fd in from a Linux checkout"),
