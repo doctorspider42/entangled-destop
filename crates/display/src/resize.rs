@@ -1,6 +1,6 @@
 //! The guest's resolution follows the window (2026-10-12).
 //!
-//! When the window changes size — a drag, maximise, fullscreen — the display
+//! When the ordinary window changes size — a drag or maximise — the display
 //! asks the guest for a desktop of the window's size in physical pixels: the
 //! virtio-gpu device reports it as the preferred mode in `GET_DISPLAY_INFO`
 //! and the EDID and raises `VIRTIO_GPU_EVENT_DISPLAY`
@@ -12,6 +12,8 @@
 //! A drag delivers dozens of sizes a second; the guest is asked once the size
 //! has held for [`SETTLE`]. `[display] follow_window = false` keeps the
 //! profile's resolution whatever the window does.
+//! F11 only changes presentation: changing the guest's display mode underneath
+//! a fullscreen game can leave its cursor and render coordinates out of sync.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -58,6 +60,21 @@ impl std::fmt::Debug for ResolutionRequest {
 }
 
 impl ResolutionRequest {
+    /// Fullscreen changes presentation, never the guest's display mode. Check
+    /// again when the debounce expires, since F11 may follow a queued resize.
+    pub(crate) fn follow_window(
+        &self,
+        enabled: bool,
+        fullscreen: bool,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if !enabled || fullscreen || width == 0 || height == 0 {
+            return false;
+        }
+        let (width, height) = guest_size_for_window(width, height);
+        self.request(width, height)
+    }
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -99,6 +116,27 @@ impl ResolutionRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f11_and_a_pending_resize_do_not_change_a_games_display_mode() {
+        let request = ResolutionRequest::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        request.set_listener(Arc::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(request.follow_window(true, false, 1920, 1017));
+        assert!(!request.follow_window(true, true, 1920, 1080));
+        assert!(!request.follow_window(true, true, 3840, 2160));
+        assert_eq!(request.preferred(), Some((1920, 1016)));
+        assert!(!request.follow_window(true, false, 1920, 1017));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(request.follow_window(true, false, 1600, 900));
+        assert!(!request.follow_window(false, false, 1280, 720));
+        assert!(!request.follow_window(true, false, 0, 0));
+        assert_eq!(request.preferred(), Some((1600, 900)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]

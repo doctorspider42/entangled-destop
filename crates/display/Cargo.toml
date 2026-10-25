@@ -41,6 +41,7 @@ arboard = { version = "3.6", default-features = false }
 # reached through `Device::as_hal`; nothing loads a second Vulkan loader.
 [target.'cfg(windows)'.dependencies]
 ash.workspace = true
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 
 # macOS presentation uses the native Metal backend, independent of the
 # Vulkan-to-Metal driver used by the guest's Venus renderer.

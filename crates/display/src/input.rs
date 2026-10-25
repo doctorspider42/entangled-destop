@@ -902,6 +902,32 @@ mod tests {
     }
 
     #[test]
+    fn grabbed_alt_tab_reaches_guest_and_ctrl_alt_still_releases_the_keyboard() {
+        let mut c = grabbed_capture();
+        press(&mut c, KeyCode::AltLeft);
+        press(&mut c, KeyCode::Tab);
+        release(&mut c, KeyCode::Tab);
+        release(&mut c, KeyCode::AltLeft);
+        let keys: Vec<_> = c
+            .events()
+            .drain()
+            .into_iter()
+            .filter(|event| event.event_type == ev::KEY)
+            .map(|event| (event.code, event.value))
+            .collect();
+        assert_eq!(keys, [(56, 1), (15, 1), (15, 0), (56, 0)]);
+        assert!(c.grabbed());
+        hold_ctrl_alt(&mut c);
+        assert_eq!(
+            release(&mut c, KeyCode::AltLeft),
+            KeyOutcome::Reserved(WindowAction::SetGrab(false))
+        );
+        assert!(!c.grabbed());
+        assert_eq!(c.pressed_count(), 0);
+        assert_eq!(press(&mut c, KeyCode::Tab), KeyOutcome::Ungrabbed);
+    }
+
+    #[test]
     fn key_press_and_release_are_syn_terminated() {
         let mut c = grabbed_capture();
         assert_eq!(press(&mut c, KeyCode::KeyA), KeyOutcome::Forwarded(30));

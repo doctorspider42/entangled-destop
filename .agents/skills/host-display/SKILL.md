@@ -222,6 +222,25 @@ GPU (`display::boost`, `display::latency`):
 
 ## Window UX and the input grab (EPIC 15)
 
+### Windows shell shortcuts and F11 (2026-10-25)
+
+`windows_keyboard` installs a `WH_KEYBOARD_LL` hook on its own message thread.
+It intercepts Alt+Tab/Esc/Space/F4, Ctrl+Esc and Windows-key chords only while
+the input grab is active AND this VM's HWND is the foreground window. Ordinary
+keys retain winit's AltGr handling. Intercepted keys are posted as normal
+WM_KEYDOWN/UP to the window's own queue, preserving order with modifiers and
+avoiding DefWindowProc's SYSKEY actions. `system_keys` tests ownership of key-up
+after a modifier is released, repeats, focus loss and the message scan-code bits.
+Ctrl+Alt remains the grab escape; Windows' secure attention sequence is outside
+this hook. Drop disables capture, posts WM_QUIT, unhooks and joins the worker.
+
+F11 preserves the guest's current display mode and only scales presentation.
+Switching Ubuntu from 1920x1016 to 1920x1080 under Portal 2 desynchronised its
+cursor; restoring 1920x1016 while the host stayed fullscreen aligned it again.
+Ordinary window resizing still follows `follow_window`; pending resize requests
+are cancelled on F11 and checked again at debounce expiry. Never reintroduce a
+fullscreen mode switch without checking in-game mouse alignment.
+
 Nothing reaches the guest unless the **grab** is active — keyboard, pointer and
 wheel alike. The grab starts inactive so the window behaves like any other
 window on the desktop.

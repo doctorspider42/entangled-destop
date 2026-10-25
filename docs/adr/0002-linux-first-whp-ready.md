@@ -1120,3 +1120,34 @@ refused, and the reply carries the guest's own identifier, sequence and
 payload. Measured on WHP with the installed Ubuntu desktop: `ping -c 3 1.1.1.1` answered 3 of 3 (9.6–12.3 ms), `ping github.com` 2 of 2 (about 24 ms), and the gateway as before.
 
 Still open: IPv6, ICMP errors (TTL exceeded, so no `traceroute`).
+
+## Amendment (2026-10-25): grabbed Windows shortcuts and stable F11 display modes
+
+Windows consumes Alt+Tab before winit can forward it to the guest. The display
+now owns a low-level keyboard hook on a dedicated message thread. Capture is
+enabled only for a grabbed, foreground VM window. Alt+Tab/Esc/Space/F4,
+Ctrl+Esc and Windows-key chords are posted as normal key messages to the same
+window queue as ordinary input, retaining modifier order without invoking
+DefWindowProc's system-key actions. Ordinary keys retain winit's AltGr handling.
+Releases remain owned after a modifier is released; focus loss or Ctrl+Alt
+returns control to the host. The hook is removed and its thread joined before
+the window is destroyed. Secure attention remains owned by Windows.
+
+F11 now scales the existing guest display instead of switching its mode.
+On this machine the previous 1920x1016-to-1920x1080 transition under Portal 2
+misaligned its cursor; restoring 1920x1016 while retaining host fullscreen
+aligned it again. Ordinary window resizes still change the preferred mode
+when `follow_window` is enabled. F11 cancels pending resize requests, and the
+debounced request checks fullscreen again before changing the guest mode.
+
+Regression coverage includes shortcut ownership, balanced key releases,
+repeat and extended scan-code packets, Ctrl+Alt escape, unchanged preferred
+mode across F11, and a real Windows hook install/disarm/unhook/join test.
+Full workspace tests passed on Windows (2400, 18 ignored) and Linux
+(2416, 26 ignored). Linux KVM remains unavailable on this development host.
+With the rebuilt local engine running the existing WHP Ubuntu guest, the user
+confirmed Alt+Tab switches Ubuntu windows while grabbed and switches Windows
+windows again after Ctrl+Alt. The runtime log records F11 entering and leaving
+fullscreen without any further guest display-mode request or scanout resize.
+This is keyboard/fullscreen acceptance, not verification of relative mouse
+capture or of the reported Portal 2 community-map crash.

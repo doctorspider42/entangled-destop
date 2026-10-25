@@ -117,8 +117,9 @@ fn file_timestamp(now: std::time::SystemTime) -> String {
 }
 
 impl DisplayHost {
-    /// Whether the guest's resolution follows the window ([`crate::resize`]);
+    /// Whether the guest's resolution follows the ordinary window ([`crate::resize`]);
     /// on unless the profile says `follow_window = false`.
+    /// F11 preserves the current guest mode and scales its presentation.
     #[must_use]
     pub fn with_follow_window(mut self, follow: bool) -> Self {
         self.follow_window = follow;
@@ -289,6 +290,8 @@ impl DisplayHost {
             grabbed: false,
             cursor_visible: true,
             cursors: None,
+            #[cfg(windows)]
+            keyboard_hook: None,
             applied_title: String::new(),
             fullscreen: false,
             mode: ScaleMode::default(),
@@ -341,6 +344,8 @@ struct App {
     /// Grab state actually applied to the window, so a repeated request (focus
     /// loss while already ungrabbed) is a no-op.
     grabbed: bool,
+    #[cfg(windows)]
+    keyboard_hook: Option<crate::windows_keyboard::KeyboardHook>,
     /// Cursor visibility actually applied to the window (WIN-1501).
     cursor_visible: bool,
     /// The two cursors used on Wayland and Windows instead of
@@ -472,6 +477,11 @@ impl App {
                 .with_maximized(saved.maximized);
         }
         let window = Arc::new(event_loop.create_window(attributes)?);
+        #[cfg(windows)]
+        match crate::windows_keyboard::KeyboardHook::new(&window) {
+            Ok(hook) => self.keyboard_hook = Some(hook),
+            Err(error) => tracing::warn!(%error, "cannot capture Windows system shortcuts"),
+        }
         self.cursors = HostCursors::new(event_loop);
         if let Some(cursors) = &self.cursors {
             // Establish a known pointer image right away: WSLg's RDP client
@@ -873,6 +883,10 @@ impl App {
             return;
         }
         self.grabbed = grabbed;
+        #[cfg(windows)]
+        if let Some(hook) = &self.keyboard_hook {
+            hook.set_grab(grabbed);
+        }
         self.update_title();
         self.sync_cursor();
         self.sync_cursor_grab();
@@ -930,6 +944,9 @@ impl App {
     /// `F11`: borderless fullscreen on the window's current monitor (WIN-1504).
     fn toggle_fullscreen(&mut self) {
         self.fullscreen = !self.fullscreen;
+        // F11 scales the existing desktop. A display-mode switch underneath
+        // an X11 game can desynchronise its mouse and rendering coordinates.
+        self.resize_pending = None;
         let fullscreen = self.fullscreen;
         if let Some(window) = self.window.as_ref() {
             // `Borderless(None)` means "the monitor this window is on", which is
@@ -1117,8 +1134,8 @@ impl ApplicationHandler<HostEvent> for App {
             if Instant::now() >= due {
                 self.resize_pending = None;
                 if let Some((w, h)) = self.window_size() {
-                    let (w, h) = crate::resize::guest_size_for_window(w, h);
-                    self.resolution.request(w, h);
+                    self.resolution
+                        .follow_window(self.follow_window, self.fullscreen, w, h);
                 }
             } else {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(due));
@@ -1185,7 +1202,7 @@ impl ApplicationHandler<HostEvent> for App {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
                 }
-                if self.follow_window && size.width > 0 && size.height > 0 {
+                if self.follow_window && !self.fullscreen && size.width > 0 && size.height > 0 {
                     self.resize_pending = Some(Instant::now());
                 }
                 self.recompute_viewport();
@@ -1305,6 +1322,9 @@ impl ApplicationHandler<HostEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Unhook and join before the HWND can be destroyed or reused.
+        #[cfg(windows)]
+        drop(self.keyboard_hook.take());
         self.save_placement();
         let stats = self.frame_stats();
         let scanout = lock_scanout(&self.scanout).stats();
