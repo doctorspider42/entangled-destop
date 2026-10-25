@@ -245,11 +245,11 @@ fn running_row(
     });
 }
 
-/// Pause and Shut down for a running machine. Only for a machine this manager
+/// Suspend and Shut down for a running machine. Only for a machine this manager
 /// started: the control channel is a pipe to a child, so a VM launched from a
 /// terminal has none and the buttons say so rather than lying.
 ///
-/// Reads "Pause · Shut down" in either layout direction: `right_to_left` is
+/// Reads "Suspend · Shut down" in either layout direction: `right_to_left` is
 /// for a caller laying out from the right edge.
 pub(crate) fn running_controls(
     ui: &mut egui::Ui,
@@ -259,25 +259,17 @@ pub(crate) fn running_controls(
     actions: &mut Vec<Action>,
 ) {
     let controllable = app.has_control(&vm.name);
-    // Pausing needs the backend to freeze the processors; not every one can.
     let cpu_block = app.backend_of(&vm.name).cpu_lifecycle_block();
-    let paused = app.is_paused(&vm.name);
-    let pause = |ui: &mut egui::Ui| {
-        ui::secondary_button(
-            ui,
-            if paused { "Continue" } else { "Pause" },
-            controllable && cpu_block.is_none(),
-        )
-        .on_hover_text(if let Some(reason) = cpu_block {
-            reason
-        } else if !controllable {
-            "This VM was not started from here"
-        } else if paused {
-            "Let the machine continue exactly where it stopped"
-        } else {
-            "Freeze the machine; nothing in it makes progress"
-        })
-        .clicked()
+    let suspend = |ui: &mut egui::Ui| {
+        ui::primary_button_enabled(ui, "Suspend", controllable && cpu_block.is_none())
+            .on_hover_text(if let Some(reason) = cpu_block {
+                reason
+            } else if !controllable {
+                "This VM was not started from here"
+            } else {
+                "Save the session to disk and stop the machine. Resume returns to this session."
+            })
+            .clicked()
     };
     let shut_down = |ui: &mut egui::Ui| {
         ui::secondary_button(ui, "Shut down", controllable)
@@ -289,15 +281,15 @@ pub(crate) fn running_controls(
             })
             .clicked()
     };
-    let (paused_clicked, shut_clicked) = if right_to_left {
+    let (suspend_clicked, shut_clicked) = if right_to_left {
         let shut = shut_down(ui);
-        (pause(ui), shut)
+        (suspend(ui), shut)
     } else {
-        let pause = pause(ui);
-        (pause, shut_down(ui))
+        let save = suspend(ui);
+        (save, shut_down(ui))
     };
-    if paused_clicked {
-        actions.push(Action::TogglePause(vm.name.clone()));
+    if suspend_clicked {
+        actions.push(Action::Suspend(vm.name.clone()));
     }
     if shut_clicked {
         actions.push(Action::Shutdown(vm.name.clone()));

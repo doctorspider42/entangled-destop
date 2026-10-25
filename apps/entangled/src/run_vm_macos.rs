@@ -369,12 +369,12 @@ fn run_inner(
                             STOP.store(true, Ordering::Relaxed)
                         }
                         ControlEvent::PowerButtonRequested => power_requested = true,
-                        ControlEvent::PauseToggleRequested
-                        | ControlEvent::ResetRequested
-                        | ControlEvent::SaveRequested => tracing::warn!(
-                            ?event,
-                            "ARM64 lifecycle operation is not implemented yet"
-                        ),
+                        ControlEvent::ResetRequested | ControlEvent::SaveRequested => {
+                            tracing::warn!(
+                                ?event,
+                                "ARM64 lifecycle operation is not implemented yet"
+                            )
+                        }
                         _ => {}
                     }
                 }

@@ -26,7 +26,7 @@
 //! - `F11` toggles borderless fullscreen and `Ctrl+Alt+O` toggles 1:1 pixel mode
 //!   (title gains ` — 1:1`); neither appears in the guest input stream
 //!   (WIN-1504);
-//! - `Ctrl+Alt+P` and `Ctrl+Alt+R` ask the VM supervisor to pause or reboot
+//! - `Ctrl+Alt+S` and `Ctrl+Alt+R` ask the VM supervisor to suspend or reboot
 //!   (ADR-0005); this demo has no VM behind it and only logs them.
 //! - `Ctrl+Alt+Q` quits — like the other reserved shortcuts it never shows up in
 //!   the drained guest input stream;
@@ -62,7 +62,7 @@ fn main() -> Result<(), display::DisplayError> {
         DisplayHost::new(DisplayConfig::default())?.with_title("Entangled Desktop display demo");
     tracing::info!(
         "click the image to grab input; Ctrl+Alt releases it, F11 fullscreen, \
-         Ctrl+Alt+O 1:1, Ctrl+Alt+P / Ctrl+Alt+R are lifecycle requests (no VM here), \
+         Ctrl+Alt+O 1:1, Ctrl+Alt+S / Ctrl+Alt+R are lifecycle requests (no VM here), \
          Ctrl+Alt+Q quits"
     );
     let handle = host.handle();
@@ -153,8 +153,7 @@ fn guest_thread(
                 // This demo has no VM behind it, so there is nothing to
                 // freeze, reboot or write to a file; logging them proves the
                 // shortcuts reach a supervisor at all (ADR-0005, ADR-0006).
-                ControlEvent::PauseToggleRequested
-                | ControlEvent::ResetRequested
+                ControlEvent::ResetRequested
                 | ControlEvent::SaveRequested
                 | ControlEvent::PowerButtonRequested => {
                     tracing::info!(?event, "lifecycle request (no VM behind this demo)");

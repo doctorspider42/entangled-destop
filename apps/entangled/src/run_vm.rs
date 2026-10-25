@@ -25,7 +25,7 @@
 //!
 //! A VM here can be frozen and rebooted in place. Everything that decides *when*
 //! is shared: [`LifecycleSupervisor`] is the one thread that turns a request —
-//! from the guest, the window's `Ctrl+Alt+P`/`Ctrl+Alt+R`, or the
+//! from the guest, the window's `Ctrl+Alt+S`/`Ctrl+Alt+R`, or the
 //! `--control-stdin` channel — into the operation, and [`host_api::VmMachine`]
 //! is what a pause freezes and a reset puts back. Only the two rows above
 //! differ per host.
@@ -246,7 +246,7 @@ fn open_presentation(
                 tracing::info!(
                     "window controls: click the image to grab input, Ctrl+Alt releases it, \
                      Ctrl+Alt+G toggles, F11 fullscreen, Ctrl+Alt+O 1:1, Ctrl+Alt+V types the clipboard, \
-                     Ctrl+Alt+P pauses, Ctrl+Alt+R reboots, Ctrl+Alt+Q shuts down"
+                     Ctrl+Alt+S suspends, Ctrl+Alt+R reboots, Ctrl+Alt+Q shuts down"
                 );
                 // The window says, once it knows its monitor, what the
                 // guest's refresh looks like there — and warns when the guest
@@ -833,8 +833,6 @@ fn build_devices(
 /// the supervisor thread is the only one that blocks.
 #[derive(Debug, Default)]
 struct LifecycleRequests {
-    /// The window's `Ctrl+Alt+P`: freeze, or continue if already frozen.
-    pause_toggle: AtomicBool,
     /// The control channel's explicit `pause` / `resume`, which a program
     /// driving a VM wants instead of a toggle it would have to track.
     pause: AtomicBool,
@@ -893,9 +891,6 @@ fn note_control_event(
         }
         display::ControlEvent::GrabToggled(grabbed) => {
             tracing::info!(grabbed, "input grab toggled");
-        }
-        display::ControlEvent::PauseToggleRequested => {
-            requests.pause_toggle.store(true, Ordering::Relaxed);
         }
         display::ControlEvent::ResetRequested => {
             requests.reset.store(true, Ordering::Relaxed);
@@ -1179,7 +1174,7 @@ const QUIESCE_SETTLE: Duration = Duration::from_secs(5);
 
 /// How often the supervisor looks for a lifecycle request.
 ///
-/// The latency a person notices between pressing Ctrl+Alt+P and the VM
+/// The latency a person notices between requesting suspend and the VM
 /// freezing, and — more importantly — the delay between a guest writing its
 /// reset register and the host restarting it. Small enough that a reboot looks
 /// instant, large enough that an idle VM costs nothing.
@@ -1220,7 +1215,7 @@ impl LifecycleSupervisor {
                         continue;
                     }
                     // Reset wins over pause: a guest that asked to reboot while
-                    // someone was holding the pause key wants to reboot, and
+                    // a diagnostic client had paused it wants to reboot, and
                     // `Lifecycle::reset` works from either state.
                     let guest_asked = lifecycle.take_guest_reset();
                     if guest_asked || requests.reset.swap(false, Ordering::Relaxed) {
@@ -1231,15 +1226,10 @@ impl LifecycleSupervisor {
                             || Some(VmState::Running),
                         );
                     } else {
-                        // The window sends a toggle (it cannot know the state);
-                        // the control channel sends what it means. Both end up
-                        // here, and the toggle is resolved against the truth.
-                        let toggled = requests.pause_toggle.swap(false, Ordering::Relaxed);
-                        let paused = lifecycle.is_paused();
-                        let pause =
-                            requests.pause.swap(false, Ordering::Relaxed) || (toggled && !paused);
-                        let resume =
-                            requests.resume.swap(false, Ordering::Relaxed) || (toggled && paused);
+                        // Explicit pause/resume remain on the diagnostic control
+                        // channel; the product offers suspend instead.
+                        let pause = requests.pause.swap(false, Ordering::Relaxed);
+                        let resume = requests.resume.swap(false, Ordering::Relaxed);
                         if pause {
                             Self::serve(&vm_state, VmState::Paused, || lifecycle.pause(), || None);
                         } else if resume {
@@ -1584,7 +1574,7 @@ pub fn run_with(
     // The lifecycle supervisor: the one thread that turns a *request* to pause,
     // resume or reset into the thing itself. Requests reach it from three
     // places — the guest (a write to a reset control, or a triple fault), the
-    // window (Ctrl+Alt+P / Ctrl+Alt+R) and, on a reset that the machine cannot
+    // window (Ctrl+Alt+S / Ctrl+Alt+R) and, on a reset that the machine cannot
     // serve, nowhere at all.
     //
     // A thread of its own rather than a branch in `should_stop` because both

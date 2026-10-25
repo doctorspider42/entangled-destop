@@ -239,4 +239,44 @@ mod tests {
         // SAFETY: this test created and still owns the message-only window.
         unsafe { DestroyWindow(window) }.unwrap();
     }
+
+    #[test]
+    fn a_new_grab_can_replace_a_hook_whose_worker_was_lost() {
+        // SAFETY: an invisible message-only STATIC window never takes focus
+        // or captures real desktop input. It is owned and destroyed here.
+        let window = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("Hook recovery test"),
+                WINDOW_STYLE::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let old = KeyboardHook::install(window.0 as isize).unwrap();
+        old.set_grab(true);
+        // SAFETY: the ready handshake established this owned thread's queue.
+        unsafe { PostThreadMessageW(old.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !old.thread.as_ref().unwrap().is_finished() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(old.thread.as_ref().unwrap().is_finished());
+        drop(old);
+        let next = KeyboardHook::install(window.0 as isize).unwrap();
+        next.set_grab(true);
+        assert!(!next.thread.as_ref().unwrap().is_finished());
+        assert_eq!(next.epoch.load(Ordering::SeqCst) & 1, 1);
+        drop(next);
+        // SAFETY: still this test's live message-only window.
+        unsafe { DestroyWindow(window) }.unwrap();
+    }
 }

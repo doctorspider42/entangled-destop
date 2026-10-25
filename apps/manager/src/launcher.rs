@@ -401,11 +401,11 @@ pub fn install_spec(
 
 /// `entangled run --control-stdin <profile>` (GUI-1603). The VM opens its own
 /// window; the manager tracks the child and keeps its stdin as the lifecycle
-/// control channel, which is what the Pause and Restart buttons write to
+/// control channel, which is what the Suspend and Restart buttons write to
 /// (ADR-0005).
 ///
 /// Under the WSL backend the same pipe still works: `wsl.exe` forwards its
-/// stdin to the Linux process, so Pause and Restart reach the guest exactly as
+/// stdin to the Linux process, so Suspend and Restart reach the guest exactly as
 /// they do natively. What differs is the window — WSLg opens it, on its own
 /// Wayland compositor.
 pub fn run_spec(
@@ -441,7 +441,7 @@ pub fn run_spec(
 /// profile of that name still exists.
 ///
 /// The control channel is the same pipe a `run` gets, so a resumed machine can
-/// be paused, restarted and suspended again like any other. A bare `save` on it
+/// be restarted and suspended again like any other. A bare `save` on it
 /// writes back to the file it came from, which is what makes closing and
 /// re-opening a machine a loop rather than a one-way trip.
 pub fn resume_spec(
@@ -1037,7 +1037,7 @@ mod tests {
         // write them to, and vice versa (ADR-0005).
         assert!(
             spec.control,
-            "a run task must keep its child's stdin, or Pause and Restart have nowhere to go"
+            "a run task must keep its child's stdin, or Suspend and Restart have nowhere to go"
         );
         assert_eq!(spec.cwd, Path::new("/srv/entangled"));
         assert_eq!(spec.log_path, Path::new("/vms/debian-demo-run.log"));
@@ -1089,7 +1089,7 @@ mod tests {
     }
 
     /// The WSL backend: `wsl.exe` is the program, the profile path is
-    /// translated, and stdin stays a pipe so Pause and Restart still reach the
+    /// translated, and stdin stays a pipe so Suspend and Restart still reach the
     /// guest through `wsl.exe`.
     #[test]
     fn the_wsl_backend_rewrites_the_program_and_the_paths() {

@@ -239,14 +239,6 @@ struct Shared {
     /// (`entangled run --control-stdin`, ADR-0005). `None` for every other kind
     /// of task, and after the child has gone.
     control: Mutex<Option<std::process::ChildStdin>>,
-    /// Whether the manager has *asked* this VM to pause.
-    ///
-    /// Deliberately "asked", not "is": the VM can also be frozen from its own
-    /// window with Ctrl+Alt+P, and the manager would not know. Tracking the
-    /// request is what the Pause/Resume button needs and all it can honestly
-    /// claim; the VM's own idea of its state is one `status` command away for
-    /// anything that needs the truth.
-    pause_requested: AtomicBool,
     /// Whether the manager has asked this VM to write itself to a file and stop
     /// (ADR-0006). A successful suspend is one-way; a refusal clears the
     /// request and keeps the live session. It is what tells the card that a
@@ -323,26 +315,6 @@ impl Task {
             .is_ok_and(|control| control.is_some())
     }
 
-    /// Whether the manager has asked this VM to pause. See
-    /// [`Shared::pause_requested`] for why this is a request and not a state.
-    pub fn pause_requested(&self) -> bool {
-        self.shared.pause_requested.load(Ordering::Acquire)
-    }
-
-    /// Freezes the VM, or lets a frozen one continue (ADR-0005).
-    ///
-    /// Returns false when there is no control channel or the write failed —
-    /// the child having exited between the click and the write, most likely,
-    /// which is a race the UI cannot avoid and must not crash on.
-    pub fn set_paused(&self, paused: bool) -> bool {
-        let command = if paused { "pause" } else { "resume" };
-        if !self.send_control(command) {
-            return false;
-        }
-        self.shared.pause_requested.store(paused, Ordering::Release);
-        true
-    }
-
     /// Presses the guest's ACPI power button: it shuts itself down cleanly,
     /// and the VM ends when it powers off. The guest decides — a desktop may
     /// ask first — so this is a request, not a stop; [`Self::request_stop`]
@@ -357,8 +329,6 @@ impl Task {
         if !self.send_control("reset") {
             return false;
         }
-        // A reset always leaves the VM running, whichever state it was in.
-        self.shared.pause_requested.store(false, Ordering::Release);
         true
     }
 
@@ -559,7 +529,6 @@ impl Supervisor {
             stop: AtomicBool::new(false),
             kill: AtomicBool::new(false),
             control: Mutex::new(child.stdin.take()),
-            pause_requested: AtomicBool::new(false),
             suspend_requested: AtomicBool::new(false),
             suspend_at: Mutex::new(None),
         });
@@ -1292,7 +1261,7 @@ mod tests {
         assert_eq!(reason, "no space left on device");
     }
 
-    /// Suspend is one-way (ADR-0006) and needs a control channel, like Pause.
+    /// Suspend is one-way (ADR-0006) and needs a control channel, like Restart.
     #[cfg(unix)]
     #[test]
     fn suspend_writes_save_down_the_control_channel_once() {

@@ -245,17 +245,6 @@ fn more_menu(
                 actions.push(Action::Reset(vm.name.clone()));
             }
             if ui
-                .add_enabled(cpu_controllable, egui::Button::new("Suspend"))
-                .on_hover_text(
-                    "Write the whole machine to a file and stop it. Opening it again \
-                     puts you back exactly here.",
-                )
-                .on_disabled_hover_text(cpu_block.unwrap_or("This VM was not started from here"))
-                .clicked()
-            {
-                actions.push(Action::Suspend(vm.name.clone()));
-            }
-            if ui
                 .button(RichText::new("Force stop").color(theme::ERR))
                 .on_hover_text(
                     "Power the machine off now, like pulling the plug. Anything the \

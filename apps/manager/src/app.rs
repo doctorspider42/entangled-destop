@@ -349,8 +349,6 @@ pub enum Action {
     Stop(String),
     /// Press a running VM's power button: the guest shuts itself down.
     Shutdown(String),
-    /// Freeze a running VM, or let a frozen one continue (ADR-0005).
-    TogglePause(String),
     /// Reboot a running VM in place — the machine reset, not stop-then-start.
     Reset(String),
     /// Write a running VM to its snapshot file and stop it (ADR-0006).
@@ -1687,43 +1685,6 @@ impl ManagerApp {
         }
     }
 
-    /// Freezes a running VM or lets it continue (ADR-0005).
-    ///
-    /// Over the control channel `run_spec` opened, which is also why this can
-    /// only work for a VM *this* manager started: a control channel is a pipe
-    /// to a child, and a VM someone launched from a terminal has none.
-    fn toggle_pause(&mut self, name: &str) {
-        if self.reject_unsupported_cpu_control(name) {
-            return;
-        }
-        let Some(task) = self.supervisor.active_task(name) else {
-            self.toast(ToastLevel::Warn, format!("'{name}' is not running"));
-            return;
-        };
-        let paused = task.pause_requested();
-        let (level, text) = if !task.has_control() {
-            (
-                ToastLevel::Warn,
-                format!("'{name}' has no control channel — it was not started from here"),
-            )
-        } else if task.set_paused(!paused) {
-            (
-                ToastLevel::Info,
-                if paused {
-                    format!("'{name}' resumed")
-                } else {
-                    format!("'{name}' paused")
-                },
-            )
-        } else {
-            (
-                ToastLevel::Error,
-                format!("could not reach '{name}' to pause it"),
-            )
-        };
-        self.toast(level, text);
-    }
-
     /// Reboots a running VM in place: the same reset the guest's own Restart
     /// performs, in the same process and the same window.
     /// Presses a running VM's ACPI power button. The guest powers off by
@@ -1782,7 +1743,7 @@ impl ManagerApp {
 
     /// Writes a running VM to a file and stops it (ADR-0006).
     ///
-    /// Down the same control channel Pause and Restart use, and with the same
+    /// Down the same control channel Suspend and Restart use, and with the same
     /// honesty rule: a machine this manager did not start has no pipe, and the
     /// button says so rather than pretending. What it does *not* do is wait —
     /// a desktop-sized guest takes several seconds, and the frame loop is the
@@ -1995,15 +1956,7 @@ impl ManagerApp {
         }
     }
 
-    /// Whether the manager has asked this VM to pause — what the card's
-    /// Pause/Resume button is labelled from.
-    pub fn is_paused(&self, name: &str) -> bool {
-        self.supervisor
-            .active_task(name)
-            .is_some_and(|task| task.pause_requested())
-    }
-
-    /// Whether this VM can be paused or restarted from here at all.
+    /// Whether this VM can be controlled from here at all.
     pub fn has_control(&self, name: &str) -> bool {
         self.supervisor
             .active_task(name)
@@ -3761,7 +3714,6 @@ impl ManagerApp {
             Action::Start(name) => self.start(&name),
             Action::Stop(name) => self.stop(&name),
             Action::Shutdown(name) => self.shutdown(&name),
-            Action::TogglePause(name) => self.toggle_pause(&name),
             Action::Reset(name) => self.reset(&name),
             Action::Suspend(name) => self.suspend(&name),
             Action::ResumeVm(name) => self.resume_vm(&name),

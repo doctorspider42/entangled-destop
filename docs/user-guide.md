@@ -20,7 +20,7 @@ which is which, so you can tell tested instructions from plausible ones.
 - [Quickstart: Debian](#quickstart-debian)
 - [Living with a VM](#living-with-a-vm)
 - [Machines on disk](#machines-on-disk)
-- [Pause, reboot, suspend and restore](#pause-reboot-suspend-and-restore)
+- [Reboot, suspend and restore](#reboot-suspend-and-restore)
 - [The desktop manager](#the-desktop-manager)
 - [Limits, in one place](#limits-in-one-place)
 - [Troubleshooting](troubleshooting.md)
@@ -692,13 +692,12 @@ until you ask it not to.
 | `Ctrl+Alt` (pressed and released with nothing in between) | release the grab; held keys are released in the guest too |
 | `Ctrl+Alt+G` | toggle the grab explicitly |
 | `Ctrl+Alt+Q` | ask the VM to stop |
-| `Ctrl+Alt+P` | pause / resume the guest |
 | `Ctrl+Alt+R` | reboot the machine in place |
 | `Ctrl+Alt+S` | suspend to the snapshot file and stop |
 | `Ctrl+Alt+O` | 1:1 pixel mode (no scaling) |
 | `F11` | borderless fullscreen |
 | any other `Ctrl+Alt+<key>` | forwarded to the guest, so `Ctrl+Alt+F2` still switches its console |
-| pointer at the top edge (fullscreen, or while grabbed) | the quick-actions bar: shut down, restart, pause/resume, suspend, fullscreen, fit/1:1, release input, power off |
+| pointer at the top edge of a focused window | the quick-actions bar: shut down, suspend, restart, fullscreen, fit/1:1, release input, power off |
 
 The window title says whether input is grabbed. Losing focus releases the grab
 and every key the guest was told is down.
@@ -1211,11 +1210,8 @@ read/write will corrupt it. The manager's *Clone…* copies a whole machine safe
 (see [The views](#the-views)); by hand, copy the image sparsely, with its
 `.nvram`.
 
-## Pause, reboot, suspend and restore
+## Reboot, suspend and restore
 
-- **Pause** (`Ctrl+Alt+P`, or `pause` on the control channel) stops every vCPU
-  and quiesces the devices, so nothing touches guest memory while it is frozen.
-  Resume continues the same boot.
 - **Shut down** (the window's quick-actions bar, `shutdown` on the control
   channel, or the manager's *Shut down*) presses the guest's ACPI power button.
   The guest shuts itself down and the VM ends when it powers off. Before the
@@ -1230,6 +1226,15 @@ read/write will corrupt it. The manager's *Clone…* copies a whole machine safe
   entangled resume ~/entangled-vms/ubuntu.esnap
   entangled snapshot ~/entangled-vms/ubuntu.esnap   # just describe the file
   ```
+
+In gaming mouse mode the host pointer is locked at the centre. Release it with
+Ctrl+Alt, then move to the top edge to use the quick-actions bar; it works in a
+normal window too. Suspend is also a primary action on the manager's running
+card and machine page. There is no Pause button or pause keyboard shortcut.
+
+A failed suspend keeps the live session and reports why saving failed. Active
+Venus GPU state may prevent saving to disk; an error never means the session
+was saved.
 
 **A resume does not delete the snapshot**, on purpose: a restore that fails on
 startup has to be retriable, and `entangled resume` points a later bare `save`
@@ -1279,7 +1284,7 @@ state:
 | State | Buttons |
 |---|---|
 | **Stopped** | **Start** |
-| **Running** | **Stop**, **Pause** / **Resume**, **Restart**, **Suspend** |
+| **Running** | **Suspend**, **Shut down**; **Restart** and **Force stop** in the More menu |
 | **Stopping** | **Kill** (shutdown was asked for; force it) |
 | **Installing** | **Abort** |
 | **Suspending** | none — it is writing itself to a file and will stop when it has |
@@ -1331,7 +1336,7 @@ dimmed: the screen as it was left. The pictures are small PNGs in
 `.thumbnails/` beside the profiles, and *Delete machine* removes them with
 everything else.
 
-Pause, Restart and Suspend need the control channel, which only exists for a VM
+Restart and Suspend need the control channel, which only exists for a VM
 *this manager started*; on a machine someone launched from a terminal they are
 greyed out and say so rather than pretending.
 
@@ -1534,7 +1539,7 @@ configuration:
     several machines.
 14. **Nothing adopts an orphaned VM.** If the manager is restarted while a VM it
     started is running, its card shows *Stopped* while the machine is very much
-    alive — and Pause, Restart and Suspend are greyed out on any VM this copy of
+    alive — and Restart and Suspend are greyed out on any VM this copy of
     the manager did not start, because the control channel is a pipe to a child
     process. A *suspended* machine is the exception: that state is a file on
     disk, so it survives a restart of the manager.

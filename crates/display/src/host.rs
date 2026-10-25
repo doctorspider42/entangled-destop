@@ -509,11 +509,6 @@ impl App {
                 .with_maximized(saved.maximized);
         }
         let window = Arc::new(event_loop.create_window(attributes)?);
-        #[cfg(windows)]
-        match crate::windows_keyboard::KeyboardHook::new(&window) {
-            Ok(hook) => self.keyboard_hook = Some(hook),
-            Err(error) => tracing::warn!(%error, "cannot capture Windows system shortcuts"),
-        }
         self.cursors = HostCursors::new(event_loop);
         if let Some(cursors) = &self.cursors {
             // Establish a known pointer image right away: WSLg's RDP client
@@ -783,7 +778,6 @@ impl App {
         match action {
             ToolbarAction::PowerButton => lifecycle(self, ControlEvent::PowerButtonRequested),
             ToolbarAction::PowerOff => lifecycle(self, ControlEvent::QuitRequested),
-            ToolbarAction::PauseToggle => lifecycle(self, ControlEvent::PauseToggleRequested),
             ToolbarAction::Reset => lifecycle(self, ControlEvent::ResetRequested),
             ToolbarAction::Suspend => lifecycle(self, ControlEvent::SaveRequested),
             ToolbarAction::ToggleFullscreen => self.toggle_fullscreen(),
@@ -929,8 +923,27 @@ impl App {
         }
         self.grabbed = grabbed;
         #[cfg(windows)]
-        if let Some(hook) = &self.keyboard_hook {
-            hook.set_grab(grabbed);
+        {
+            // Windows can silently remove a low-level hook after a timeout.
+            // A new capture must not reuse a hook left idle since VM startup.
+            // Drop also disarms and joins it before the host regains ownership.
+            drop(self.keyboard_hook.take());
+            if grabbed {
+                if let Some(window) = &self.window {
+                    match crate::windows_keyboard::KeyboardHook::new(window) {
+                        Ok(hook) => {
+                            hook.set_grab(true);
+                            self.keyboard_hook = Some(hook);
+                            tracing::info!("Windows shortcut capture armed for this grab");
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot capture Windows system shortcuts");
+                            self.shot
+                                .notify("KEYBOARD CAPTURE FAILED - RELEASE INPUT AND RETRY");
+                        }
+                    }
+                }
+            }
         }
         self.update_title();
         self.sync_cursor();
@@ -1375,7 +1388,10 @@ impl ApplicationHandler<HostEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let serial = self.toolbar.serial();
-                let eligible = self.fullscreen || self.grabbed;
+                // Gaming capture pins the host cursor at the centre. Ctrl+Alt
+                // releases it; the top edge must still work after that release,
+                // including in a normal window with no grab.
+                let eligible = self.capture.focused();
                 let over_bar = self.toolbar.on_pointer(
                     position.x,
                     position.y,

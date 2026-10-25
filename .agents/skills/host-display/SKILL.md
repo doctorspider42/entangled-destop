@@ -224,7 +224,10 @@ GPU (`display::boost`, `display::latency`):
 
 ### Windows shell shortcuts and F11 (2026-10-25)
 
-`windows_keyboard` installs a `WH_KEYBOARD_LL` hook on its own message thread.
+`windows_keyboard` installs a fresh `WH_KEYBOARD_LL` hook on its own message
+thread at each new grab and drops/disarms/joins it on release or focus loss.
+Do not reuse a hook left idle since window creation: Windows can silently remove
+a timed-out low-level hook. A failed install shows a window notice.
 It intercepts Alt+Tab/Esc/Space/F4, Ctrl+Esc and Windows-key chords only while
 the input grab is active AND this VM's HWND is the foreground window. Ordinary
 keys retain winit's AltGr handling. Intercepted keys are posted as normal
@@ -547,16 +550,18 @@ first line that was not UTF-8.
 
 ## The quick-actions bar (`toolbar.rs`, 2026-10-12)
 
-A VMware-style bar at the top edge: Shut down (ACPI power button), Restart,
-Pause, Suspend | Fullscreen, Fit/1:1, Release input | Power off.
+A VMware-style bar at the top edge: Shut down (ACPI power button), Suspend,
+Restart | Fullscreen, Fit/1:1, Release input | Power off. Pause has no button or
+reserved keyboard shortcut; Ctrl+Alt+P belongs to the guest.
 
-- **When it shows** is policy in `Toolbar::on_pointer`: only if the window is
-  fullscreen *or* grabbed (a confined pointer cannot be heading for the title
-  bar; an ungrabbed windowed one usually is), when the pointer is within
+- **When it shows** is policy in `Toolbar::on_pointer`: whenever the window is
+  focused, including an ungrabbed normal window, when the pointer is within
   `REVEAL_EDGE` of the top; it hides once the pointer leaves the bar, its label
   and `HIDE_MARGIN`. While the pointer is over the bar `captures_pointer()` is
   true: `host.rs` withholds the motion and the clicks from the guest and
-  `sync_cursor` shows the host arrow.
+  `sync_cursor` shows the host arrow. Relative gaming input pins the host
+  pointer centrally; Ctrl+Alt releases capture so the user can reach the top
+  edge. Never turn camera movement into an automatic menu trigger.
 - **Restart and Power off ask twice** (`CONFIRM_WINDOW`, 3 s); the armed label
   says "CLICK AGAIN TO …" in the warning colour.
 - **Drawing**: a premultiplied BGRA image rendered on the CPU whenever
@@ -581,7 +586,6 @@ Two more reserved `Ctrl+Alt` chords, alongside `G` (grab), `Q` (shut down) and
 
 | Shortcut | `ControlEvent` | Effect |
 |---|---|---|
-| `Ctrl+Alt+P` | `PauseToggleRequested` | freeze the VM, or let a frozen one continue |
 | `Ctrl+Alt+R` | `ResetRequested` | reboot the VM in place |
 
 Both follow the `Ctrl+Alt+Q` pattern exactly: `release_all()` first, so a guest

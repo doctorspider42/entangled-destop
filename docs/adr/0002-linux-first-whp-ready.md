@@ -1203,3 +1203,35 @@ The user confirmed unrestricted camera movement in Portal 2 and fullscreen
 without black bars. Ctrl+Alt releases capture and clicking back restores gaming
 mode. This confirms relative input/fullscreen behavior, not community-map crash
 handling or Vulkan snapshot support.
+
+
+### Product controls follow-up (2026-10-25)
+
+The focused VM window now exposes its top-edge toolbar even when ungrabbed
+and windowed. Relative gaming mode pins the native pointer centrally, so the
+user releases with Ctrl+Alt before moving to the top edge; looking up in a game
+must not accidentally open host controls. Suspend is the second toolbar action
+and a primary action beside Shut down on manager cards and the machine page.
+Pause was removed from those controls and Ctrl+Alt+P is forwarded to the guest.
+The diagnostic pause/resume commands and internal lifecycle barriers remain.
+
+Windows shortcut capture is installed afresh at every new input grab, then
+disarmed, unhooked and joined at release/focus loss. Initialization failure is
+reported visibly rather than only in a log. This hardens recovery against a
+lost hook; it does not establish that a timeout caused the reported failure.
+Microsoft documents silent removal after LowLevelHooksTimeout and no API for
+querying whether a hook was removed:
+[LowLevelKeyboardProc](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelkeyboardproc).
+A native message-only-window regression replaces a lost worker and re-arms
+capture without intercepting real desktop input.
+
+Verification: the Windows workspace passed 2414 tests (18 ignored), and Linux
+passed 2429 (26 ignored) with a single test thread. Workspace Clippy with
+warnings denied, formatting on both hosts, and cargo-deny passed. The real
+toolbar rasterizer was inspected at its Suspend hover state; manager mock
+screenshots of All machines and the running machine page show Suspend beside
+Shut down, with no Pause control. Native computer-use screenshot capture failed
+with a frame timeout and could not deliver a grab shortcut, so physical
+Alt+Tab delivery and top-edge interaction remain pending user confirmation;
+the native hook lifetime/recovery tests passed. No Windows timeout diagnosis
+is inferred from the absence of that confirmation.

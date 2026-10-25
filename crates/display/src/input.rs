@@ -23,7 +23,6 @@
 //! | `Ctrl+Alt` (released with nothing pressed in between) | release the grab |
 //! | `Ctrl+Alt+G` | toggle the grab ([`ControlEvent::GrabToggled`]) |
 //! | `Ctrl+Alt+Q` | ask the VM to shut down ([`ControlEvent::QuitRequested`]) |
-//! | `Ctrl+Alt+P` | freeze/continue the VM ([`ControlEvent::PauseToggleRequested`]) |
 //! | `Ctrl+Alt+R` | reboot the VM in place ([`ControlEvent::ResetRequested`]) |
 //! | `Ctrl+Alt+S` | suspend the VM to its snapshot file ([`ControlEvent::SaveRequested`]) |
 //! | `F11` | toggle borderless fullscreen ([`WindowAction::ToggleFullscreen`]) |
@@ -101,12 +100,6 @@ pub enum ControlEvent {
     QuitRequested,
     /// The window's close button was used.
     WindowCloseRequested,
-    /// `Ctrl+Alt+P`: freeze the VM, or let a frozen one continue (ADR-0005).
-    ///
-    /// A *toggle* rather than a pair, because only the supervisor knows which
-    /// state the VM is actually in — the window is one of several things that
-    /// can pause it.
-    PauseToggleRequested,
     /// `Ctrl+Alt+R`: reboot the VM in place (ADR-0005).
     ///
     /// The host-initiated peer of the guest pressing Restart: same machine
@@ -139,7 +132,7 @@ pub enum WindowAction {
     SetGrab(bool),
     /// `Ctrl+Alt+Q`: the user asked the VM to shut down.
     Quit,
-    /// `Ctrl+Alt+P` / `Ctrl+Alt+R` / `Ctrl+Alt+S`: a lifecycle request the
+    /// `Ctrl+Alt+R` / `Ctrl+Alt+S`: a lifecycle request the
     /// supervisor serves (ADR-0005, ADR-0006). The window itself does nothing
     /// but report it — pausing is not a window state, and neither is being
     /// written to a file.
@@ -874,17 +867,7 @@ impl InputCapture {
                 self.release_all();
                 Some(WindowAction::TypeClipboard)
             }
-            // Pause and reset (ADR-0005). Neither collides with anything the
-            // guest is likely to want: `Ctrl+Alt+P` and `Ctrl+Alt+R` are not
-            // VT switches (those are the function keys, still forwarded), and
-            // both are consumed here so a paused guest cannot see half a
-            // chord. As with `Ctrl+Alt+Q`, the modifiers are handed back first
-            // so the guest is not left holding them across the freeze.
-            KeyCode::KeyP => {
-                self.release_all();
-                self.control.push(ControlEvent::PauseToggleRequested);
-                Some(WindowAction::Lifecycle)
-            }
+            // Reset hands modifiers back before the guest restarts.
             KeyCode::KeyR => {
                 self.release_all();
                 self.control.push(ControlEvent::ResetRequested);
@@ -1582,6 +1565,24 @@ mod tests {
             ],
             "fullscreen and scaling stay inside the event loop"
         );
+    }
+
+    #[test]
+    fn former_pause_shortcut_is_forwarded_and_suspend_remains_reserved() {
+        let mut capture = grabbed_capture();
+        hold_ctrl_alt(&mut capture);
+        capture.events().drain();
+        assert!(matches!(
+            press(&mut capture, KeyCode::KeyP),
+            KeyOutcome::Forwarded(_)
+        ));
+        assert!(capture.control().drain().is_empty());
+        release(&mut capture, KeyCode::KeyP);
+        assert_eq!(
+            press(&mut capture, KeyCode::KeyS),
+            KeyOutcome::Reserved(WindowAction::Lifecycle)
+        );
+        assert_eq!(capture.control().drain(), vec![ControlEvent::SaveRequested]);
     }
 
     #[test]

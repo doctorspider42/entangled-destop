@@ -301,7 +301,7 @@ On Windows the manager offers two hypervisors: **Windows (WHP)**, running
 - `backend::reachability` also warns (does not refuse) when a machine lives on a
   Windows drive: drvfs has no sparse files, so a 16 GiB image really occupies
   16 GiB.
-- The control pipe survives `wsl.exe`, so Pause and Restart still work. The
+- The control pipe survives `wsl.exe`, so Suspend and Restart still work. The
   window does not come up on the Windows desktop — WSLg opens its own.
 - **Capabilities follow the kernel, not the host.** `Backend::virgl_block`
   (through `gpu_block(GpuRenderer)`, which blocks only virgl — the Venus GPU
@@ -575,29 +575,19 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
   testing against the shared `debian-demo` profile, check
   `pgrep -af "[e]ntangled run"` first — two VMs on one disk would corrupt it.
 
-## Pause and Restart: the control channel (ADR-0005)
+## Suspend and Restart: the control channel (ADR-0005/0006)
 
-A running machine's page has **Pause** and **Shut down**, with **Restart**,
-**Suspend** and **Force stop** under its `…` menu. They are not a stop and a
-start: they reach the live VM.
+Running cards and the machine page have a primary **Suspend** action beside
+**Shut down**. **Restart** and **Force stop** remain in the `�` menu. Pause and
+Continue have no product buttons, manager actions or Ctrl+Alt+P shortcut.
 
-The mechanism is the child's stdin. `launcher::run_spec` now spawns
-`entangled run --control-stdin <profile>` and `TaskSpec::control` makes the
-supervisor keep stdin as a pipe instead of `Stdio::null()`; `Task::set_paused`
-and `Task::reset` write `pause` / `resume` / `reset` lines into it. A pipe rather
-than a socket because it is the one channel that exists identically on both
-hosts, needs no path, no permissions and no cleanup, and dies with the process it
-controls — which for "pause this VM" is exactly the lifetime wanted.
-
-Two honesty rules the UI follows, and should keep following:
-
-- **The buttons are disabled for a VM this manager did not start.** A control
-  channel is a pipe to a child; a VM launched from a terminal has none, and the
-  hover text says so rather than the button lying.
-- **`pause_requested` is a request, not a state.** The VM can also be frozen
-  from its own window with `Ctrl+Alt+P`, and the manager would not know. What the
-  flag drives is the button's label, which is all it can honestly claim. The
-  VM's own answer is one `status` command away for anything that needs the truth.
+`launcher::run_spec` starts `entangled run --control-stdin <profile>` and
+`TaskSpec::control` retains its stdin pipe. `Task::suspend`, `Task::reset` and
+`Task::shutdown` send `save`, `reset` and `shutdown`. The pipe works on both
+hosts and dies with the child. Controls are disabled for machines this manager
+did not start, with an explanation on hover. The engine retains diagnostic
+pause/resume commands and its internal quiesce barrier for snapshot correctness;
+removing a product option must not remove that mechanism.
 
 **Port forwards** (2026-10-12) live under Network & devices for a usernet
 machine: one text field per `[network] forward` rule, a Remove button each,
@@ -620,7 +610,7 @@ broken pipe.
 
 ## Suspend, Resume and the Snapshots view (ADR-0006)
 
-Suspend rides the same pipe as Pause and Restart — `Task::suspend` writes one
+Suspend rides the same pipe as Restart — `Task::suspend` writes one
 `save` line — and Resume is a different child command, `entangled resume
 --control-stdin <file>` (`launcher::resume_spec`), with the same `TaskKind::Run`
 and the same log, because "resumed" and "started" are one event in a machine's

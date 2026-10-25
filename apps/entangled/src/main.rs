@@ -171,7 +171,7 @@ enum Command {
         /// (ADR-0005, ADR-0006).
         ///
         /// For a program driving this VM — `entangled-manager` uses it for the
-        /// Pause and Restart buttons. The window's Ctrl+Alt+P, Ctrl+Alt+R and
+        /// Suspend and Restart buttons. The window's Ctrl+Alt+R and
         /// Ctrl+Alt+S do the same things for a person, and need no flag.
         #[arg(long)]
         control_stdin: bool,

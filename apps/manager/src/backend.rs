@@ -96,7 +96,7 @@ impl Backend {
     /// CPU state controls require backend-specific pause, reset and snapshot support.
     pub const fn cpu_lifecycle_block(self) -> Option<&'static str> {
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) && matches!(self, Self::Native) {
-            Some("Pause, restart and suspend are not yet available on the native ARM64 backend.")
+            Some("Restart and suspend are not yet available on the native ARM64 backend.")
         } else {
             None
         }

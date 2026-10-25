@@ -1,12 +1,10 @@
 //! The quick-actions bar that slides in at the top edge of a VM window: shut
-//! down, restart, pause, suspend, fullscreen, 1:1, release input, power off.
+//! down, suspend, restart, fullscreen, 1:1, release input, power off.
 //!
 //! # When it shows
 //!
-//! Only where the top edge means "I want the VM's controls" rather than "I am
-//! on my way to the title bar": in **fullscreen**, and while the input is
-//! **grabbed** (the pointer is confined to the window, so it cannot be heading
-//! anywhere else). The pointer touching the top [`REVEAL_EDGE`] pixels shows
+//! Available whenever the VM window is focused, including after Ctrl+Alt
+//! releases gaming capture. Touching the top [`REVEAL_EDGE`] pixels shows
 //! the bar; leaving the bar by more than [`HIDE_MARGIN`] hides it. While the
 //! pointer is over the bar the guest gets no pointer events and the host
 //! cursor is shown, so the bar is used with the host's own arrow.
@@ -53,8 +51,6 @@ pub enum Button {
     Shutdown,
     /// Reboot in place (asks twice).
     Restart,
-    /// Freeze or continue.
-    Pause,
     /// Write the VM to its snapshot file and stop.
     Suspend,
     /// Borderless fullscreen on and off.
@@ -76,11 +72,10 @@ pub enum Button {
 impl Button {
     /// Left to right; a group gap separates the guest's lifecycle, the
     /// window's own controls and the plug.
-    pub const ALL: [Button; 11] = [
+    pub const ALL: [Button; 10] = [
         Button::Shutdown,
-        Button::Restart,
-        Button::Pause,
         Button::Suspend,
+        Button::Restart,
         Button::Fullscreen,
         Button::Scale,
         Button::Screenshot,
@@ -105,7 +100,6 @@ impl Button {
         match self {
             Button::Shutdown => "SHUT DOWN",
             Button::Restart => "RESTART  CTRL+ALT+R",
-            Button::Pause => "PAUSE / RESUME  CTRL+ALT+P",
             Button::Suspend => "SUSPEND TO DISK  CTRL+ALT+S",
             Button::Fullscreen => "FULLSCREEN  F11",
             Button::Scale => "FIT / 1:1  CTRL+ALT+O",
@@ -131,7 +125,6 @@ impl Button {
         match self {
             Button::Shutdown => ToolbarAction::PowerButton,
             Button::Restart => ToolbarAction::Reset,
-            Button::Pause => ToolbarAction::PauseToggle,
             Button::Suspend => ToolbarAction::Suspend,
             Button::Fullscreen => ToolbarAction::ToggleFullscreen,
             Button::Scale => ToolbarAction::ToggleScale,
@@ -151,8 +144,6 @@ pub enum ToolbarAction {
     PowerButton,
     /// Stop the VM now (the window's close button, `Ctrl+Alt+Q`).
     PowerOff,
-    /// Freeze the VM, or let a frozen one continue.
-    PauseToggle,
     /// Reboot the VM in place.
     Reset,
     /// Suspend to the snapshot file.
@@ -664,34 +655,6 @@ fn draw_icon(canvas: &mut Canvas, button: Button, r: Rect, colour: [f32; 4], s: 
             ];
             canvas.fill(r, colour, |x, y| sd_convex(x, y, &pts));
         }
-        Button::Pause => {
-            let h = k * 0.95;
-            canvas.fill(r, colour, |x, y| {
-                let left = sd_round_rect(
-                    x,
-                    y,
-                    Rect {
-                        x: c.0 - 5.0 * s,
-                        y: c.1 - h,
-                        w: 3.4 * s,
-                        h: 2.0 * h,
-                    },
-                    1.0 * s,
-                );
-                let right = sd_round_rect(
-                    x,
-                    y,
-                    Rect {
-                        x: c.0 + 1.6 * s,
-                        y: c.1 - h,
-                        w: 3.4 * s,
-                        h: 2.0 * h,
-                    },
-                    1.0 * s,
-                );
-                left.min(right)
-            });
-        }
         Button::Suspend => {
             // A crescent moon.
             canvas.fill(r, colour, |x, y| {
@@ -1055,17 +1018,14 @@ mod tests {
     fn it_shows_only_at_the_top_edge_and_only_when_eligible() {
         let now = Instant::now();
         let mut t = bar();
-        assert!(
-            !t.on_pointer(960.0, 1.0, false, now),
-            "windowed and ungrabbed: never"
-        );
+        assert!(!t.on_pointer(960.0, 1.0, false, now), "unfocused: never");
         assert!(!t.visible());
         t.on_pointer(960.0, 300.0, true, now);
         assert!(!t.visible(), "the middle of the screen does not reveal it");
         t.on_pointer(960.0, 1.0, true, now);
         assert!(t.visible(), "the top edge does");
         // Moving down onto a button keeps it, and captures the pointer.
-        let (x, y) = centre(t.layout(), Button::Pause);
+        let (x, y) = centre(t.layout(), Button::Suspend);
         assert!(t.on_pointer(x, y, true, now));
         // Wandering far below hides it.
         t.on_pointer(x, 600.0, true, now);
