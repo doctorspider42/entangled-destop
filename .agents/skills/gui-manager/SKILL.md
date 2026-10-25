@@ -630,11 +630,11 @@ history. Four rules earned by building it:
   at the ends of that pipe. A prefix spelled twice drifts, and the failure is
   silent: the Suspend button spins until the child exits and then says the wrong
   thing. `parse_reply` / `save_outcome` are the reader.
-- **A failed suspend still exits 0.** The engine stops the VM either way, so the
-  exit status cannot tell success from a snapshot that was never written — the
-  reply line is the only answer, and `LogBuffer::push_line` lifts it out **as it
-  goes past**. Scanning the tail afterwards loses it: a desktop guest can push
-  the whole log buffer through in the seconds a suspend takes.
+- **Only a successful suspend stops the VM.** A refusal keeps the session and
+  restores its previous pause state. `collect_task_results` consumes failures
+  from active tasks with `take_suspend_failure`, clears the spinner and permits
+  a retry; waiting for child exit would leave the UI stuck. `LogBuffer::push_line`
+  captures replies as they pass, including saves requested from the VM window.
 - **`Suspended` is a fact on disk, not a process.** `status_of` returns it for a
   machine with no child *and* a `<name>.esnap` beside its profile, which is why
   a card still reads correctly after the manager restarts. Only that

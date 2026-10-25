@@ -248,9 +248,8 @@ struct Shared {
     /// anything that needs the truth.
     pause_requested: AtomicBool,
     /// Whether the manager has asked this VM to write itself to a file and stop
-    /// (ADR-0006). Unlike a pause this is **one-way**: `Suspended` never goes
-    /// back to `Running` in the same process, so the flag is set once and stays
-    /// set for the rest of the task's life. It is what tells the card that a
+    /// (ADR-0006). A successful suspend is one-way; a refusal clears the
+    /// request and keeps the live session. It is what tells the card that a
     /// child which is about to exit is not being stopped, and what stops the
     /// exit being reported as "powered off".
     suspend_requested: AtomicBool,
@@ -371,19 +370,40 @@ impl Task {
     /// where the file will appear without naming it on a command line it would
     /// have to translate for WSL.
     ///
-    /// One-way, by construction. The engine serves a save ahead of every other
-    /// lifecycle request and exits afterwards whether it worked or not, so
-    /// there is nothing to un-ask.
+    /// A successful save ends the child; a failed save keeps the session and
+    /// lets the manager clear the request and report the error.
     pub fn suspend(&self) -> bool {
         if self.suspend_requested() {
             return true;
         }
-        if !self.send_control(control_api::control::CMD_SAVE) {
-            return false;
-        }
+        self.shared.log.lock_or_recover().save_result = None;
         *self.shared.suspend_at.lock_or_recover() = Some(Instant::now());
         self.shared.suspend_requested.store(true, Ordering::Release);
+        if !self.send_control(control_api::control::CMD_SAVE) {
+            self.shared
+                .suspend_requested
+                .store(false, Ordering::Release);
+            *self.shared.suspend_at.lock_or_recover() = None;
+            return false;
+        }
         true
+    }
+
+    /// Consumes a refusal while the child is still alive, ending the spinner
+    /// and allowing another attempt. Window-triggered saves use this too.
+    pub fn take_suspend_failure(&self) -> Option<String> {
+        let mut log = self.shared.log.lock_or_recover();
+        if !matches!(log.save_result, Some(Err(_))) {
+            return None;
+        }
+        let Some(Err(reason)) = log.save_result.take() else {
+            return None;
+        };
+        self.shared
+            .suspend_requested
+            .store(false, Ordering::Release);
+        *self.shared.suspend_at.lock_or_recover() = None;
+        Some(reason)
     }
 
     /// Whether this VM is on its way into a file.
@@ -1308,6 +1328,20 @@ mod tests {
             1,
             "one save, not two: {echoed:?}"
         );
+        let task = sup.task(id).unwrap();
+        task.shared.log.lock_or_recover().push_line(
+            "entangled-control: error save Venus objects cannot be saved; session kept Running"
+                .into(),
+        );
+        assert!(task.take_suspend_failure().unwrap().contains("Venus"));
+        assert!(!task.suspend_requested());
+        assert!(task.suspending_for().is_none());
+        assert!(
+            task.take_suspend_failure().is_none(),
+            "notice is consumed once"
+        );
+        assert!(task.is_active(), "refusal keeps the process alive");
+        assert!(task.suspend(), "a refusal permits a retry");
         sup.task(id).expect("task").request_kill();
         wait_until(|| !sup.any_active(), "child exit");
     }

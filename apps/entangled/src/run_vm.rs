@@ -943,7 +943,7 @@ pub const CONTROL_PREFIX: &str = control_api::control::PREFIX;
 /// | `pause` | freeze the VM (idempotent) |
 /// | `resume` | let it continue (idempotent) |
 /// | `reset` | reboot it in place |
-/// | `save [path]` | suspend to `path` (or the profile's default) and exit |
+/// | `save [path]` | suspend to `path` (or the profile's default); exit on success |
 /// | `type <text>` | type `<text>` and Enter on the guest's serial console |
 /// | `serial-key <name>` | send a named arrow, escape, tab or enter key on serial |
 /// | `status` | print the current [`RunState`](vmm_core::RunState) |
@@ -1197,6 +1197,7 @@ impl LifecycleSupervisor {
         lifecycle: Arc<Lifecycle>,
         requests: Arc<LifecycleRequests>,
         vm_state: Arc<Mutex<VmState>>,
+        display: Option<display::DisplayHandle>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
@@ -1204,18 +1205,19 @@ impl LifecycleSupervisor {
             .name("lifecycle".into())
             .spawn(move || {
                 while !flag.load(Ordering::Relaxed) && !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
-                    // Suspend wins over everything, and ends the VM (ADR-0006).
+                    // Suspend wins over everything; only success ends the VM.
                     // Nothing else is worth doing to a machine that is about to
                     // stop existing in this process, and a reset served first
                     // would put a *rebooted* guest in the file.
                     if let Some(path) = requests.take_save() {
-                        Self::suspend(&vm_state, &lifecycle, &path);
-                        // Whether it worked or not: a failed suspend leaves the
-                        // VM paused and the user without the file they asked
-                        // for, and running on as if nothing happened would be
-                        // the one outcome nobody can act on.
-                        SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
-                        return;
+                        if Self::suspend(&vm_state, &lifecycle, &path) {
+                            SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                        if let Some(display) = &display {
+                            display.notify("SUSPEND FAILED - SESSION KEPT - SEE LOG");
+                        }
+                        continue;
                     }
                     // Reset wins over pause: a guest that asked to reboot while
                     // someone was holding the pause key wants to reboot, and
@@ -1277,23 +1279,41 @@ impl LifecycleSupervisor {
     /// for this and has no other way to learn the file is complete — and
     /// because a suspend is the one lifecycle operation whose *result* is a
     /// thing on disk rather than a state the VM is in.
-    fn suspend(vm_state: &Mutex<VmState>, lifecycle: &Lifecycle, path: &Path) {
+    fn suspend(vm_state: &Mutex<VmState>, lifecycle: &Lifecycle, path: &Path) -> bool {
+        let was_paused = lifecycle.is_paused();
         Self::advance(vm_state, VmState::Suspending);
-        match lifecycle.save(path) {
+        let saved = match lifecycle.save(path) {
             Ok(summary) => {
                 Self::advance(vm_state, VmState::Suspended);
                 tracing::info!(path = %path.display(), %summary, "VM suspended");
                 println!("{CONTROL_PREFIX} saved {} {summary}", path.display());
+                true
             }
             Err(error) => {
                 tracing::error!(path = %path.display(), %error, "suspend failed");
-                println!("{CONTROL_PREFIX} error save {error}");
-                // The seam left the VM paused; the state machine has to agree,
-                // and `Suspending -> Paused` is exactly that transition.
+                // A save reads the quiesced machine; refusal is not a reason
+                // to destroy the only live copy. Restore the previous pause
+                // state, including failures before pause/capture completed.
+                if !was_paused {
+                    if let Err(resume_error) = lifecycle.resume() {
+                        tracing::error!(%resume_error, "cannot resume after failed suspend");
+                    }
+                }
                 Self::advance(vm_state, VmState::Paused);
+                match lifecycle.state() {
+                    vmm_core::RunState::Running => Self::advance(vm_state, VmState::Running),
+                    vmm_core::RunState::Stopping => Self::advance(vm_state, VmState::Stopping),
+                    _ => {}
+                }
+                println!(
+                    "{CONTROL_PREFIX} error save {error}; session kept {:?}",
+                    lifecycle.state()
+                );
+                false
             }
-        }
+        };
         let _ = std::io::Write::flush(&mut std::io::stdout());
+        saved
     }
 
     /// Runs one lifecycle operation and keeps [`VmState`] honest about it.
@@ -1577,6 +1597,7 @@ pub fn run_with(
         Arc::clone(&lifecycle),
         Arc::clone(&requests),
         Arc::clone(&vm_state),
+        Some(display_handle.clone()),
     );
     spawn_typist(typist.clone(), keyboard_sink.clone(), Arc::clone(&quiesce));
     if control_stdin {
@@ -2896,6 +2917,140 @@ fn extend_cmdline(configured: &str, clauses: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The actual supervisor must survive a refused save and still service
+    /// controls. This caught the unconditional shutdown following any save.
+    #[test]
+    fn refused_suspend_keeps_supervisor_and_session_alive() {
+        use super::*;
+        use std::time::Instant;
+        let lifecycle = Lifecycle::new(1);
+        let requests = Arc::new(LifecycleRequests::default());
+        let state = Arc::new(Mutex::new(VmState::Running));
+        let supervisor = LifecycleSupervisor::start(
+            Arc::clone(&lifecycle),
+            Arc::clone(&requests),
+            Arc::clone(&state),
+            None,
+        );
+        let path = std::env::temp_dir().join("entangled-refused-suspend.esnap");
+        requests.request_save(path);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if requests.save.lock().unwrap().is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!SHUTDOWN_REQUESTED.load(Ordering::Relaxed));
+        assert!(!supervisor.handle.as_ref().unwrap().is_finished());
+        assert_eq!(LifecycleSupervisor::read(&state), VmState::Running);
+        assert_eq!(lifecycle.state(), vmm_core::RunState::Running);
+        requests.resume.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while requests.resume.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !requests.resume.load(Ordering::Relaxed),
+            "controls still serviced"
+        );
+    }
+
+    #[test]
+    fn failed_snapshot_restores_the_previous_pause_state() {
+        use super::*;
+        use vmm_core::hv::{HvError, VcpuRegisters, X86Registers, X86SpecialRegisters};
+        struct Cpu;
+        impl VcpuRegisters for Cpu {
+            fn get_registers(&self) -> Result<X86Registers, HvError> {
+                Ok(Default::default())
+            }
+            fn set_registers(&self, _: &X86Registers) -> Result<(), HvError> {
+                Ok(())
+            }
+            fn get_special_registers(&self) -> Result<X86SpecialRegisters, HvError> {
+                Ok(Default::default())
+            }
+            fn set_special_registers(&self, _: &X86SpecialRegisters) -> Result<(), HvError> {
+                Ok(())
+            }
+        }
+        impl vmm_core::ResettableVcpu for Cpu {
+            fn reset_arch_state(&mut self, _: bool) -> Result<(), HvError> {
+                Ok(())
+            }
+            fn save_cpu_state(&self) -> Result<X86CpuState, HvError> {
+                Ok(X86CpuState {
+                    index: 0,
+                    registers: Default::default(),
+                    special_registers: Default::default(),
+                    msrs: vec![],
+                    xcr0: 1,
+                    xsave: Default::default(),
+                    lapic: Default::default(),
+                    mp_state: Default::default(),
+                    events: Default::default(),
+                    debug_registers: Default::default(),
+                })
+            }
+        }
+        struct Machine;
+        impl vmm_core::MachineLifecycle for Machine {
+            fn reset_machine(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn reset_vcpu(&self, _: u32, _: &dyn VcpuRegisters) -> Result<(), String> {
+                Ok(())
+            }
+            fn save_machine(&self, _: &[X86CpuState], _: &Path) -> Result<String, String> {
+                Err("virtio-gpu: live Venus objects cannot be saved".into())
+            }
+        }
+        for paused in [false, true] {
+            let lifecycle = Lifecycle::new(1);
+            lifecycle.attach_machine(Arc::new(Machine));
+            let worker = Arc::clone(&lifecycle);
+            let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let progress = Arc::clone(&ticks);
+            let cpu = std::thread::spawn(move || {
+                let mut cpu = Cpu;
+                while worker.checkpoint(0, &mut cpu) != vmm_core::Checkpoint::Stopped {
+                    progress.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            if paused {
+                lifecycle.pause().unwrap();
+            }
+            let state = Mutex::new(if paused {
+                VmState::Paused
+            } else {
+                VmState::Running
+            });
+            assert!(!LifecycleSupervisor::suspend(
+                &state,
+                &lifecycle,
+                Path::new("unused.esnap")
+            ));
+            assert_eq!(lifecycle.is_paused(), paused);
+            assert_eq!(
+                LifecycleSupervisor::read(&state),
+                if paused {
+                    VmState::Paused
+                } else {
+                    VmState::Running
+                }
+            );
+            let before = ticks.load(Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(25));
+            assert_eq!(ticks.load(Ordering::Relaxed) == before, paused);
+            lifecycle.resume().unwrap();
+            lifecycle.shutdown();
+            cpu.join().unwrap();
+        }
+    }
+
     use super::{
         direct_linux_cmdline, extend_cmdline, gpu_plan, shares_scanout, venus_host_visible_bytes,
         GpuPlan, VenusSource,

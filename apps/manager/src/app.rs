@@ -1370,12 +1370,27 @@ impl ManagerApp {
     /// Turns finished children into toasts, and finishes the install flow by
     /// stamping the wizard's memory/vCPU choice onto the profile the CLI wrote.
     fn collect_task_results(&mut self) {
+        let failures: Vec<_> = self
+            .supervisor
+            .tasks()
+            .iter()
+            .filter(|task| task.is_active())
+            .filter_map(|task| {
+                task.take_suspend_failure()
+                    .map(|reason| (task.vm.clone(), reason))
+            })
+            .collect();
+        for (vm, reason) in failures {
+            self.toast(
+                ToastLevel::Error,
+                format!("'{vm}' could not be suspended: {reason}"),
+            );
+            self.log_open = true;
+        }
         for (kind, vm, outcome) in self.supervisor.drain_finished() {
-            // A suspend ends the child too, and the exit status cannot tell the
-            // two apart: the engine exits cleanly whether the snapshot was
-            // written or not (ADR-0006), because a VM that has been told to
-            // stop existing must not run on either way. The reply line it
-            // printed is the only answer, so it decides the toast.
+            // A successful suspend ends the child. The reply also supports
+            // older engines that exited even on failure; active refusals
+            // from current engines were handled above.
             if let Some(result) = self.suspend_outcome(&vm) {
                 match result {
                     Ok(detail) => {

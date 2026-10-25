@@ -7,7 +7,7 @@
 //! [`InputQueue`].
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, StartCause, WindowEvent};
@@ -1225,7 +1225,11 @@ impl ApplicationHandler<HostEvent> for App {
             let until = *until;
             if Instant::now() >= until {
                 self.note = None;
+                self.toolbar.clear_notice();
                 self.update_title();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             } else {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(until));
             }
@@ -1280,6 +1284,14 @@ impl ApplicationHandler<HostEvent> for App {
             }
             // `about_to_wait` looks at the activity; the wakeup was the point.
             HostEvent::GpuActive => {}
+            HostEvent::Notice(message) => {
+                self.note = Some((message.into(), Instant::now() + Duration::from_secs(30)));
+                self.toolbar.show_notice(message);
+                self.update_title();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             HostEvent::Shutdown => {
                 tracing::info!("shutdown requested; closing the window");
                 event_loop.exit();

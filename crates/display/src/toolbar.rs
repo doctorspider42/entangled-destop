@@ -275,6 +275,7 @@ pub struct Toolbar {
     serial: u64,
     /// The rendered picture and the serial it was drawn at.
     cache: Option<(u64, Overlay)>,
+    notice: Option<&'static str>,
 }
 
 /// The rendered bar, ready for the renderer.
@@ -306,6 +307,7 @@ impl Toolbar {
             armed: None,
             serial: 1,
             cache: None,
+            notice: None,
         }
     }
 
@@ -321,7 +323,20 @@ impl Toolbar {
 
     /// Whether the bar is showing.
     pub fn visible(&self) -> bool {
-        self.visible
+        self.visible || self.notice.is_some()
+    }
+
+    /// A lifecycle failure remains visible even when the pointer hides the bar.
+    pub fn show_notice(&mut self, message: &'static str) {
+        self.notice = Some(message);
+        self.changed();
+    }
+
+    /// Clears the lifecycle notice when its host timer expires.
+    pub fn clear_notice(&mut self) {
+        if self.notice.take().is_some() {
+            self.changed();
+        }
     }
 
     /// Changes whenever the picture would: compare to know when to redraw.
@@ -439,7 +454,7 @@ impl Toolbar {
     /// The picture to draw, or `None` while hidden. Re-rendered only when the
     /// state changed since the last call.
     pub fn overlay(&mut self) -> Option<&Overlay> {
-        if !self.visible {
+        if !self.visible() {
             return None;
         }
         let stale = self.cache.as_ref().map(|(s, _)| *s) != Some(self.serial);
@@ -449,6 +464,7 @@ impl Toolbar {
                 self.hover,
                 self.armed.map(|(b, _)| b),
                 self.serial,
+                self.notice,
             );
             self.cache = Some((self.serial, overlay));
         }
@@ -878,15 +894,23 @@ fn draw_text(canvas: &mut Canvas, text: &str, x: f64, y: f64, k: f64, colour: [f
 
 // ---------------------------------------------------------------- render
 
-fn render(layout: &Layout, hover: Option<Button>, armed: Option<Button>, serial: u64) -> Overlay {
+fn render(
+    layout: &Layout,
+    hover: Option<Button>,
+    armed: Option<Button>,
+    serial: u64,
+    notice: Option<&str>,
+) -> Overlay {
     let s = layout.scale;
     let k = font_scale(s);
-    let label = hover.map(|b| {
-        if armed == Some(b) {
-            b.armed_label()
-        } else {
-            b.label()
-        }
+    let label = notice.or_else(|| {
+        hover.map(|b| {
+            if armed == Some(b) {
+                b.armed_label()
+            } else {
+                b.label()
+            }
+        })
     });
     // The label box hangs below the bar, centred on it, as wide as it needs.
     let (label_w, label_h) = label.map_or((0.0, 0.0), |l| text_size(l, k));
@@ -981,6 +1005,21 @@ fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_notice_is_visible_without_pointer_reveal() {
+        let mut toolbar = bar();
+        assert!(toolbar.overlay().is_none());
+        toolbar.show_notice("SUSPEND FAILED - SESSION KEPT - SEE LOG");
+        let notice = toolbar.overlay().unwrap().clone();
+        assert!(notice.height > toolbar.layout().bar.h as u32);
+        toolbar.on_pointer(500.0, 500.0, false, Instant::now());
+        assert!(toolbar.visible());
+        assert!(!toolbar.captures_pointer());
+        assert!(toolbar.overlay().is_some());
+        toolbar.clear_notice();
+        assert!(toolbar.overlay().is_none());
+    }
 
     fn bar() -> Toolbar {
         Toolbar::new((1920, 1080), 1.0)

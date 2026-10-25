@@ -30,6 +30,8 @@ pub(crate) enum HostEvent {
     /// The guest used the GPU while the window was not boosting it
     /// ([`crate::boost`]): look again.
     GpuActive,
+    /// A bounded, host-generated lifecycle notice, including in fullscreen.
+    Notice(&'static str),
     /// Tear the window down and return from [`crate::DisplayHost::run`].
     Shutdown,
 }
@@ -208,6 +210,13 @@ pub struct DisplayHandle {
 }
 
 impl DisplayHandle {
+    /// Shows a host-generated notice in the title and fullscreen toolbar.
+    pub fn notify(&self, message: &'static str) {
+        if let Some(proxy) = &self.waker.proxy {
+            let _ = proxy.send_event(HostEvent::Notice(message));
+        }
+    }
+
     pub(crate) fn new(
         scanout: SharedScanout,
         waker: Waker,

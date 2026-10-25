@@ -1,5 +1,43 @@
 # ADR-0006: Suspend and restore — writing a VM down, and reading it back
 
+## Amendment, 2026-10-25: a refused save preserves the live session
+
+The window's Suspend button exposed a destructive error path: Venus correctly
+refused a snapshot containing live host Vulkan state, but the lifecycle supervisor
+stopped the VM even though no snapshot existed. Only a successful save may now
+request shutdown. On refusal, the supervisor restores the previous pause state,
+reports the error on the control channel, keeps serving controls, and shows a
+30-second notice in the window title and toolbar, including fullscreen. The
+manager consumes the failure while the child is alive, ends its spinner and
+allows another attempt. This supersedes the older failed-save exit policy below.
+
+This does not make active Venus Vulkan objects serializable. A live 3D session
+still refuses suspend to disk when its GPU state cannot be carried; Pause keeps
+that session in memory. Neither an error nor Pause is reported as a saved session.
+Regression coverage exercises supervisor survival, a device refusal after CPU
+capture with running and paused guests, continued CPU progress after refusal,
+and manager retry after receiving the error.
+
+Native WHP acceptance on this machine: the Ubuntu Venus desktop refused its
+three exported device-local blobs while running, returned to Running, and
+continued answering SSH. A second attempt while paused left it Paused; Resume
+then restored SSH access. Ubuntu subsequently powered off normally. Separately,
+a diskless 256 MiB, one-vCPU UEFI/2D control VM saved successfully, exited,
+restored in a new process, and processed a serial Enter into BootManagerMenuApp;
+it then saved again and exited. This is a firmware-level save/restore check,
+not evidence of successful desktop or 3D hibernation. Runtime logs are
+`F:/VMs/Entangled/suspend-fixed.log` and
+`F:/VMs/Entangled/local-build/suspend-2d{,-resume}.log`. The notice was inspected
+using the toolbar's actual rasterizer; native window capture timed out, while
+the accessibility title confirmed that the live window received the notice.
+
+Verification: Windows workspace 2412 passed / 18 ignored; Linux workspace 2428
+passed / 26 ignored with `--test-threads=1`; workspace Clippy with warnings
+denied and formatting passed on both hosts, and cargo-deny passed. A parallel
+Linux run reproduced the two existing TCP teardown timing failures (the
+same-breath close and flow-table saturation tests); the first parallel run
+and the final complete serial run passed. No networking code was changed.
+
 - Status: accepted
 - Date: 2026-08-21
 - Extends: [ADR-0005](0005-vm-lifecycle.md) (the controlled stop this is built on)
