@@ -13,6 +13,16 @@
 //! engine do the arithmetic. That keeps the guest-facing half of this crate
 //! byte-identical on both hosts, which is the whole point of the sink trait.
 //!
+//! # Playback pacing
+//!
+//! `ReleaseBuffer` queues samples; the initially empty 100 ms endpoint buffer
+//! can accept several guest periods immediately. Returning those periods at
+//! once drives Linux into an xrun/reopen loop (and clicks a USB DAC repeatedly).
+//! Wait for `IAudioClock` to advance by the submitted audio's duration instead,
+//! using its own frequency rather than assuming its units are guest frames.
+//! An empty endpoint is re-primed with a bounded 20 ms silence lead and its
+//! clock origin rebased, so a pause does not turn into catch-up completions.
+//!
 //! # Threading
 //!
 //! Everything here happens on the device's pump thread: the COM apartment is
@@ -25,8 +35,9 @@
 use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::{
-    eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioRenderClient,
-    IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, WAVEFORMATEX,
+    eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioClock,
+    IAudioRenderClient, IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
+    WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -119,9 +130,14 @@ pub struct WasapiSink {
     com: Option<ComGuard>,
     client: Option<IAudioClient>,
     render: Option<IAudioRenderClient>,
+    clock: Option<IAudioClock>,
+    clock_hz: u64,
+    rate_hz: u32,
+    clock_origin: u64,
+    submitted_frames: u64,
     buffer_frames: u32,
     frame_bytes: usize,
-    /// How long to sleep when the endpoint buffer is full.
+    /// How long to sleep between buffer/clock polls.
     wait: Duration,
 }
 
@@ -154,6 +170,11 @@ impl WasapiSink {
             com: None,
             client: None,
             render: None,
+            clock: None,
+            clock_hz: 0,
+            rate_hz: 0,
+            clock_origin: 0,
+            submitted_frames: 0,
             buffer_frames: 0,
             frame_bytes: 4,
             wait: Duration::from_millis(5),
@@ -183,7 +204,9 @@ impl WasapiSink {
             }
         }
         self.render = None;
+        self.clock = None;
         self.buffer_frames = 0;
+        self.submitted_frames = 0;
     }
 }
 
@@ -236,21 +259,38 @@ impl AudioSink for WasapiSink {
         // SAFETY: same.
         let render: IAudioRenderClient = unsafe { client.GetService() }
             .map_err(|e| AudioError::Io(format!("IAudioRenderClient: {e}")))?;
+        // SAFETY: the client is initialised; GetService returns a live clock
+        // belonging to this stream, used and released on this pump thread.
+        let clock: IAudioClock = unsafe { client.GetService() }
+            .map_err(|e| AudioError::Io(format!("IAudioClock: {e}")))?;
+        // SAFETY: `clock` is live. Its frequency defines GetPosition's units;
+        // with shared-mode conversion these need not be guest audio frames.
+        let clock_hz = unsafe { clock.GetFrequency() }
+            .map_err(|e| AudioError::Io(format!("GetFrequency: {e}")))?;
+        if clock_hz == 0 {
+            return Err(AudioError::Io("WASAPI clock has zero frequency".into()));
+        }
         // SAFETY: same.
         unsafe { client.Start() }.map_err(|e| AudioError::Io(format!("Start: {e}")))?;
 
         self.buffer_frames = buffer_frames;
-        // Sleep for a quarter of the endpoint buffer when it is full: long
-        // enough not to spin, short enough never to starve it.
-        let quarter = u64::from(buffer_frames) * 250 / u64::from(format.rate_hz.max(1));
-        self.wait = Duration::from_millis(quarter.clamp(1, 50));
+        // Poll below a guest period, including PipeWire's 2048-byte periods.
+        self.wait = Duration::from_millis(1);
+        self.clock = Some(clock);
+        self.clock_hz = clock_hz;
+        self.rate_hz = format.rate_hz;
+        self.clock_origin = 0;
         self.client = Some(client);
         self.render = Some(render);
         Ok(())
     }
 
     fn write(&mut self, pcm: &[u8]) -> Result<usize, AudioError> {
-        let (Some(client), Some(render)) = (self.client.as_ref(), self.render.as_ref()) else {
+        let (Some(client), Some(render), Some(clock)) = (
+            self.client.as_ref(),
+            self.render.as_ref(),
+            self.clock.as_ref(),
+        ) else {
             return Err(AudioError::Io("WASAPI stream is not open".into()));
         };
         let frame_bytes = self.frame_bytes.max(1);
@@ -262,8 +302,29 @@ impl AudioSink for WasapiSink {
 
         while done_frames < total_frames {
             // SAFETY: `client` is a live, started client.
-            let padding = unsafe { client.GetCurrentPadding() }
+            let mut padding = unsafe { client.GetCurrentPadding() }
                 .map_err(|e| AudioError::Io(format!("GetCurrentPadding: {e}")))?;
+            if padding == 0 {
+                // Startup, pause/resume, or a host underrun: rebase rather
+                // than catching up with a burst of guest completions. Keep
+                // 20 ms ahead of the device so polling/scheduling jitter
+                // does not put a hole at every guest period boundary.
+                self.clock_origin = clock_position(clock)?;
+                self.submitted_frames = 0;
+                let lead = (self.rate_hz / 50).min(self.buffer_frames / 2);
+                if lead > 0 {
+                    // SAFETY: lead fits in the empty endpoint buffer. Silent
+                    // ReleaseBuffer initialises the packet without reading it.
+                    unsafe {
+                        render
+                            .GetBuffer(lead)
+                            .map_err(|e| AudioError::Io(format!("GetBuffer (silence): {e}")))?;
+                        render.ReleaseBuffer(lead, AUDCLNT_BUFFERFLAGS_SILENT)
+                    }
+                    .map_err(|e| AudioError::Io(format!("ReleaseBuffer (silence): {e}")))?;
+                    padding = lead;
+                }
+            }
             let free = self.buffer_frames.saturating_sub(padding);
             if free == 0 {
                 if Instant::now() >= deadline {
@@ -300,6 +361,21 @@ impl AudioSink for WasapiSink {
             unsafe { render.ReleaseBuffer(take_u32, 0) }
                 .map_err(|e| AudioError::Io(format!("ReleaseBuffer: {e}")))?;
             done_frames += take;
+            self.submitted_frames = self.submitted_frames.saturating_add(take as u64);
+            // ReleaseBuffer only queues samples; it does not play them. In
+            // particular the initial 100 ms of free space must not retire
+            // 100 ms of guest periods at once (ALSA xrun/reopen loop).
+            while !clock_reached(
+                clock_position(clock)?.saturating_sub(self.clock_origin),
+                self.clock_hz,
+                self.submitted_frames,
+                self.rate_hz,
+            ) {
+                if Instant::now() >= deadline {
+                    return Err(AudioError::Io("WASAPI playback clock stopped".into()));
+                }
+                std::thread::sleep(self.wait);
+            }
         }
         Ok(done_frames.saturating_mul(frame_bytes))
     }
@@ -307,6 +383,19 @@ impl AudioSink for WasapiSink {
     fn stop(&mut self) {
         self.release();
     }
+}
+
+fn clock_position(clock: &IAudioClock) -> Result<u64, AudioError> {
+    let mut position = 0;
+    // SAFETY: clock is live, position is writable, and the optional correlated
+    // QPC timestamp is not needed. WASAPI's position is relative to Start.
+    unsafe { clock.GetPosition(&mut position, None) }
+        .map_err(|e| AudioError::Io(format!("GetPosition: {e}")))?;
+    Ok(position)
+}
+
+fn clock_reached(position: u64, frequency: u64, frames: u64, rate_hz: u32) -> bool {
+    u128::from(position) * u128::from(rate_hz) >= u128::from(frames) * u128::from(frequency)
 }
 
 // ------------------------------------------------------------ capture source
@@ -551,6 +640,54 @@ impl AudioSource for WasapiSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_clock_uses_its_frequency_and_does_not_round_a_period_down() {
+        // Shared-mode clocks may count bytes at the engine's mix rate rather
+        // than frames at the guest's rate. Cross-multiply without truncation.
+        assert!(!clock_reached(4095, 384_000, 512, 48_000));
+        assert!(clock_reached(4096, 384_000, 512, 48_000));
+        assert!(!clock_reached(4458, 384_000, 512, 44_100));
+        assert!(clock_reached(4459, 384_000, 512, 44_100));
+        assert!(!clock_reached(u64::MAX, u64::MAX, u64::MAX, 48_000));
+    }
+
+    /// Exercises the real endpoint buffer, which RecordingSink cannot model.
+    /// Silence only; explicit because opening a host DAC may click once.
+    #[test]
+    #[ignore = "opens the host audio endpoint; run explicitly on Windows"]
+    fn wasapi_periods_are_paced_from_the_first_write_and_after_an_idle_gap() {
+        if let Err(error) = WasapiSink::probe() {
+            eprintln!("skipping: {error}");
+            return;
+        }
+        let mut sink = WasapiSink::new();
+        for rate_hz in [48_000, 44_100] {
+            let format = StreamFormat {
+                rate_hz,
+                channels: 2,
+            };
+            let pcm = [0u8; 2048];
+            sink.start(format, pcm.len())
+                .expect("open default endpoint");
+            for round in 0..2 {
+                let started = Instant::now();
+                for period in 1..=8 {
+                    assert_eq!(sink.write(&pcm).expect("write silence"), pcm.len());
+                    let expected = format.duration_of(period * pcm.len());
+                    assert!(
+                        started.elapsed() >= expected.mul_f64(0.85),
+                        "{rate_hz} Hz round {round} period {period}: completed {expected:?} of audio in {:?}",
+                        started.elapsed()
+                    );
+                }
+                // Also covers the endpoint draining while the VM is paused.
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            sink.stop();
+            assert!(sink.write(&pcm).is_err());
+        }
+    }
 
     /// Self-skipping: a CI container (and a Windows box with no audio driver)
     /// has no render endpoint, and that must not be a failure.
