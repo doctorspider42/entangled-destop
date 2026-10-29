@@ -28,7 +28,17 @@ fn image(ctx_id: u32, id: u64, alive: &Arc<()>) -> ScanoutImage {
 #[test]
 fn directory_file_preserves_page_identity_permissions_and_stale_generations() {
     let source = BlobDirectory::default();
-    let page = Arc::new(RingPages::new(4096).unwrap());
+    // Model a 4 KiB blob with larger native backing even on 4 KiB hosts.
+    let alignment = (crate::venus::shmem::page_size() as u64).max(16 << 10);
+    let page = Arc::new(
+        RingPages::from_checkpoint(
+            4096,
+            alignment,
+            alignment,
+            &crate::venus::shmem::PageBudget::new(alignment),
+        )
+        .unwrap(),
+    );
     let mapped_bytes = page.mapped_len();
     page.write_bytes(16, b"saved bytes").unwrap();
     source.insert(8, 1, page.clone());
@@ -89,7 +99,7 @@ fn directory_file_preserves_page_identity_permissions_and_stale_generations() {
     );
     assert_eq!(
         budget.used(),
-        4096,
+        mapped_bytes,
         "three blobs and an import share one charge"
     );
     drop((imported, blobs, directory, pages));
