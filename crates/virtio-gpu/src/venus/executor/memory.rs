@@ -352,6 +352,25 @@ fn requirements() -> VkMemoryRequirements2 {
 }
 
 impl<H: HostVulkan> VulkanContext<H> {
+    pub(super) fn checkpoint_dedicated_identity(
+        &self,
+        device: u64,
+        dedicated: Option<DedicatedTo>,
+    ) -> Option<Arc<()>> {
+        match dedicated? {
+            DedicatedTo::Image(id) => self
+                .objects
+                .image(device, id)
+                .ok()
+                .map(|image| image.identity.clone()),
+            DedicatedTo::Buffer(id) => self
+                .objects
+                .buffer(device, id)
+                .ok()
+                .map(|buffer| buffer.identity.clone()),
+        }
+    }
+
     // ---------------------------------------------------------- memory
 
     /// `vkAllocateMemory`. See the module docs for the two paths, and for
@@ -375,6 +394,10 @@ impl<H: HostVulkan> VulkanContext<H> {
         args: &mut AllocateMemoryArgs,
     ) -> Result<(), ExecError> {
         const NAME: &str = "vkAllocateMemory";
+        self.memory_sequence = self
+            .memory_sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid(NAME, "allocation ordinal exhausted"))?;
         let device_id = args.device.0;
         let id = args.p_memory.map(|h| h.0).unwrap_or(0);
         let (device, guest) = self
@@ -492,6 +515,36 @@ impl<H: HostVulkan> VulkanContext<H> {
         if let Err(refused) = self.objects.reserve(Kind::DeviceMemory, 1) {
             args.ret = self.refuse("vkAllocateMemory", &refused);
             return Ok(());
+        }
+        if let Some(link) = self.restoring_shared.get(&self.memory_sequence).cloned() {
+            return self.restore_linked_allocation(
+                args,
+                id,
+                &link,
+                (ty.property_flags, flags),
+                dedicated.map(|(to, _)| to),
+                (import.is_some(), export_types),
+            );
+        }
+        if let Some(link) = self.restoring_pages.get(&self.memory_sequence).cloned() {
+            return self.restore_linked_pages(
+                args,
+                id,
+                &link,
+                (ty.property_flags, flags),
+                dedicated.map(|(to, _)| to),
+                (import.is_some(), export_types),
+            );
+        }
+        if let Some(meta) = self.restoring_import {
+            return self.restore_import_placeholder(
+                args,
+                id,
+                meta,
+                (ty.property_flags, flags),
+                dedicated.map(|(to, _)| to),
+                (import.is_some(), export_types),
+            );
         }
         if let Some(resource_id) = import {
             // An import carries the application's own export info through
@@ -630,6 +683,12 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.objects.insert_memory(
                     id,
                     MemoryObject {
+                        dedicated_identity: self
+                            .checkpoint_dedicated_identity(device_id, dedicated.map(|(to, _)| to)),
+                        checkpoint_placeholder: false,
+                        allocation_serial: self.memory_sequence,
+                        shared_handle: None,
+                        identity: Arc::new(()),
                         device: device_id,
                         host: memory,
                         size,
@@ -667,7 +726,7 @@ impl<H: HostVulkan> VulkanContext<H> {
     /// # Errors
     /// `VK_ERROR_OUT_OF_DEVICE_MEMORY` past either share or its whole: what a
     /// driver answers for an exhausted heap.
-    fn charge_allocation(
+    pub(super) fn charge_allocation(
         &self,
         guest: &GuestDevice,
         heap_index: u32,
@@ -831,6 +890,11 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.objects.insert_memory(
                     id,
                     MemoryObject {
+                        dedicated_identity: self.checkpoint_dedicated_identity(device_id, None),
+                        checkpoint_placeholder: false,
+                        allocation_serial: self.memory_sequence,
+                        shared_handle: None,
+                        identity: Arc::new(()),
                         device: device_id,
                         host: memory,
                         size,
@@ -858,7 +922,7 @@ impl<H: HostVulkan> VulkanContext<H> {
     /// import it: a handle of this host type, made on the same GPU and
     /// driver (`deviceUUID` and `driverUUID` equal), on a device that can
     /// import at all. Why not, otherwise.
-    fn handle_export<'s>(
+    pub(super) fn handle_export<'s>(
         shared: &'s SharedHandle,
         guest: &GuestDevice,
     ) -> Result<&'s HandleExport<H>, &'static str> {
@@ -950,6 +1014,12 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.objects.insert_memory(
                     id,
                     MemoryObject {
+                        dedicated_identity: self
+                            .checkpoint_dedicated_identity(device_id, dedicated),
+                        checkpoint_placeholder: false,
+                        allocation_serial: self.memory_sequence,
+                        shared_handle: self.recipes.as_ref().map(|_| shared.clone()),
+                        identity: Arc::new(()),
                         device: device_id,
                         host: memory,
                         size,
@@ -1164,10 +1234,46 @@ impl<H: HostVulkan> VulkanContext<H> {
         // directory until the renderer inserts the blob, straight after).
         let shared = SharedRef::of(&handle);
         memory.shared = Some(shared.clone());
+        memory.shared_handle = self.recipes.as_ref().map(|_| handle.clone());
         if let Some(blobs) = self.blobs.clone() {
             let ctx_id = self.ctx_id;
             for (id, image) in self.objects.unrecorded_images_on(blob_id) {
                 record_image(ctx_id, &blobs, &shared, id, image);
+            }
+        }
+        let epoch = self.payloads.ownership.reserve_epoch();
+        if epoch != 0 {
+            if self.objects.checkpoint_buffers().any(|(_, buffer)| {
+                buffer
+                    .bound
+                    .is_some_and(|binding| binding.memory == blob_id)
+            }) {
+                self.payloads
+                    .ownership
+                    .invalidate("exported shared buffer has no checkpoint payload representation");
+            }
+            for (id, image) in self.objects.checkpoint_images() {
+                if image
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.memory == blob_id)
+                {
+                    let cell = self
+                        .image_tracking
+                        .images
+                        .get(&id)
+                        .and_then(|state| state.checkpoint_cell(0, 0));
+                    if cell.is_some_and(|cell| {
+                        !matches!(cell.owner, super::image_layouts::Owner::Initial)
+                    }) {
+                        self.payloads
+                            .ownership
+                            .invalidate("payload was first exported after unmarked GPU use");
+                    }
+                    self.payloads
+                        .ownership
+                        .observe(epoch, None, image, cell, &self.objects);
+                }
             }
         }
         tracing::debug!(
@@ -1322,6 +1428,12 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.objects.insert_buffer(
                     id,
                     BufferObject {
+                        checkpoint_owner: None,
+                        sharing: super::objects::Sharing::new(
+                            info.sharing_mode,
+                            info.p_queue_family_indices.as_deref().unwrap_or_default(),
+                        ),
+                        identity: Arc::new(()),
                         device: device_id,
                         host: buffer,
                         size: info.size,
@@ -1331,6 +1443,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                         external,
                         handle,
                         bound: None,
+                        bound_identity: None,
                     },
                 );
                 args.ret = VK_SUCCESS;
@@ -1616,10 +1729,26 @@ impl<H: HostVulkan> VulkanContext<H> {
         let ret = self.host.bind_buffer_memory(&device.host, &host_binds);
         if ret == VK_SUCCESS {
             for bind in binds {
+                if self
+                    .objects
+                    .memory(device_id, bind.memory.0)
+                    .is_ok_and(|memory| memory.shared.is_some())
+                {
+                    self.payloads.ownership.invalidate(
+                        "shared buffer binding has no checkpoint payload representation",
+                    );
+                }
+                let identity = self
+                    .objects
+                    .memory(device_id, bind.memory.0)
+                    .map_err(id_error(command))?
+                    .identity
+                    .clone();
                 let buffer = self
                     .objects
                     .buffer_mut(device_id, bind.buffer.0)
                     .map_err(id_error(command))?;
+                buffer.bound_identity = Some(identity);
                 buffer.bound = Some(Binding {
                     memory: bind.memory.0,
                     offset: bind.memory_offset,
@@ -1684,6 +1813,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             ));
         }
         args.ret = self.host.buffer_device_address(&device.host, buffer.host);
+        self.device_addresses_exposed |= args.ret != 0;
         Ok(())
     }
 
@@ -2100,6 +2230,21 @@ impl<H: HostVulkan> VulkanContext<H> {
                 image.bound_planes |= 1 << index;
             }
             for bind in binds {
+                let identity = self
+                    .objects
+                    .memory(device_id, bind.memory.0)
+                    .map_err(id_error(command))?
+                    .identity
+                    .clone();
+                let image = self
+                    .objects
+                    .image_mut(device_id, bind.image.0)
+                    .map_err(id_error(command))?;
+                image.binding_identities.push(identity);
+                image.bindings.push(Binding {
+                    memory: bind.memory.0,
+                    offset: bind.memory_offset,
+                });
                 self.record_scanout_image(device_id, bind);
             }
         }
@@ -2125,6 +2270,11 @@ impl<H: HostVulkan> VulkanContext<H> {
         let Ok(image) = self.objects.image_mut(device_id, bind.image.0) else {
             return;
         };
+        if shared.is_some() && (image.canonical.is_none() || bind.memory_offset != 0) {
+            self.payloads
+                .ownership
+                .invalidate("shared image binding has no canonical checkpoint representation");
+        }
         if image.canonical.is_none() {
             return;
         }

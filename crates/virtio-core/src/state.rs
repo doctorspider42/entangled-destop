@@ -748,6 +748,25 @@ impl TransportState {
 
     // --------------------------------------------------- suspend and restore
 
+    pub fn has_streamed_state(&self) -> bool {
+        self.device.has_streamed_state()
+    }
+    pub fn prepare_snapshot(&mut self) -> Result<(), crate::DeviceError> {
+        self.device.prepare_snapshot()
+    }
+    pub fn save_streamed_state(
+        &mut self,
+        out: &mut dyn std::io::Write,
+    ) -> Result<(), crate::DeviceError> {
+        self.device.save_streamed_state(out)
+    }
+    pub fn load_streamed_state(
+        &mut self,
+        reader: &mut dyn crate::StateReader,
+    ) -> Result<(), crate::DeviceError> {
+        self.device.load_streamed_state(reader)
+    }
+
     /// The device's [`crate::VirtioDevice::snapshot_refusal`] (ADR-0006).
     pub fn snapshot_refusal(&self) -> Option<String> {
         self.device.snapshot_refusal()

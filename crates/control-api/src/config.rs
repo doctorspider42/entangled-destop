@@ -653,6 +653,10 @@ pub struct DisplaySection {
     /// an older release, and every section here denies unknown fields).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub venus: bool,
+    /// Opt into experimental disk checkpoints of Venus resources on x86 hosts.
+    /// Ignored for other renderers. Unsupported GPU states still refuse safely.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub venus_checkpoints: bool,
     /// The refresh rate the virtual monitor's EDID advertises, in Hz
     /// (GAME-2105).
     ///
@@ -773,6 +777,7 @@ impl Default for DisplaySection {
             virgl: false,
             virgl_isolation: VirglIsolation::default(),
             venus: false,
+            venus_checkpoints: false,
             refresh_hz: DEFAULT_REFRESH_HZ,
             frame_stats: None,
             host_visible_mib: None,
@@ -1614,6 +1619,7 @@ scale = 1.0
         let mut display = DisplaySection {
             virgl_isolation: VirglIsolation::InProcess,
             host_visible_mib: Some(512),
+            venus_checkpoints: true,
             ..DisplaySection::default()
         };
         for renderer in GpuRenderer::ALL {
@@ -1622,9 +1628,27 @@ scale = 1.0
             assert!(!(display.virgl && display.venus));
             assert_eq!(display.virgl_isolation, VirglIsolation::InProcess);
             assert_eq!(display.host_visible_mib, Some(512));
+            assert!(display.venus_checkpoints);
         }
         assert_eq!(GpuRenderer::Venus.to_string(), "venus");
         assert_eq!(GpuRenderer::TwoD.to_string(), "2d");
+    }
+
+    #[test]
+    fn venus_checkpoints_are_opt_in_and_absent_from_legacy_profiles() {
+        let mut cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).expect("legacy profile");
+        assert!(!cfg.display.venus_checkpoints);
+        let legacy = toml::to_string(&cfg).expect("serialize");
+        assert!(!legacy.contains("venus_checkpoints"));
+        cfg.display.venus_checkpoints = true;
+        let enabled = toml::to_string(&cfg).expect("serialize opt-in");
+        assert!(enabled.contains("venus_checkpoints = true"));
+        assert!(
+            VmConfig::from_toml(&enabled)
+                .unwrap()
+                .display
+                .venus_checkpoints
+        );
     }
 
     #[test]

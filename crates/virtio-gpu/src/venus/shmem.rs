@@ -796,6 +796,40 @@ impl RingPages {
         Self::memory_pages(size, align, budget, false)
     }
 
+    /// Rebuild a public checkpoint allocation, preserving both the declared
+    /// ring size and the rounded mapping span. No publication exists yet.
+    pub(crate) fn from_checkpoint(
+        declared: u64,
+        mapped: u64,
+        align: u64,
+        budget: &Arc<PageBudget>,
+    ) -> Result<Self, ShmemError> {
+        if declared == 0
+            || align < page_size() as u64
+            || !align.is_power_of_two()
+            || align > MAX_MEMORY_ALIGNMENT
+            || declared.checked_next_multiple_of(align) != Some(mapped)
+        {
+            return Err(ShmemError::UnusableLayout {
+                size: mapped,
+                align,
+            });
+        }
+        let mut pages = Self::memory_pages(mapped, align, budget, false)?;
+        pages.declared = declared;
+        Ok(pages)
+    }
+
+    pub(crate) fn allocation_alignment(&self) -> u64 {
+        self.alloc.align() as u64
+    }
+
+    /// Allocation owner identity, not an importer. Ring blobs have no page
+    /// charge: their lifetime and byte caps belong to the renderer's ledger.
+    pub(crate) fn checkpoint_budget(&self) -> Option<&Arc<PageBudget>> {
+        self.charge.as_ref().map(|(budget, _)| budget)
+    }
+
     /// [`for_memory`](Self::for_memory), marked host-private or not.
     fn memory_pages(
         size: u64,
@@ -1255,11 +1289,21 @@ impl RingPages {
     /// [`ShmemError::BytesOutsideResource`] when `offset + src.len()` passes
     /// [`resource_len`](Self::resource_len); nothing is written then.
     pub fn write_bytes(&self, offset: u64, src: &[u8]) -> Result<(), ShmemError> {
-        let base = self.byte_range(offset, src.len())?;
+        self.write_bytes_bounded(offset, src, self.declared)
+    }
+
+    /// Checkpoint the mapping padding too: published pages beyond a ring's
+    /// declared length still belong to the guest-visible mapping.
+    pub(crate) fn write_mapped_bytes(&self, offset: u64, src: &[u8]) -> Result<(), ShmemError> {
+        self.write_bytes_bounded(offset, src, self.mapped_len())
+    }
+
+    fn write_bytes_bounded(&self, offset: u64, src: &[u8], limit: u64) -> Result<(), ShmemError> {
+        let base = self.byte_range_bounded(offset, src.len(), limit)?;
         // Host-private pages: excluded from a plain read in progress.
         let _access = self.private_access();
-        // SAFETY: `byte_range` established `base + src.len() <=
-        // self.declared <= self.alloc.size()`, so every byte touched below is
+        // SAFETY: `byte_range_bounded` established `base + src.len() <=
+        // limit <= self.alloc.size()`, so every byte touched below is
         // inside our own live allocation and `add(base + i)` stays within one
         // allocated object for every `i` in `0..src.len()`. `AtomicU8` needs no
         // alignment beyond a byte. The stores are atomic because the guest may
@@ -1282,9 +1326,22 @@ impl RingPages {
     ///
     /// [`ShmemError::BytesOutsideResource`]; `dst` is left as it was.
     pub fn read_bytes(&self, offset: u64, dst: &mut [u8]) -> Result<(), ShmemError> {
-        let base = self.byte_range(offset, dst.len())?;
+        self.read_bytes_bounded(offset, dst, self.declared)
+    }
+
+    pub(crate) fn read_mapped_bytes(&self, offset: u64, dst: &mut [u8]) -> Result<(), ShmemError> {
+        self.read_bytes_bounded(offset, dst, self.mapped_len())
+    }
+
+    fn read_bytes_bounded(
+        &self,
+        offset: u64,
+        dst: &mut [u8],
+        limit: u64,
+    ) -> Result<(), ShmemError> {
+        let base = self.byte_range_bounded(offset, dst.len(), limit)?;
         let _access = self.private_access();
-        // SAFETY: as in `write_bytes`: `byte_range` keeps every byte inside
+        // SAFETY: as in `write_bytes_bounded`: the checked range keeps every byte inside
         // the live allocation, and the loads are relaxed atomics because the
         // guest may be storing to the same bytes.
         unsafe {
@@ -1299,15 +1356,20 @@ impl RingPages {
     /// `offset` as a host index, once `offset + len` is proven inside the
     /// declared resource.
     fn byte_range(&self, offset: u64, len: usize) -> Result<usize, ShmemError> {
+        self.byte_range_bounded(offset, len, self.declared)
+    }
+
+    fn byte_range_bounded(&self, offset: u64, len: usize, limit: u64) -> Result<usize, ShmemError> {
+        let limit = limit.min(self.mapped_len());
         let len64 = len as u64;
         offset
             .checked_add(len64)
-            .filter(|end| *end <= self.declared)
+            .filter(|end| *end <= limit)
             .and_then(|_| usize::try_from(offset).ok())
             .ok_or(ShmemError::BytesOutsideResource {
                 offset,
                 len: len64,
-                size: self.declared,
+                size: limit,
             })
     }
 

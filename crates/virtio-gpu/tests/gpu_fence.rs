@@ -142,6 +142,18 @@ impl DeferringRenderer {
 }
 
 impl Renderer3d for DeferringRenderer {
+    fn checkpoint(
+        &mut self,
+        request: virtio_gpu::renderer::checkpoint::CheckpointRequest<'_>,
+    ) -> Result<(), CommandError> {
+        match request {
+            virtio_gpu::renderer::checkpoint::CheckpointRequest::Enable { .. } => Ok(()),
+            _ => Err(CommandError::Renderer(
+                "fence test double does not serialize native state".into(),
+            )),
+        }
+    }
+
     fn capsets(&self) -> &[CapsetInfo] {
         self.inner.capsets()
     }
@@ -462,23 +474,27 @@ struct Harness {
 
 impl Harness {
     fn new(control: FenceControl) -> Self {
-        Self::build(control, 16, None, true)
+        Self::build(control, 16, None, true, false)
     }
 
     fn with_ring(control: FenceControl, ring_size: u16) -> Self {
-        Self::build(control, ring_size, None, true)
+        Self::build(control, ring_size, None, true, false)
     }
 
     /// A device the machine layer never handed a waker: a unit test's, or a
     /// host configuration whose waker never fires.
     fn without_waker(control: FenceControl) -> Self {
-        Self::build(control, 16, None, false)
+        Self::build(control, 16, None, false, false)
     }
 
     /// A harness whose fence watchdog fires after `timeout` — zero makes the
     /// watchdog observable without a two-second test.
     fn with_fence_timeout(control: FenceControl, timeout: Duration) -> Self {
-        Self::build(control, 16, Some(timeout), true)
+        Self::build(control, 16, Some(timeout), true, false)
+    }
+
+    fn with_checkpoint(control: FenceControl) -> Self {
+        Self::build(control, 16, Some(Duration::ZERO), true, true)
     }
 
     fn build(
@@ -486,10 +502,14 @@ impl Harness {
         ring_size: u16,
         timeout: Option<Duration>,
         waker: bool,
+        checkpoint: bool,
     ) -> Self {
         let display = DisplayHandle::detached(64, 64).expect("detached display");
         let mut device =
             GpuDevice::with_renderer(display.clone(), Box::new(DeferringRenderer::new(control)));
+        if checkpoint {
+            device.enable_accelerated_checkpoints(4096).unwrap();
+        }
         // The machine layer hands every device a waker before it reaches its
         // transport, on both hosts (KVM's queue worker, WHP's host-wake
         // thread).
@@ -725,6 +745,64 @@ fn a_fenced_submit_is_answered_only_when_the_host_fence_retires() {
         0,
         "the response carries VIRTIO_GPU_FLAG_FENCE"
     );
+    assert!(!h.needs_reset());
+}
+
+#[test]
+fn checkpoint_preparation_returns_finished_response_and_irq_without_consuming_new_guest_work() {
+    let control = FenceControl::default();
+    let mut h = Harness::with_checkpoint(control.clone());
+    h.open_3d();
+    assert!(h
+        .run(&submit_3d(1, &stream_of(1)).fenced(0x1101))
+        .is_empty());
+    h.write32(mmio::INTERRUPT_ACK, mmio::INT_VRING | mmio::INT_CONFIG);
+    let waiting_head = h.publish(&submit_3d(1, &stream_of(2)));
+    control.retire(0x1101);
+    h.transport.prepare_snapshot().unwrap();
+    let done = h.collect();
+    assert_eq!(done.len(), 1);
+    assert_ok(&done[0]);
+    assert_eq!(done[0].fence_id(), 0x1101);
+    assert_ne!(done[0].head, waiting_head);
+    assert_ne!(h.read32(mmio::INTERRUPT_STATUS) & mmio::INT_VRING, 0);
+    h.kick();
+    let later = h.collect();
+    assert_eq!(later.len(), 1);
+    assert_eq!(
+        later[0].head, waiting_head,
+        "the paused guest's next request stayed queued"
+    );
+    assert_ok(&later[0]);
+}
+
+#[test]
+fn checkpoint_timeout_cannot_complete_a_fence_and_source_can_retry_after_real_retirement() {
+    let control = FenceControl::default();
+    let mut h = Harness::with_checkpoint(control.clone());
+    h.open_3d();
+    assert!(h
+        .run(&submit_3d(1, &stream_of(1)).fenced(0x1102))
+        .is_empty());
+    h.write32(mmio::INTERRUPT_ACK, mmio::INT_VRING | mmio::INT_CONFIG);
+    let used = h.control.used_idx(&h.mem);
+    let err = h.transport.prepare_snapshot().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("no fence was completed by timeout"),
+        "{err}"
+    );
+    assert_eq!(h.control.used_idx(&h.mem), used);
+    assert!(h.collect().is_empty());
+    assert_eq!(h.read32(mmio::INTERRUPT_STATUS) & mmio::INT_VRING, 0);
+    assert!(!h.needs_reset());
+    control.retire(0x1102);
+    h.transport.prepare_snapshot().unwrap();
+    let done = h.collect();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].fence_id(), 0x1102);
+    assert_ok(&done[0]);
+    assert_ne!(h.read32(mmio::INTERRUPT_STATUS) & mmio::INT_VRING, 0);
     assert!(!h.needs_reset());
 }
 

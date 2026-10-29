@@ -110,6 +110,9 @@ use super::pump::{Idle, Pass, PumpError, RingBacking, RingPump, RingSink, STATUS
 use super::ring::HostWord;
 use super::shmem::RingPages;
 
+mod checkpoint_worker;
+pub use checkpoint_worker::{WorkerCheckpoint, WorkerCheckpointError};
+
 /// The shortest `ALIVE` reporting period this host honours.
 ///
 /// `VkRingMonitorInfoMESA::maxReportingPeriodMicroseconds` is a guest `u32`,
@@ -286,6 +289,25 @@ impl<S: RingSink> RingService<S> {
             parked: false,
             stopped: None,
         }
+    }
+
+    /// Restart a checkpointed pump with its restored sink, before the guest or
+    /// worker can run. An old park/doorbell is not a durable notification:
+    /// restart polling and clear IDLE so queued work cannot be stranded. Idle
+    /// timing and backoff restart at `now`; fatal pumps remain stopped.
+    pub fn from_checkpoint(
+        mut pump: RingPump,
+        sink: S,
+        now: Duration,
+        backing: &impl RingBacking,
+    ) -> Self {
+        if pump.is_idle() {
+            pump.leave_idle(backing);
+        }
+        let stopped = pump.is_fatal().then_some(RingStop::Pump(PumpError::Fatal));
+        let mut service = Self::new(pump, sink, now);
+        service.stopped = stopped;
+        service
     }
 
     /// Poll by yielding alone for `spin` after every progress (and every
@@ -496,6 +518,9 @@ struct WorkerShared {
     /// `true` while a doorbell has arrived that the worker has not acted on.
     doorbell: Mutex<bool>,
     changed: Condvar,
+    capture_requested: AtomicBool,
+    capture: Mutex<checkpoint_worker::CaptureState>,
+    capture_done: Condvar,
 }
 
 impl WorkerShared {
@@ -520,11 +545,12 @@ impl WorkerShared {
         self.changed.notify_all();
     }
 
-    /// Block until a doorbell (consumed, `true`) or a stop (`false`).
+    /// Block until a doorbell (consumed, `true`), stop or capture interrupt
+    /// (`false`). A capture never consumes an already pending real doorbell.
     fn wait_for_doorbell(&self) -> bool {
         let mut rung = relock(&self.doorbell);
         loop {
-            if self.stopping() {
+            if self.stopping() || self.capture_requested.load(Ordering::Acquire) {
                 return false;
             }
             if *rung {
@@ -544,7 +570,7 @@ impl WorkerShared {
     /// recorded between the sink's look and this wait is never slept past.
     fn wait_blocked(&self, limit: Duration) {
         let mut rung = relock(&self.doorbell);
-        if self.stopping() {
+        if self.stopping() || self.capture_requested.load(Ordering::Acquire) {
             return;
         }
         if !*rung {
@@ -554,7 +580,9 @@ impl WorkerShared {
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
-        *rung = false;
+        if !self.capture_requested.load(Ordering::Acquire) {
+            *rung = false;
+        }
     }
 
     /// Sit out one poll backoff. Short ones sleep (high resolution on both
@@ -706,7 +734,8 @@ fn serve<S: RingSink>(
     shared: &WorkerShared,
 ) -> RingPump {
     let origin = Instant::now();
-    let keep_going = || !shared.stopping();
+    let keep_going = || !shared.stopping() && !shared.capture_requested.load(Ordering::Acquire);
+    let mut wake_pending = false;
     // The frame profile (ADR-0004, the CSS amendment): off unless its target
     // was enabled when the ring was adopted.
     let mut profile = super::profile::enabled().then(WorkerProfile::new);
@@ -715,12 +744,20 @@ fn serve<S: RingSink>(
         .unwrap_or("venus-ring")
         .to_owned();
     loop {
+        checkpoint_worker::capture_pending(&service, quiesce, shared);
         // ADR-0005: the pass is taken before the ring is touched, held for
         // exactly one step, and never while parked or sleeping.
         let Some(pass) = quiesce.wait_while_paused(keep_going) else {
-            break;
+            if shared.stopping() {
+                break;
+            }
+            continue;
         };
         let now = origin.elapsed();
+        if wake_pending {
+            service.wake(now, pages);
+            wake_pending = false;
+        }
         if service.idle_due(now) {
             shared.forget_doorbell();
         }
@@ -758,14 +795,14 @@ fn serve<S: RingSink>(
                 let rung = shared.wait_for_doorbell();
                 mark(WorkerState::Parked, since);
                 if !rung {
-                    break;
+                    if shared.stopping() {
+                        break;
+                    }
+                    continue;
                 }
-                // Waking writes `status`, so it is a pass of its own.
-                let Some(pass) = quiesce.wait_while_paused(keep_going) else {
-                    break;
-                };
-                service.wake(origin.elapsed(), pages);
-                drop(pass);
+                // Keep a consumed doorbell across a checkpoint interrupt of
+                // the pause gate. Waking writes status under the next pass.
+                wake_pending = true;
             }
             Step::Stopped(why) => {
                 tracing::warn!(
@@ -780,6 +817,7 @@ fn serve<S: RingSink>(
             profile.log_if_due(&name);
         }
     }
+    checkpoint_worker::capture_final(&service, shared);
     service.into_parts().0
 }
 
@@ -1302,6 +1340,45 @@ mod tests {
     }
 
     // -------------------------------------------------- the idle contract
+
+    #[test]
+    fn restored_park_polls_pending_work_without_a_durable_doorbell() {
+        let ring = Guest::new(TIMEOUT);
+        let mut original = ring.service(Swallow::default(), Duration::ZERO);
+        ring.submit(b"before");
+        assert_eq!(original.step(Duration::ZERO, &ring), Step::Again);
+        assert_eq!(original.step(TIMEOUT, &ring), Step::Park);
+        ring.submit(b"after");
+        let progress = original.pump().checkpoint();
+        drop(original);
+        let pump = RingPump::from_checkpoint(ring.layout, &ring, &progress).unwrap();
+        let now = Duration::from_secs(10);
+        let mut restored = RingService::from_checkpoint(pump, Swallow::default(), now, &ring);
+        assert!(!restored.is_parked());
+        assert_eq!(ring.status(), 0);
+        assert_eq!(restored.step(now, &ring), Step::Again);
+        assert_eq!(restored.sink().0, b"after");
+        assert_eq!(ring.head(), 11);
+        assert_eq!(restored.step(now + TIMEOUT, &ring), Step::Park);
+    }
+
+    #[test]
+    fn restored_fatal_service_never_invokes_its_sink() {
+        let ring = Guest::new(TIMEOUT);
+        let mut pump = RingPump::new(ring.layout, &ring).unwrap();
+        pump.mark_fatal(&ring);
+        ring.submit(b"must not run");
+        let pump = RingPump::from_checkpoint(ring.layout, &ring, &pump.checkpoint()).unwrap();
+        let mut restored =
+            RingService::from_checkpoint(pump, Swallow::default(), Duration::ZERO, &ring);
+        assert_eq!(
+            restored.step(TIMEOUT, &ring),
+            Step::Stopped(RingStop::Pump(PumpError::Fatal))
+        );
+        assert!(restored.sink().0.is_empty());
+        assert_eq!(ring.head(), 0);
+        assert_eq!(ring.status(), STATUS_FATAL);
+    }
 
     #[test]
     fn idle_is_published_only_once_the_timeout_has_passed_without_progress() {

@@ -7973,7 +7973,6 @@ pub fn is_pass_through(command: &Command<'_>) -> bool {
     matches!(
         command,
         Command::GetFenceStatus(_)
-            | Command::GetEventStatus(_)
             | Command::MergePipelineCaches(_)
             | Command::GetRenderAreaGranularity(_)
             | Command::EndCommandBuffer(_)
@@ -8391,7 +8390,6 @@ pub const TRANSLATED: &[&str] = &[
 /// Commands served by translation and the host call alone.
 pub const PASS_THROUGH: &[&str] = &[
     "vkGetFenceStatus",
-    "vkGetEventStatus",
     "vkMergePipelineCaches",
     "vkGetRenderAreaGranularity",
     "vkEndCommandBuffer",

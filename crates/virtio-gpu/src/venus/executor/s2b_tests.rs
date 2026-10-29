@@ -402,7 +402,11 @@ fn a_handle_blob_is_read_back_between_an_acquire_and_a_release_matching_the_gues
 
     let barriers = host.image_barriers();
     let ours = &barriers[before..];
-    assert_eq!(ours.len(), 2, "one acquire and one release");
+    assert_eq!(
+        ours.len(),
+        4,
+        "two ownership operations and two local layout transitions"
+    );
     let family = h.renderer.factory().scanout().unwrap().family();
     let image = ours[0].image;
     assert_ne!(image, 0);
@@ -410,7 +414,7 @@ fn a_handle_blob_is_read_back_between_an_acquire_and_a_release_matching_the_gues
         ours[0],
         FakeBarrier {
             image,
-            layouts: (LAYOUT_COLOR_ATTACHMENT, LAYOUT_TRANSFER_SRC),
+            layouts: (LAYOUT_COLOR_ATTACHMENT, LAYOUT_COLOR_ATTACHMENT),
             families: (FOREIGN, family),
             src: (0x1, 0),        // TOP_OF_PIPE
             dst: (0x1000, 0x800), // TRANSFER, TRANSFER_READ
@@ -418,15 +422,37 @@ fn a_handle_blob_is_read_back_between_an_acquire_and_a_release_matching_the_gues
         "acquired from FOREIGN, from the layout the guest released in"
     );
     assert_eq!(
-        ours[1],
+        ours[3],
         FakeBarrier {
             image,
-            layouts: (LAYOUT_TRANSFER_SRC, LAYOUT_COLOR_ATTACHMENT),
+            layouts: (LAYOUT_COLOR_ATTACHMENT, LAYOUT_COLOR_ATTACHMENT),
             families: (family, FOREIGN),
             src: (0x1000, 0),
             dst: (0x2000 | 0x4000, 0), // BOTTOM_OF_PIPE | HOST (the buffer's)
         },
         "released back to FOREIGN in the guest's own layout"
+    );
+    assert_eq!(
+        ours[1],
+        FakeBarrier {
+            image,
+            layouts: (LAYOUT_COLOR_ATTACHMENT, LAYOUT_TRANSFER_SRC),
+            families: (u32::MAX, u32::MAX),
+            src: (0x1000, 0),
+            dst: (0x1000, 0x800),
+        },
+        "transition locally after acquiring ownership"
+    );
+    assert_eq!(
+        ours[2],
+        FakeBarrier {
+            image,
+            layouts: (LAYOUT_TRANSFER_SRC, LAYOUT_COLOR_ATTACHMENT),
+            families: (u32::MAX, u32::MAX),
+            src: (0x1000, 0x800),
+            dst: (0x1000, 0),
+        },
+        "restore the agreed layout before releasing ownership"
     );
     assert_ne!(
         ours[0].layouts.0, 0,

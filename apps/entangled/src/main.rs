@@ -685,7 +685,7 @@ fn resume(args: ResumeArgs) -> Result<(), String> {
         screenshot,
     } = args;
     let info = snapshot::open(&snapshot)?;
-    let cfg = snapshot::config_from(&info.metadata)?;
+    let cfg = snapshot::config_for_restore(&info)?;
     tracing::info!(
         vm = %info.metadata.vm_name,
         file = %snapshot.display(),

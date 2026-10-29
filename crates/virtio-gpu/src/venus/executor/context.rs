@@ -208,8 +208,13 @@ pub const MIN_RECORDED_COMMAND_BYTES: usize = 64;
 /// The `VkResult` `command` answers: the generated table's, and the
 /// hand-written host calls' that table does not list — what a lost device can
 /// come back through.
-fn result_of(command: &Command<'_>) -> Option<VkResult> {
+pub(crate) fn result_of(command: &Command<'_>) -> Option<VkResult> {
     match command {
+        Command::CreateInstance(a) => Some(a.ret),
+        Command::EnumeratePhysicalDevices(a) => Some(a.ret),
+        Command::EnumeratePhysicalDeviceGroups(a) => Some(a.ret),
+        Command::CreateDevice(a) => Some(a.ret),
+        Command::GetMemoryResourcePropertiesMESA(a) => Some(a.ret),
         Command::AllocateMemory(a) => Some(a.ret),
         Command::BindBufferMemory(a) => Some(a.ret),
         Command::BindBufferMemory2(a) => Some(a.ret),
@@ -239,6 +244,25 @@ pub(super) fn id_error(command: &'static str) -> impl Fn(IdError) -> ExecError {
 /// satisfies Vulkan's external-synchronization rules for everything this
 /// stage calls).
 pub struct VulkanContext<H: HostVulkan> {
+    /// Whole-factory reconstruction validates allocation-owner identity;
+    /// legacy object-namespace helpers do not carry owner manifests.
+    pub(super) strict_checkpoint_budgets: bool,
+    pub(super) restoring_pages:
+        std::collections::BTreeMap<u64, super::checkpoint_pages::HostAllocationLink>,
+    pub(super) restoring_import: Option<super::checkpoint_imports::ImportRecipe>,
+    pub(super) memory_sequence: u64,
+    pub(super) restoring_shared:
+        std::collections::BTreeMap<u64, super::checkpoint_shared::SharedAllocationLink>,
+    pub(super) image_tracking: super::image_layouts::ImageTracking,
+    /// Opt-in until the whole renderer checkpoint (including memory/rings)
+    /// exists. Captured in guest-id form before dispatch translates handles.
+    pub(super) recipes: Option<super::checkpoint::RecipeJournal>,
+    /// Monotonic for this context's lifetime: once a nonzero device address
+    /// reached the guest, even freeing its buffer cannot prove that every
+    /// copy of that address disappeared from guest memory or shader data.
+    pub(super) device_addresses_exposed: bool,
+    pub(super) buffer_ownership_transfers: bool,
+    pub(super) buffer_tracking: super::buffer_ownership::BufferTracking,
     pub(super) ctx_id: u32,
     pub(super) host: Arc<H>,
     pub(super) objects: Objects<H>,
@@ -298,6 +322,10 @@ pub struct VulkanContext<H: HostVulkan> {
 }
 
 impl<H: HostVulkan> VulkanContext<H> {
+    /// Stable guest context identity, independent of native object handles.
+    pub fn context_id(&self) -> u32 {
+        self.ctx_id
+    }
     /// An empty context on `host`, with a host-visible budget of its own
     /// ([`super::MAX_HOST_VISIBLE_BYTES`]).
     pub fn new(ctx_id: u32, host: Arc<H>) -> Self {
@@ -344,6 +372,16 @@ impl<H: HostVulkan> VulkanContext<H> {
         limits: super::limits::ContextLimits,
     ) -> Self {
         Self {
+            recipes: None,
+            device_addresses_exposed: false,
+            buffer_ownership_transfers: false,
+            buffer_tracking: Default::default(),
+            memory_sequence: 0,
+            restoring_pages: std::collections::BTreeMap::new(),
+            strict_checkpoint_budgets: false,
+            restoring_import: None,
+            restoring_shared: std::collections::BTreeMap::new(),
+            image_tracking: super::image_layouts::ImageTracking::default(),
             ctx_id,
             host,
             objects: Objects::with_limits(limits),
@@ -499,7 +537,18 @@ impl<H: HostVulkan> VulkanContext<H> {
             self.graveyard.park(self.ctx_id, parked);
         }
         self.recordings = super::writes::Recordings::default();
+        self.image_tracking = super::image_layouts::ImageTracking::default();
+        self.memory_sequence = 0;
+        self.device_addresses_exposed = false;
+        self.buffer_ownership_transfers = false;
+        self.buffer_tracking = Default::default();
+        self.restoring_pages.clear();
+        self.restoring_import = None;
+        self.restoring_shared.clear();
         self.payloads.forget_context(self.ctx_id);
+        if let Some(journal) = &mut self.recipes {
+            journal.clear();
+        }
     }
 
     /// Execute one decoded command, filling its outputs in place.
@@ -510,6 +559,18 @@ impl<H: HostVulkan> VulkanContext<H> {
         if self.fatal {
             return Err(ExecError::ContextFatal(self.ctx_id));
         }
+        let recipe = self
+            .recipes
+            .as_ref()
+            .filter(|journal| journal.recording())
+            .map(|_| super::checkpoint::encode_recipe(command));
+        let image_note = self.image_tracking.prepare(command, &self.objects);
+        let buffer_transfer = super::checkpoint_queues::buffer_transfer(command);
+        let buffer_note = if self.recipes.is_some() {
+            self.buffer_tracking.prepare(command, &self.objects)
+        } else {
+            Ok(super::buffer_ownership::Note::None)
+        };
         let result = match unadmitted_link(command) {
             Some(error) => Err(error),
             None => self
@@ -525,6 +586,22 @@ impl<H: HostVulkan> VulkanContext<H> {
         // the hand-written host calls (an allocation, a bind, an image) — a
         // lost device ends the context once this command is answered.
         self.note_result(command.name(), result_of(command));
+        if result.is_ok() && result_of(command).is_none_or(|ret| ret == VK_SUCCESS) {
+            self.buffer_ownership_transfers |= buffer_transfer;
+            self.buffer_tracking.finish(buffer_note, &self.objects);
+            self.image_tracking.finish(image_note, &self.objects);
+        }
+        if result.is_ok() {
+            let import_recipe = self.import_recipe(command);
+            if let (Some(journal), Some(recipe)) = (&mut self.recipes, recipe) {
+                journal.note(recipe, command);
+                if let Some(meta) = import_recipe {
+                    if let Err(error) = journal.note_import(meta) {
+                        journal.fail(error);
+                    }
+                }
+            }
+        }
         result
     }
 
@@ -1958,6 +2035,13 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.objects.insert_image(
                     id,
                     ImageObject {
+                        sharing: super::objects::Sharing::new(
+                            info.sharing_mode,
+                            info.p_queue_family_indices.as_deref().unwrap_or_default(),
+                        ),
+                        bindings: Vec::new(),
+                        binding_identities: Vec::new(),
+                        identity: Arc::new(()),
                         device: device_id,
                         host: image,
                         facts: image_facts(info, planes),
@@ -2144,6 +2228,13 @@ impl<H: HostVulkan> VulkanContext<H> {
         self.objects.insert_image(
             id,
             ImageObject {
+                sharing: super::objects::Sharing::new(
+                    info.sharing_mode,
+                    info.p_queue_family_indices.as_deref().unwrap_or_default(),
+                ),
+                bindings: Vec::new(),
+                binding_identities: Vec::new(),
+                identity: Arc::new(()),
                 device: device_id,
                 host: image,
                 facts: image_facts(info, 1),

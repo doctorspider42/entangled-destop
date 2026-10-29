@@ -194,8 +194,8 @@ fn a_scanout_read_waits_for_the_last_submission_that_touched_the_buffer() {
     assert_eq!(read(&mut h, r).expect("finished now"), texels(r));
     assert_eq!(
         host.image_barriers().len(),
-        before + 2,
-        "one acquire, one release"
+        before + 4,
+        "one acquire, two local layout transitions, one release"
     );
     assert!(
         h.renderer.factory().payloads().running(&p).is_empty(),

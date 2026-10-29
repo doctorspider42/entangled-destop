@@ -98,6 +98,7 @@ pub(super) struct Resolver<'a, H: HostVulkan> {
     pub(super) objects: &'a Objects<H>,
     pub(super) device: u64,
     pub(super) command: &'static str,
+    checkpoint_cb: Option<u64>,
 }
 
 impl<H: HostVulkan> Resolver<'_, H> {
@@ -155,6 +156,11 @@ impl<H: HostVulkan> Resolve for Resolver<'_, H> {
         may_be_null: bool,
         what: &'static str,
     ) -> Result<u64, ExecError> {
+        if kind == Kind::CommandBuffer {
+            if let Some(raw) = self.checkpoint_cb {
+                return Ok(raw);
+            }
+        }
         if id == 0 {
             if may_be_null {
                 return Ok(0);
@@ -521,12 +527,20 @@ impl<H: HostVulkan> VulkanContext<H> {
                 };
                 self.create_costing(command, Kind::QueryPool, facts, (Class::Queries, slots))
             }
-            Command::CreateEvent(_) => self.create(
-                command,
-                Kind::Event,
-                Facts::Event(super::objects::EventState::default()),
-                0,
-            ),
+            Command::CreateEvent(args) => {
+                let state = super::objects::EventState {
+                    device_only: args
+                        .p_create_info
+                        .as_ref()
+                        .is_some_and(|info| info.flags & 1 != 0),
+                    ..Default::default()
+                };
+                self.create(command, Kind::Event, Facts::Event(state), 0)
+            }
+            Command::GetEventStatus(args) => {
+                self.require_host_event("vkGetEventStatus", args.device.0, args.event.0)?;
+                self.pass_through(command)
+            }
             // The host's own set and reset (`super::hold`): a set releases
             // what waits on it, a reset waits for work that waits on it.
             Command::SetEvent(args) => {
@@ -719,7 +733,19 @@ impl<H: HostVulkan> VulkanContext<H> {
             }
 
             // ---------------------------------------------- pipeline caches
-            Command::GetPipelineCacheData(_) => self.pass_through(command),
+            Command::GetPipelineCacheData(args) => {
+                let requested = args.p_data_size;
+                let data_requested = args.p_data.is_some();
+                let cache = args.pipeline_cache.0;
+                let result = self.pass_through(command);
+                if let Command::GetPipelineCacheData(args) = command {
+                    tracing::debug!(ctx_id = self.ctx_id, cache, ?requested, data_requested,
+                        returned = ?args.p_data_size, bytes = args.p_data.as_ref().map(Vec::len),
+                        ret = args.ret, error = ?result.as_ref().err(),
+                        "Venus pipeline cache query completed");
+                }
+                result
+            }
 
             // ------------------------------------------------ queries
             Command::GetQueryPoolResults(args) => {
@@ -1779,6 +1805,25 @@ impl<H: HostVulkan> VulkanContext<H> {
             objects: &self.objects,
             device,
             command: command.name(),
+            checkpoint_cb: None,
+        };
+        generated::translate(&mut resolver, command)
+    }
+
+    pub(super) fn translate_checkpoint_event(
+        &self,
+        device: u64,
+        cb: u64,
+        command: &mut Command<'_>,
+    ) -> Result<(), ExecError> {
+        if !matches!(command, Command::CmdSetEvent(_) | Command::CmdSetEvent2(_)) {
+            return Err(invalid(command.name(), "not an event signal recipe"));
+        }
+        let mut resolver = Resolver {
+            objects: &self.objects,
+            device,
+            command: command.name(),
+            checkpoint_cb: Some(cb),
         };
         generated::translate(&mut resolver, command)
     }
@@ -2769,7 +2814,15 @@ impl<H: HostVulkan> VulkanContext<H> {
         op: EventOp,
         command: &mut Command<'_>,
     ) -> Result<(), ExecError> {
-        let uses = self.plan_event_ops(name, cb, &[(event, op)])?;
+        let mut uses = self.plan_event_ops(name, cb, &[(event, op)])?;
+        if op == EventOp::Set {
+            let signal = self.retain_event_signal(command)?;
+            if let Some((_, use_)) = uses.iter_mut().find(|(id, _)| *id == event) {
+                if use_.signal.is_none() {
+                    use_.signal = Some(signal);
+                }
+            }
+        }
         self.pass_through(command)?;
         self.store_event_uses(cb, uses);
         Ok(())
@@ -2882,6 +2935,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             objects: &self.objects,
             device,
             command,
+            checkpoint_cb: None,
         };
         resolver.handle(kind, id, false, "objectHandle")
     }

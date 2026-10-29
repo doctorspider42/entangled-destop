@@ -372,6 +372,10 @@ impl HostWaker for DeferredWaker {
     }
 }
 
+/// Bounded, verified seekable component supplied by the snapshot container.
+pub trait StateReader: std::io::Read + std::io::Seek {}
+impl<T: std::io::Read + std::io::Seek + ?Sized> StateReader for T {}
+
 /// Contract between the transport (`virtio-mmio` today, virtio-pci later)
 /// and a device implementation.
 ///
@@ -380,6 +384,30 @@ impl HostWaker for DeferredWaker {
 /// activation with ready queues. Implementations must treat all queue content
 /// as untrusted (see crate docs and [`crate::chain`]).
 pub trait VirtioDevice: Send {
+    /// Extra native state too large for save_device's small register blob.
+    /// Opt-in only; callers must pair it with save/load_streamed_state.
+    fn has_streamed_state(&self) -> bool {
+        false
+    }
+
+    /// Called with all workers stopped, before CPU/APIC capture. May return
+    /// already completed responses and IRQs, never start another guest request.
+    fn prepare_snapshot(&mut self) -> Result<(), DeviceError> {
+        Ok(())
+    }
+
+    fn save_streamed_state(&mut self, _: &mut dyn std::io::Write) -> Result<(), DeviceError> {
+        Err(DeviceError::Backend(
+            "this device has no streamed snapshot state".into(),
+        ))
+    }
+
+    fn load_streamed_state(&mut self, _: &mut dyn StateReader) -> Result<(), DeviceError> {
+        Err(DeviceError::Backend(
+            "this device cannot load streamed snapshot state".into(),
+        ))
+    }
+
     /// Device id advertised to the guest.
     fn device_type(&self) -> DeviceType;
 

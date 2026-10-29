@@ -46,6 +46,8 @@ use virtio_queue::{Queue, QueueT};
 use vm_memory::{Bytes, GuestAddress};
 
 use crate::blob::{BlobSupport, BlobTable, MAX_BLOB_ENTRIES};
+
+pub mod checkpoint;
 use crate::error::CommandError;
 use crate::fence::{FenceQueue, FenceTimeline, MAX_PENDING_FENCES};
 use crate::pacing::FramePacing;
@@ -358,7 +360,10 @@ pub struct GpuDevice<S: ScanoutSink> {
     /// What the renderer said it can do with blobs, cached so the hot path
     /// does not go through the trait object per command.
     blob_support: BlobSupport,
+    accelerated_checkpoints: bool,
     scanout: Option<ScanoutBinding>,
+    /// The displayed cursor may outlive the resource it was copied from.
+    saved_cursor: Option<crate::save::SavedCursor>,
     /// `events_read` of `struct virtio_gpu_config`: `VIRTIO_GPU_EVENT_DISPLAY`
     /// when the host's preferred resolution changed (the window was resized),
     /// set by the display's listener on its own thread — hence atomic — and
@@ -450,7 +455,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
             three_d: None,
             blobs: BlobTable::new(0),
             blob_support: BlobSupport::NONE,
+            accelerated_checkpoints: false,
             scanout: None,
+            saved_cursor: None,
             events_read: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             // EDID (MVP-811) because GNOME/mutter builds its outputs from it;
             // no resource UUID / blob resources. VIRGL is added by
@@ -779,6 +786,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             self.display
                 .hide_cursor()
                 .map_err(|error| CommandError::Display(error.to_string()))?;
+            self.saved_cursor = None;
             tracing::debug!("virtio-gpu cursor hidden");
             return Ok(());
         }
@@ -825,6 +833,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 }
             };
         let outcome = pixels.and_then(|pixels| {
+            let pixels = pixels
+                .get(..width as usize * height as usize * 4)
+                .ok_or_else(|| CommandError::Display("cursor pixel data is truncated".into()))?;
             self.display
                 .set_cursor(
                     width,
@@ -835,10 +846,19 @@ impl<S: ScanoutSink> GpuDevice<S> {
                     cursor.y,
                     pixels,
                 )
-                .map_err(|error| CommandError::Display(error.to_string()))
+                .map_err(|error| CommandError::Display(error.to_string()))?;
+            Ok(crate::save::SavedCursor {
+                width,
+                height,
+                hot_x: cursor.hot_x,
+                hot_y: cursor.hot_y,
+                x: cursor.x,
+                y: cursor.y,
+                pixels: pixels.to_vec(),
+            })
         });
         self.flush_buf = scratch;
-        outcome?;
+        self.saved_cursor = Some(outcome?);
         tracing::debug!(
             resource = cursor.resource_id,
             width,
@@ -860,7 +880,12 @@ impl<S: ScanoutSink> GpuDevice<S> {
         tracing::trace!(x = cursor.x, y = cursor.y, "virtio-gpu cursor moved");
         self.display
             .move_cursor(cursor.x, cursor.y)
-            .map_err(|error| CommandError::Display(error.to_string()))
+            .map_err(|error| CommandError::Display(error.to_string()))?;
+        if let Some(saved) = &mut self.saved_cursor {
+            saved.x = cursor.x;
+            saved.y = cursor.y;
+        }
+        Ok(())
     }
 
     /// Handles one control chain: either writes the response (and reports how
@@ -1080,6 +1105,15 @@ impl<S: ScanoutSink> GpuDevice<S> {
         queue: &mut Queue,
         mem: &Arc<GuestMem>,
     ) -> Result<usize, DeviceError> {
+        self.complete_fences_with_watchdog(queue, mem, true)
+    }
+
+    fn complete_fences_with_watchdog(
+        &mut self,
+        queue: &mut Queue,
+        mem: &Arc<GuestMem>,
+        watchdog: bool,
+    ) -> Result<usize, DeviceError> {
         // A renderer that has died takes precedence over anything it still
         // owes: everything held goes back to the guest as an error (GPU-012).
         let lost = self.degrade_if_renderer_lost();
@@ -1118,7 +1152,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // too. Completing in submission order keeps the guest's fence
         // timeline monotonic, which is why this drains a prefix rather than
         // picking out individual stale entries.
-        if let Some(oldest) = self.pending_fences.oldest_age() {
+        if let Some(oldest) = self.pending_fences.oldest_age().filter(|_| watchdog) {
             if oldest >= self.fence_timeout {
                 let abandoned = self.pending_fences.drain_all();
                 self.fence_stats.timed_out = self
@@ -2681,6 +2715,40 @@ fn write_response(mem: &GuestMem, writable: &[Segment], parts: [&[u8]; 2]) -> u3
 }
 
 impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
+    fn has_streamed_state(&self) -> bool {
+        self.accelerated_checkpoints
+    }
+
+    fn prepare_snapshot(&mut self) -> Result<(), DeviceError> {
+        if self.accelerated_checkpoints {
+            return self.prepare_accelerated_checkpoint();
+        }
+        Ok(())
+    }
+
+    fn save_streamed_state(&mut self, out: &mut dyn std::io::Write) -> Result<(), DeviceError> {
+        if !self.accelerated_checkpoints {
+            return Err(DeviceError::Backend(
+                "GPU checkpoints were not enabled".into(),
+            ));
+        }
+        self.save_accelerated_checkpoint(out, Duration::from_secs(120))
+            .map_err(|error| DeviceError::Backend(error.to_string()))
+    }
+
+    fn load_streamed_state(
+        &mut self,
+        reader: &mut dyn virtio_core::StateReader,
+    ) -> Result<(), DeviceError> {
+        if !self.accelerated_checkpoints {
+            return Err(DeviceError::Backend(
+                "GPU checkpoints were not enabled".into(),
+            ));
+        }
+        self.load_accelerated_checkpoint(reader, Duration::from_secs(120))
+            .map_err(|error| DeviceError::Backend(error.to_string()))
+    }
+
     fn device_type(&self) -> DeviceType {
         DeviceType::Gpu
     }
@@ -2893,6 +2961,17 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
     /// (a Venus context's host Vulkan objects). Everything else this device
     /// owns is either saved or honestly counted — see [`Self::save_device`].
     fn snapshot_refusal(&self) -> Option<String> {
+        if self.accelerated_checkpoints {
+            // Explicit experimental opt-in pairs this device with a streamed
+            // native section. That writer still refuses unsupported state;
+            // the default production path retains the original guard below.
+            return (self.renderer_lost
+                || self.restored_3d_lost
+                || !self.pending_fences.is_empty())
+            .then(|| {
+                "virtio-gpu: accelerated checkpoint has lost state or pending responses".into()
+            });
+        }
         self.three_d
             .as_ref()
             .and_then(Gpu3d::snapshot_refusal)
@@ -2901,6 +2980,7 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
 
     fn save_device(&self) -> Vec<u8> {
         let state = crate::save::GpuState {
+            cursor: self.saved_cursor.clone(),
             events_read: self.events_read.load(std::sync::atomic::Ordering::Acquire),
             live_3d_contexts: self
                 .three_d
@@ -2971,7 +3051,7 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
                 // The device was never activated, so nothing can have been
                 // created either. A snapshot that says otherwise describes a
                 // machine this one is not.
-                if !state.resources.is_empty() {
+                if !state.resources.is_empty() || state.cursor.is_some() {
                     return Err(DeviceError::Backend(format!(
                         "virtio-gpu snapshot has {} resources but the device was not activated",
                         state.resources.len()
@@ -3045,6 +3125,26 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
             }
         }
 
+        if let Some(cursor) = state.cursor {
+            self.display
+                .set_cursor(
+                    cursor.width,
+                    cursor.height,
+                    cursor.hot_x,
+                    cursor.hot_y,
+                    cursor.x,
+                    cursor.y,
+                    &cursor.pixels,
+                )
+                .map_err(|error| DeviceError::Backend(error.to_string()))?;
+            self.saved_cursor = Some(cursor);
+        } else {
+            self.display
+                .hide_cursor()
+                .map_err(|error| DeviceError::Backend(error.to_string()))?;
+            self.saved_cursor = None;
+        }
+
         if state.live_3d_contexts > 0 || state.live_blobs > 0 {
             // Nothing in virglrenderer, or in GL, hands a live rendering
             // context back in a form another process could reload; and a blob
@@ -3105,6 +3205,8 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         self.events_read
             .store(0, std::sync::atomic::Ordering::Release);
         self.scanout = None;
+        self.saved_cursor = None;
+        let _ = self.display.hide_cursor();
         self.resources.clear();
         self.blobs.clear();
         self.req_buf = Vec::new();

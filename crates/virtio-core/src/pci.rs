@@ -689,6 +689,25 @@ impl PciTransport {
         self.state.snapshot_refusal()
     }
 
+    pub fn has_streamed_state(&self) -> bool {
+        self.state.has_streamed_state()
+    }
+    pub fn prepare_snapshot(&mut self) -> Result<(), crate::DeviceError> {
+        self.state.prepare_snapshot()
+    }
+    pub fn save_streamed_state(
+        &mut self,
+        out: &mut dyn std::io::Write,
+    ) -> Result<(), crate::DeviceError> {
+        self.state.save_streamed_state(out)
+    }
+    pub fn load_streamed_state(
+        &mut self,
+        reader: &mut dyn crate::StateReader,
+    ) -> Result<(), crate::DeviceError> {
+        self.state.load_streamed_state(reader)
+    }
+
     /// Puts a saved slot back. See [`TransportState::load`] for the order and
     /// for what a refusal means.
     pub fn load(

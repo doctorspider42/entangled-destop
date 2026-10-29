@@ -424,6 +424,17 @@ pub trait RingSink {
     /// A sink that may block inside [`consume`](Self::consume) keeps it and
     /// gives up when it is raised; the default has no use for it.
     fn attach_stop(&mut self, _stop: super::service::StopSignal) {}
+
+    /// Host-only metadata at a complete-call quiesce point. No guest/native
+    /// writes may occur here. The enclosing manifest carries the backing pages.
+    fn checkpoint_state(&self) -> Result<Vec<u8>, String> {
+        Err("this ring sink does not support checkpoints".into())
+    }
+
+    /// Adopt host-only metadata into a fresh sink, before its worker can run.
+    fn restore_checkpoint_state(&mut self, _bytes: &[u8], _seqno: u64) -> Result<(), String> {
+        Err("this ring sink cannot restore checkpoints".into())
+    }
 }
 
 /// What one pass over the ring did.
@@ -505,6 +516,8 @@ pub enum Idle {
 /// correct producer produces, or a ring already written off because of one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PumpError {
+    #[error("invalid ring checkpoint: {0}")]
+    InvalidCheckpoint(&'static str),
     #[error(
         "the host owns head and status and expects both zeroed at ring \
          creation, but head is {head:#x} and status is {status:#x}"
@@ -584,6 +597,88 @@ pub struct RingPump {
 }
 
 impl RingPump {
+    /// Save host-owned progress between complete sink calls. The caller must
+    /// quiesce the worker and save its sink and shared pages at the same point.
+    /// The layout belongs to the enclosing manifest; no native address is saved.
+    #[must_use]
+    pub fn checkpoint(&self) -> [u8; 24] {
+        let words = [
+            1_u32,
+            self.cur,
+            self.status,
+            u32::from(self.stalled_at.is_some()),
+            self.stalled_at.unwrap_or(0),
+            u32::from(self.fatal),
+        ];
+        let mut bytes = [0; 24];
+        for (dst, word) in bytes.chunks_exact_mut(4).zip(words) {
+            dst.copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Adopt saved progress without resetting shared control words or consuming
+    /// commands. Pages, layout and sink must come from the same quiesced save;
+    /// workers and the monitor must remain stopped until restoration finishes.
+    ///
+    /// # Errors
+    /// Refuses malformed metadata and inconsistent shared control words without
+    /// writing the backing. ALIVE is independent of the pump's status mirror.
+    pub fn from_checkpoint(
+        layout: RingLayout,
+        backing: &impl RingBacking,
+        bytes: &[u8],
+    ) -> Result<Self, PumpError> {
+        let invalid = PumpError::InvalidCheckpoint;
+        if bytes.len() != 24 {
+            return Err(invalid("record size"));
+        }
+        let mut words = [0_u32; 6];
+        for (word, src) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+            *word = u32::from_le_bytes(src.try_into().expect("four-byte chunk"));
+        }
+        let [version, cur, status, has_stall, stalled, fatal] = words;
+        if version != 1 || has_stall > 1 || fatal > 1 {
+            return Err(invalid("version or boolean"));
+        }
+        if status & !(STATUS_IDLE | STATUS_FATAL) != 0
+            || (status & STATUS_FATAL != 0) != (fatal != 0)
+            || (has_stall == 0 && stalled != 0)
+        {
+            return Err(invalid("status or absent stall"));
+        }
+        let size = u32::try_from(layout.buffer().len()).unwrap_or(0);
+        if size == 0 || !size.is_power_of_two() {
+            return Err(invalid("buffer size"));
+        }
+        if has_stall != 0 {
+            let pending = stalled.wrapping_sub(cur);
+            if pending == 0 || pending > size {
+                return Err(invalid("stalled cursor"));
+            }
+        }
+        let shared_status = backing.load_host_word(&layout.status());
+        if backing.load_host_word(&layout.head()) != cur || shared_status & !STATUS_ALIVE != status
+        {
+            return Err(invalid("shared control words"));
+        }
+        // A fatal ring may retain the invalid tail that caused its failure.
+        if fatal == 0 && backing.load_guest_word(&layout.tail()).wrapping_sub(cur) > size {
+            return Err(invalid("pending tail"));
+        }
+        Ok(Self {
+            layout,
+            idle_timeout: Duration::from_nanos(layout.idle_timeout_ns()).min(MAX_IDLE_TIMEOUT),
+            buffer_size: size,
+            mask: size - 1,
+            cur,
+            status,
+            shadow: Vec::new(),
+            stalled_at: (has_stall != 0).then_some(stalled),
+            fatal: fatal != 0,
+        })
+    }
+
     /// Start consuming a validated ring.
     ///
     /// Checks the one precondition the reference checks in
@@ -1173,6 +1268,81 @@ mod tests {
     }
 
     // ----------------------------------------------------------------- setup
+
+    #[test]
+    fn checkpoint_preserves_wrapped_progress_without_replaying_consumed_bytes() {
+        let ring = MockRing::new();
+        let mut pump = pump_on(&ring);
+        // Restore near the counter wrap, not merely the circular-buffer edge.
+        pump.cur = u32::MAX - 3;
+        ring.poke(ring.layout().head().offset(), pump.cur);
+        ring.produce(pump.cur, b"abcdefghijkl");
+        ring.set_tail(8);
+        let mut first = Sink::take(8);
+        pump.pump(&*ring, &mut first).unwrap();
+        assert_eq!(pump.cursor(), 4);
+        let bytes = pump.checkpoint();
+        drop(pump);
+        ring.clear_ops();
+        let mut restored = RingPump::from_checkpoint(ring.layout(), &*ring, &bytes).unwrap();
+        assert!(ring.stores_to(ring.layout().head().offset()).is_empty());
+        assert!(ring.status_writes().is_empty());
+        let mut next = Sink::everything();
+        restored.pump(&*ring, &mut next).unwrap();
+        assert_eq!(next.seen, vec![b"ijkl".to_vec()]);
+        assert_eq!(restored.cursor(), 8);
+    }
+
+    #[test]
+    fn checkpoint_preserves_stall_idle_alive_and_fatal_without_writes() {
+        let ring = MockRing::new();
+        let mut pump = pump_on(&ring);
+        ring.produce(0, b"pending");
+        ring.set_tail(7);
+        pump.pump(&*ring, &mut Sink::nothing()).unwrap();
+        pump.enter_idle(&*ring);
+        ring.poke(
+            ring.layout().status().offset(),
+            pump.status() | STATUS_ALIVE,
+        );
+        let bytes = pump.checkpoint();
+        let mut restored = RingPump::from_checkpoint(ring.layout(), &*ring, &bytes).unwrap();
+        let mut sink = Sink::everything();
+        restored.pump(&*ring, &mut sink).unwrap();
+        assert_eq!(sink.calls, 0);
+        assert!(restored.is_idle());
+        ring.produce(7, b"!");
+        ring.set_tail(8);
+        restored.leave_idle(&*ring);
+        restored.pump(&*ring, &mut sink).unwrap();
+        assert_eq!(sink.seen, vec![b"pending!".to_vec()]);
+        restored.mark_fatal(&*ring);
+        ring.set_tail(1000);
+        let mut fatal =
+            RingPump::from_checkpoint(ring.layout(), &*ring, &restored.checkpoint()).unwrap();
+        assert_eq!(fatal.pump(&*ring, &mut sink), Err(PumpError::Fatal));
+    }
+
+    #[test]
+    fn checkpoint_rejects_corrupt_progress_without_touching_shared_pages() {
+        let ring = MockRing::new();
+        let pump = pump_on(&ring);
+        let good = pump.checkpoint();
+        for (index, value) in [(0, 2), (1, 1), (2, STATUS_ALIVE), (3, 2), (4, 1), (5, 1)] {
+            let mut bytes = good;
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            ring.clear_ops();
+            assert!(RingPump::from_checkpoint(ring.layout(), &*ring, &bytes).is_err());
+            assert!(ring.stores_to(ring.layout().head().offset()).is_empty());
+            assert!(ring.status_writes().is_empty());
+        }
+        assert!(RingPump::from_checkpoint(ring.layout(), &*ring, &good[..23]).is_err());
+        ring.set_tail(BUFFER + 1);
+        assert!(RingPump::from_checkpoint(ring.layout(), &*ring, &good).is_err());
+        ring.set_tail(0);
+        ring.poke(ring.layout().status().offset(), 1 << 31);
+        assert!(RingPump::from_checkpoint(ring.layout(), &*ring, &good).is_err());
+    }
 
     #[test]
     fn a_zeroed_ring_is_adopted_and_a_dirty_one_is_refused() {

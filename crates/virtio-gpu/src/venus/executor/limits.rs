@@ -465,6 +465,150 @@ pub struct Limits {
 }
 
 impl Limits {
+    pub(crate) fn restore_context_budget_links(
+        self: &Arc<Self>,
+        links: &super::checkpoint_budgets::ContextBudgetLinks,
+        table: &super::checkpoint_budgets::BudgetTable,
+    ) -> Result<ContextLimits, super::checkpoint::RecipeError> {
+        let invalid = super::checkpoint::RecipeError::Invalid;
+        links.validate(table)?;
+        let mut shares = Vec::new();
+        shares
+            .try_reserve(CLASS_COUNT)
+            .map_err(|_| super::checkpoint::RecipeError::Budget)?;
+        for class in CLASSES {
+            let share = table.budget(links.classes[class.index()])?;
+            let whole = &self.wholes[class.index()];
+            if share
+                .whole()
+                .is_none_or(|parent| !Arc::ptr_eq(parent, whole))
+                || share.limit() != self.caps.of(class).0.min(whole.limit())
+            {
+                return Err(invalid(
+                    "context class share belongs to another factory or cap",
+                ));
+            }
+            shares.push(share.clone());
+        }
+        let shares: [Arc<PageBudget>; CLASS_COUNT] = shares
+            .try_into()
+            .map_err(|_| invalid("context budget class count differs"))?;
+        let mut device_local = HashMap::new();
+        device_local
+            .try_reserve(links.heaps.len())
+            .map_err(|_| super::checkpoint::RecipeError::Budget)?;
+        let roots = self
+            .device_local
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (key, id) in &links.heaps {
+            let share = table.budget(*id)?;
+            let root = roots
+                .get(key)
+                .ok_or(invalid("context heap root is absent"))?;
+            if share
+                .whole()
+                .is_none_or(|parent| !Arc::ptr_eq(parent, root))
+                || share.limit() != part(root.limit(), DEVICE_LOCAL_SHARE)
+            {
+                return Err(invalid(
+                    "context heap share belongs to another factory or cap",
+                ));
+            }
+            device_local.insert(*key, share.clone());
+        }
+        Ok(ContextLimits {
+            renderer: self.clone(),
+            shares,
+            device_local: std::cell::RefCell::new(device_local),
+        })
+    }
+
+    /// The payload's original owner may outlive its context. Use that exact
+    /// heap share during native payload reconstruction, not a newly made share.
+    pub(crate) fn checkpoint_payload_limits(
+        self: &Arc<Self>,
+        owner: u32,
+        table: &super::checkpoint_budgets::BudgetTable,
+    ) -> Result<ContextLimits, super::checkpoint::RecipeError> {
+        let invalid = super::checkpoint::RecipeError::Invalid;
+        let super::checkpoint_budgets::BudgetRootKey::Heap(key) = table.root_key(owner)? else {
+            return Err(invalid("shared-image owner is not a GPU heap share"));
+        };
+        let budget = table.budget(owner)?;
+        let roots = self
+            .device_local
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let root = roots
+            .get(&key)
+            .ok_or(invalid("payload heap root is absent"))?;
+        if budget
+            .whole()
+            .is_none_or(|parent| !Arc::ptr_eq(parent, root))
+            || budget.limit() != part(root.limit(), DEVICE_LOCAL_SHARE)
+        {
+            return Err(invalid("payload owner belongs to another factory or cap"));
+        }
+        let limits = self.context();
+        limits.device_local.borrow_mut().insert(key, budget.clone());
+        Ok(limits)
+    }
+    pub(crate) fn checkpoint_class_root(
+        &self,
+        index: u32,
+    ) -> Result<super::checkpoint_budgets::BudgetRoot, super::checkpoint::RecipeError> {
+        let class = CLASSES
+            .get(index as usize)
+            .ok_or(super::checkpoint::RecipeError::Invalid(
+                "unknown budget class",
+            ))?;
+        Ok(super::checkpoint_budgets::BudgetRoot {
+            key: super::checkpoint_budgets::BudgetRootKey::Class(index),
+            whole: self.wholes[class.index()].clone(),
+            share_limit: self.caps.of(*class).0,
+        })
+    }
+
+    pub(crate) fn checkpoint_heap_root(
+        &self,
+        key: HeapKey,
+        heap: u64,
+    ) -> super::checkpoint_budgets::BudgetRoot {
+        super::checkpoint_budgets::BudgetRoot {
+            key: super::checkpoint_budgets::BudgetRootKey::Heap(key),
+            whole: self.device_local(key, heap),
+            share_limit: self.caps.device_local_share(heap),
+        }
+    }
+
+    pub(crate) fn checkpoint_roots(
+        &self,
+    ) -> Result<Vec<super::checkpoint_budgets::BudgetRoot>, super::checkpoint::RecipeError> {
+        let heaps = self
+            .device_local
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut roots = Vec::new();
+        roots
+            .try_reserve(CLASS_COUNT + heaps.len())
+            .map_err(|_| super::checkpoint::RecipeError::Budget)?;
+        for class in CLASSES {
+            roots.push(self.checkpoint_class_root(class.index() as u32)?);
+        }
+        let mut keys = heaps.keys().copied().collect::<Vec<_>>();
+        keys.sort_unstable();
+        for key in keys {
+            let whole = heaps[&key].clone();
+            let share_limit = part(whole.limit(), DEVICE_LOCAL_SHARE);
+            roots.push(super::checkpoint_budgets::BudgetRoot {
+                key: super::checkpoint_budgets::BudgetRootKey::Heap(key),
+                whole,
+                share_limit,
+            });
+        }
+        Ok(roots)
+    }
     /// Budgets for `caps`, none of them used.
     #[must_use]
     pub fn new(caps: Caps) -> Arc<Self> {
@@ -546,6 +690,34 @@ impl Default for ContextLimits {
 }
 
 impl ContextLimits {
+    pub(crate) fn checkpoint_budget_links(
+        &self,
+        host: &Arc<PageBudget>,
+        table: &mut super::checkpoint_budgets::BudgetTable,
+    ) -> Result<super::checkpoint_budgets::ContextBudgetLinks, super::checkpoint::RecipeError> {
+        let host_pages = table.register(host)?;
+        let mut classes = [0; CLASS_COUNT];
+        for class in CLASSES {
+            classes[class.index()] = table.register(self.share(class))?;
+        }
+        let map = self.device_local.borrow();
+        let mut keys = map.keys().copied().collect::<Vec<_>>();
+        keys.sort_unstable();
+        let mut heaps = Vec::new();
+        heaps
+            .try_reserve(keys.len())
+            .map_err(|_| super::checkpoint::RecipeError::Budget)?;
+        for key in keys {
+            heaps.push((key, table.register(&map[&key])?));
+        }
+        let links = super::checkpoint_budgets::ContextBudgetLinks {
+            host_pages,
+            classes,
+            heaps,
+        };
+        links.validate(table)?;
+        Ok(links)
+    }
     /// The renderer these shares belong to.
     #[must_use]
     pub fn renderer(&self) -> &Arc<Limits> {

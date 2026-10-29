@@ -37,6 +37,8 @@
 //!   scanout_present   u32   0 or 1
 //!   scanout: resource_id u32 | x u32 | y u32 | w u32 | h u32
 //!            source u32 (0 = 2D, 1 = 3D, 2 = blob) | stride u32 | offset u32
+//!   cursor_present    u32 (v3) 0 or 1
+//!   cursor: width, height, hot_x, hot_y, x, y, pixel_bytes (all u32) | BGRA bytes
 //! ```
 
 use crate::protocol::{MemEntry, Rect};
@@ -49,7 +51,12 @@ use crate::protocol::{MemEntry, Rect};
 /// is a different shape, so it is refused by number rather than misread — and
 /// the *section* version around it (`vm_snapshot::devices::VIRTIO_VERSION`)
 /// refuses it one layer earlier, with a message that names both versions.
-pub const GPU_STATE_VERSION: u32 = 2;
+/// **3** adds the independent hardware cursor plane. Version 2 remains readable
+/// with no cursor; writing it again upgrades it to version 3.
+pub const GPU_STATE_VERSION: u32 = 3;
+
+mod cursor;
+pub use cursor::SavedCursor;
 
 /// Refuses a blob that claims more resources than the device could ever hold,
 /// before anything is allocated. [`crate::resource::MAX_RESOURCES`] is the real
@@ -135,6 +142,8 @@ pub struct GpuState {
     pub live_blobs: u32,
     pub resources: Vec<SavedResource>,
     pub scanout: Option<SavedScanout>,
+    /// Retained pixels, independent of the resource the guest may have freed.
+    pub cursor: Option<SavedCursor>,
 }
 
 /// Why a saved GPU blob could not be read.
@@ -287,6 +296,7 @@ impl GpuState {
             }
             None => put32(&mut out, 0),
         }
+        cursor::encode(&mut out, self.cursor.as_ref());
         out
     }
 
@@ -295,7 +305,7 @@ impl GpuState {
     pub fn decode(bytes: &[u8]) -> Result<Self, GpuStateError> {
         let mut r = Cursor::new(bytes);
         let version = r.u32("version")?;
-        if version != GPU_STATE_VERSION {
+        if version != 2 && version != GPU_STATE_VERSION {
             return Err(GpuStateError::Version {
                 found: version,
                 expected: GPU_STATE_VERSION,
@@ -368,6 +378,11 @@ impl GpuState {
         } else {
             None
         };
+        let cursor = if version >= 3 {
+            cursor::decode(&mut r)?
+        } else {
+            None
+        };
         if r.left() != 0 {
             return Err(GpuStateError::Trailing(r.left()));
         }
@@ -377,6 +392,7 @@ impl GpuState {
             live_blobs,
             resources,
             scanout,
+            cursor,
         })
     }
 }
@@ -387,6 +403,7 @@ mod tests {
 
     fn sample() -> GpuState {
         GpuState {
+            cursor: None,
             events_read: 0,
             live_3d_contexts: 2,
             live_blobs: 0,
@@ -441,6 +458,7 @@ mod tests {
             })
             .collect();
         let state = GpuState {
+            cursor: None,
             events_read: 0,
             live_3d_contexts: 0,
             live_blobs: 0,
@@ -470,7 +488,7 @@ mod tests {
         // present flag and the eight-word scanout record.
         assert_eq!(
             bytes.len(),
-            20 + 20 + 2048 * SAVED_ENTRY_BYTES + 36,
+            20 + 20 + 2048 * SAVED_ENTRY_BYTES + 36 + 4,
             "the encoder and SAVED_ENTRY_BYTES disagree"
         );
     }
@@ -575,6 +593,7 @@ mod tests {
             put32(&mut bytes, code);
             put32(&mut bytes, stride);
             put32(&mut bytes, offset);
+            put32(&mut bytes, 0); // no cursor
             bytes
         };
         assert!(matches!(

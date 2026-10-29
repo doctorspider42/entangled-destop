@@ -527,6 +527,30 @@ pub struct RingLayout {
 }
 
 impl RingLayout {
+    /// Guest-relative layout for a checkpoint. Empty extra space has no
+    /// location; all nonempty ranges retain their original ring-relative offsets.
+    #[must_use]
+    pub fn create_info(&self) -> RingCreateInfo {
+        let base = self.ring.start();
+        let (extra_offset, extra_size) = self
+            .extra
+            .map_or((0, 0), |extra| (extra.start() - base, extra.len()));
+        RingCreateInfo {
+            flags: self.flags,
+            resource_id: self.resource_id,
+            offset: base,
+            size: self.ring.len(),
+            idle_timeout_ns: self.idle_timeout_ns,
+            head_offset: self.head.offset() - base,
+            tail_offset: self.tail.offset() - base,
+            status_offset: self.status.offset() - base,
+            buffer_offset: self.buffer.start() - base,
+            buffer_size: self.buffer.len(),
+            extra_offset,
+            extra_size,
+        }
+    }
+
     /// Validate one guest-proposed layout against the resource it names.
     ///
     /// `resource_size` is the length of the shared-memory resource

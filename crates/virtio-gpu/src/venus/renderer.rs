@@ -154,6 +154,12 @@ use std::time::Duration;
 use thiserror::Error;
 use virtio_core::{GuestMem, HostWaker, Quiesce, ShmBacking};
 
+pub mod checkpoint_archive;
+pub mod checkpoint_blobs;
+pub mod checkpoint_directory;
+pub mod checkpoint_objects;
+pub mod checkpoint_rings;
+
 use crate::blob::{BlobMapping, BlobSupport};
 use crate::error::CommandError;
 use crate::protocol::{
@@ -363,6 +369,20 @@ const CAPSETS: [CapsetInfo; 1] = [CapsetInfo {
 /// ([`VenusError::SinkUnavailable`]): a ring with nowhere to put its bytes is
 /// not one to adopt and then quietly drop the bytes of.
 pub trait SinkFactory: Send {
+    /// Factory-specific reconstruction dispatched through the renderer's
+    /// object-safe interface. Pure capture/legacy factories refuse by default.
+    fn checkpoint(
+        _renderer: &mut VenusRenderer<Self>,
+        _request: crate::renderer::checkpoint::CheckpointRequest<'_>,
+    ) -> Result<(), CommandError>
+    where
+        Self: Sized,
+    {
+        Err(CommandError::Renderer(
+            "this Venus factory cannot stream checkpoints".into(),
+        ))
+    }
+
     /// The sink every ring gets.
     type Sink: RingSink + Send + 'static;
 
@@ -385,6 +405,23 @@ pub trait SinkFactory: Send {
     /// As [`sink_for`](Self::sink_for).
     fn sink_for_ring(&mut self, env: RingEnv) -> io::Result<Self::Sink> {
         self.sink_for(env.ctx_id, env.ring)
+    }
+
+    /// Validate a checkpoint's blob span against its actual reconstructed
+    /// allocation. An opaque handle's file metadata cannot establish its size.
+    /// This must only inspect host metadata, without native or guest writes.
+    fn validate_checkpoint_blob(&self, backing: &ExportedMemory, size: u64) -> Result<(), String> {
+        match backing {
+            ExportedMemory::Pages(pages)
+                if size != 0
+                    && size <= pages.mapped_len()
+                    && !pages.is_host_private()
+                    && !pages.is_poisoned() =>
+            {
+                Ok(())
+            }
+            _ => Err("checkpoint blob span cannot be validated against its allocation".into()),
+        }
     }
 
     /// What `VkDeviceMemory` `blob_id` of context `ctx_id` is, for a
@@ -1343,6 +1380,45 @@ pub struct ContextBlobs {
 }
 
 impl ContextBlobs {
+    /// Validate a saved reply binding against a directory whose generations
+    /// have been restored. A stale incarnation is Gone even if its id has
+    /// since been reused by a different context; it must never be rebound.
+    pub(crate) fn check_saved_reply(
+        &self,
+        blob: BlobRef,
+        offset: u64,
+        size: u64,
+    ) -> Result<(), ReplyBlobError> {
+        self.directory.with(|state| {
+            let entry = state
+                .blobs
+                .get(&blob.resource_id)
+                .filter(|entry| entry.generation == blob.generation)
+                .ok_or(ReplyBlobError::Gone(blob.resource_id))?;
+            if entry.ctx_id != 0 && entry.ctx_id != self.ctx_id {
+                return Err(ReplyBlobError::Foreign {
+                    resource_id: blob.resource_id,
+                    owner: entry.ctx_id,
+                    ctx_id: self.ctx_id,
+                });
+            }
+            let len = entry
+                .pages()
+                .filter(|_| entry.memory.is_none())
+                .ok_or(ReplyBlobError::NotAHostBlob(blob.resource_id))?
+                .resource_len();
+            if offset.checked_add(size).is_none_or(|end| end > len) {
+                return Err(ReplyBlobError::OutsideBlob {
+                    resource_id: blob.resource_id,
+                    offset,
+                    size,
+                    blob: len,
+                });
+            }
+            Ok(())
+        })
+    }
+
     /// Judge a `vkSetReplyCommandStreamMESA`: the resource must be a host blob
     /// of this context and `offset + size` must fit it (`vkr_transport.c:14-29`,
     /// `vkr_cs.c:10-38`).
@@ -2556,6 +2632,23 @@ impl<F> VenusRenderer<F> {
         &self.sinks
     }
 
+    #[cfg(test)]
+    pub(crate) fn factory_mut_for_test(&mut self) -> &mut F {
+        &mut self.sinks
+    }
+
+    /// Populate a cold checkpoint factory before any restored workers exist.
+    pub fn checkpoint_factory_mut(
+        &mut self,
+    ) -> Result<&mut F, super::executor::checkpoint::RecipeError> {
+        if !self.quiesce.is_paused() || !self.contexts.is_empty() || self.live.count() != 0 {
+            return Err(super::executor::checkpoint::RecipeError::Invalid(
+                "checkpoint factory adoption requires a fresh paused renderer",
+            ));
+        }
+        Ok(&mut self.sinks)
+    }
+
     /// Transport commands that were decoded and accepted without being
     /// executed — the reply-stream commands the context stream carries but
     /// serves only on a ring.
@@ -3725,6 +3818,13 @@ impl<F: SinkFactory> VenusRenderer<F> {
 }
 
 impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
+    fn checkpoint(
+        &mut self,
+        request: crate::renderer::checkpoint::CheckpointRequest<'_>,
+    ) -> Result<(), CommandError> {
+        F::checkpoint(self, request)
+    }
+
     fn capsets(&self) -> &[CapsetInfo] {
         &CAPSETS
     }
@@ -4158,6 +4258,49 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_reply_checks_incarnation_before_owner_and_bounds_without_writes() {
+        let directory = BlobDirectory::default();
+        let pages = Arc::new(RingPages::new(4096).unwrap());
+        directory.insert(7, 1, Arc::clone(&pages));
+        let blobs = directory.for_context(1);
+        let bound = blobs.bind(7, 32, 16).unwrap();
+        assert_eq!(blobs.check_saved_reply(bound, 32, 16), Ok(()));
+        assert!(matches!(
+            blobs.check_saved_reply(bound, 4090, 16),
+            Err(ReplyBlobError::OutsideBlob { .. })
+        ));
+        assert!(matches!(
+            blobs.check_saved_reply(bound, u64::MAX, 1),
+            Err(ReplyBlobError::OutsideBlob { .. })
+        ));
+        assert!(matches!(
+            directory.for_context(2).check_saved_reply(bound, 32, 16),
+            Err(ReplyBlobError::Foreign { .. })
+        ));
+        // Reusing the id for another context must not resurrect the old window.
+        directory.insert(7, 2, Arc::clone(&pages));
+        assert_eq!(
+            blobs.check_saved_reply(bound, 32, 16),
+            Err(ReplyBlobError::Gone(7))
+        );
+        let mut bytes = [1; 16];
+        pages.read_bytes(32, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 16]);
+        directory.insert(9, 0, Arc::clone(&pages));
+        let kernel = blobs.bind(9, 0, 4096).unwrap();
+        assert_eq!(blobs.check_saved_reply(kernel, 0, 4096), Ok(()));
+        directory.insert_memory(10, 1, ExportedMemory::Pages(pages), 4096);
+        let memory = directory.with(|state| BlobRef {
+            resource_id: 10,
+            generation: state.blobs[&10].generation,
+        });
+        assert_eq!(
+            blobs.check_saved_reply(memory, 0, 16),
+            Err(ReplyBlobError::NotAHostBlob(10))
+        );
+    }
 
     use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
     use std::sync::Condvar;

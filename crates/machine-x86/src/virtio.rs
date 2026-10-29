@@ -497,6 +497,100 @@ impl VirtioMmioBus {
             .collect()
     }
 
+    /// Explicit GPU-stream inventory; never infer support from a device type
+    /// alone. Poisoned locks refuse instead of silently omitting a slot.
+    pub fn gpu_checkpoint_slots(&self) -> Result<Vec<u32>, crate::state::StateError> {
+        let mut slots = Vec::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            let transport = slot
+                .transport
+                .lock()
+                .map_err(|_| crate::state::StateError::Poisoned("virtio-mmio stream inventory"))?;
+            if transport.device_type() == virtio_core::DeviceType::Gpu
+                && transport.has_streamed_state()
+            {
+                slots.push(index as u32);
+            }
+        }
+        Ok(slots)
+    }
+
+    pub fn prepare_snapshot(&self) -> Result<(), crate::state::StateError> {
+        for (index, slot) in self.slots.iter().enumerate() {
+            slot.transport
+                .lock()
+                .map_err(|_| {
+                    crate::state::StateError::Poisoned("virtio-mmio checkpoint preparation")
+                })?
+                .prepare_snapshot()
+                .map_err(|error| crate::state::StateError::Stream {
+                    slot: index as u32,
+                    reason: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn save_streamed_state(
+        &self,
+        index: u32,
+        out: &mut dyn std::io::Write,
+    ) -> Result<(), crate::state::StateError> {
+        let slot = self
+            .slots
+            .get(index as usize)
+            .ok_or(crate::state::StateError::BadValue {
+                what: "streamed device slot",
+                value: u64::from(index),
+            })?;
+        let mut transport = slot
+            .transport
+            .lock()
+            .map_err(|_| crate::state::StateError::Poisoned("virtio-mmio stream save"))?;
+        if !transport.has_streamed_state() {
+            return Err(crate::state::StateError::Stream {
+                slot: index,
+                reason: "device has no streamed state".into(),
+            });
+        }
+        transport
+            .save_streamed_state(out)
+            .map_err(|error| crate::state::StateError::Stream {
+                slot: index,
+                reason: error.to_string(),
+            })
+    }
+
+    pub fn load_streamed_state(
+        &self,
+        index: u32,
+        reader: &mut dyn virtio_core::StateReader,
+    ) -> Result<(), crate::state::StateError> {
+        let slot = self
+            .slots
+            .get(index as usize)
+            .ok_or(crate::state::StateError::BadValue {
+                what: "streamed device slot",
+                value: u64::from(index),
+            })?;
+        let mut transport = slot
+            .transport
+            .lock()
+            .map_err(|_| crate::state::StateError::Poisoned("virtio-mmio stream load"))?;
+        if !transport.has_streamed_state() {
+            return Err(crate::state::StateError::Stream {
+                slot: index,
+                reason: "device cannot load streamed state".into(),
+            });
+        }
+        transport
+            .load_streamed_state(reader)
+            .map_err(|error| crate::state::StateError::Stream {
+                slot: index,
+                reason: error.to_string(),
+            })
+    }
+
     /// Every slot on this window, for a snapshot (ADR-0006).
     pub fn save_state(&self) -> Vec<crate::state::SavedVirtioSlot> {
         self.slots

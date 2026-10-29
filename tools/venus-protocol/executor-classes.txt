@@ -123,6 +123,7 @@ vkGetQueryPoolResults           # the range inside the pool, the size bounded
 vkResetQueryPool
 vkCreateEvent
 vkDestroyEvent
+vkGetEventStatus                # host access rejects device-only events
 vkCreatePrivateDataSlot
 vkDestroyPrivateDataSlot
 vkSetPrivateData                # objectHandle is an id of objectType
@@ -215,7 +216,6 @@ vkEndCommandBuffer
 vkTrimCommandPool
 vkMergePipelineCaches
 vkGetFenceStatus
-vkGetEventStatus
 vkGetRenderAreaGranularity
 vkGetDescriptorSetLayoutSupport
 vkGetDeviceGroupPeerMemoryFeatures

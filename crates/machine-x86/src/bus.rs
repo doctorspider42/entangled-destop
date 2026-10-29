@@ -80,6 +80,9 @@ pub struct MachineBus {
     reset: Arc<ResetControl>,
 }
 
+#[cfg(test)]
+mod stream_tests;
+
 impl MachineBus {
     /// A machine with only the serial console.
     pub fn new(serial: SerialConsole) -> Self {
@@ -226,6 +229,42 @@ impl MachineBus {
             refusals.extend(pci.snapshot_refusals());
         }
         refusals
+    }
+
+    pub fn gpu_checkpoint_slots(&self) -> Result<Vec<u32>, crate::state::StateError> {
+        match &self.pci {
+            Some(pci) => pci.gpu_checkpoint_slots(),
+            None => self.virtio.gpu_checkpoint_slots(),
+        }
+    }
+
+    pub fn prepare_snapshot(&self) -> Result<(), crate::state::StateError> {
+        match &self.pci {
+            Some(pci) => pci.prepare_snapshot(),
+            None => self.virtio.prepare_snapshot(),
+        }
+    }
+
+    pub fn save_streamed_state(
+        &self,
+        slot: u32,
+        out: &mut dyn std::io::Write,
+    ) -> Result<(), crate::state::StateError> {
+        match &self.pci {
+            Some(pci) => pci.save_streamed_state(slot, out),
+            None => self.virtio.save_streamed_state(slot, out),
+        }
+    }
+
+    pub fn load_streamed_state(
+        &self,
+        slot: u32,
+        reader: &mut dyn virtio_core::StateReader,
+    ) -> Result<(), crate::state::StateError> {
+        match &self.pci {
+            Some(pci) => pci.load_streamed_state(slot, reader),
+            None => self.virtio.load_streamed_state(slot, reader),
+        }
     }
 
     /// Everything on this bus, for a snapshot (ADR-0006).

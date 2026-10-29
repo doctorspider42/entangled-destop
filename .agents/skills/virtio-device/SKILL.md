@@ -998,6 +998,16 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
     resamples and we ship no converter; the capture client is packet-oriented,
     hence `WasapiSource`'s leftover buffer (`ReleaseBuffer` must consume a whole
     packet or none).
+    **WASAPI queuing is not playback (2026-10-25).** `ReleaseBuffer` can
+    accept the first 100 ms instantly. Completing guest periods on that copy
+    caused an ALSA xrun/reopen loop (~20 starts/s), making USB DACs click.
+    `WasapiSink` now waits on `IAudioClock`, converting its frequency against
+    the guest rate with u128 arithmetic. An empty endpoint gets a bounded
+    20 ms silence lead and a rebased clock, including after pause. Never use
+    the endpoint's free space as the guest's clock. The explicit hardware
+    regression is `cargo test -p virtio-sound wasapi_periods -- --ignored`:
+    44.1/48 kHz, 2048-byte periods, first-write and post-idle pacing. It opens
+    the real default output (silence only); RecordingSink cannot catch this.
   Underruns and overruns are counted and logged at most once a second, never
   allowed to wedge the device — the playback pump writes silence and carries
   on, and the capture pump only reads what the guest has made room for, so a
@@ -1206,6 +1216,433 @@ goes through the same `reconcile_notify` for the same reason.
 ### 3. `queue_positions`, and a `save_device`/`load_device` pair if you hold
 anything else (ADR-0006)
 
+Venus checkpoint groundwork (`venus::executor::checkpoint`, 2026-10-25):
+`VulkanContext::enable_object_recipes` must run on a fresh context. Recipes
+retain guest-id wire commands before translation, with a shared `PageBudget`
+and a 64 MiB cap; overflow refuses recipe saving without killing the guest.
+`restore_object_recipes` validates framing/protocol first, rebuilds fresh host
+objects, verifies their guest replies against the recorded results and destroys
+partial objects on an executor/host failure or changed outputs. A failed state
+change invalidates the journal without killing ordinary guest execution. Historical
+GPU submissions and waits are excluded and are rejected in recipe files.
+`save_host_memory` streams object-owned imported pages in 64 KiB chunks;
+`restore_host_memory` validates all allocation ids/lengths before writing any.
+Native test `checkpoint_recreates_a_device_and_the_gpu_reads_the_restored_host_memory`
+fills on the GPU, destroys the old device, reconstructs another and has the GPU
+copy the restored bytes. `checkpoint_buffer_survives_the_saving_process_exiting`
+runs the save and restore halves in separate processes, with bounded child
+timeouts; only the fixture files carry state between them. The fixture also
+carries private image pixels and layouts; it is not desktop acceptance.
+
+`save_sync_state`/`restore_sync_state` additionally carry completed fence states,
+timeline counters, binary permanent/temporary payloads, and event signals. Park
+all guest/ring writers first. A bounded GPU idle settles clock bookkeeping and
+deferred destroys; held submissions are currently refused, never discarded.
+Validate the whole sync file before native state changes. A host failure during
+restore destroys/parks the partial context; a failed capture preserves it.
+The native fixture now carries sync state between its two processes and then
+submits actual GPU waits for the restored semaphores and events.
+
+An event's Boolean status is NOT its whole state: preserve host vs GPU signalling,
+the original queue family, legacy source stages or the exact synchronization2
+dependency info. Future waits must match that signal; replacing it with a host
+set or an arbitrary `CmdSetEvent2` is incorrect. Signal recipes keep their own
+`RecordingBytes` charge and outlive the signalling command buffer. Buffer/image
+generation tokens prevent a reused guest id from silently changing a dependency;
+retired dependencies still refuse capture pending their reconstruction support.
+GPU event reconstruction retains private command pools/fences through the normal
+queue clock and deferred destruction, including on timeout. Host operations on
+DEVICE_ONLY events are rejected. Protected-only queues and multi-device execution
+masks remain explicit event reconstruction refusals.
+
+`save_device_buffers`/`restore_device_buffers` stream live bound private VRAM
+buffers through 1 MiB host-private staging chunks. The native two-process fixture
+fills over 2 MiB in RTX 2070 private VRAM and checks exact GPU readback after the
+new process uploads all three chunks. Target checks currently require existing
+transfer usage, one unprotected queue, no uncaptured device address and no
+shared/exported or image-aliased allocation. Image objects retain all successful
+plane bindings, not just canonical scanout bindings, for that alias check.
+Staging buffer/memory/pool objects enter the normal deferred-destruction graph
+with their private queue fence. On readback timeout both staging and a later
+guest-destroyed source survive until GPU completion. On disk-write failure the
+source context stays usable; on upload failure partial reconstruction is discarded.
+Validate the complete buffer file and bindings before any GPU upload. Streaming
+host-memory/buffer blobs emit the checked wire decoder's four-byte padding too:
+guest allocation and buffer lengths need not themselves be multiples of four.
+
+`image_layouts` tracks executed per-aspect/mip/layer layouts and ownership,
+not merely recorded barriers. Commit only host-accepted submissions, including
+secondary command buffers and render-pass final transitions. Keep framebuffer
+layer bounds, multiview masks, depth/stencil aspects and 3D-view rules. Equal-layout
+Sync2 barriers preserve existing heterogeneous layouts. Sparse rectangular spans,
+charged recording metadata and bounded secondary expansion prevent a small guest
+request from producing an unbounded host allocation. Tracking failure disables
+checkpoint metadata without terminating guest execution.
+
+`save_device_images`/`restore_device_images` currently cover private non-aliased,
+single-sample 2D color images with transfer usage and a single unprotected queue
+of unit transfer granularity. Validate every file record before any GPU upload,
+including sharing mode, layout/usage compatibility, binding and format geometry.
+View-only flags MUTABLE_FORMAT, CUBE_COMPATIBLE, BLOCK_TEXEL_VIEW_COMPATIBLE and
+EXTENDED_USAGE are permitted without changing base subresource geometry. For
+EXTENDED_USAGE, independently require native base-format transfer feature bits:
+usage can otherwise be supported only by a view format. Sparse/protected/alias
+and other flags still refuse. The native fixture covers mutable extended views.
+The format block table is generated from the vendored vk.xml by
+`scripts/venus-checkpoint-formats.py` (`--check` verifies it). Staging tiles are
+at most 1 MiB; compressed edge blocks and exceptionally wide rows are covered.
+Each readback restores the source layout; each completed upload updates executed
+layout tracking so the next tile cannot discard previously restored pixels.
+The native two-process fixture restores a 513x513 RGBA image across two tiles
+and checks every nonzero pixel plus the shader-read layout. Source destruction
+after timeout preserves image and staging until GPU completion; native upload
+failure discards the partial reconstruction. Bindings retain allocation generation
+tokens too: a freed/reused memory id must never cause a read from a dangling resource.
+Host-visible optimal images, depth/stencil, multisampling, multiple queues,
+active aliases and shared payloads still require their own image support.
+
+Private image component v2 stores aspect and native queue family per record.
+Depth/stencil formats 124..130 use their aspect-compatible 1/2/4-byte texels.
+Combined formats require equal saved layout and owner for depth/stencil, and
+private transitions cover both aspects even without separateDepthStencilLayouts.
+Commit both layouts after every uploaded tile, so a later stencil upload never
+discards depth. Validate all paired records before any GPU work; resolve the
+saved queue family and require graphics capability for depth/stencil copies.
+The native fixture now carries a 513x513 D32_SFLOAT_S8_UINT image with known
+depth and nonzero stencil through separate processes and a second capture.
+Independent separate-aspect layouts remain refused.
+
+`ScanoutDevice::save_shared_image`/`restore_shared_image` add a separate payload
+component for released canonical BGRA8 images at allocation offset zero. Only
+pixels, GPU/driver UUIDs, allocation metadata, canonical create parameters and
+release layout/family enter the file; restore makes a new allocation and OS handle.
+The caller must drain all writers and prove the active canonical image and its
+stable-layout external release; the blob directory does not yet persist that
+proof, context links or attachment permissions. Validate full framing before host
+allocation, verify the current canonical parameters and charge the restored heap
+to the renderer's ContextLimits. Native imports retain the export's charge as long
+as they retain the payload. Staging reads/writes require coherent native host types.
+The native separate-process fixture uses a varying 513x257 pattern, drops each
+exporting device before capture/readback, checks layouts GENERAL/color/shader/
+transfer-src/transfer-dst, and checks that a failed disk write preserves the source.
+A timed-out upload retains native objects and its heap charge until GPU completion.
+Private layout transitions happen locally between matching external ownership
+operations; undo them before releasing back to the agreed layout.
+
+Shared payload v3 retains pending external releases with distinct old/new
+layouts (ReleasedTransition); v1 stable releases and v2 Initial remain readable.
+Never collapse that pair into an equal-layout release. Readback acquires the
+saved pair, copies in a supported local layout, returns locally to oldLayout,
+and releases oldLayout→newLayout again. Restore uploads into oldLayout and
+recreates that exact release before guest workers start. Both layouts must be
+defined and compatible with image usage; v3 rejects equal pairs as noncanonical.
+The native two-process fixture carries a COLOR_ATTACHMENT→GENERAL release,
+checks green pixels after failed writes and cold restore, then acquires the
+original pair in the resumed guest and verifies its subsequent blue clear.
+
+`checkpoint_shared` links allocation generations to preloaded shared payloads
+before recipe binding. Each successful/lifetime-replayed allocation has a context
+ordinal; a reused guest memory id cannot redirect a destroyed generation. In
+checkpoint-enabled contexts, allocations retain the SharedHandle identity even
+after their blob is deleted. Normal contexts keep the original handle lifetime.
+`SharedPayloads` deduplicates those identities across contexts/blobs into dense
+file ids, then resolves ids to newly recreated handles. Its link codec bounds
+counts and rejects duplicate ids/ordinals, unknown payloads and trailing data.
+Validate links before replay and require every linked generation to remain alive
+and to refer to the expected payload afterwards; mismatch discards reconstruction.
+Linked native memory imports reuse the payload's charge. Device addresses,
+protected/multi-device allocations and incompatible sizes/types remain refused.
+Pure `GetMemoryResourcePropertiesMESA` queries are excluded from reconstruction:
+their old blob can be gone, and they do not construct any object state.
+
+The native separate-process shared-image fixture now carries two real contexts'
+recipes, allocation links and sync state too. It destroys both original native
+devices before saving the released green image, recreates the payload in the new
+process, restores both contexts without their old blob directory, writes blue
+through the restored exporter and reads those new pixels on the importer's own
+native device. Use `execute_wait` in such direct native fixtures: `execute` alone
+only polls a wait once, whereas a ring sink drives the real sliced wait loop.
+
+Recipe format version 2 adds bounded historical-import geometry (allocation
+ordinal, device/id, actual host size, backing kind) beside command history. Keep
+host-memory payload format version 1 independent. Validate the entire import
+metadata footer against the decoded allocation commands before creating objects;
+charge metadata to the same 64 MiB journal budget and invalidate capture on overflow.
+An import with no live shared link reconstructs private scratch of its original
+host size, preserving guest binding/dedication facts. This handles retired VRAM
+and host-page imports after their blobs disappear. Do not use guest allocation
+size as the native import size: the original imported payload may be larger.
+Every scratch allocation must be freed by later recipe history. A remaining live
+placeholder refuses restore and destroys the partial context. Linked imports must
+match the captured host geometry. Host pages use checked import alignment/type
+and the normal page budget; private VRAM uses normal heap accounting. Historical
+GPU submissions remain excluded. The native two-process exporter/importer fixture
+now includes both a retired VRAM import and a retired host-page import before its
+live shared allocation; reconstruction succeeds without either old blob directory.
+
+`checkpoint_pages::HostPageTable` gives rings, reply windows, page blobs and
+Vulkan allocations one dense page namespace. Register all roots across the
+renderer; identical Arc identities share a file id, equal bytes do not imply
+shared identity. Stream each allocation once, in 64 KiB chunks, including mapped
+padding beyond a ring's declared size. Preserve declared size, mapped span and
+allocation alignment. Validate the whole page file before allocating; a failed
+later allocation drops earlier pages and refunds their budgets. The renderer must
+supply the original owner/share budget for each root (`restore_with_budgets`).
+Private staging/poisoned pages are refused. New mapped-byte accessors keep checked
+bounds and the same atomic/private-lock rules as ordinary RingPages byte access.
+
+HostAllocationLink files preserve allocation generations, page ids and one-blob
+export state. `restore_object_recipes_with_memory` links both VRAM and host pages
+before binds and requires every live host allocation to have a page link. Missing,
+stale, duplicate/cross-kind links or changed geometry refuse restore and clean up.
+Loaded pages are charged once; native imports retain their Arc without charging
+again. Uncaptured device addresses and multi-device page allocations remain refused.
+The legacy object-only/shared-VRAM entry points retain their separate host-memory
+payload path. The native separate-process fixture now persists one live host-page
+root shared by exporter/importer, verifies its original bytes, changes it through
+the restored exporter's CPU view and copies it through the importer's GPU into
+readback memory. It also keeps the earlier shared-image and retired-import checks.
+This proves page identity, not reconstruction of the blob directory/aperture/rings.
+
+`RingPump::checkpoint/from_checkpoint` carries bounded, versioned host progress:
+wrapping consumed cursor, idle/fatal intent and the stalled tail. Adoption checks
+saved shared head/status and pending-tail bounds without writing pages or calling
+the sink; ALIVE remains independent. Fatal rings retain their failure, including
+an invalid tail. Capture must occur between complete sink calls while quiesced;
+the caller must restore the matching layout, shared pages and sink state before
+starting workers. `RingService::from_checkpoint` restarts polling and clears IDLE
+before workers/guest run: old doorbells are not durable. It resets only timing
+and backoff, preserves fatal stoppage, and checks queued work without replaying
+the consumed prefix. Live worker capture is available through the on-demand
+`RingWorker::checkpoint` query and the renderer's `checkpoint_rings` manifest.
+
+`executor::checkpoint_ring` carries a fixed 64-byte versioned sink record:
+context/ring identity, reply blob id AND generation, offset/size/cursor, and the
+virtqueue roundtrip count. Restore the directory with its exact saved generations
+before adopting sinks; assigning new generations can resurrect a stale binding.
+Live bindings must pass owner/type/range checks; a Gone binding stays stale rather
+than becoming None (that would change when a later Vulkan command is refused).
+Validate the full record before changing either sink or roundtrip. Diagnostic
+blocked-wait timestamps are not durable state; the pump reoffers that command.
+The codec is used by on-demand worker capture, not inside a command in progress.
+
+`renderer::checkpoint_directory` persists the directory's exact generations and
+next-generation counter, page/shared-payload roots, import attachments, canonical
+image associations, pending binds and the handle reverse index (including absent
+indices/aliases). Pages/payload ids share the global allocation-link namespaces.
+Decode the complete bounded record and validate every root before image resolution.
+`VulkanContext::restore_directory_image` checks the reconstructed image recipe,
+binding offset, allocation generation and actual payload, then reuses/creates the
+image-owned liveness token. A fresh directory never mutates the source on failure.
+The saved release remains historical metadata, not executed ownership proof.
+
+`RingWorker::checkpoint` sends an on-demand request to the owning thread under a
+closed, settled gate; it does not stop/restart the source or write its shared words.
+Queries wake a park without consuming a real doorbell. Keep a consumed wake across
+capture interrupts at the pause gate; otherwise failure/resume could strand work.
+Serials prevent timed-out responses answering a later query. Fatal ended workers
+retain their final metadata; teardown stops refuse capture. Unsupported sinks and
+unsettled whole calls refuse, never discard work. Metadata is bounded at 4 KiB per
+sink. `checkpoint_rings` adds context identity/poison/monitor period, complete
+relative layouts, page roots, seqnos and pump/sink state with one overall deadline.
+Both manifest codecs bound counts/bytes, reject duplicates and validate framing.
+
+The native two-process fixture now also reloads the blob directory and actual
+executing sinks/workers. Both resumed rings append another reply to their original
+window at its saved cursor without rebinding; previous reply bytes survive. Their
+roundtrip counts survive too. The fixture also restores renderer blob mappings
+and accounting through the manifest below. It now uses the budget-aware native
+factory and the renderer's real restore_rings path, rather than hand-built workers.
+Transport/VM integration and rebooted-desktop acceptance remain missing.
+
+`checkpoint_blobs` retains blob names/kinds/sizes, accepted scanouts and exact
+guest-aperture offsets. Restore resolves the directory, validates all inventories,
+owner/cap/geometry checks, nonoverlapping publication ranges and canonical-image
+matches before publishing anything. `SinkFactory::validate_checkpoint_blob` must
+check the actual allocation span; the native factory checks HandleExport's real
+size/type, not two agreeing file fields. Prepare failure forgets partial scanout
+targets and drops all prior Publication guards, unmapping the new aperture. Cached
+presenter OS handles are regenerated. Capture refuses an accepted handle scanout
+without a live image recipe, preserving the source. Ring restore preflights all
+pages/control words and all sink metadata before clearing IDLE/starting threads;
+it recreates context poison state, monitors and roundtrip counts too. Native sink
+and ring seqnos must agree, including when one is zero. Tests cover rollback,
+forged spans, mapping aliases, monitor/context metadata and continued replies.
+
+`checkpoint_budgets` records exact PageBudget root/share identities, including
+orphan owners surviving context-id reuse. File counters/caps never grant storage:
+roots resolve to the new factory's current policies, shares start empty and live
+allocations charge them once. Context links distinguish every object class, host
+pages and GPU heap. HostPageTable::restore_owned preserves anonymous renderer Shm
+roots as uncharged ring pages; native allocation links require a captured share.
+Blob manifests cross-check anonymous roots against Shm records. Strict native
+replay requires original allocations to use their context's exact owner, while
+imports may retain another owner within the same factory root. Owned shared-image
+restore verifies the GPU heap share before allocation.
+
+`checkpoint_factory` joins every native context's budget links, bounded recipes,
+global shared/page links and sync state in a versioned object manifest (512 MiB
+total metadata). A common deadline bounds capture/restore. Decode validates the
+whole framing before copying components, and restore resolves all graph links
+before native replay. Prepared CheckpointContext guards destroy native objects
+on failure, including earlier contexts when a later replay fails; adoption checks
+factory identity/services and refuses duplicates. Allocation contents and full
+renderer orchestration remain separate. checkpoint_factory_mut only permits
+adoption into a fresh paused renderer before workers exist.
+
+`checkpoint_shared::PayloadBudgetOwners` checks actual restored HandleExport
+size/type/UUIDs and the exact live charge/share, not just agreeing file fields.
+`checkpoint_ownership` retains executed canonical layouts per shared identity.
+Epochs reserved before native submission prevent delayed CPU commits from
+overwriting newer cross-context work. Only accepted submits update the cache;
+unsubmitted recorded barriers do not. Unclaimed payloads, ordering timeouts,
+missing marks, unsupported shared buffer/image bindings and exports after earlier
+unmarked GPU use invalidate capture without interrupting the source. Retained
+weak identities cover canonical orphan exports. Capture still requires drained
+GPU/presenter writers. A private uploader returns a RestoredSharedImage proof
+only after successful native upload/release; cold factory adoption checks backend,
+actual charge and owner identity before seeding later checkpoint ownership.
+Reset clears old-session ownership errors and records.
+
+Factory enable_checkpoint_recipes installs one retention budget before the first
+context, covering empty contexts and reused context ids. Late enable refuses
+without consuming the source factory, including after an old context was destroyed.
+`renderer::checkpoint_objects` combines factory, blobs, rings and owner manifests
+in one bounded object graph. Native/ring context inventories must match. Capture
+uses one deadline and refuses outstanding transport retirement/native graveyards.
+Restore checks actual page/payload owner identities, prepares contexts, restores
+private allocation contents through a callback, publishes mappings and only then
+starts paused workers. Failure resets all adopted contexts and publications.
+The cold factory retains recipes for future newly created contexts too.
+
+HostPageTable::restore_owned_reader validates the entire seekable component's
+framing, declared/mapped/alignment geometry and owners before allocating. It reads
+payloads in at most 64 KiB chunks, preserves anonymous ring-page semantics and
+padding, and refunds unpublished allocations on I/O failure. Use a bounded section
+reader or standalone component file, not an unbounded view of the whole VM file.
+The native separate-process fixture now exercises the integrated object-graph
+loader and a file-backed page reader. It explicitly publishes three mappings
+(two reply pools and the native shared page allocation), checks the fresh address,
+preserves green pixels and resumes both rings. Merely comparing two zero mapping
+counts would not prove aperture restoration.
+
+`renderer::checkpoint_archive` streams the graph, pages, shared images and private
+buffer/image contents in one forward-only envelope, with predicted lengths rather
+than a second GPU readback. File-backed private readers validate all targets before
+upload; source and restored page ids are local to one capture, never interchangeable
+between separately captured manifests. Native RTX tests restore this archive in a
+fresh process, verify private GPU contents and three mappings, and save again.
+
+`blob::checkpoint` and `renderer::checkpoint` retain the virtio front-end names,
+capsets, backing lists, aperture reservations and accepted scanouts. Restoring a
+reservation must bypass clear_span, preserve the cold machine's backing and never
+republish native pages or recreate a context. The native manifest checks exact
+front-end context/blob/publication/scanout agreement before reconstruction. The
+object-safe Renderer3d checkpoint request dispatches to an opt-in factory; other
+factories/renderers refuse by default. Enable recipes before the first context.
+
+vm-snapshot's explicit save_with_gpu/restore_with_gpu APIs carry streamed per-slot
+GPU sections (kind 14, v1). Ordinary restore refuses those sections. GPU-aware
+restore checks GPU integrity before RAM changes, then retains the same opened file
+for VerifiedSectionReader uploads: full digest first, each random-access cache
+refill reauthenticated against that pass. Never reopen a snapshot path for native
+upload, and never use an unbounded whole-file reader. Lifecycle.prepare_save runs
+after pause/quiesce but before CPU/APIC capture; only already completed device
+work may return guest responses/IRQs there. The device drain is still separate.
+
+GpuDevice's accelerated component carries its logical namespace, event bits and
+active scanout before the renderer archive. Apply it after ordinary transport/2D
+state and RAM; clear restored_3d_lost only after adoption and presentation succeed.
+Presentation failure resets native objects/publications and clears partial blobs.
+VirtioDevice's optional has_streamed_state/prepare_snapshot/save_streamed_state/
+load_streamed_state flow through TransportState, both transports and MachineBus.
+Never silently omit a poisoned slot from the extra-state inventory. Preparation
+polls already submitted GPU work for up to two seconds, returning only genuinely
+retired responses and their IRQs before CPU/APIC capture. It must not pop a new
+guest request or use the ordinary fence watchdog: timeout leaves the response
+pending and refuses, so a later retry can complete it correctly.
+
+The engine has a per-profile display.venus_checkpoints=true opt-in (false is
+omitted when serializing); ENTANGLED_VENUS_CHECKPOINT=1 remains a developer
+override. Resume selects Venus and retention automatically when the file carries
+a GPU section, including older experimental files without the profile key.
+Default Venus refusal for other profiles is unchanged. With opt-in,
+the archive validators still refuse unsupported GPU state; retention can still
+exhaust its 64 MiB budget. GPU-aware restore requires exact archive/cold-device
+slot agreement before RAM changes. Both host boot paths keep the worker gate
+closed and platform timers paused until device/GPU/CPU restoration finishes.
+
+Do not equate address-capable memory/buffer flags with an address actually
+returned to the guest. VulkanContext tracks every nonzero GetBufferDeviceAddress
+reply with a monotonic context flag. Such a context still refuses whole capture
+and private-buffer readback, even after freeing the queried buffer/memory: copies
+may remain in guest RAM or shader data. Unqueried address-capable allocations can
+use the ordinary reconstruction/readback path; this does not implement replay of
+exposed device addresses. Opaque capture queries/nonzero capture addresses remain
+refused by the execution policy. The separate query/freed-buffer regression proves
+the guard, and the flag-only regression checks data restore and a second save.
+Linked host-page/shared reconstruction also accepts unexposed DEVICE_ADDRESS
+allocation flags; capture-replay and multi-device allocation flags still refuse.
+
+`checkpoint_aliases` distinguishes suballocation from aliasing using live native
+memory requirements and allocation generation identities. Same-linearity ranges
+use raw overlap; opposite linear/nonlinear ranges include bufferImageGranularity.
+Bound metadata counts and keep the sweep O(N log N). Overlapping image bindings
+still refuse, while disjoint buffer/image suballocations can be captured.
+
+`checkpoint_queues` deterministically selects a fetched unprotected copy queue,
+with at most 64 fetched queues per device. Every declared queue must already
+be fetched before private copies: after timeout all possible future submissions
+must encounter the installed fan-out waits. Unfetched queues refuse before GPU
+work until private bridges for those native queues are implemented. `checkpoint_queue_copy` adds private
+binary-semaphore fan-in from all other queues before each transfer, then fan-out
+back to them afterwards. Submission order or a host idle wait alone is not the
+cross-queue memory dependency. Prepare all semaphores/fences before submitting,
+track every accepted submit in its queue clock, and keep scratch until every
+involved queue finishes, including on timeout or partial failure.
+
+`buffer_ownership` records bounded full/partial direct accesses with buffer
+generation identities and snapshots secondary recordings. Only accepted submits
+commit family proofs. At multiple fetched families, exclusive private buffers
+need a complete executed proof; opaque commands in another family invalidate
+that inference. With no direct access for a generation, a sole opaque family
+also bounds all possible defined writes; capture there cannot discard defined
+data from another family. Do not apply that inference to a partially tracked
+range or multiple possible families. Unknown or mixed ranges still refuse. A factory manifest v2 has
+six components, adding the bounded ownership/opaque-family codec. Validate its
+complete inventory, geometry, ordering and families before applying any record.
+Restored uploads establish completed native ownership for the next capture.
+Concurrent resource family sets must permit the copy queue. Successfully recorded
+buffer family transfers still invalidate capture until their range state is
+represented; recipe replay preserves this guard. Private image queues come from
+executed subresource ownership, with incompatible cells refused. Native separate-
+process fixtures fill private VRAM through a second queue where hardware permits.
+
+The opt-in path is wired through full VM disk snapshots. Real Windows Ubuntu
+GNOME has survived two fresh-process headless restore/save cycles with identical
+boot ID and compositor PID; windowed and host-reboot acceptance are tracked in
+docs/venus-checkpoint-progress-2026-10-26.md. Do not generalize that evidence to
+every Vulkan workload or host. Recipe compaction, arbitrary images, ambiguous
+buffer ownership, actual aliasing/exposed addresses and held future work remain
+explicit limitations. Never remove a refusal without representing its state.
+
+Nautilus also retains unused dedicated canonical shared images. The shared-image
+payload codec retains v1 for released pixels and adds v2 exclusively for Initial:
+96 bytes, no pixels, no external release. Initial capture requires a live dedicated
+exporter and dedicated matching live importers, all at UNDEFINED/Initial. Both
+binding allocation generations and the dedicated image generation captured at
+allocation time must match; a recycled guest image id is insufficient. Earlier
+buffer bindings are excluded by dedication. Missing metadata, unknown ownership,
+a destroyed exporter, nonmatching aliases or tracking errors still refuse.
+Restore validates native geometry/binding but submits no image upload for Initial.
+Cold adoption retains explicit Initial ownership, validates it against the rebuilt
+graph before starting workers, and blocks prepare/read/share/claim scanout until
+accepted guest image work replaces it. Never invent a release or zero its bytes.
+Bounded refusal diagnostics remain useful for unsupported live graphs. Native
+separate-process tests cover Initial save/restore/resave, all scanout guards,
+and subsequent guest initialization followed by actual green-pixel readback.
+Real desktop acceptance and current limitations are in the progress record.
+
 `TransportState::save`/`load` carry everything the transport owns — features,
 status, queue geometry, the ISR, `config_generation`, the MSI-X table. What it
 cannot see is inside your device:
@@ -1257,6 +1694,28 @@ when a resumed guest misbehaves: on **KVM** the 8259s, IOAPIC and 8254 are in
 the kernel, and the snapshot carries them through `vmm_core::hv::HostIrqChip`.
 A restore that skipped them comes back with every IOAPIC pin masked — and MSI-X
 devices keep working, so the VM looks half-alive.
+
+The hardware cursor is an independent display plane, not a live-resource link.
+GpuDevice retains exactly the bounded BGRA image accepted by set_cursor plus
+hotspot and raw signed-coordinate bits, updates it only after sink success,
+and clears it on hide/reset. GpuState v3 carries this plane; v2 reads with no
+cursor and upgrades on save. Validate width/height, exact pixel count and full
+framing before allocation. A cursor's old 2D/3D resource may already be freed,
+or its guest backing overwritten: never rebuild the cursor from that resource.
+The split-virtqueue/display test frees the source, overwrites its backing, destroys
+the device, restores into a fresh transport/display, checks actual composite
+pixels and MOVE without a new UPDATE, then hide and another save.
+
+User-mode networking also owes small lifecycle state. NetDevice supplies its MAC
+to NetBackend before any guest frame, so an idle restored DHCP client can receive
+an inbound SYN immediately. Usernet persists learned MAC and next unused inbound
+source port in ENTGLNET v1 (24 bytes); host flows/sockets are not carried. Validate
+all framing and reserved fields before mutation; restore ports only into a fresh
+NAT that has accepted no inbound traffic. Empty old payloads retain the configured
+MAC. Fresh routed NATs seed smoltcp and the starting source port independently;
+restored allocators continue instead of reusing a tuple still remembered by the
+guest TCP stack. A real host-socket regression checks SYN delivery before any
+DHCP/ARP/TX; repeated Windows Ubuntu resumes answered first SSH in one second.
 
 ## Publishing the renderer (ADR-0004, 2026-09-16)
 

@@ -264,6 +264,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             // it draws nothing a GPU would help with, and it must not need a
             // host Vulkan device to install onto a disk.
             venus: false,
+            venus_checkpoints: false,
             refresh_hz: control_api::DEFAULT_REFRESH_HZ,
             frame_stats: None,
             host_visible_mib: None,

@@ -118,6 +118,8 @@ use super::modifier::CanonicalImage;
 use super::objects::Kind;
 use super::policy;
 
+pub mod checkpoint;
+
 /// How long one scanout read waits for the GPU: 100 ms, six frames at
 /// 60 Hz. The copy of a 1080p frame takes a fraction of a millisecond on a
 /// real GPU; a wait this long is a GPU in trouble, and the device's queue
@@ -199,6 +201,8 @@ struct Target<H: HostVulkan> {
     /// The handle it was imported from, by identity, not held open: the
     /// import references the payload itself.
     shared: SharedRef,
+    /// An import keeps the payload's GPU budget charged even if its blob dies.
+    _charge: Option<Arc<crate::venus::shmem::Charge>>,
     image_key: CanonicalImage,
     spec: crate::renderer::ScanoutBlobSpec,
     memory: Option<H::Memory>,
@@ -249,6 +253,8 @@ pub struct ScanoutDevice<H: HostVulkan> {
     cb: u64,
     fence: u64,
     import_alignment: u64,
+    /// Native coherent host-memory types: staging uses plain CPU reads/writes.
+    coherent_types: u32,
     /// A submission the last read gave up waiting for.
     in_flight: bool,
     /// Least recently read first.
@@ -312,6 +318,7 @@ impl<H: HostVulkan> ScanoutDevice<H> {
             cb: 0,
             fence: 0,
             import_alignment: 4096,
+            coherent_types: 0,
             in_flight: false,
             targets: Vec::new(),
         };
@@ -357,6 +364,16 @@ impl<H: HostVulkan> ScanoutDevice<H> {
             .ok_or("the host GPU has no queue family that can copy")?;
         self.family = family;
         self.import_alignment = guest.import_alignment.max(4096);
+        self.coherent_types = guest
+            .host_memory
+            .memory_types
+            .iter()
+            .enumerate()
+            .take(guest.host_memory.memory_type_count as usize)
+            .filter(|(_, ty)| ty.property_flags & 6 == 6)
+            .fold(0, |bits, (index, _)| {
+                bits | 1u32.checked_shl(index as u32).unwrap_or(0)
+            });
         let request = DeviceRequest {
             queues: vec![QueueRequest {
                 flags: 0,
@@ -562,6 +579,7 @@ impl<H: HostVulkan> ScanoutDevice<H> {
         let mut made = Target::<H> {
             resource_id: target.resource_id,
             shared: SharedRef::of(&target.handle),
+            _charge: export.charge.clone(),
             image_key: target.image.clone(),
             spec: target.spec,
             memory: None,
@@ -645,7 +663,7 @@ impl<H: HostVulkan> ScanoutDevice<H> {
             p_next: Vec::new(),
             flags: 0,
             size: bytes,
-            usage: BUFFER_USAGE_TRANSFER_DST,
+            usage: BUFFER_USAGE_TRANSFER_DST | 0x1,
             sharing_mode: 0,
             queue_family_index_count: 0,
             p_queue_family_indices: None,
@@ -669,7 +687,8 @@ impl<H: HostVulkan> ScanoutDevice<H> {
         let types = host
             .host_pointer_types(device, pages.import_pages())
             .map_err(|r| refused(format!("vkGetMemoryHostPointerPropertiesEXT ({r})")))?
-            & req.memory_type_bits;
+            & req.memory_type_bits
+            & self.coherent_types;
         if types == 0 {
             return Err(refused(
                 "no memory type takes our pages for the staging buffer",
@@ -733,6 +752,18 @@ impl<H: HostVulkan> ScanoutDevice<H> {
         release: ScanoutRelease,
         rect: Rect,
     ) -> Result<CopiedRect, ScanoutError> {
+        self.copy_with_transition(target, release.layout, release, rect)
+    }
+
+    // Checkpoints must preserve both layouts of an outstanding ownership
+    // transfer; an ordinary scanout release has identical old/new layouts.
+    fn copy_with_transition(
+        &mut self,
+        target: &ScanoutTarget,
+        old_layout: i32,
+        release: ScanoutRelease,
+        rect: Rect,
+    ) -> Result<CopiedRect, ScanoutError> {
         use policy::{QUEUE_FAMILY_EXTERNAL, QUEUE_FAMILY_FOREIGN};
         let copy = copy_layout(release.layout).ok_or_else(|| {
             refused(format!(
@@ -764,8 +795,6 @@ impl<H: HostVulkan> ScanoutDevice<H> {
         let (Some(image), Some(buffer), Some(pages)) = (t.image, t.buffer, t.pages.clone()) else {
             return Err(refused("an incomplete import"));
         };
-        let device = self.device.as_ref().ok_or_else(|| refused("no device"))?;
-        let queue = self.queue.ok_or_else(|| refused("no queue"))?;
         let (cb, fence, family) = (self.cb, self.fence, self.family);
         let range = VkImageSubresourceRange {
             aspect_mask: ASPECT_COLOR,
@@ -791,13 +820,13 @@ impl<H: HostVulkan> ScanoutDevice<H> {
         let acquire = barrier(
             (STAGE_TOP_OF_PIPE, 0),
             (STAGE_TRANSFER, ACCESS_TRANSFER_READ),
-            (release.layout, copy),
+            (old_layout, release.layout),
             (release.family, family),
         );
         let give_back = barrier(
             (STAGE_TRANSFER, 0),
             (STAGE_BOTTOM_OF_PIPE, 0),
-            (copy, release.layout),
+            (old_layout, release.layout),
             (family, release.family),
         );
         let visible = VkBufferMemoryBarrier {
@@ -810,7 +839,7 @@ impl<H: HostVulkan> ScanoutDevice<H> {
             offset: 0,
             size: u64::MAX,
         };
-        let commands = vec![
+        let mut commands = vec![
             Command::ResetFences(ResetFencesArgs {
                 device: VkDevice(0),
                 fence_count: 1,
@@ -888,6 +917,41 @@ impl<H: HostVulkan> ScanoutDevice<H> {
                 ret: VK_ERROR_UNKNOWN,
             }),
         ];
+        {
+            let local = |layouts, before, after| {
+                Command::CmdPipelineBarrier(CmdPipelineBarrierArgs {
+                    command_buffer: VkCommandBuffer(cb),
+                    src_stage_mask: STAGE_TRANSFER,
+                    dst_stage_mask: STAGE_TRANSFER,
+                    image_memory_barrier_count: 1,
+                    p_image_memory_barriers: Some(vec![barrier(
+                        (STAGE_TRANSFER, before),
+                        (STAGE_TRANSFER, after),
+                        layouts,
+                        (u32::MAX, u32::MAX),
+                    )]),
+                    ..Default::default()
+                })
+            };
+            // Reverse the private readback before recreating the exact saved
+            // release. Both the acquire and release use the pending old/new pair.
+            if copy != old_layout {
+                commands.insert(5, local((copy, old_layout), ACCESS_TRANSFER_READ, 0));
+            }
+            if copy != release.layout {
+                commands.insert(4, local((release.layout, copy), 0, ACCESS_TRANSFER_READ));
+            }
+        }
+        self.submit_copy_commands(commands)?;
+        Ok(CopiedRect { pages, row, rows })
+    }
+
+    /// Record and submit private copies. The target objects are already retained
+    /// in `targets`, including when a bounded wait times out.
+    fn submit_copy_commands(&mut self, commands: Vec<Command<'_>>) -> Result<(), ScanoutError> {
+        let device = self.device.as_ref().ok_or_else(|| refused("no device"))?;
+        let queue = self.queue.ok_or_else(|| refused("no queue"))?;
+        let (cb, fence) = (self.cb, self.fence);
         for mut command in commands {
             let name = command.name();
             self.host
@@ -940,7 +1004,7 @@ impl<H: HostVulkan> ScanoutDevice<H> {
                 )));
             }
         }
-        Ok(CopiedRect { pages, row, rows })
+        Ok(())
     }
 }
 

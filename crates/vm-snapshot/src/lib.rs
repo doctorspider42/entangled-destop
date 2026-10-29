@@ -41,7 +41,8 @@ pub mod vm;
 
 pub use error::{Result, SnapshotError};
 pub use format::{
-    Arch, HostKind, SectionEntry, SectionKind, SnapshotReader, SnapshotWriter, MAGIC, VERSION,
+    Arch, HostKind, SectionEntry, SectionKind, SnapshotReader, SnapshotWriter,
+    VerifiedSectionReader, MAGIC, VERSION,
 };
 pub use memory::{Codec, MemoryStats, SaveOptions, Unreported};
 pub use meta::{DeviceSlot, FileFingerprint, FileRole, MachineShape, Metadata};

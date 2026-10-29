@@ -66,6 +66,8 @@ use crate::protocol::{
 };
 use crate::renderer::ScanoutBlobSpec;
 
+pub mod checkpoint;
+
 /// Granularity of everything in the host-visible window. Blob sizes and map
 /// offsets are multiples of this, because the guest maps the window with its
 /// own page tables and x86-64 Linux' page is 4 KiB.
@@ -503,6 +505,11 @@ impl BlobTable {
 
     pub fn get(&self, id: u32) -> Option<&BlobResource> {
         self.resources.get(&id)
+    }
+
+    /// Live logical resources; native allocations belong to the renderer.
+    pub fn iter(&self) -> impl Iterator<Item = &BlobResource> {
+        self.resources.values()
     }
 
     /// Validates the *shape* of a create request without touching the table —

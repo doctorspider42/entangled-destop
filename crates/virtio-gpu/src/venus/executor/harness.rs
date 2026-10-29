@@ -43,7 +43,9 @@ const TAIL: u64 = 4;
 const STATUS: u64 = 8;
 const BUFFER_OFFSET: u64 = 0x100;
 const RING_BUFFER: u64 = 0x1_0000;
-const RING_BYTES: u64 = BUFFER_OFFSET + RING_BUFFER + 0x100;
+// Match the virtio front end's whole-page blob contract even though this
+// harness creates its blobs directly through the renderer seam.
+const RING_BYTES: u64 = (BUFFER_OFFSET + RING_BUFFER + 0x100).next_multiple_of(4096);
 
 /// What a submission came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,7 +360,11 @@ impl<H: HostVulkan> Harness<H> {
     /// [`Self::new`] behind the VM's pause gate `quiesce` (ADR-0005), as
     /// the device hands it over at activation, before any ring exists.
     pub fn gated(host: Arc<H>, quiesce: Arc<virtio_core::Quiesce>) -> Self {
-        Self::build_with(ExecutorFactory::new(host), None, Some(quiesce))
+        Self::gated_factory(ExecutorFactory::new(host), quiesce)
+    }
+
+    pub fn gated_factory(factory: ExecutorFactory<H>, quiesce: Arc<virtio_core::Quiesce>) -> Self {
+        Self::build_with(factory, None, Some(quiesce))
     }
 
     fn build(factory: ExecutorFactory<H>, monitor_us: Option<u32>) -> Self {

@@ -1030,6 +1030,16 @@ impl FakeVulkan {
         let stuck = self.stuck.load(Ordering::SeqCst);
         let lost_ret = VK_ERROR_DEVICE_LOST;
         match command {
+            Command::GetEventStatus(a) => {
+                if lost {
+                    return lost_ret;
+                }
+                if self.event_set(a.event.0) {
+                    VK_EVENT_SET
+                } else {
+                    VK_EVENT_RESET
+                }
+            }
             Command::QueueSubmit(a) => {
                 if lost {
                     return lost_ret;

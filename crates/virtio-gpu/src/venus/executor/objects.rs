@@ -382,6 +382,8 @@ pub struct Doomed<H: HostVulkan> {
 
 /// The host object a [`Doomed`] entry destroys.
 pub enum DoomedObject<H: HostVulkan> {
+    /// Private checkpoint resources still used by their GPU transfer.
+    Checkpoint(Box<super::checkpoint_buffers::CheckpointScratch<H>>),
     /// Any of the stage-5b.2 kinds, by raw handle.
     Raw(RawObject),
     /// A `VkImage`.
@@ -402,6 +404,7 @@ impl<H: HostVulkan> DoomedObject<H> {
     /// Destroy it on the host, now.
     pub fn destroy(self, host: &H, device: &H::Device) {
         match self {
+            Self::Checkpoint(scratch) => scratch.destroy(host, device),
             Self::Raw(raw) => host.destroy_object(device, raw.kind, raw.host),
             Self::Image(image) => host.destroy_image(device, image),
             Self::Buffer(buffer) => host.destroy_buffer(device, buffer),
@@ -446,6 +449,16 @@ pub enum DedicatedTo {
 
 /// A `VkDeviceMemory`.
 pub struct MemoryObject<H: HostVulkan> {
+    /// A private reconstruction stand-in for an already retired import. It
+    /// must be freed by the recipe history before reconstruction may succeed.
+    pub checkpoint_placeholder: bool,
+    /// Allocation ordinal within this context's reconstruction command history.
+    pub allocation_serial: u64,
+    /// In checkpoint-enabled contexts, keep shared payload identity while an
+    /// allocation imports it, including after its original blob/exporter dies.
+    pub shared_handle: Option<crate::venus::renderer::SharedHandle>,
+    /// Allocation generation, retained by bindings after the guest frees it.
+    pub identity: Arc<()>,
     /// Its device's guest id.
     pub device: u64,
     /// The host memory.
@@ -480,6 +493,8 @@ pub struct MemoryObject<H: HostVulkan> {
     pub exported: bool,
     /// The dedicated resource, if the allocation named one.
     pub dedicated: Option<DedicatedTo>,
+    /// The resource generation named at allocation time, never a recycled id.
+    pub dedicated_identity: Option<Arc<()>>,
     /// `VkMemoryAllocateFlagsInfo::flags`, 0 without one.
     pub allocate_flags: u32,
     /// Whether it is exportable device-local memory or an import of such
@@ -538,8 +553,47 @@ pub struct Binding {
     pub offset: u64,
 }
 
+/// Compact, bounded sharing metadata for private checkpoint copies. Families
+/// outside this mask remain supported at runtime, but refuse checkpointing.
+#[derive(Debug, Clone, Copy)]
+pub enum Sharing {
+    Exclusive,
+    Concurrent(u64),
+    Unsupported,
+}
+impl Sharing {
+    pub fn new(mode: crate::venus::protocol::VkSharingMode, families: &[u32]) -> Self {
+        match mode {
+            0 => Self::Exclusive,
+            1 => {
+                let mut mask = 0;
+                for family in families {
+                    let Some(bit) = 1_u64.checked_shl(*family) else {
+                        return Self::Unsupported;
+                    };
+                    mask |= bit;
+                }
+                Self::Concurrent(mask)
+            }
+            _ => Self::Unsupported,
+        }
+    }
+    pub fn allows(self, family: u32) -> bool {
+        match self {
+            Self::Exclusive => true,
+            Self::Concurrent(mask) => 1_u64.checked_shl(family).is_some_and(|bit| mask & bit != 0),
+            Self::Unsupported => false,
+        }
+    }
+}
+
 /// A `VkBuffer`.
 pub struct BufferObject<H: HostVulkan> {
+    /// Executed direct accesses, for checkpoint copies across queue families.
+    pub checkpoint_owner: Option<(u32, bool)>,
+    pub sharing: Sharing,
+    /// A resource generation: guest ids and native handles can both be reused.
+    pub identity: Arc<()>,
     /// Its device's guest id.
     pub device: u64,
     /// The host buffer.
@@ -564,6 +618,8 @@ pub struct BufferObject<H: HostVulkan> {
     pub handle: bool,
     /// Its binding, once bound. A buffer is bound at most once.
     pub bound: Option<Binding>,
+    /// The allocation generation actually bound to the native buffer.
+    pub bound_identity: Option<Arc<()>>,
 }
 
 /// What the executor keeps of a `VkImageCreateInfo`: every field a later
@@ -598,6 +654,12 @@ pub struct ImageFacts {
 
 /// A `VkImage`.
 pub struct ImageObject<H: HostVulkan> {
+    pub sharing: Sharing,
+    /// Every successful plane binding, including non-canonical images.
+    pub bindings: Vec<Binding>,
+    /// Allocation generations in the same order as `bindings`.
+    pub binding_identities: Vec<Arc<()>>,
+    pub identity: Arc<()>,
     /// Its device's guest id.
     pub device: u64,
     /// The host image.
@@ -766,15 +828,53 @@ pub enum Facts {
 /// the host has been asked to leave it, in the order the host saw it — a
 /// host `vkSetEvent`/`vkResetEvent`, or the last set or reset of a submit
 /// that reached the driver.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventState {
+    /// `VK_EVENT_CREATE_DEVICE_ONLY_BIT`: host set/reset/status calls are
+    /// forbidden; reconstruction must drive this event through a GPU command.
+    pub device_only: bool,
     /// Set, as far as the driver has been told: a GPU wait on it will pass.
     pub set: bool,
     /// Work that reached the driver waits on it having been set before the
     /// submit (a wait on a set from outside its command buffer), and may
     /// still be running: a reset of it waits for that work first.
     pub waiters: bool,
+    /// Preserve whether the host or GPU signalled it, including the exact
+    /// synchronization2 dependency a future vkCmdWaitEvents2 must match.
+    pub signal: Option<EventSignal>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventSignal {
+    Host,
+    Device {
+        recipe: Arc<EventSignalRecipe>,
+        family: u32,
+    },
+}
+
+#[derive(Debug)]
+pub struct EventSignalRecipe {
+    pub bytes: Vec<u8>,
+    pub resources: Vec<EventSignalResource>,
+    /// An event may outlive the command buffer which signalled it, so the
+    /// retained command must keep its own charge after that buffer is freed.
+    pub _charge: Charge,
+}
+
+#[derive(Debug)]
+pub struct EventSignalResource {
+    pub kind: Kind,
+    pub id: u64,
+    pub identity: Arc<()>,
+}
+
+impl PartialEq for EventSignalRecipe {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+impl Eq for EventSignalRecipe {}
 
 /// What the executor knows of a semaphore (stage 5b.3).
 ///
@@ -1073,6 +1173,71 @@ impl<H: HostVulkan> Default for Objects<H> {
 }
 
 impl<H: HostVulkan> Objects<H> {
+    pub(super) fn checkpoint_memories(&self) -> impl Iterator<Item = (u64, &MemoryObject<H>)> {
+        self.memories.iter().map(|(id, memory)| (*id, memory))
+    }
+    pub(super) fn checkpoint_buffers(&self) -> impl Iterator<Item = (u64, &BufferObject<H>)> {
+        self.buffers.iter().map(|(id, buffer)| (*id, buffer))
+    }
+
+    pub(super) fn checkpoint_images(&self) -> impl Iterator<Item = (u64, &ImageObject<H>)> {
+        self.images.iter().map(|(id, image)| (*id, image))
+    }
+
+    pub(super) fn checkpoint_image(&self, id: u64) -> Option<&ImageObject<H>> {
+        self.images.get(&id)
+    }
+
+    pub(super) fn retain_checkpoint_scratch(
+        &mut self,
+        device: u64,
+        scratch: super::checkpoint_buffers::CheckpointScratch<H>,
+    ) {
+        let after = self
+            .queues
+            .iter()
+            .filter(|(_, queue)| queue.device == device)
+            .map(|(id, queue)| (*id, queue.clock.submitted))
+            .collect();
+        self.doom(
+            device,
+            after,
+            DoomedObject::Checkpoint(Box::new(scratch)),
+            Held(None),
+        );
+    }
+    pub(super) fn checkpoint_device_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<_> = self.devices.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    pub(super) fn checkpoint_sync_objects(&self) -> Vec<(u64, RawObject)> {
+        let mut objects: Vec<_> = self
+            .raw
+            .iter()
+            .filter(|(_, object)| {
+                matches!(object.kind, Kind::Fence | Kind::Event | Kind::Semaphore)
+            })
+            .map(|(id, object)| (*id, object.clone()))
+            .collect();
+        objects.sort_unstable_by_key(|(id, _)| *id);
+        objects
+    }
+
+    /// A checkpoint's private command pool stays alive with its queued work,
+    /// including when a bounded wait expires. The queue owns its completion
+    /// fence through its normal clock; teardown/graveyard preserve both.
+    pub(super) fn retain_checkpoint_pool(&mut self, device: u64, queue: u64, pool: H::CommandPool) {
+        let serial = self.queues.get(&queue).map_or(0, |q| q.clock.submitted);
+        self.doom(
+            device,
+            vec![(queue, serial)],
+            DoomedObject::Pool(pool),
+            Held(None),
+        );
+    }
+
     /// An empty table charging `limits`.
     #[must_use]
     pub fn with_limits(limits: ContextLimits) -> Self {
@@ -1740,6 +1905,17 @@ impl<H: HostVulkan> Objects<H> {
     /// As [`Self::image`], for memory.
     pub fn memory(&self, device: u64, id: u64) -> Result<&MemoryObject<H>, IdError> {
         child_in(&self.memories, &self.kinds, Kind::DeviceMemory, device, id)
+    }
+
+    /// Object-owned host-visible pages, addressed by the guest's memory id.
+    /// Exported pages surviving their memory object are owned by the renderer's
+    /// blob table and must be checkpointed there as well.
+    pub(super) fn checkpoint_pages(
+        &self,
+    ) -> impl Iterator<Item = (u64, &crate::venus::shmem::RingPages)> {
+        self.memories
+            .iter()
+            .filter_map(|(id, memory)| memory.pages.as_deref().map(|pages| (*id, pages)))
     }
 
     /// The memory `id` names, whatever its device: how a blob finds the

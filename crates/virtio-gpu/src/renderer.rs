@@ -40,6 +40,8 @@ use crate::protocol::{Box3d, MemEntry, Rect, ResourceCreate3d, ResourceCreateBlo
 /// in the guest costs one; GNOME plus a busy desktop is a few dozen.
 pub const MAX_CONTEXTS: usize = 128;
 
+pub mod checkpoint;
+
 /// Most live 3D resources across all contexts. mesa allocates one per
 /// buffer/texture; a composited desktop holds thousands, not tens of
 /// thousands.
@@ -151,6 +153,14 @@ impl Resource3dDesc {
 /// call (host GL errors, renderer-side limits), which the device answers in
 /// band.
 pub trait Renderer3d: Send {
+    /// Optional streaming checkpoint implementation. Keeping the default a
+    /// refusal prevents legacy renderers from silently losing native state.
+    fn checkpoint(&mut self, _: checkpoint::CheckpointRequest<'_>) -> Result<(), CommandError> {
+        Err(CommandError::Renderer(
+            "this renderer cannot stream accelerated checkpoints".into(),
+        ))
+    }
+
     /// The capability sets this renderer serves, in `capset_index` order.
     fn capsets(&self) -> &[CapsetInfo];
 

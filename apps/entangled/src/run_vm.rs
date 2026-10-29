@@ -78,6 +78,8 @@ const VENUS_CAPTURE_ENV: &str = "ENTANGLED_VENUS_CAPTURE";
 /// before the guest boots if the host has no Vulkan loader or no device the
 /// executor would expose.
 const VENUS_ENV: &str = "ENTANGLED_VENUS";
+/// Developer-only opt-in while native checkpoint coverage is incomplete.
+const VENUS_CHECKPOINT_ENV: &str = "ENTANGLED_VENUS_CHECKPOINT";
 
 /// Why the Venus executor was attached, for its log line and its errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,6 +629,18 @@ fn build_devices(
         let renderer = virtio_gpu::VenusRenderer::new(sinks)
             .with_host_visible_bytes(venus_host_visible_bytes(&cfg.display));
         let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
+        let checkpoint_override = std::env::var(VENUS_CHECKPOINT_ENV).as_deref() == Ok("1");
+        if cfg.display.venus_checkpoints || checkpoint_override {
+            gpu.enable_accelerated_checkpoints(64 << 20)
+                .map_err(|error| {
+                    format!("cannot enable experimental Venus checkpoints: {error}")
+                })?;
+            tracing::info!(
+                profile = cfg.display.venus_checkpoints,
+                developer_override = checkpoint_override,
+                "experimental Venus disk checkpoints enabled before guest context creation"
+            );
+        }
         gpu.set_refresh_hz(cfg.display.refresh_hz);
         gpu.set_frame_stats(cfg.display.frame_stats.clone());
         devices.push(Box::new(gpu));
@@ -1998,6 +2012,15 @@ mod host_api {
     }
 
     impl vmm_core::MachineLifecycle for VmMachine {
+        fn prepare_save(&self) -> Result<(), String> {
+            if !self.quiesce.is_paused() || !self.quiesce.wait_until_idle(QUIESCE_SETTLE) {
+                return Err("device workers did not reach the snapshot pause gate".into());
+            }
+            self.bus
+                .prepare_snapshot()
+                .map_err(|error| error.to_string())
+        }
+
         /// Everything that touches guest memory without a vCPU behind it stops:
         /// the queue workers and virtio-net's receive thread through the gate,
         /// the 8254's timer thread and the ACPI PM timer through the bus.
@@ -2128,7 +2151,29 @@ mod host_api {
                 ),
                 None => None,
             };
-            let report = vm_snapshot::vm::save(
+            let gpu_slots = self
+                .bus
+                .gpu_checkpoint_slots()
+                .map_err(|error| error.to_string())?;
+            struct GpuSave<'a> {
+                bus: &'a MachineBus,
+                slots: Vec<u32>,
+            }
+            impl vm_snapshot::vm::GpuSave for GpuSave<'_> {
+                fn slots(&self) -> &[u32] {
+                    &self.slots
+                }
+                fn save(
+                    &mut self,
+                    slot: u32,
+                    out: &mut dyn std::io::Write,
+                ) -> vm_snapshot::Result<()> {
+                    self.bus
+                        .save_streamed_state(slot, out)
+                        .map_err(|error| vm_snapshot::SnapshotError::Gpu(error.to_string()))
+                }
+            }
+            let report = vm_snapshot::vm::save_with_gpu(
                 path,
                 self.mem.as_ref(),
                 vm_snapshot::vm::SaveRequest {
@@ -2139,6 +2184,10 @@ mod host_api {
                     clock,
                     host_irqchip,
                     machine: &machine,
+                },
+                &mut GpuSave {
+                    bus: &self.bus,
+                    slots: gpu_slots,
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -2205,12 +2254,23 @@ mod host_api {
     ) -> Result<Vec<X86CpuState>, String> {
         let devices = bus_device_slots(bus);
         let shape = crate::snapshot::shape(cfg, devices);
-        let restored = vm_snapshot::vm::restore(path, mem, &shape).map_err(|e| e.to_string())?;
+        let gpu_slots = bus
+            .gpu_checkpoint_slots()
+            .map_err(|error| error.to_string())?;
+        let mut restored = vm_snapshot::vm::restore_with_gpu(path, mem, &shape, &gpu_slots)
+            .map_err(|e| e.to_string())?;
         for note in &restored.notes {
             tracing::warn!("{note}");
         }
         bus.load_state(&restored.machine)
             .map_err(|e| format!("cannot restore the machine's devices: {e}"))?;
+        if let Some(archives) = &mut restored.gpu {
+            for slot in gpu_slots {
+                let mut section = archives.section(slot).map_err(|error| error.to_string())?;
+                bus.load_streamed_state(slot, &mut section)
+                    .map_err(|error| format!("cannot restore accelerated GPU state: {error}"))?;
+            }
+        }
         // The hypervisor's own chips go back *after* the devices, so a
         // redirection entry that is about to become live points at a device
         // that is already there.
@@ -2360,6 +2420,9 @@ mod host {
         // The VM's pause gate (ADR-0005), created before the devices so every
         // worker thread that is about to be spawned can be handed it.
         let quiesce = virtio_core::Quiesce::new();
+        if restore.is_some() {
+            quiesce.pause();
+        }
         let hv = Hypervisor::open().map_err(|e| e.to_string())?;
         let mut vm = Vm::new(&hv, machine).map_err(|e| e.to_string())?;
 
@@ -2484,6 +2547,9 @@ mod host {
         // restore re-activates every virtio slot, and a device that started a
         // worker without the gate would be one a pause could not stop.
         bus.set_quiesce(Arc::clone(&quiesce));
+        if restore.is_some() {
+            bus.set_paused(true);
+        }
 
         let clock = vm.clock();
         let host_irqchip = vm.irqchip();
@@ -2562,6 +2628,10 @@ mod host {
             dirty,
         }));
 
+        if restore.is_some() {
+            bus.set_paused(false);
+            quiesce.resume();
+        }
         let threads = spawn_vcpus_with(vcpus, |_| Box::new(bus.clone()), Some(lifecycle))
             .map_err(|e| e.to_string())?;
         Ok(Started {
@@ -2659,6 +2729,9 @@ mod host {
             restore,
         } = request;
         let quiesce = virtio_core::Quiesce::new();
+        if restore.is_some() {
+            quiesce.pause();
+        }
         let hv = WhpHypervisor::open().map_err(|e| e.to_string())?;
         // Everything a real guest needs: local APIC emulation (interrupt
         // delivery, the `hlt` idle wait) and this machine's CPUID policy. One
@@ -2775,6 +2848,9 @@ mod host {
         };
         // Before anything can activate a device; see the KVM path.
         bus.set_quiesce(Arc::clone(&quiesce));
+        if restore.is_some() {
+            bus.set_paused(true);
+        }
 
         let (entry, vcpus) = match restore {
             None => {
@@ -2827,6 +2903,10 @@ mod host {
             dirty,
         }));
 
+        if restore.is_some() {
+            bus.set_paused(false);
+            quiesce.resume();
+        }
         let threads = spawn_vcpus_with(vcpus, |_| Box::new(bus.clone()), Some(lifecycle))
             .map_err(|e| e.to_string())?;
         Ok(Started {

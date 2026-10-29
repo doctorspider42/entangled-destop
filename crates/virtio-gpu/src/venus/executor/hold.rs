@@ -101,7 +101,7 @@ use super::context::{invalid, ExecError, VulkanContext};
 use super::generated;
 use super::host::HostVulkan;
 use super::limits::Class;
-use super::objects::{EventState, Facts, Kind, SemaphoreState};
+use super::objects::{EventSignal, EventState, Facts, Kind, SemaphoreState};
 
 /// How long a ring worker sleeps, with the context lock released, before it
 /// asks again about a wait whose answer is behind held work.
@@ -222,7 +222,7 @@ pub enum EventOp {
 }
 
 /// What one command buffer does to one event, summed over its recording.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventUse {
     /// It waits on the event before setting it itself: the event must be
     /// set when the command buffer runs, by something outside it.
@@ -231,6 +231,7 @@ pub struct EventUse {
     pub resets: bool,
     /// The event's state after it: set, reset, or untouched.
     pub exit: Option<bool>,
+    pub signal: Option<EventSignal>,
 }
 
 impl EventUse {
@@ -241,10 +242,16 @@ impl EventUse {
     /// only a host `vkSetEvent` racing the GPU could release it.
     pub fn record(&mut self, op: EventOp) -> Result<(), &'static str> {
         match op {
-            EventOp::Set => self.exit = Some(true),
+            EventOp::Set => {
+                if self.exit != Some(true) {
+                    self.exit = Some(true);
+                    self.signal = None;
+                }
+            }
             EventOp::Reset => {
                 self.resets = true;
                 self.exit = Some(false);
+                self.signal = None;
             }
             EventOp::Wait => match self.exit {
                 Some(true) => {}
@@ -264,12 +271,15 @@ impl EventUse {
     ///
     /// # Errors
     /// As [`Self::record`].
-    pub fn then(&mut self, then: EventUse) -> Result<(), &'static str> {
+    pub fn then(&mut self, then: &EventUse) -> Result<(), &'static str> {
         if then.needs_set {
             self.record(EventOp::Wait)?;
         }
         self.resets |= then.resets;
         if then.exit.is_some() {
+            if then.exit != Some(true) || then.resets || self.exit != Some(true) {
+                self.signal = then.signal.clone();
+            }
             self.exit = then.exit;
         }
         Ok(())
@@ -466,8 +476,8 @@ impl<H: HostVulkan> VulkanContext<H> {
     }
 
     fn event_facts(&self, device: u64, id: u64) -> Option<EventState> {
-        match self.objects.raw(Kind::Event, device, id).ok()?.facts {
-            Facts::Event(state) => Some(state),
+        match &self.objects.raw(Kind::Event, device, id).ok()?.facts {
+            Facts::Event(state) => Some(state.clone()),
             _ => None,
         }
     }
@@ -574,7 +584,15 @@ impl<H: HostVulkan> VulkanContext<H> {
     /// A submit of `ops` reached the driver: what it signals is covered from
     /// now on, what it waits on is consumed, what it does to events is the
     /// events' state.
-    fn commit_host(&mut self, device: u64, ops: &SyncOps) {
+    fn commit_host(
+        &mut self,
+        queue: u64,
+        device: u64,
+        ops: &SyncOps,
+        epoch: u64,
+        claimed: &[crate::venus::renderer::SharedRef],
+    ) {
+        let family = self.objects.queue(queue).map_or(0, |q| q.family);
         for batch in ops {
             for (id, _) in &batch.waits {
                 self.update_semaphore(device, *id, |s| {
@@ -584,16 +602,38 @@ impl<H: HostVulkan> VulkanContext<H> {
                 });
             }
             for cb in &batch.cbs {
+                self.buffer_tracking
+                    .submitted(*cb, device, family, &mut self.objects);
+                self.image_tracking.submitted(
+                    *cb,
+                    family,
+                    &self.objects,
+                    epoch,
+                    Some((&self.payloads.ownership, claimed)),
+                );
+                if self.image_tracking.error.is_some() {
+                    self.payloads
+                        .ownership
+                        .invalidate("accepted submit has untracked executed image state");
+                }
                 let uses: Vec<(u64, EventUse)> = self
                     .recordings
                     .events
                     .get(cb)
-                    .map(|u| u.iter().map(|(e, u)| (*e, *u)).collect())
+                    .map(|u| u.iter().map(|(e, u)| (*e, u.clone())).collect())
                     .unwrap_or_default();
                 for (event, used) in uses {
                     self.update_event(device, event, |e| {
                         e.waiters |= used.needs_set;
                         if let Some(exit) = used.exit {
+                            if !exit || !e.set || used.resets {
+                                e.signal = used.signal.map(|signal| match signal {
+                                    EventSignal::Device { recipe, .. } => {
+                                        EventSignal::Device { recipe, family }
+                                    }
+                                    EventSignal::Host => EventSignal::Host,
+                                });
+                            }
                             e.set = exit;
                         }
                     });
@@ -751,6 +791,15 @@ impl<H: HostVulkan> VulkanContext<H> {
         // running when this starts (`super::writes`). The mark follows the
         // submit whatever the driver answers, so the claim always ends.
         let claim = self.claim_payloads(queue, &buffers);
+        let checkpoint_epoch = self.payloads.ownership.reserve_epoch();
+        let checkpoint_claimed = if checkpoint_epoch != 0 {
+            claim
+                .as_ref()
+                .map(|claim| claim.touched.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let passed = self.pass_through(command);
         let submitted = passed.is_ok() && generated::result_of(command) == Some(VK_SUCCESS);
         if submitted {
@@ -766,7 +815,7 @@ impl<H: HostVulkan> VulkanContext<H> {
         }
         passed?;
         if submitted {
-            self.commit_host(device, ops);
+            self.commit_host(queue, device, ops, checkpoint_epoch, &checkpoint_claimed);
         }
         Ok(())
     }
@@ -979,7 +1028,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                 None => {
                     let use_ = current
                         .and_then(|c| c.get(event))
-                        .copied()
+                        .cloned()
                         .unwrap_or_default();
                     planned.push((*event, use_));
                     planned.len() - 1
@@ -1017,14 +1066,14 @@ impl<H: HostVulkan> VulkanContext<H> {
                             .events
                             .get(&primary)
                             .and_then(|c| c.get(event))
-                            .copied()
+                            .cloned()
                             .unwrap_or_default();
                         planned.push((*event, use_));
                         planned.len() - 1
                     }
                 };
                 if let Some((_, use_)) = planned.get_mut(at) {
-                    use_.then(*then).map_err(|what| invalid(command, what))?;
+                    use_.then(then).map_err(|what| invalid(command, what))?;
                 }
             }
         }
@@ -1056,16 +1105,37 @@ impl<H: HostVulkan> VulkanContext<H> {
         event: u64,
         set: bool,
     ) -> Result<(), ExecError> {
+        self.require_host_event(command.name(), device, event)?;
         if !set && self.event_facts(device, event).is_some_and(|e| e.waiters) {
             self.settle(device);
             self.update_event(device, event, |e| e.waiters = false);
         }
         self.pass_through(command)?;
         if generated::result_of(command) == Some(VK_SUCCESS) {
-            self.update_event(device, event, |e| e.set = set);
+            self.update_event(device, event, |e| {
+                if !set || !e.set {
+                    e.signal = set.then_some(EventSignal::Host);
+                }
+                e.set = set;
+            });
             if set {
                 self.release_held()?;
             }
+        }
+        Ok(())
+    }
+
+    pub(super) fn require_host_event(
+        &self,
+        command: &'static str,
+        device: u64,
+        event: u64,
+    ) -> Result<(), ExecError> {
+        if self
+            .event_facts(device, event)
+            .is_some_and(|state| state.device_only)
+        {
+            return Err(invalid(command, "a host operation on a DEVICE_ONLY event"));
         }
         Ok(())
     }
@@ -1088,7 +1158,8 @@ mod tests {
             EventUse {
                 needs_set: true,
                 resets: true,
-                exit: Some(true)
+                exit: Some(true),
+                signal: None
             }
         );
         let mut split = EventUse::default();
@@ -1106,10 +1177,10 @@ mod tests {
         primary.record(EventOp::Set).unwrap();
         let mut secondary = EventUse::default();
         secondary.record(EventOp::Wait).unwrap();
-        primary.then(secondary).unwrap();
+        primary.then(&secondary).unwrap();
         assert!(!primary.needs_set, "the primary set it before");
         let mut reset = EventUse::default();
         reset.record(EventOp::Reset).unwrap();
-        assert!(reset.then(secondary).is_err());
+        assert!(reset.then(&secondary).is_err());
     }
 }

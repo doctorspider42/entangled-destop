@@ -532,6 +532,22 @@ fn the_host_gpu_renders_the_triangle_and_every_pixel_matches_the_reference() {
     assert_eq!(outcome, Outcome::Consumed);
     submit_and_wait(&mut h, &[CB], FENCE);
 
+    let executed_layout = h
+        .renderer
+        .factory()
+        .with_context(h.ctx, |context| {
+            context.checkpoint_image_layouts(IMG).unwrap()
+        })
+        .unwrap();
+    assert_eq!(executed_layout.len(), 1);
+    assert_eq!(
+        executed_layout[0].cell.layout, 6,
+        "the rendered attachment reached TRANSFER_SRC_OPTIMAL"
+    );
+    assert_eq!(
+        executed_layout[0].cell.owner,
+        crate::venus::executor::image_layouts::Owner::Queue(0)
+    );
     let mut got = vec![0u8; bytes as usize];
     readback.pages().read_bytes(0, &mut got).unwrap();
     match raster::verify(&got, raster::CLEAR_6) {

@@ -111,6 +111,9 @@ pub enum SnapshotError {
 
     #[error("cannot restore: {0}")]
     Restore(String),
+
+    #[error("accelerated GPU checkpoint failed: {0}")]
+    Gpu(String),
 }
 
 impl SnapshotError {

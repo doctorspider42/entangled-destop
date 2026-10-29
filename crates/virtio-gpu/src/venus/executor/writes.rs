@@ -208,6 +208,7 @@ pub struct Claimed {
 /// and its scanout device. See the module docs.
 #[derive(Debug, Default)]
 pub struct Payloads {
+    pub(super) ownership: super::checkpoint_ownership::SharedOwnership,
     map: Mutex<HashMap<usize, Payload>>,
     #[cfg(test)]
     on_wait: WaitHook,
@@ -389,6 +390,7 @@ pub struct Recordings {
 pub struct PendingMark {
     queue: u64,
     serial: u64,
+    pub(super) touched: Vec<SharedRef>,
 }
 
 impl<H: HostVulkan> VulkanContext<H> {
@@ -420,6 +422,7 @@ impl<H: HostVulkan> VulkanContext<H> {
     /// touch nothing any more.
     pub(super) fn forget_recordings(&mut self, cbs: &[u64]) {
         for cb in cbs {
+            self.image_tracking.forget_recording(*cb);
             self.recordings.touches.remove(cb);
             self.recordings.events.remove(cb);
         }
@@ -428,6 +431,7 @@ impl<H: HostVulkan> VulkanContext<H> {
     /// Every recording of a command buffer that no longer exists goes (a
     /// pool destroyed, a device gone).
     pub(super) fn prune_recordings(&mut self) {
+        self.image_tracking.prune(&self.objects);
         let objects = &self.objects;
         self.recordings
             .touches
@@ -484,6 +488,9 @@ impl<H: HostVulkan> VulkanContext<H> {
             return None;
         }
         if let Err(why) = self.start_queue_sync(queue) {
+            self.payloads
+                .ownership
+                .invalidate("shared submit could not be ordered for checkpointing");
             if !self.unordered_logged {
                 self.unordered_logged = true;
                 tracing::warn!(
@@ -514,6 +521,9 @@ impl<H: HostVulkan> VulkanContext<H> {
             self.shared_waits.waited += 1;
         }
         if claimed.timed_out {
+            self.payloads
+                .ownership
+                .invalidate("shared submissions overlapped after an ordering timeout");
             self.shared_waits.timed_out += 1;
             tracing::debug!(
                 ctx_id = self.ctx_id,
@@ -521,7 +531,11 @@ impl<H: HostVulkan> VulkanContext<H> {
                  waiting for another process's GPU work on it"
             );
         }
-        Some(PendingMark { queue, serial })
+        Some(PendingMark {
+            queue,
+            serial,
+            touched,
+        })
     }
 
     /// After the submit a [`Self::claim_payloads`] was for (whatever the
@@ -529,7 +543,7 @@ impl<H: HostVulkan> VulkanContext<H> {
     /// the queue's work up to it has finished. A mark the host refuses
     /// completes it at once — the submit then is not ordered after.
     pub(super) fn submit_mark(&mut self, pending: PendingMark) {
-        let PendingMark { queue, serial } = pending;
+        let PendingMark { queue, serial, .. } = pending;
         let Some(fence) = self.mark_fence(queue) else {
             self.complete_unmarked(queue, serial);
             return;
@@ -594,6 +608,9 @@ impl<H: HostVulkan> VulkanContext<H> {
 
     /// Serial `serial` of `queue` will have no mark: nothing waits for it.
     fn complete_unmarked(&self, queue: u64, serial: u64) {
+        self.payloads
+            .ownership
+            .invalidate("shared submit completion mark was unavailable");
         if let Some(sync) = self.objects.queue(queue).ok().and_then(|q| q.sync.as_ref()) {
             sync.progress().complete(serial);
         }

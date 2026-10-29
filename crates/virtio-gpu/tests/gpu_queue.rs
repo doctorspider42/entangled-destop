@@ -1022,6 +1022,69 @@ fn the_cursor_plane_is_composited_moved_and_hidden() {
 }
 
 #[test]
+fn a_cursor_survives_device_reconstruction_after_its_resource_is_freed() {
+    let mut h = Harness::new(16, 16);
+    h.fill_backing(FB_ADDR, 16, 16, BLUE_BGRA);
+    h.setup_scanout(1, 16, 16, FB_ADDR);
+    assert_ok(&h.run(&transfer_to_host(1, rect(0, 0, 16, 16), 0)));
+    assert_ok(&h.run(&resource_flush(1, rect(0, 0, 16, 16))));
+    let cursor_fb = FB_ADDR + 0x4000;
+    assert_ok(&h.run(&create_2d(2, FORMAT_B8G8R8A8_UNORM, 2, 2)));
+    h.fill_backing(cursor_fb, 2, 2, RED_BGRA);
+    assert_ok(&h.run(&attach_backing(2, &[(cursor_fb, 16)])));
+    assert_ok(&h.run(&transfer_to_host(2, rect(0, 0, 2, 2), 0)));
+    h.run_cursor(&cursor_command(cmd::UPDATE_CURSOR, 8, 8, 2, (1, 1)));
+    h.run_cursor(&cursor_command(cmd::MOVE_CURSOR, 0, 0, 0, (0, 0)));
+    assert_ok(&h.run(&resource_unref(2)));
+    h.fill_backing(cursor_fb, 2, 2, GREEN_BGRA);
+    let saved = h.transport.save();
+    let mem = h.mem.clone();
+    drop(h);
+
+    let display = DisplayHandle::detached(16, 16).unwrap();
+    let irq = Arc::new(TestIrqLine::default());
+    let mut transport = MmioTransport::new(
+        0,
+        Box::new(GpuDevice::new(display.clone())),
+        mem.clone(),
+        irq.clone(),
+    )
+    .unwrap();
+    transport.load(&saved).unwrap();
+    let mut h = Harness {
+        mem,
+        control: SplitRing::layout(CONTROL_RING_BASE, RING_SIZE),
+        cursor: SplitRing::layout(CURSOR_RING_BASE, RING_SIZE),
+        transport,
+        irq,
+        display,
+    };
+    assert_eq!(
+        h.screenshot().px(0, 0),
+        RED_RGBA,
+        "retained image and clipped hotspot restored"
+    );
+    assert_eq!(
+        h.screenshot().px(8, 8),
+        BLUE_RGBA,
+        "latest position, not the old UPDATE position"
+    );
+    h.run_cursor(&cursor_command(cmd::MOVE_CURSOR, 8, 8, 0, (0, 0)));
+    assert_eq!(
+        h.screenshot().px(7, 7),
+        RED_RGBA,
+        "MOVE needs no new cursor image after resume"
+    );
+    h.run_cursor(&cursor_command(cmd::UPDATE_CURSOR, 0, 0, 0, (0, 0)));
+    let hidden = h.transport.save();
+    assert!(virtio_gpu::save::GpuState::decode(&hidden.device)
+        .unwrap()
+        .cursor
+        .is_none());
+    assert_eq!(h.screenshot().px(7, 7), BLUE_RGBA);
+}
+
+#[test]
 fn bogus_cursor_commands_are_dropped_without_breaking_the_device() {
     let mut h = Harness::new(16, 16);
     h.fill_backing(FB_ADDR, 16, 16, GREEN_BGRA);

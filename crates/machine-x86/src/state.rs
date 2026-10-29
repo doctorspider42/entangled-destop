@@ -57,6 +57,9 @@ pub enum StateError {
 
     #[error("a device lock is poisoned; {0} was not restored")]
     Poisoned(&'static str),
+
+    #[error("streamed state of virtio slot {slot}: {reason}")]
+    Stream { slot: u32, reason: String },
 }
 
 /// The 16550's register file and whatever the host had typed at it.

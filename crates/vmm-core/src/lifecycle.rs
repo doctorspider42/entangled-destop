@@ -106,7 +106,7 @@ pub enum LifecycleError {
     #[error("machine reset failed: {0}")]
     Reset(String),
 
-    #[error("reading the vCPU state failed: {0}")]
+    #[error("saving the VM state failed: {0}")]
     Save(String),
 
     #[error("the VM is stopping")]
@@ -218,6 +218,15 @@ pub trait MachineLifecycle: Send + Sync {
     /// previous boot. Called on that vCPU's own thread, after
     /// [`ResettableVcpu::reset_arch_state`].
     fn reset_vcpu(&self, index: u32, vcpu: &dyn VcpuRegisters) -> Result<(), String>;
+
+    /// Finish checkpoint preparation after every vCPU and host worker has
+    /// stopped, but before CPU/APIC state is captured. A device may drain
+    /// already completed work and return its responses/interrupts here; doing
+    /// so after CPU capture could save a used-ring update without its IRQ.
+    /// No worker or vCPU may be released, and no new guest request is started.
+    fn prepare_save(&self) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Write the whole machine — guest memory, every device, and the `cpus`
     /// the lifecycle has already collected — to `path` (ADR-0006).
@@ -646,6 +655,7 @@ impl Lifecycle {
     pub fn save(&self, path: &Path) -> Result<String, LifecycleError> {
         let machine = self.machine().ok_or(LifecycleError::NoMachine)?;
         self.pause()?;
+        machine.prepare_save().map_err(LifecycleError::Save)?;
         let cpus = self.capture_cpus()?;
         if cpus.len() as u32 != self.vcpus {
             return Err(LifecycleError::Save(format!(
@@ -1434,6 +1444,71 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, LifecycleError::Save(_)), "{err}");
         assert_eq!(lifecycle.state(), RunState::Paused);
+        stop(&lifecycle, handles);
+    }
+
+    #[test]
+    fn snapshot_preparation_precedes_cpu_capture_and_failure_is_retryable() {
+        struct PreparingMachine {
+            lifecycle: std::sync::Weak<Lifecycle>,
+            capture_fails: Arc<AtomicBool>,
+            preparation_fails: AtomicBool,
+            quiesced: AtomicBool,
+            saves: AtomicU32,
+        }
+        impl MachineLifecycle for PreparingMachine {
+            fn quiesce(&self) {
+                self.quiesced.store(true, Ordering::Release);
+            }
+            fn unquiesce(&self) {
+                self.quiesced.store(false, Ordering::Release);
+            }
+            fn reset_machine(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn reset_vcpu(&self, _: u32, _: &dyn VcpuRegisters) -> Result<(), String> {
+                Ok(())
+            }
+            fn prepare_save(&self) -> Result<(), String> {
+                assert_eq!(self.lifecycle.upgrade().unwrap().state(), RunState::Paused);
+                assert!(self.quiesced.load(Ordering::Acquire));
+                if self.preparation_fails.load(Ordering::Acquire) {
+                    return Err("GPU did not settle".into());
+                }
+                // Fake CPU capture refuses until this hook has run, making
+                // the ordering assertion independent of thread scheduling.
+                self.capture_fails.store(false, Ordering::Release);
+                Ok(())
+            }
+            fn save_machine(&self, cpus: &[X86CpuState], _: &Path) -> Result<String, String> {
+                assert_eq!(cpus.len(), 2);
+                assert!(self.quiesced.load(Ordering::Acquire));
+                assert_eq!(self.lifecycle.upgrade().unwrap().state(), RunState::Paused);
+                self.saves.fetch_add(1, Ordering::AcqRel);
+                Ok("saved".into())
+            }
+        }
+        let lifecycle = Lifecycle::new(2);
+        let capture_fails = Arc::new(AtomicBool::new(true));
+        let machine = Arc::new(PreparingMachine {
+            lifecycle: Arc::downgrade(&lifecycle),
+            capture_fails: capture_fails.clone(),
+            preparation_fails: AtomicBool::new(true),
+            quiesced: AtomicBool::new(false),
+            saves: AtomicU32::new(0),
+        });
+        lifecycle.attach_machine(machine.clone());
+        let (handles, _, _) = spawn_fake_vcpus_with(&lifecycle, 2, capture_fails.clone());
+        let err = lifecycle.save(Path::new("unused.esnap")).unwrap_err();
+        assert!(err.to_string().contains("GPU did not settle"), "{err}");
+        assert!(capture_fails.load(Ordering::Acquire));
+        assert_eq!(machine.saves.load(Ordering::Acquire), 0);
+        assert_eq!(lifecycle.state(), RunState::Paused);
+        machine.preparation_fails.store(false, Ordering::Release);
+        assert_eq!(lifecycle.save(Path::new("unused.esnap")).unwrap(), "saved");
+        assert_eq!(machine.saves.load(Ordering::Acquire), 1);
+        lifecycle.resume().unwrap();
+        assert!(!machine.quiesced.load(Ordering::Acquire));
         stop(&lifecycle, handles);
     }
 }

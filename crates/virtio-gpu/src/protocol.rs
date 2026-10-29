@@ -578,8 +578,9 @@ pub struct UpdateCursor {
     /// `pos.scanout_id`.
     pub scanout_id: u32,
     /// Cursor position on the scanout, in scanout coordinates. Unsigned on the
-    /// wire (`le32`); the hotspot subtraction that can go negative is the
-    /// host's to do, in wider arithmetic.
+    /// wire (`le32`); Linux also carries negative DRM coordinates in their
+    /// two's-complement bits. The display interprets that sign before widening
+    /// and subtracting the hotspot.
     pub x: u32,
     pub y: u32,
     /// The 2D resource holding the cursor image, or 0 to hide the cursor.

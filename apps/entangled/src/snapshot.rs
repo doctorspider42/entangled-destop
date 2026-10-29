@@ -97,6 +97,24 @@ pub fn config_from(metadata: &Metadata) -> Result<VmConfig, String> {
     })
 }
 
+/// A streamed GPU archive requires its renderer and recipe retention from the
+/// first context. Carry that mode in the file, including older experimental
+/// snapshots whose profile predated the persistent opt-in. Ordinary snapshots
+/// must not invent an extra GPU section in the cold-device inventory.
+pub fn config_for_restore(info: &vm_snapshot::SnapshotInfo) -> Result<VmConfig, String> {
+    let mut cfg = config_from(&info.metadata)?;
+    let accelerated = info
+        .sections
+        .iter()
+        .any(|section| section.kind == vm_snapshot::format::SectionKind::Gpu);
+    cfg.display.venus_checkpoints = accelerated;
+    if accelerated {
+        cfg.display
+            .set_gpu_renderer(control_api::GpuRenderer::Venus);
+    }
+    Ok(cfg)
+}
+
 /// Reads a snapshot's header and metadata, refusing early and by name.
 ///
 /// Called before a single byte of a VM is allocated, so `entangled resume` on a
@@ -185,5 +203,33 @@ path = "/does/not/exist/root.raw"
             default_path(Path::new("demo.toml"), "demo"),
             PathBuf::from("demo.esnap")
         );
+    }
+
+    #[test]
+    fn gpu_archives_select_their_restore_mode_without_a_developer_environment() {
+        let mut cfg = profile();
+        cfg.display.venus_checkpoints = true;
+        let mut info = vm_snapshot::SnapshotInfo {
+            metadata: metadata(&cfg, Vec::new()),
+            host: vm_snapshot::format::HostKind::KvmLinux,
+            file_bytes: 0,
+            sections: Vec::new(),
+            restorable_here: true,
+            refusal: None,
+        };
+        assert!(!config_for_restore(&info).unwrap().display.venus_checkpoints);
+        info.sections.push(vm_snapshot::vm::SnapshotSummary {
+            kind: vm_snapshot::format::SectionKind::Gpu,
+            instance: 2,
+            bytes: 64,
+        });
+        let restored = config_for_restore(&info).unwrap();
+        assert!(restored.display.venus_checkpoints);
+        assert_eq!(
+            restored.display.gpu_renderer(),
+            control_api::GpuRenderer::Venus
+        );
+        let saved = metadata(&restored, Vec::new());
+        assert!(config_from(&saved).unwrap().display.venus_checkpoints);
     }
 }

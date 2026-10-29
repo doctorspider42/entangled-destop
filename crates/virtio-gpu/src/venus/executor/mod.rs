@@ -167,11 +167,28 @@
 //! display's copy as [`writes::Owner::Presenter`], until the display drops
 //! the lease.
 
+mod buffer_ownership;
+pub mod checkpoint;
+mod checkpoint_aliases;
+pub mod checkpoint_budgets;
+pub mod checkpoint_buffers;
+pub mod checkpoint_factory;
+pub mod checkpoint_images;
+pub(crate) mod checkpoint_imports;
+mod checkpoint_io;
+pub mod checkpoint_ownership;
+pub mod checkpoint_pages;
+mod checkpoint_queue_copy;
+mod checkpoint_queues;
+pub mod checkpoint_ring;
+pub mod checkpoint_shared;
+pub(crate) mod checkpoint_sync;
 pub mod context;
 pub mod device_objects;
 pub mod generated;
 pub mod hold;
 pub mod host;
+pub(crate) mod image_layouts;
 pub mod limits;
 pub mod memory;
 pub mod modifier;
@@ -980,6 +997,19 @@ impl<H: HostVulkan> RingSink for ExecutingSink<H> {
     fn attach_stop(&mut self, stop: StopSignal) {
         self.stop = stop;
     }
+
+    fn checkpoint_state(&self) -> Result<Vec<u8>, String> {
+        Ok(self.checkpoint_ring().to_vec())
+    }
+
+    fn restore_checkpoint_state(&mut self, bytes: &[u8], seqno: u64) -> Result<(), String> {
+        self.restore_ring_checkpoint(bytes)
+            .map_err(|error| error.to_string())?;
+        if self.virtqueue_seqno.current() != seqno {
+            return Err("ring and sink roundtrip counts differ".into());
+        }
+        Ok(())
+    }
 }
 
 /// Contexts' devices whose GPU work had not finished when the context went
@@ -1111,6 +1141,9 @@ pub struct ExecutorFactory<H: HostVulkan> {
     /// What holding back uncovered submits did, every context together
     /// ([`hold`]).
     hold_stats: Arc<hold::HoldStats>,
+    /// Opt-in global retention budget, installed before creating any context.
+    checkpoint_recipes: Option<Arc<PageBudget>>,
+    checkpoint_seen_contexts: bool,
 }
 
 impl<H: HostVulkan> std::fmt::Debug for ExecutorFactory<H> {
@@ -1154,6 +1187,8 @@ impl<H: HostVulkan> ExecutorFactory<H> {
             presenter_progress: Arc::new(writes::Progress::default()),
             presenter_serial: 0,
             hold_stats: Arc::new(hold::HoldStats::default()),
+            checkpoint_recipes: None,
+            checkpoint_seen_contexts: false,
         }
     }
 
@@ -1289,6 +1324,7 @@ impl<H: HostVulkan> ExecutorFactory<H> {
     }
 
     fn context(&mut self, ctx_id: u32) -> Arc<Mutex<VulkanContext<H>>> {
+        self.checkpoint_seen_contexts = true;
         let host = &self.host;
         let budget = &self.budget;
         let share = self.context_share;
@@ -1297,6 +1333,7 @@ impl<H: HostVulkan> ExecutorFactory<H> {
         let limits = &self.limits;
         let graveyard = &self.graveyard;
         let hold_stats = &self.hold_stats;
+        let checkpoint_recipes = &self.checkpoint_recipes;
         Arc::clone(self.contexts.entry(ctx_id).or_insert_with(|| {
             let mut context = VulkanContext::with_caps(
                 ctx_id,
@@ -1308,12 +1345,22 @@ impl<H: HostVulkan> ExecutorFactory<H> {
             context.payloads = Arc::clone(payloads);
             context.graveyard = Arc::clone(graveyard);
             context.hold_stats = Arc::clone(hold_stats);
+            if let Some(budget) = checkpoint_recipes {
+                context.recipes = Some(checkpoint::RecipeJournal::new(budget));
+            }
             Arc::new(Mutex::new(context))
         }))
     }
 }
 
 impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
+    fn checkpoint(
+        renderer: &mut crate::venus::renderer::VenusRenderer<Self>,
+        request: crate::renderer::checkpoint::CheckpointRequest<'_>,
+    ) -> Result<(), crate::CommandError> {
+        renderer.checkpoint_request(request)
+    }
+
     type Sink = ExecutingSink<H>;
 
     fn sink_for(&mut self, ctx_id: u32, ring: u64) -> io::Result<Self::Sink> {
@@ -1333,6 +1380,26 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
     fn context_created(&mut self, ctx_id: u32) {
         self.graveyard.reap(&self.host);
         let _ = self.context(ctx_id);
+    }
+
+    fn validate_checkpoint_blob(&self, backing: &ExportedMemory, size: u64) -> Result<(), String> {
+        let valid = match backing {
+            ExportedMemory::Pages(pages) => {
+                size != 0
+                    && size <= pages.mapped_len()
+                    && !pages.is_host_private()
+                    && !pages.is_poisoned()
+            }
+            ExportedMemory::Handle(handle) => handle
+                .0
+                .downcast_ref::<memory::HandleExport<H>>()
+                .is_some_and(|export| size != 0 && size <= export.size),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err("checkpoint blob exceeds or mismatches its actual allocation".into())
+        }
     }
 
     fn export_memory(
@@ -1369,9 +1436,13 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
         if let Some(device) = self.scanout.as_mut() {
             device.clear();
         }
+        self.payloads.ownership.reset();
     }
 
     fn prepare_scanout(&mut self, target: &ScanoutTarget) -> Result<(), String> {
+        self.payloads
+            .ownership
+            .require_initialized(&target.handle)?;
         let device = self.scanout_device(target)?;
         match device.prepare(target) {
             Ok(()) => Ok(()),
@@ -1390,6 +1461,9 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
         rect: crate::protocol::Rect,
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
+        self.payloads
+            .ownership
+            .require_initialized(&target.handle)?;
         // The blob's payload claimed for the copy: every guest submission
         // touching it finished first, and none starts until the copy has
         // (`writes`'s module docs).
@@ -1439,6 +1513,9 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
         &mut self,
         target: &ScanoutTarget,
     ) -> Result<crate::shared::SharedScanoutImage, String> {
+        self.payloads
+            .ownership
+            .require_initialized(&target.handle)?;
         let export = target
             .handle
             .0
@@ -1473,6 +1550,9 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
         &mut self,
         target: &ScanoutTarget,
     ) -> Result<Box<dyn FnOnce() + Send>, String> {
+        self.payloads
+            .ownership
+            .require_initialized(&target.handle)?;
         // The claim the readback takes (`read_scanout`), as an owner of its
         // own: the presenter's copy runs on another device and outlives the
         // flush (the lease is dropped once it has run), so a readback of the

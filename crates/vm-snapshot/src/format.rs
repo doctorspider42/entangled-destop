@@ -29,6 +29,9 @@ use sha2::{Digest, Sha256};
 use crate::codec::{Reader, Writer};
 use crate::error::{Result, SnapshotError};
 
+mod verified;
+pub use verified::VerifiedSectionReader;
+
 /// First eight bytes of every snapshot file.
 pub const MAGIC: [u8; 8] = *b"ENTGLSNP";
 
@@ -190,6 +193,9 @@ pub enum SectionKind {
     /// pair, IOAPIC and 8254. Absent on a host whose chips are in userspace,
     /// where they are in the [`SectionKind::IrqChip`] section instead.
     HostIrqChip,
+    /// Streamed accelerated GPU state. Instance is its virtio slot, distinct
+    /// from the small transport/device-register section for that same slot.
+    Gpu,
 }
 
 impl SectionKind {
@@ -208,6 +214,7 @@ impl SectionKind {
             SectionKind::Virtio => 11,
             SectionKind::ResetControl => 12,
             SectionKind::HostIrqChip => 13,
+            SectionKind::Gpu => 14,
         }
     }
 
@@ -226,6 +233,7 @@ impl SectionKind {
             11 => SectionKind::Virtio,
             12 => SectionKind::ResetControl,
             13 => SectionKind::HostIrqChip,
+            14 => SectionKind::Gpu,
             other => return Err(SnapshotError::UnknownSection { kind: other }),
         })
     }
@@ -245,6 +253,7 @@ impl SectionKind {
             SectionKind::Virtio => "virtio",
             SectionKind::ResetControl => "reset-control",
             SectionKind::HostIrqChip => "host-irqchip",
+            SectionKind::Gpu => "gpu",
         }
     }
 }

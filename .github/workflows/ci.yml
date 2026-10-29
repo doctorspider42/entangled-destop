@@ -99,6 +99,8 @@ jobs:
         # ash's sources (fetched above); it also refuses a classification
         # that disagrees with the executor's hand-written match arms.
         run: python scripts/venus-exec-gen.py --check
+      - name: Checkpoint image format geometry matches the Vulkan registry
+        run: python scripts/venus-checkpoint-formats.py --check
       - name: Differential check against the generated C
         run: python tools/venus-protocol/harness/run_differential.py --seeds 256
 

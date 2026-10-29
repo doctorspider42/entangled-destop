@@ -273,6 +273,20 @@ fn count_of(len: usize) -> u32 {
 }
 
 impl<H: HostVulkan> VulkanContext<H> {
+    /// Only after a bounded host idle has succeeded: settle our bookkeeping
+    /// without resubmitting guest work or altering guest fence payloads.
+    pub(super) fn checkpoint_complete_idle(&mut self, device: u64) {
+        for queue in self.objects.queues_of(device) {
+            let done = self
+                .objects
+                .queue_mut(queue)
+                .map(|q| q.clock.complete_through(q.clock.submitted))
+                .unwrap_or_default();
+            self.recycle_clock_fences(queue, device, done);
+        }
+        self.objects.reap_doomed(&*self.host);
+    }
+
     fn stopping(&self) -> bool {
         self.stop
             .as_ref()

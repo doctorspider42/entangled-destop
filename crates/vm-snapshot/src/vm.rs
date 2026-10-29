@@ -33,6 +33,9 @@ use crate::format::{HostKind, SectionKind, SnapshotReader, SnapshotWriter};
 use crate::memory::{self, MemoryStats};
 use crate::meta::{MachineShape, Metadata};
 
+mod gpu;
+pub use gpu::{GpuArchives, GpuSave};
+
 /// Everything [`save`] needs besides guest memory and a path.
 pub struct SaveRequest<'a> {
     pub metadata: Metadata,
@@ -104,8 +107,34 @@ pub fn save<M: GuestMemory>(path: &Path, mem: &M, request: SaveRequest<'_>) -> R
 where
     M::R: Sync,
 {
+    save_impl(path, mem, request, None)
+}
+
+/// Save accelerated state directly into digested GPU sections. The caller
+/// keeps all CPU/device/presenter writers stopped for the complete save.
+pub fn save_with_gpu<M: GuestMemory>(
+    path: &Path,
+    mem: &M,
+    request: SaveRequest<'_>,
+    gpu: &mut dyn GpuSave,
+) -> Result<SaveReport>
+where
+    M::R: Sync,
+{
+    save_impl(path, mem, request, Some(gpu))
+}
+
+fn save_impl<M: GuestMemory>(
+    path: &Path,
+    mem: &M,
+    request: SaveRequest<'_>,
+    gpu: Option<&mut dyn GpuSave>,
+) -> Result<SaveReport>
+where
+    M::R: Sync,
+{
     let partial = partial_path(path);
-    let outcome = save_partial(path, &partial, mem, request);
+    let outcome = save_partial(path, &partial, mem, request, gpu);
     if outcome.is_err() {
         // A failed suspend must not leave a `.part` beside the snapshot it did
         // not replace: the next one would overwrite it anyway, but a stray file
@@ -120,6 +149,7 @@ fn save_partial<M: GuestMemory>(
     partial: &Path,
     mem: &M,
     request: SaveRequest<'_>,
+    gpu: Option<&mut dyn GpuSave>,
 ) -> Result<SaveReport>
 where
     M::R: Sync,
@@ -174,6 +204,7 @@ where
     for (kind, version, instance, payload) in devices::encode_machine(request.machine) {
         writer.put(kind, version, instance, &payload)?;
     }
+    gpu::save_sections(&mut writer, request.machine, gpu)?;
     let stats = memory::save_with(mem, &mut writer, options)?;
     let (bytes, file) = writer.finish()?;
     file.sync_all()
@@ -207,6 +238,9 @@ pub struct Restored {
     pub clock: Option<VmClockState>,
     pub host_irqchip: Option<HostIrqChipState>,
     pub machine: MachineState,
+    /// Present only for an explicitly GPU-aware restore. Apply these archives
+    /// to the cold devices before starting any worker, presenter or vCPU.
+    pub gpu: Option<GpuArchives>,
     pub memory: MemoryStats,
     /// Advisory differences that did not justify a refusal (a firmware image
     /// that changed, say). Worth printing.
@@ -245,14 +279,39 @@ pub fn restore<M: GuestMemory>(path: &Path, mem: &M, shape: &MachineShape) -> Re
     restore_contents(reader, mem, shape, started)
 }
 
+/// GPU-aware counterpart of restore. It verifies every GPU section before RAM
+/// changes and retains the same opened file for bounded random-access uploads.
+pub fn restore_with_gpu<M: GuestMemory>(
+    path: &Path,
+    mem: &M,
+    shape: &MachineShape,
+    expected_gpu_slots: &[u32],
+) -> Result<Restored> {
+    let started = Instant::now();
+    let file = std::fs::File::open(path).map_err(SnapshotError::io("opening the snapshot"))?;
+    let reader = SnapshotReader::open(file)?;
+    reader.require_native()?;
+    restore_contents_with_gpu(reader, mem, shape, started, Some(expected_gpu_slots))
+}
+
 // The public entry point checks the native host before this byte-level
 // decoder can touch RAM. Tests can exercise the decoder with a theoretical
 // x86 machine on development hosts that cannot run that machine.
 fn restore_contents<M: GuestMemory>(
+    reader: SnapshotReader<std::fs::File>,
+    mem: &M,
+    shape: &MachineShape,
+    started: Instant,
+) -> Result<Restored> {
+    restore_contents_with_gpu(reader, mem, shape, started, None)
+}
+
+fn restore_contents_with_gpu<M: GuestMemory>(
     mut reader: SnapshotReader<std::fs::File>,
     mem: &M,
     shape: &MachineShape,
     started: Instant,
+    expected_gpu_slots: Option<&[u32]>,
 ) -> Result<Restored> {
     reader.require_version(SectionKind::Metadata, 0, crate::meta::METADATA_VERSION)?;
     let metadata = Metadata::decode(&reader.read_section(SectionKind::Metadata, 0)?)?;
@@ -310,7 +369,22 @@ fn restore_contents<M: GuestMemory>(
     }
     .check(shape)?;
 
+    let gpu_slots = gpu::validate_sections(&mut reader, &machine, expected_gpu_slots.is_some())?;
+    if let Some(expected) = expected_gpu_slots {
+        if gpu_slots != expected {
+            return Err(SnapshotError::Mismatch {
+                field: "accelerated GPU checkpoint slots".into(),
+                snapshot: format!("{gpu_slots:?}"),
+                current: format!("{expected:?}"),
+            });
+        }
+    }
     let memory = memory::restore(mem, &mut reader)?;
+    let gpu = if gpu_slots.is_empty() {
+        None
+    } else {
+        Some(GpuArchives::new(reader, gpu_slots))
+    };
 
     Ok(Restored {
         metadata,
@@ -318,6 +392,7 @@ fn restore_contents<M: GuestMemory>(
         clock,
         host_irqchip,
         machine,
+        gpu,
         memory,
         notes,
         elapsed: started.elapsed(),
@@ -381,6 +456,7 @@ pub fn inspect(path: &Path) -> Result<SnapshotInfo> {
 
 #[cfg(test)]
 mod tests {
+    mod gpu_tests;
     use machine_x86::state::{SavedAcpiPm, SavedResetControl, SavedSerial, SavedVirtioSlot};
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
     use vmm_core::hv::{
@@ -515,6 +591,7 @@ mod tests {
             SectionKind::Virtio => 11,
             SectionKind::ResetControl => 12,
             SectionKind::HostIrqChip => 13,
+            SectionKind::Gpu => 14,
         }
     }
 
