@@ -172,7 +172,7 @@ fn blob_maps_keep_guest_offsets_with_new_pages_and_preserve_aliases_and_scanout(
     let (saved, old_pages, bytes, payloads) = page_fixture();
     let encoded = saved.encode().unwrap();
     let saved = BlobCheckpointSet::decode(&encoded).unwrap();
-    let budget = PageBudget::new(4096);
+    let budget = PageBudget::new(old_pages.page(1).unwrap().mapped_len());
     let pages = HostPageTable::restore(&bytes, &budget).unwrap();
     assert_eq!(pages.pages().len(), 1);
     let (mut restored, window, gate) = renderer(Factory::new(200));

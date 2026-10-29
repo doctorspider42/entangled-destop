@@ -58,7 +58,13 @@ impl ScanoutSink for Sink {
 }
 
 fn source(renderer_scanout: bool) -> (Arc<FakeVulkan>, GpuDevice<Sink>, Vec<u8>) {
-    let host = Arc::new(FakeVulkan::standard());
+    let mut gpu = crate::venus::executor::fake::gpu("checkpoint fixture GPU");
+    // Exercise larger native allocations even on hosts with 4 KiB pages.
+    gpu.info.host_import_alignment = 16 << 10;
+    let host = Arc::new(FakeVulkan::new(vec![
+        crate::venus::executor::fake::cpu(),
+        gpu,
+    ]));
     let gate = Quiesce::new();
     let mut factory = ExecutorFactory::new(host.clone());
     factory
@@ -67,13 +73,22 @@ fn source(renderer_scanout: bool) -> (Arc<FakeVulkan>, GpuDevice<Sink>, Vec<u8>)
     let mut harness = h::Harness::gated_factory(factory, gate.clone());
     h::with_device(&mut harness);
     const IMAGE_RESOURCE: u32 = 11;
+    const IMAGE_BYTES: u64 = 8192;
     if renderer_scanout {
         harness
-            .send(&h::allocate(h::DEVICE, h::MEMORY, 8192, 3, vec![]))
+            .send(&h::allocate(h::DEVICE, h::MEMORY, IMAGE_BYTES, 3, vec![]))
             .unwrap();
         harness
-            .memory_blob(h::CTX, IMAGE_RESOURCE, h::MEMORY, 8192)
+            .memory_blob(h::CTX, IMAGE_RESOURCE, h::MEMORY, IMAGE_BYTES)
             .unwrap();
+        assert!(
+            harness
+                .renderer
+                .blob_pages(IMAGE_RESOURCE)
+                .unwrap()
+                .mapped_len()
+                > IMAGE_BYTES
+        );
     }
     harness
         .renderer
@@ -87,7 +102,16 @@ fn source(renderer_scanout: bool) -> (Arc<FakeVulkan>, GpuDevice<Sink>, Vec<u8>)
     }
     let sizes: Vec<_> = ids
         .into_iter()
-        .map(|id| (id, harness.renderer.blob_pages(id).unwrap().resource_len()))
+        .map(|id| {
+            // The guest memory blob names its requested span, not the larger
+            // native allocation used to meet imported-host-pointer alignment.
+            let size = if id == IMAGE_RESOURCE {
+                IMAGE_BYTES
+            } else {
+                harness.renderer.blob_pages(id).unwrap().resource_len()
+            };
+            (id, size)
+        })
         .collect();
     let spec = ScanoutBlobSpec {
         format: crate::FORMAT_B8G8R8A8_UNORM,

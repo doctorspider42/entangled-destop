@@ -4,7 +4,9 @@ use super::*;
 fn address_capable_host_pages_reconstruct_without_exposing_a_device_address() {
     use crate::venus::executor::{fake::FakeVulkan, harness as h};
     use crate::venus::protocol::*;
-    let host = Arc::new(FakeVulkan::standard());
+    let mut gpu = super::super::fake::gpu("large-page checkpoint fixture");
+    gpu.info.host_import_alignment = 16 << 10;
+    let host = Arc::new(FakeVulkan::new(vec![super::super::fake::cpu(), gpu]));
     let recipes_budget = PageBudget::new(super::super::checkpoint::MAX_RECIPE_BYTES);
     let mut source = VulkanContext::new(1, host.clone());
     source.enable_object_recipes(&recipes_budget).unwrap();
@@ -38,6 +40,7 @@ fn address_capable_host_pages_reconstruct_without_exposing_a_device_address() {
         assert!(super::super::context::result_of(&command).is_none_or(|value| value == VK_SUCCESS));
     }
     let links = source.host_allocation_links().unwrap();
+    let mapped_bytes = links[0].pages.mapped_len();
     links[0].pages.write_bytes(4000, &[0xa7; 97]).unwrap();
     let mut pages = HostPageTable::default();
     let encoded_links = pages.encode_links(&links).unwrap();
@@ -48,7 +51,7 @@ fn address_capable_host_pages_reconstruct_without_exposing_a_device_address() {
     drop(source);
     drop(links);
     drop(pages);
-    let loaded = HostPageTable::restore(&data, &PageBudget::new(8192)).unwrap();
+    let loaded = HostPageTable::restore(&data, &PageBudget::new(mapped_bytes)).unwrap();
     let links = loaded.resolve_links(&encoded_links).unwrap();
     let mut cold = VulkanContext::new(1, host.clone());
     cold.restore_object_recipes_with_memory(&recipes, &recipes_budget, &[], &links)

@@ -29,6 +29,7 @@ fn image(ctx_id: u32, id: u64, alive: &Arc<()>) -> ScanoutImage {
 fn directory_file_preserves_page_identity_permissions_and_stale_generations() {
     let source = BlobDirectory::default();
     let page = Arc::new(RingPages::new(4096).unwrap());
+    let mapped_bytes = page.mapped_len();
     page.write_bytes(16, b"saved bytes").unwrap();
     source.insert(8, 1, page.clone());
     let stale = source.for_context(1).bind(8, 0, 100).unwrap();
@@ -49,7 +50,7 @@ fn directory_file_preserves_page_identity_permissions_and_stale_generations() {
     let mut data = Vec::new();
     pages.save(&mut data).unwrap();
     drop((source, pages, page));
-    let budget = super::super::super::shmem::PageBudget::new(4096);
+    let budget = super::super::super::shmem::PageBudget::new(mapped_bytes);
     let pages = HostPageTable::restore(&data, &budget).unwrap();
     let record = DirectoryCheckpoint::decode(&metadata).unwrap();
     let directory = BlobDirectory::from_checkpoint(&record, &pages, &payloads, no_image).unwrap();
