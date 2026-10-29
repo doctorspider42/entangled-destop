@@ -249,6 +249,7 @@ impl NetDevice {
 
     /// Same, for a backend that is already shared (or a `dyn` one).
     pub fn with_backend(backend: Arc<dyn NetBackend>, mac: MacAddr) -> Self {
+        backend.set_guest_mac(mac);
         Self {
             backend,
             mac,
@@ -897,6 +898,16 @@ impl VirtioDevice for NetDevice {
             (Some(rx), Some(tx)) => vec![position(&lock(rx)), position(tx)],
             _ => Vec::new(),
         }
+    }
+
+    fn save_device(&self) -> Vec<u8> {
+        self.backend.save_state()
+    }
+
+    fn load_device(&mut self, bytes: &[u8]) -> Result<(), DeviceError> {
+        self.backend
+            .load_state(bytes)
+            .map_err(|error| DeviceError::Backend(error.to_string()))
     }
 
     fn reset(&mut self) {

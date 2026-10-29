@@ -57,6 +57,7 @@
 //! * make this module index a buffer with a guest-supplied number. Every header read
 //!   here goes through `smoltcp::wire`'s checked accessors.
 
+use std::hash::{BuildHasher, Hasher};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -276,6 +277,7 @@ pub struct TcpNat {
     listeners: Vec<(TcpListener, PortForward)>,
     /// The next gateway-side port an inbound flow tries.
     next_inbound_port: u16,
+    opened_inbound: bool,
 }
 
 impl TcpNat {
@@ -300,7 +302,15 @@ impl TcpNat {
         let mut device = IpQueues::default();
         // `HardwareAddress::Ip` selects `Medium::Ip`: no MAC, no ARP, no neighbour
         // cache â€” the router above owns all three.
-        let iface_config = Config::new(HardwareAddress::Ip);
+        let mut iface_config = Config::new(HardwareAddress::Ip);
+        // A restored guest still remembers the old TCP sequence space. Never
+        // recreate the same deterministic ISNs in a new host process.
+        let seed = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        if access == HostAccess::Routed {
+            iface_config.random_seed = seed;
+        }
         let mut iface = Interface::new(iface_config, &mut device, Instant::from_millis(0));
         iface.update_ip_addrs(|addrs| {
             // The gateway's own address, so a socket bound to it works too; the
@@ -331,7 +341,12 @@ impl TcpNat {
             refused_at_limit: 0,
             retired: 0,
             listeners: Vec::new(),
-            next_inbound_port: *INBOUND_PORTS.start(),
+            next_inbound_port: if access == HostAccess::Routed {
+                *INBOUND_PORTS.start() + (seed % 16384) as u16
+            } else {
+                *INBOUND_PORTS.start()
+            },
+            opened_inbound: false,
         }
     }
 
@@ -431,10 +446,28 @@ impl TcpNat {
                 .iter()
                 .any(|f| *f.remote.ip() == gateway && f.remote.port() == port);
             if !taken {
+                self.opened_inbound = true;
                 return Some(port);
             }
         }
         None
+    }
+
+    pub(super) fn checkpoint_inbound_port(&self) -> u16 {
+        self.next_inbound_port
+    }
+
+    pub(super) fn restore_inbound_port(
+        &mut self,
+        port: u16,
+    ) -> Result<(), crate::backend::NetError> {
+        if !INBOUND_PORTS.contains(&port) || self.opened_inbound {
+            return Err(crate::backend::NetError::Checkpoint(
+                "inbound port is invalid or the new NAT already accepted connections".into(),
+            ));
+        }
+        self.next_inbound_port = port;
+        Ok(())
     }
 
     fn now(&self) -> Instant {

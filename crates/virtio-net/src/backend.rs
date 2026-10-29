@@ -67,6 +67,9 @@ pub enum NetError {
 
     #[error("this platform has no TAP support")]
     Unsupported,
+
+    #[error("invalid network backend checkpoint: {0}")]
+    Checkpoint(String),
 }
 
 /// Outcome of [`NetBackend::wait_readable`].
@@ -91,6 +94,27 @@ pub enum Readiness {
 pub trait NetBackend: Send + Sync {
     /// Short label for log records, e.g. `tap:entangled0`.
     fn name(&self) -> &str;
+
+    /// Supply the device's initial destination before its first transmitted
+    /// frame, including after restoring a guest with an existing DHCP lease.
+    fn set_guest_mac(&self, _mac: crate::MacAddr) {}
+
+    /// Small backend-owned lifecycle metadata, captured with guest RX/TX parked.
+    /// Host sockets and their flows are deliberately not serialized.
+    fn save_state(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Restore before guest RX/TX resume. Empty payloads include older snapshots.
+    fn load_state(&self, bytes: &[u8]) -> Result<(), NetError> {
+        if bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(NetError::Checkpoint(
+                "this backend has no saved state".into(),
+            ))
+        }
+    }
 
     /// Sends one frame (no virtio-net header) to the host.
     ///

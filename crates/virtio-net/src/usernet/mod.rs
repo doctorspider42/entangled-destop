@@ -57,6 +57,7 @@
 //! library to wait on many of them at once; it costs latency, not correctness, and
 //! replacing it with epoll/IOCP is a contained change behind this module.
 
+mod checkpoint;
 mod dhcp;
 pub mod hostdns;
 pub mod ntp;
@@ -1135,6 +1136,21 @@ impl Drop for UserNetBackend {
 }
 
 impl NetBackend for UserNetBackend {
+    fn set_guest_mac(&self, mac: crate::MacAddr) {
+        self.router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .guest_mac = Some(EthernetAddress(mac.0));
+    }
+
+    fn save_state(&self) -> Vec<u8> {
+        self.save_checkpoint()
+    }
+
+    fn load_state(&self, bytes: &[u8]) -> Result<(), NetError> {
+        self.load_checkpoint(bytes)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
