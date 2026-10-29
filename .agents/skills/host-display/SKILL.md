@@ -570,8 +570,21 @@ reserved keyboard shortcut; Ctrl+Alt+P belongs to the guest.
   and `HIDE_MARGIN`. While the pointer is over the bar `captures_pointer()` is
   true: `host.rs` withholds the motion and the clicks from the guest and
   `sync_cursor` shows the host arrow. Relative gaming input pins the host
-  pointer centrally; Ctrl+Alt releases capture so the user can reach the top
-  edge. Never turn camera movement into an automatic menu trigger.
+  pointer centrally, so host motion cannot reveal the bar. `draw_frame` also
+  inspects the guest's visible cursor hotspot (`Scanout::cursor_position`),
+  maps it through the viewport, and lets `Toolbar::on_guest_pointer` reveal
+  the controls when that pointer reaches the guest image's top edge. It then
+  temporarily releases the mouse lock and positions the host arrow there;
+  the logical keyboard grab stays active. Leaving the bar restores relative
+  input. Hidden/off-screen cursors and unchanged old hotspots cannot trigger
+  the menu, so game camera motion does not become a host gesture. Passive
+  lifecycle notices do not unlock the pointer. Ctrl+Alt still releases capture.
+  Linux carries signed DRM cursor-plane positions in the virtio le32 fields:
+  GNOME sent y=0xfffffffc (-4) at the top in the native acceptance. Interpret
+  them as i32 before widening; a partially clipped cursor still reaches the
+  edge. Treating them as large positive offsets loses both the cursor and the
+  menu reveal. `signed_linux_cursor_coordinates_stay_visible_at_the_top_edge`
+  covers set/move, clipping and extreme signed coordinates.
 - **Restart and Power off ask twice** (`CONFIRM_WINDOW`, 3 s); the armed label
   says "CLICK AGAIN TO …" in the warning colour.
 - **Drawing**: a premultiplied BGRA image rendered on the CPU whenever

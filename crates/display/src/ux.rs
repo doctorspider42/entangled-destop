@@ -33,6 +33,24 @@ pub(crate) fn relative_pointer_for(
     supported && grabbed && focused && requested
 }
 
+/// Maps a visible guest pointer back to physical window coordinates. This is
+/// how a relative desktop reaches host controls while its host cursor is locked.
+pub(crate) fn guest_pointer_in_window(
+    pointer: (u32, u32),
+    guest: (u32, u32),
+    viewport: Viewport,
+) -> Option<(f64, f64)> {
+    if guest.0 == 0 || guest.1 == 0 || pointer.0 >= guest.0 || pointer.1 >= guest.1 {
+        return None;
+    }
+    Some((
+        f64::from(viewport.x)
+            + f64::from(pointer.0) * f64::from(viewport.width) / f64::from(guest.0),
+        f64::from(viewport.y)
+            + f64::from(pointer.1) * f64::from(viewport.height) / f64::from(guest.1),
+    ))
+}
+
 /// How the guest image is fitted into the window (WIN-1503/1504).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScaleMode {
@@ -214,6 +232,29 @@ pub fn initial_window(req_w: u32, req_h: u32, monitor: Option<(u32, u32)>) -> In
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_desktop_cursor_maps_back_through_scaling_and_letterboxing() {
+        let viewport = Viewport {
+            x: 100,
+            y: 50,
+            width: 960,
+            height: 540,
+        };
+        assert_eq!(
+            guest_pointer_in_window((960, 0), (1920, 1080), viewport),
+            Some((580.0, 50.0))
+        );
+        assert_eq!(
+            guest_pointer_in_window((960, 540), (1920, 1080), viewport),
+            Some((580.0, 320.0))
+        );
+        assert_eq!(
+            guest_pointer_in_window((1920, 0), (1920, 1080), viewport),
+            None
+        );
+        assert_eq!(guest_pointer_in_window((0, 0), (0, 1080), viewport), None);
+    }
 
     #[test]
     fn relative_capture_requires_a_device_focus_grab_and_explicit_gaming_mode() {

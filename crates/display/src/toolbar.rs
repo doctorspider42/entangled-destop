@@ -267,6 +267,9 @@ pub struct Toolbar {
     /// The rendered picture and the serial it was drawn at.
     cache: Option<(u64, Overlay)>,
     notice: Option<&'static str>,
+    /// Last guest hotspot, including while host controls own the pointer.
+    /// Leaving the menu must not reveal it again from a stale guest cursor.
+    last_guest_pointer: Option<(u32, u32)>,
 }
 
 /// The rendered bar, ready for the renderer.
@@ -299,6 +302,7 @@ impl Toolbar {
             serial: 1,
             cache: None,
             notice: None,
+            last_guest_pointer: None,
         }
     }
 
@@ -315,6 +319,37 @@ impl Toolbar {
     /// Whether the bar is showing.
     pub fn visible(&self) -> bool {
         self.visible || self.notice.is_some()
+    }
+
+    /// Actual pointer controls are open; a passive notice alone is not a menu.
+    pub(crate) fn revealed(&self) -> bool {
+        self.visible
+    }
+
+    /// The locked host cursor cannot reach the top in relative mode. A new
+    /// visible guest hotspot can; hidden game cursors never request controls.
+    /// Returns where the host should put its arrow after releasing mouse lock.
+    pub(crate) fn on_guest_pointer(
+        &mut self,
+        pointer: Option<(u32, u32)>,
+        guest: (u32, u32),
+        viewport: crate::Viewport,
+        eligible: bool,
+        now: Instant,
+    ) -> Option<(f64, f64)> {
+        let changed = pointer != self.last_guest_pointer;
+        self.last_guest_pointer = pointer;
+        if !changed || !eligible {
+            return None;
+        }
+        let mut position = crate::ux::guest_pointer_in_window(pointer?, guest, viewport)?;
+        if position.1 - f64::from(viewport.y) > REVEAL_EDGE * self.layout.scale {
+            return None;
+        }
+        // Reachable even when the guest image is below a letterbox margin.
+        position.1 = 0.0;
+        self.on_pointer(position.0, position.1, true, now);
+        self.revealed().then_some(position)
     }
 
     /// A lifecycle failure remains visible even when the pointer hides the bar.
@@ -968,6 +1003,73 @@ fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_visible_guest_cursor_reveals_controls_while_the_host_pointer_is_locked() {
+        let mut bar = Toolbar::new((1920, 1200), 1.0);
+        let viewport = crate::Viewport {
+            x: 0,
+            y: 60,
+            width: 1920,
+            height: 1080,
+        };
+        let now = Instant::now();
+        assert_eq!(
+            bar.on_guest_pointer(Some((960, 540)), (1920, 1080), viewport, true, now),
+            None
+        );
+        assert!(!bar.revealed());
+        assert_eq!(
+            bar.on_guest_pointer(Some((960, 0)), (1920, 1080), viewport, true, now),
+            Some((960.0, 0.0))
+        );
+        assert!(bar.revealed());
+        assert!(bar.captures_pointer());
+        // A locked host's centre event must not be interpreted as guest motion.
+        // Leaving host controls closes them; the old guest edge cannot reopen.
+        bar.on_pointer(960.0, 600.0, true, now);
+        assert!(!bar.revealed());
+        assert_eq!(
+            bar.on_guest_pointer(Some((960, 0)), (1920, 1080), viewport, true, now),
+            None
+        );
+        assert!(!bar.revealed());
+        // Hidden game cursors never reveal the controls. A newly visible
+        // pointer may do so again, including at the same old hotspot.
+        assert_eq!(
+            bar.on_guest_pointer(None, (1920, 1080), viewport, true, now),
+            None
+        );
+        assert!(!bar.revealed());
+        assert!(bar
+            .on_guest_pointer(Some((960, 0)), (1920, 1080), viewport, true, now)
+            .is_some());
+    }
+
+    #[test]
+    fn guest_menu_reveal_requires_focus_and_mouse_lock_and_ignores_notices() {
+        let mut bar = Toolbar::new((1920, 1080), 1.0);
+        let viewport = crate::Viewport {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        bar.show_notice("SAVE FAILED");
+        assert!(bar.visible());
+        assert!(!bar.revealed());
+        assert_eq!(
+            bar.on_guest_pointer(
+                Some((960, 0)),
+                (1920, 1080),
+                viewport,
+                false,
+                Instant::now()
+            ),
+            None
+        );
+        assert!(!bar.revealed());
+    }
 
     #[test]
     fn lifecycle_notice_is_visible_without_pointer_reveal() {

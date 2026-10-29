@@ -306,8 +306,11 @@ impl Scanout {
             width,
             height,
             pixels: data[..needed].to_vec(),
-            x: i64::from(x) - i64::from(hot_x),
-            y: i64::from(y) - i64::from(hot_y),
+            // Linux sends signed DRM plane coordinates through virtio's le32
+            // fields (e.g. -4 at the top edge), preserving their two's-complement
+            // bits. Widen after interpreting that sign, never as a huge offset.
+            x: i64::from(x as i32) - i64::from(hot_x),
+            y: i64::from(y as i32) - i64::from(hot_y),
             hot_x,
             hot_y,
             serial: self.cursor_serial,
@@ -321,8 +324,8 @@ impl Scanout {
     pub fn move_cursor(&mut self, x: u32, y: u32) {
         self.dirty_under_cursor();
         if let Some(cursor) = &mut self.cursor {
-            cursor.x = i64::from(x) - i64::from(cursor.hot_x);
-            cursor.y = i64::from(y) - i64::from(cursor.hot_y);
+            cursor.x = i64::from(x as i32) - i64::from(cursor.hot_x);
+            cursor.y = i64::from(y as i32) - i64::from(cursor.hot_y);
         }
         self.dirty_under_cursor();
     }
@@ -336,6 +339,17 @@ impl Scanout {
     /// Whether a cursor plane is currently shown.
     pub fn cursor_visible(&self) -> bool {
         self.cursor.is_some()
+    }
+
+    /// The visible guest pointer's hotspot, rather than its image's corner.
+    /// Fully off-screen/hidden pointers cannot reveal host controls. A cursor
+    /// plane partially clipped at an edge still points at that edge.
+    pub(crate) fn cursor_position(&self) -> Option<(u32, u32)> {
+        let cursor = self.cursor.as_ref()?;
+        cursor.clipped_rect(self.width, self.height)?;
+        let x = (cursor.x + i64::from(cursor.hot_x)).clamp(0, i64::from(self.width) - 1);
+        let y = (cursor.y + i64::from(cursor.hot_y)).clamp(0, i64::from(self.height) - 1);
+        Some((x as u32, y as u32))
     }
 
     /// The cursor plane's raw image and position, for a GPU overlay; `None`
@@ -724,18 +738,41 @@ mod tests {
     }
 
     #[test]
+    fn signed_linux_cursor_coordinates_stay_visible_at_the_top_edge() {
+        let mut s = Scanout::new(1920, 1080).unwrap();
+        let image = vec![0xffu8; 64 * 64 * 4];
+        s.set_cursor(64, 64, 4, 4, 960, (-4i32) as u32, &image)
+            .unwrap();
+        assert_eq!(s.cursor_position(), Some((960, 0)));
+        assert_eq!(s.cursor_image().unwrap().y, -8);
+        assert!(s.cursor_overlay().is_some());
+        s.move_cursor(960, (-3i32) as u32);
+        assert_eq!(s.cursor_position(), Some((960, 0)));
+        s.move_cursor(960, (-100i32) as u32);
+        assert_eq!(s.cursor_position(), None);
+        s.move_cursor(i32::MIN as u32, i32::MIN as u32);
+        assert_eq!(s.cursor_position(), None);
+    }
+
+    #[test]
     fn cursor_moves_mark_both_positions_dirty_and_clip_at_edges() {
         let mut s = Scanout::new(8, 8).unwrap();
         let _ = s.take_dirty();
         let image = vec![0xffu8; 2 * 2 * 4];
         // Hotspot (1,1) at (0,0): the image's top-left hangs off screen.
         s.set_cursor(2, 2, 1, 1, 0, 0, &image).unwrap();
+        assert_eq!(
+            s.cursor_position(),
+            Some((0, 0)),
+            "use the hotspot at the edge"
+        );
         let (rect, pixels) = s.cursor_overlay().expect("clipped but visible");
         assert_eq!((rect.x, rect.y, rect.width, rect.height), (0, 0, 1, 1));
         assert_eq!(pixels.len(), 4);
 
         let _ = s.take_dirty();
         s.move_cursor(6, 6);
+        assert_eq!(s.cursor_position(), Some((6, 6)));
         // The dirty union covers the vacated corner and the new position.
         let dirty = s.take_dirty().expect("move dirties");
         assert_eq!((dirty.x, dirty.y), (0, 0));
@@ -745,8 +782,18 @@ mod tests {
 
         // Entirely off screen: no overlay, and hiding cleans up.
         s.move_cursor(20, 20);
+        assert_eq!(
+            s.cursor_position(),
+            None,
+            "off-screen cursors cannot open controls"
+        );
         assert!(s.cursor_overlay().is_none());
         s.hide_cursor();
+        assert_eq!(
+            s.cursor_position(),
+            None,
+            "hidden game cursors cannot open controls"
+        );
         assert!(!s.cursor_visible());
         assert!(s.cursor_overlay().is_none());
     }

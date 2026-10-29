@@ -648,13 +648,13 @@ impl App {
         // already on the GPU (ADR-0004, zero-copy presentation).
         let shared_frame = self.shared.get().and_then(|p| p.current());
         let mirror = Arc::clone(&self.scanout);
-        let guest_size = {
+        let (guest_size, guest_pointer) = {
             let mut scanout = lock_scanout(&mirror);
             let size = scanout.size();
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.prepare(&mut scanout, shared_frame);
             }
-            size
+            (size, scanout.cursor_position())
         };
         self.guest_size = guest_size;
         if self.occluded {
@@ -677,6 +677,7 @@ impl App {
             self.capture.set_viewport(self.viewport);
             self.sync_cursor();
         }
+        self.reveal_toolbar_from_guest(event_loop, guest_pointer, viewport);
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_toolbar(self.toolbar.overlay());
         }
@@ -958,7 +959,7 @@ impl App {
     fn sync_relative_pointer(&mut self, event_loop: &ActiveEventLoop) {
         let relative = ux::relative_pointer_for(
             self.relative_supported,
-            self.capture.grabbed() && !self.toolbar.captures_pointer(),
+            self.capture.grabbed() && !self.toolbar.revealed(),
             self.capture.focused(),
             self.relative_requested,
         );
@@ -1013,6 +1014,37 @@ impl App {
         self.update_title();
     }
 
+    /// Relative input does not move the locked host cursor. Follow the guest's
+    /// *visible* hardware pointer instead, so desktop menus remain reachable
+    /// without interpreting hidden game-camera movement as a host gesture.
+    fn reveal_toolbar_from_guest(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        pointer: Option<(u32, u32)>,
+        viewport: Viewport,
+    ) {
+        let Some(position) = self.toolbar.on_guest_pointer(
+            pointer,
+            self.guest_size,
+            viewport,
+            self.capture.relative_pointer() && self.capture.focused(),
+            Instant::now(),
+        ) else {
+            return;
+        };
+        // Unpin before moving the host arrow to the pointer the user sees.
+        // Keep the logical keyboard grab: Alt+Tab still belongs to the guest.
+        self.sync_relative_pointer(event_loop);
+        if let Some(window) = &self.window {
+            if let Err(error) = window
+                .set_cursor_position(winit::dpi::PhysicalPosition::new(position.0, position.1))
+            {
+                tracing::warn!(%error, "cannot position the toolbar cursor");
+            }
+        }
+        self.sync_cursor();
+    }
+
     fn sync_cursor_grab(&self) {
         let Some(window) = self.window.as_ref() else {
             return;
@@ -1046,7 +1078,7 @@ impl App {
         let visible = if self.capture.relative_pointer() && self.grabbed {
             false
         } else {
-            self.capture.cursor_visible() || self.toolbar.captures_pointer()
+            self.capture.cursor_visible() || self.toolbar.revealed()
         };
         if visible == self.cursor_visible {
             return;
@@ -1400,10 +1432,16 @@ impl ApplicationHandler<HostEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                if self.capture.relative_pointer() {
+                    // Locked/recentred host coordinates are not the pointer
+                    // the user sees. Guest cursor updates reveal the toolbar.
+                    self.capture
+                        .on_pointer(self.viewport, position.x, position.y);
+                    return;
+                }
                 let serial = self.toolbar.serial();
-                // Gaming capture pins the host cursor at the centre. Ctrl+Alt
-                // releases it; the top edge must still work after that release,
-                // including in a normal window with no grab.
+                // Host motion describes desktop integration, ungrabbed input,
+                // or navigation after a guest cursor revealed the controls.
                 let eligible = self.capture.focused();
                 let over_bar = self.toolbar.on_pointer(
                     position.x,
@@ -1437,8 +1475,9 @@ impl ApplicationHandler<HostEvent> for App {
                 // The toolbar takes every button over itself, and the release
                 // of a press that began there.
                 let pressed = state == winit::event::ElementState::Pressed;
-                if (pressed && self.toolbar.captures_pointer()) || (!pressed && self.toolbar_press)
-                {
+                let menu_pointer = self.toolbar.captures_pointer()
+                    || (self.relative_requested && self.toolbar.revealed());
+                if (pressed && menu_pointer) || (!pressed && self.toolbar_press) {
                     self.toolbar_press = pressed;
                     if pressed && button == winit::event::MouseButton::Left {
                         let serial = self.toolbar.serial();
@@ -1459,7 +1498,11 @@ impl ApplicationHandler<HostEvent> for App {
                 self.sync_cursor();
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                self.capture.on_wheel(delta);
+                if !self.toolbar.captures_pointer()
+                    && !(self.relative_requested && self.toolbar.revealed())
+                {
+                    self.capture.on_wheel(delta);
+                }
             }
             WindowEvent::Focused(focused) => {
                 self.capture.on_focus(focused);
