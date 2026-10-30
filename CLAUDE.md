@@ -24,7 +24,11 @@ that ends a run),
 running VM to a file and reading it back: the full CPU state per host, the
 save/load pair every device owes beside its `reset()`, the snapshot format and
 every refusal it makes — read before adding a device, or anything that holds
-state a resumed guest would notice missing).
+state a resumed guest would notice missing),
+[docs/adr/0008-windows-guests.md](docs/adr/0008-windows-guests.md) (proposed:
+what Windows guests need beyond what Linux tolerates — GOP framebuffer,
+Hyper-V enlightenments, ACPI/MSR gaps, the virtio-win unattended install —
+read before adding a guest-family switch or a legacy platform device).
 
 ## Build and test
 
