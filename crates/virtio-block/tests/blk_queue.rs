@@ -659,10 +659,10 @@ fn oversized_requests_are_rejected() {
     let (status, _) = h.run_request(T_IN, 0, &[(BUF_BASE + 0x2000, u32::MAX, true)], status_addr);
     assert_eq!(status, S_IOERR);
 
-    // Many descriptors that together exceed MAX_REQUEST_BYTES.
+    // Several descriptors that together exceed MAX_REQUEST_BYTES (128 MiB).
     let mut data = Vec::new();
-    for i in 0..8u64 {
-        data.push((BUF_BASE + 0x2000 + i * 0x1000, 1 << 20, true));
+    for i in 0..3u64 {
+        data.push((BUF_BASE + 0x2000 + i * 0x1000, 64 << 20, true));
     }
     let (status, _) = h.run_request(T_IN, 0, &data, status_addr);
     assert_eq!(status, S_IOERR);

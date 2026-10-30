@@ -255,3 +255,45 @@ risk under host load); `ignore_msrs` as a guest setting rather than an
 environment variable; the unattended path (§4); KVM, which needs the same
 RTC/FACS fixes and is untested here; and the boot framebuffer's VRAM in
 snapshots (refused for now, §6).
+
+### Correction to §4: Windows PE sees no virtio device at all
+
+§4 put `autounattend.xml` on "a small FAT volume we control". That cannot
+work. Before a driver loads, Windows PE sees **no** virtio-blk device: not
+the target disk, not the virtio-win ISO, not an answer-file volume, and not
+the installation ISO it booted from (the firmware read that, not Windows).
+The only thing Setup can read at that point is its own `boot.wim`. So
+`guest/windows/remaster-iso.sh` puts the virtio-win drivers into image 2 of
+`boot.wim` as `X:\drivers`, and the answer file as `X:\sources\
+Autounattend.xml`, which Setup's implicit search reads in the windowsPE pass.
+The ISO is rebuilt around `efisys_noprompt.bin`, so there is no "press any key"
+either. It is development tooling (wimlib, genisoimage, run in a container),
+not a product path. `entangled install windows` needs either the same edit
+done in Rust, or a boot medium Windows has an inbox driver for (AHCI/ATAPI
+or USB mass storage), and that choice is still open.
+
+Two further things stood between that and a desktop, both found on
+2026-10-31:
+
+- **A UDF image on a virtio-blk disk is not installation media.** With
+  `viostor` loaded (every virtio function is re-activated by a Windows driver
+  after `ExitBootServices`, which is how that was confirmed), Setup still
+  said "A media driver your computer needs is missing": the installation ISO
+  is a *disk* to Windows, not a CD-ROM. `remaster-iso.sh OUT.img` therefore
+  writes the tree to an MBR disk with one FAT32 partition, the shape of a USB
+  stick. `install.esd` (over 4 GiB) becomes the chosen edition as a split WIM
+  (`install.swm`, `install2.swm`). The firmware boots that disk through
+  `\EFI\BOOT\BOOTX64.EFI`, and Setup takes it as its media.
+- **The first boot from disk died on a 10.8 MB read.** EDK2's `VirtioBlkDxe`
+  never splits a `BlockIo` transfer, and Windows Boot Manager asked for 10.8 MB
+  at once. virtio-blk capped one request at 4 MiB because the whole payload
+  was staged in host memory. It now stages each segment 4 MiB at a time
+  (`STAGING_CHUNK`), and the per-request cap is 128 MiB.
+
+With those, `win10.toml` (target disk first, then the FAT32 installation disk,
+usernet, `adapter = "framebuffer"`, `ignore_msrs = true`) installs Windows 10
+Pro **with no interaction**: Setup, the copy, the reboot into the installed
+system, specialize, OOBE, and auto-logon to a desktop with NetKVM networking.
+Consumer media also refuse an answer file with no `<ProductKey>` element; an
+empty key with `WillShowUI` `Never` satisfies it, so the system is installed
+unactivated.

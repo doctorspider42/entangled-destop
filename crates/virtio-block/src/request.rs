@@ -18,9 +18,17 @@ pub const ID_BYTES: usize = 20;
 
 /// Largest total data payload we accept for one request. A guest can chain up
 /// to `virtio_core::MAX_DESC_CHAIN_LEN` descriptors of up to 4 GiB each, so
-/// without this cap a single request could ask the host to stage hundreds of
-/// gigabytes.
-pub const MAX_REQUEST_BYTES: u64 = 4 << 20;
+/// without a cap a single request could keep a vCPU copying for minutes.
+///
+/// Not a memory bound: data is staged [`STAGING_CHUNK`] bytes at a time. It
+/// was 4 MiB until a Windows boot manager asked for 10.8 MB in one read
+/// through EDK2's `VirtioBlkDxe`, which never splits a `BlockIo` transfer, and
+/// got an I/O error instead (ADR-0008).
+pub const MAX_REQUEST_BYTES: u64 = 128 << 20;
+
+/// How much of a request is staged in host memory at once: the bound on a
+/// device's staging buffer, whatever the request size.
+pub const STAGING_CHUNK: usize = 4 << 20;
 
 /// Request types from the virtio spec we implement (`VIRTIO_BLK_T_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,6 +424,14 @@ pub fn segment_count(bytes: u64) -> Result<usize, BlockError> {
 mod tests {
     use super::*;
 
+    /// What a Windows boot manager asks for through EDK2's `VirtioBlkDxe`,
+    /// which does not split a `BlockIo` read (ADR-0008).
+    #[test]
+    fn a_ten_megabyte_read_is_within_the_cap() {
+        assert_eq!(total_len([10_865_152]).ok(), Some(10_865_152));
+        assert!(validate_range(1 << 30, 0, 10_865_152).is_ok());
+    }
+
     const CAP: u64 = 64; // 32 KiB disk
 
     #[test]
@@ -515,7 +531,7 @@ mod tests {
             Err(BlockError::RequestTooLarge(_))
         ));
         assert!(matches!(
-            validate_range(capacity, 0, 32 << 20),
+            validate_range(capacity, 0, MAX_REQUEST_BYTES * 8),
             Err(BlockError::RequestTooLarge(_))
         ));
         // Exactly at the cap is still a legal request.

@@ -29,7 +29,8 @@ use crate::request::{
     sector_offset, segment_count, total_len, validate_range, BlockError, DiscardSegment,
     ReclaimRange, RequestHeader, RequestType, DISCARD_SECTOR_ALIGNMENT, DISCARD_SEGMENT_LEN,
     ID_BYTES, MAX_DISCARD_SECTORS, MAX_DISCARD_SEG, MAX_REQUEST_BYTES, MAX_WRITE_ZEROES_SECTORS,
-    REQUEST_HEADER_LEN, SECTOR_SIZE, S_IOERR, S_OK, S_UNSUPP, WRITE_ZEROES_MAY_UNMAP,
+    REQUEST_HEADER_LEN, SECTOR_SIZE, STAGING_CHUNK, S_IOERR, S_OK, S_UNSUPP,
+    WRITE_ZEROES_MAY_UNMAP,
 };
 
 /// `VIRTIO_BLK_F_RO`: the disk is read-only.
@@ -100,7 +101,7 @@ pub struct BlockDevice {
     features: u64,
     acked_features: u64,
     /// Reusable staging buffer, so steady-state I/O does not allocate. Bounded
-    /// by [`MAX_REQUEST_BYTES`] because that caps any single buffer.
+    /// by [`STAGING_CHUNK`]: requests are staged a chunk at a time.
     io_buf: Vec<u8>,
 
     // Set on activate(), cleared on reset().
@@ -361,27 +362,31 @@ impl BlockDevice {
 
         let mut written = 0u32;
         for segment in data_in {
-            let chunk = segment.len as usize;
-            if chunk == 0 {
-                continue;
+            // Staged STAGING_CHUNK at a time, so a large segment never makes
+            // the host allocate its size.
+            let mut done = 0usize;
+            while done < segment.len as usize {
+                let chunk = (segment.len as usize - done).min(STAGING_CHUNK);
+                let addr = segment.addr.wrapping_add(done as u64);
+                self.reserve(chunk);
+                if let Err(error) = self.disk.read_at(&mut self.io_buf[..chunk], offset) {
+                    tracing::warn!(disk = %self.name, offset, %error, "virtio-blk read failed");
+                    return (S_IOERR, written);
+                }
+                if let Err(error) = mem.write_slice(&self.io_buf[..chunk], GuestAddress(addr)) {
+                    tracing::warn!(
+                        disk = %self.name,
+                        addr = format_args!("{addr:#x}"),
+                        len = chunk,
+                        %error,
+                        "virtio-blk read target is not writable guest memory"
+                    );
+                    return (S_IOERR, written);
+                }
+                offset = offset.saturating_add(chunk as u64);
+                written = written.saturating_add(chunk as u32);
+                done += chunk;
             }
-            self.reserve(chunk);
-            if let Err(error) = self.disk.read_at(&mut self.io_buf[..chunk], offset) {
-                tracing::warn!(disk = %self.name, offset, %error, "virtio-blk read failed");
-                return (S_IOERR, written);
-            }
-            if let Err(error) = mem.write_slice(&self.io_buf[..chunk], GuestAddress(segment.addr)) {
-                tracing::warn!(
-                    disk = %self.name,
-                    addr = format_args!("{:#x}", segment.addr),
-                    len = segment.len,
-                    %error,
-                    "virtio-blk read target is not writable guest memory"
-                );
-                return (S_IOERR, written);
-            }
-            offset = offset.saturating_add(chunk as u64);
-            written = written.saturating_add(segment.len);
         }
         (S_OK, written)
     }
@@ -417,28 +422,28 @@ impl BlockDevice {
         };
 
         for segment in data_out {
-            let chunk = segment.len as usize;
-            if chunk == 0 {
-                continue;
+            let mut done = 0usize;
+            while done < segment.len as usize {
+                let chunk = (segment.len as usize - done).min(STAGING_CHUNK);
+                let addr = segment.addr.wrapping_add(done as u64);
+                self.reserve(chunk);
+                if let Err(error) = mem.read_slice(&mut self.io_buf[..chunk], GuestAddress(addr)) {
+                    tracing::warn!(
+                        disk = %self.name,
+                        addr = format_args!("{addr:#x}"),
+                        len = chunk,
+                        %error,
+                        "virtio-blk write source is not readable guest memory"
+                    );
+                    return (S_IOERR, 0);
+                }
+                if let Err(error) = self.disk.write_at(&self.io_buf[..chunk], offset) {
+                    tracing::warn!(disk = %self.name, offset, %error, "virtio-blk write failed");
+                    return (S_IOERR, 0);
+                }
+                offset = offset.saturating_add(chunk as u64);
+                done += chunk;
             }
-            self.reserve(chunk);
-            if let Err(error) =
-                mem.read_slice(&mut self.io_buf[..chunk], GuestAddress(segment.addr))
-            {
-                tracing::warn!(
-                    disk = %self.name,
-                    addr = format_args!("{:#x}", segment.addr),
-                    len = segment.len,
-                    %error,
-                    "virtio-blk write source is not readable guest memory"
-                );
-                return (S_IOERR, 0);
-            }
-            if let Err(error) = self.disk.write_at(&self.io_buf[..chunk], offset) {
-                tracing::warn!(disk = %self.name, offset, %error, "virtio-blk write failed");
-                return (S_IOERR, 0);
-            }
-            offset = offset.saturating_add(chunk as u64);
         }
         (S_OK, 0)
     }
@@ -677,8 +682,8 @@ impl BlockDevice {
         raw
     }
 
-    /// Grows the staging buffer to at least `len` bytes. `len` is bounded by
-    /// [`MAX_REQUEST_BYTES`] because [`total_len`] already vetted the request.
+    /// Grows the staging buffer to at least `len` bytes. Every caller passes
+    /// at most [`STAGING_CHUNK`] or a reclaim array bounded far below it.
     fn reserve(&mut self, len: usize) {
         if self.io_buf.len() < len {
             self.io_buf.resize(len, 0);
