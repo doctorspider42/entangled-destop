@@ -43,9 +43,9 @@ use windows::Win32::System::Hypervisor::{
     WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonNone,
     WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonX64ApicEoi,
     WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess,
-    WHvSetVirtualProcessorRegisters, WHvX64RegisterApicBase, WHvX64RegisterRax, WHvX64RegisterRbx,
-    WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip, WHV_PARTITION_HANDLE,
-    WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
+    WHvRunVpExitReasonX64MsrAccess, WHvSetVirtualProcessorRegisters, WHvX64RegisterApicBase,
+    WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
+    WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
 };
 
 use crate::hv::{
@@ -185,6 +185,149 @@ impl WhpVcpu {
     ) -> Result<(), VmmError> {
         let count = self.batch_count(names, values.as_ptr(), values.len())?;
         get_regs_raw(self.partition.handle(), self.index, names, values, count)
+    }
+
+    /// For the exit trace: this VP's general registers and the code around
+    /// `rip`, read through the guest's own page tables. A cancelled run is the
+    /// only sample of a loop that never exits, and the RIP alone does not say
+    /// what the loop waits for.
+    fn trace_sample(&self, rip: u64) {
+        use crate::hv::VcpuRegisters as _;
+        if let Ok(r) = self.get_registers() {
+            eprintln!(
+                "vp{} regs rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} \
+                 rbp={:#x} rsp={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}",
+                self.index,
+                r.rax,
+                r.rbx,
+                r.rcx,
+                r.rdx,
+                r.rsi,
+                r.rdi,
+                r.rbp,
+                r.rsp,
+                r.r8,
+                r.r9,
+                r.r10,
+                r.r11
+            );
+        }
+        self.trace_bytes("code", rip.wrapping_sub(48), 96);
+        eprintln!("vp{} at {}", self.index, self.trace_symbol(rip));
+        self.trace_bugcheck(rip);
+        if let Ok(r) = self.get_registers() {
+            self.trace_bytes("stack", r.rsp, 256);
+            // Return addresses: every stack slot that names kernel code.
+            let mut stack = [0u8; 256];
+            if self.read_gva(r.rsp, &mut stack).is_some() {
+                for slot in stack.chunks_exact(8).take(32) {
+                    let value = u64::from_le_bytes(slot.try_into().unwrap_or([0; 8]));
+                    if value >> 40 == 0xff_fff8 {
+                        let mut probe = [0u8; 1];
+                        if self.read_gva(value, &mut probe).is_some() {
+                            eprintln!(
+                                "vp{} stack {value:#x} {}",
+                                self.index,
+                                self.trace_symbol(value)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prints `len` bytes of guest virtual memory at `start`, for the trace.
+    fn trace_bytes(&self, what: &str, start: u64, len: usize) {
+        let mut bytes = vec![0u8; len];
+        if self.read_gva(start, &mut bytes).is_none() {
+            eprintln!("vp{} {what}@{start:#x} does not translate", self.index);
+            return;
+        }
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!("vp{} {what}@{start:#x} {hex}", self.index);
+    }
+
+    /// Reads guest virtual memory through this VP's page tables, a page at a
+    /// time. `None` when any byte does not translate or is not RAM.
+    fn read_gva(&self, gva: u64, buf: &mut [u8]) -> Option<()> {
+        use vm_memory::Bytes as _;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let at = gva.checked_add(done as u64)?;
+            let in_page = (4096 - (at & 0xfff)) as usize;
+            let len = in_page.min(buf.len() - done);
+            let gpa = self.translate_gva(at)?;
+            self.partition
+                .memory()
+                .read_slice(&mut buf[done..done + len], vm_memory::GuestAddress(gpa))
+                .ok()?;
+            done += len;
+        }
+        Some(())
+    }
+
+    /// When `rip` is in a Windows kernel that has bugchecked, the stop code
+    /// and its four parameters, from the exported `KiBugCheckData`. A
+    /// bugcheck before the boot display is up shows nothing on screen, and the
+    /// kernel then sits in `HalReturnToFirmware` trying to reboot.
+    fn trace_bugcheck(&self, rip: u64) {
+        let read = |gva: u64, buf: &mut [u8]| self.read_gva(gva, buf);
+        let Some(base) = super::guest_symbols::image_base(&read, rip) else {
+            return;
+        };
+        let Some(data) = super::guest_symbols::export_address(&read, base, "KiBugCheckData") else {
+            return;
+        };
+        let mut raw = [0u8; 40];
+        if self.read_gva(data, &mut raw).is_none() {
+            return;
+        }
+        let word =
+            |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+        eprintln!(
+            "vp{} bugcheck code={:#x} p1={:#x} p2={:#x} p3={:#x} p4={:#x}",
+            self.index,
+            word(0) & 0xffff_ffff,
+            word(1),
+            word(2),
+            word(3),
+            word(4)
+        );
+    }
+
+    /// `module+export+off` for `rip`, when it is inside a PE image.
+    fn trace_symbol(&self, rip: u64) -> String {
+        let read = |gva: u64, buf: &mut [u8]| self.read_gva(gva, buf);
+        let Some(base) = super::guest_symbols::image_base(&read, rip) else {
+            return "?".into();
+        };
+        let name =
+            super::guest_symbols::nearest_export(&read, base, rip).unwrap_or_else(|| "?".into());
+        format!("image@{base:#x} {name}")
+    }
+
+    /// The guest physical address `gva` maps to on this VP, if any.
+    fn translate_gva(&self, gva: u64) -> Option<u64> {
+        use windows::Win32::System::Hypervisor::{
+            WHvTranslateGva, WHvTranslateGvaFlagValidateRead, WHvTranslateGvaResultSuccess,
+            WHV_TRANSLATE_GVA_RESULT,
+        };
+        let mut result = WHV_TRANSLATE_GVA_RESULT::default();
+        let mut gpa = 0u64;
+        // SAFETY: the partition and VP are live, and both out-parameters are
+        // locals that outlive the call.
+        let call = unsafe {
+            WHvTranslateGva(
+                self.partition.handle(),
+                self.index,
+                gva,
+                WHvTranslateGvaFlagValidateRead,
+                &raw mut result,
+                &raw mut gpa,
+            )
+        };
+        (call.is_ok() && result.ResultCode == WHvTranslateGvaResultSuccess).then_some(gpa)
     }
 
     /// Writes an arbitrary register batch.
@@ -377,6 +520,9 @@ impl WhpVcpu {
             .local_apic
             .then(|| Arc::clone(self.partition.halt_gate()));
         let gate = halt_gate.as_ref();
+        // The MSRs already logged, so a guest that polls one does not flood
+        // the log (`WhpOptions::ignore_msrs`).
+        let mut msrs_seen = std::collections::BTreeSet::new();
 
         while running.load(Ordering::Acquire) {
             if let Some(lifecycle) = lifecycle {
@@ -394,11 +540,24 @@ impl WhpVcpu {
             let exit = self.run_once()?;
             if trace_exits {
                 eprintln!(
-                    "vp{} exit={} rip={:#x}",
-                    self.index, exit.ExitReason.0, exit.VpContext.Rip
+                    "vp{} exit={} rip={:#x}{}",
+                    self.index,
+                    exit.ExitReason.0,
+                    exit.VpContext.Rip,
+                    trace_detail(&exit)
                 );
+                // A cancelled run, and a write to the reset port: the moment a
+                // guest that just bugchecked is about to take the evidence
+                // with it.
+                if exit.ExitReason == WHvRunVpExitReasonCanceled || is_reset_port_write(&exit) {
+                    self.trace_sample(exit.VpContext.Rip);
+                }
             }
             match exit.ExitReason {
+                WHvRunVpExitReasonX64MsrAccess => {
+                    self.handle_ignored_msr(&exit, &mut msrs_seen)?;
+                    continue;
+                }
                 WHvRunVpExitReasonX64Halt => match gate {
                     // Nothing can wake a CPU without a local APIC, so `hlt`
                     // really is the end (the phase-1 smoke guests rely on this).
@@ -664,6 +823,53 @@ impl WhpVcpu {
         )
     }
 
+    /// Serves an MSR WHP does not implement, the way KVM's `ignore_msrs`
+    /// does: a read is 0, a write is dropped, and the MSR is logged the first
+    /// time each vCPU sees it. Only reached with `WhpOptions::ignore_msrs`.
+    fn handle_ignored_msr(
+        &self,
+        exit: &WHV_RUN_VP_EXIT_CONTEXT,
+        seen: &mut std::collections::BTreeSet<(u32, bool)>,
+    ) -> Result<(), VmmError> {
+        // SAFETY: `ExitReason == WHvRunVpExitReasonX64MsrAccess` selects the
+        // `MsrAccess` arm; its access info is a bitfield union read through
+        // its `u32` storage, whose bit 0 is `IsWrite`.
+        let (msr, is_write, value) = unsafe {
+            let access = exit.Anonymous.MsrAccess;
+            (
+                access.MsrNumber,
+                access.AccessInfo.AsUINT32 & 1 != 0,
+                (access.Rdx << 32) | (access.Rax & 0xffff_ffff),
+            )
+        };
+        if seen.insert((msr, is_write)) {
+            tracing::warn!(
+                vcpu = self.index,
+                msr = format_args!("{msr:#x}"),
+                write = is_write,
+                value = format_args!("{value:#x}"),
+                rip = format_args!("{:#x}", exit.VpContext.Rip),
+                "guest touched an MSR WHP does not implement; ignoring it"
+            );
+        }
+        let next_rip = exit
+            .VpContext
+            .Rip
+            .wrapping_add(Self::instruction_length(exit));
+        let mut values = Aligned16([zeroed_value(); 3]);
+        values.0[0].Reg64 = next_rip;
+        if is_write {
+            return self.set_raw(&[WHvX64RegisterRip], &values.0[..1]);
+        }
+        // `rdmsr` writes EDX:EAX, zero-extended into RDX and RAX.
+        values.0[1].Reg64 = 0;
+        values.0[2].Reg64 = 0;
+        self.set_raw(
+            &[WHvX64RegisterRip, WHvX64RegisterRax, WHvX64RegisterRdx],
+            &values.0,
+        )
+    }
+
     /// Answers a `cpuid` the partition's exit list trapped, by applying this
     /// machine's policy to the result WHP would have returned.
     ///
@@ -683,6 +889,18 @@ impl WhpVcpu {
                 edx: access.DefaultResultRdx as u32,
             },
         );
+        if std::env::var_os(TRACE_EXITS_ENV).is_some() {
+            eprintln!(
+                "vp{} cpuid {:#x}/{:#x} -> {:08x} {:08x} {:08x} {:08x}",
+                self.index,
+                access.Rax as u32,
+                access.Rcx as u32,
+                result.eax,
+                result.ebx,
+                result.ecx,
+                result.edx
+            );
+        }
         // `cpuid` zero-extends into the 64-bit registers, so writing the 32-bit
         // values as `u64` is exactly the architectural result.
         let names = [
@@ -829,6 +1047,69 @@ fn park(
 
 /// Environment variable that turns on per-exit tracing in the run loop.
 pub const TRACE_EXITS_ENV: &str = "ENTANGLED_WHP_TRACE_EXITS";
+
+/// What an exit was *about*, for the trace: the port, the guest physical
+/// address, or the `cpuid` leaf. A RIP alone tells which instruction looped;
+/// this tells what it was waiting for, which is what bringing up a guest the
+/// machine has never run (Windows, ADR-0008 §3) needs.
+/// Whether `exit` is a write to the PC reset control register (`0xcf9`).
+fn is_reset_port_write(exit: &WHV_RUN_VP_EXIT_CONTEXT) -> bool {
+    if exit.ExitReason != WHvRunVpExitReasonX64IoPortAccess {
+        return false;
+    }
+    // SAFETY: the exit reason selects the `IoPortAccess` arm; the access info
+    // is a bitfield union read through its `u32` storage.
+    let (port, info) = unsafe {
+        let io = exit.Anonymous.IoPortAccess;
+        (io.PortNumber, io.AccessInfo.AsUINT32)
+    };
+    port == 0xcf9 && IoAccessInfo::decode(info).is_write
+}
+
+// The `WHvRunVpExitReason*` names are the bindings' own constants.
+#[allow(non_upper_case_globals)]
+fn trace_detail(exit: &WHV_RUN_VP_EXIT_CONTEXT) -> String {
+    match exit.ExitReason {
+        WHvRunVpExitReasonX64IoPortAccess => {
+            // SAFETY: the exit reason selects the `IoPortAccess` arm, and
+            // `AccessInfo` is a union of a bitfield struct and its `u32`
+            // storage, which `AsUINT32` reads.
+            let (port, info, rax) = unsafe {
+                let io = exit.Anonymous.IoPortAccess;
+                (io.PortNumber, io.AccessInfo.AsUINT32, io.Rax)
+            };
+            let info = IoAccessInfo::decode(info);
+            let dir = if info.is_write { "out" } else { "in" };
+            format!(
+                " {dir} port={port:#06x} size={} rax={rax:#x}",
+                info.access_size
+            )
+        }
+        WHvRunVpExitReasonMemoryAccess => {
+            // SAFETY: the exit reason selects the `MemoryAccess` arm; the
+            // access info is a bitfield union read through its `u32` storage.
+            let (gpa, info) = unsafe {
+                let access = exit.Anonymous.MemoryAccess;
+                (access.Gpa, access.AccessInfo.AsUINT32)
+            };
+            format!(" gpa={gpa:#x} type={}", info & 0x3)
+        }
+        WHvRunVpExitReasonX64Cpuid => {
+            // SAFETY: the exit reason selects the `CpuidAccess` arm.
+            let (leaf, subleaf) = unsafe {
+                let access = exit.Anonymous.CpuidAccess;
+                (access.Rax, access.Rcx)
+            };
+            format!(" leaf={leaf:#x} subleaf={subleaf:#x}")
+        }
+        // A cancelled run is a sample of where the guest was: with no exit of
+        // its own, it is the only way to see a loop that never traps.
+        WHvRunVpExitReasonCanceled | WHvRunVpExitReasonX64Halt => {
+            format!(" rflags={:#x}", exit.VpContext.Rflags)
+        }
+        _ => String::new(),
+    }
+}
 
 /// `WHV_MEMORY_ACCESS_INFO::AccessType`: 0 read, 1 write, 2 execute.
 const MEMORY_ACCESS_EXECUTE: u32 = 2;

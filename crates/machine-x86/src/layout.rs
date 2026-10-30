@@ -80,6 +80,12 @@ pub const ACPI_PM_BASE: u16 = 0x0600;
 /// Size of the ACPI PM register block.
 pub const ACPI_PM_SIZE: u16 = 0x10;
 
+/// GSI of the RTC's interrupt: ISA IRQ 8, identity-mapped like every ISA
+/// line here. Its periodic interrupt is the system clock of a Windows guest
+/// on a machine without an HPET (ADR-0008 §3), and it is the reason
+/// [`VIRTIO_IRQS`] skips pin 8.
+pub const RTC_GSI: u32 = 8;
+
 /// GSI reserved for the ACPI System Control Interrupt (FADT `SCI_INT`).
 ///
 /// Not 9, the PC convention: 9 is one of the pins [`VIRTIO_IRQS`] hands to

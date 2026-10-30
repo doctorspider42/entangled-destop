@@ -42,6 +42,8 @@ pub mod ioapic;
 pub mod pic;
 pub mod pit;
 
+pub(crate) use pit::raise_timer_thread_priority;
+
 use std::sync::{Arc, Mutex};
 
 use virtio_core::interrupt::IrqLine;
@@ -138,6 +140,17 @@ impl UserspaceIrqChip {
         match self.ioapic.line(SERIAL_PIN) {
             Ok(line) => line,
             Err(_) => unreachable!("SERIAL_PIN is within the IOAPIC's pin count"),
+        }
+    }
+
+    /// The RTC's interrupt: IOAPIC pin [`crate::layout::RTC_GSI`].
+    pub fn rtc_line(&self) -> Arc<dyn IrqLine> {
+        match u8::try_from(crate::layout::RTC_GSI)
+            .ok()
+            .and_then(|pin| self.ioapic.line(pin).ok())
+        {
+            Some(line) => line,
+            None => unreachable!("RTC_GSI is within the IOAPIC's pin count"),
         }
     }
 

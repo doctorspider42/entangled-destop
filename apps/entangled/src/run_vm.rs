@@ -32,6 +32,9 @@
 
 pub use crate::run_options::{RunOptions, ScreenshotRequest};
 
+#[path = "framebuffer_present.rs"]
+mod framebuffer_present;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -533,7 +536,12 @@ fn build_devices(
     // no Vulkan at all — so a guest that gets a reply from us gets nothing and
     // waits. It is how the protocol is studied, never a thing a profile should
     // be able to ask for by accident. The precedent is `ENTANGLED_GPU_FENCES`.
-    if let GpuPlan::Capture(prefix) = plan {
+    if cfg.display.adapter == control_api::DisplayAdapter::Framebuffer {
+        // No virtio-gpu: the boot framebuffer is the display (ADR-0008 §1),
+        // attached by the machine after the virtio functions and presented
+        // by `framebuffer_present`. The config refuses 3D beside it.
+        tracing::info!("display adapter: boot framebuffer, no virtio-gpu");
+    } else if let GpuPlan::Capture(prefix) = plan {
         // The files are made per ring, long after this point; a directory that
         // is not there is worth failing the run for now rather than refusing
         // every ring later.
@@ -1565,6 +1573,21 @@ pub fn run_with(
     let bus = started.bus;
     let threads = started.threads;
     let quiesce = started.quiesce;
+    // The boot framebuffer has no flush: the guest writes VRAM and nothing
+    // tells the host, so a thread looks (ADR-0008 §1). Stopped on drop, at
+    // the end of this function, after the vCPUs.
+    let _framebuffer_presenter = match bus.pci().and_then(|pci| pci.framebuffer()) {
+        Some(fb) => Some(
+            framebuffer_present::Presenter::start(
+                Arc::clone(&fb.device),
+                display_handle.clone(),
+                Arc::clone(&quiesce),
+                cfg.display.refresh_hz,
+            )
+            .map_err(|e| format!("cannot start the framebuffer presenter: {e}"))?,
+        ),
+        None => None,
+    };
 
     // Lifecycle (MVP-1203, ADR-0005): Created -> Running -> Stopping -> Stopped,
     // with Running <-> Paused and Running -> Resetting -> Running in between,
@@ -2487,13 +2510,14 @@ mod host {
                     (MachineBus::with_virtio(serial, virtio), cmdline)
                 }
                 VirtioTransport::Pci => {
-                    let pci = VirtioPciBus::attach_with_shm(
+                    let pci = VirtioPciBus::attach_with_display(
                         vm.fd_shared(),
                         Arc::clone(&mem),
                         devices,
                         machine_x86::notify::QueueNotifyMode::from_env(),
                         machine_x86::virtio_pci::PciInterruptMode::from_env(),
                         shm(),
+                        super::framebuffer_present::config_for(cfg),
                     )
                     .map_err(|e| e.to_string())?;
                     let cmdline =
@@ -2523,6 +2547,17 @@ mod host {
                 tracing::warn!(%error, "no ACPI SCI irqfd; the power button cannot interrupt the guest")
             }
         }
+        // The RTC's IRQ 8, which a Windows guest takes as its clock
+        // (ADR-0008 §3). A no-op for a direct-Linux machine, which has no RTC.
+        let bus =
+            match machine_x86::irqfd::IrqFdLine::new(&vm.fd_shared(), machine_x86::layout::RTC_GSI)
+            {
+                Ok(line) => bus.with_rtc_interrupt(Arc::new(line)),
+                Err(error) => {
+                    tracing::warn!(%error, "no RTC irqfd; the RTC cannot interrupt the guest");
+                    bus
+                }
+            };
 
         // Boot mode dispatch (EPIC 18 / ADR-0003). Everything above this point —
         // memory, IRQ chip, serial, the whole virtio window — is identical for both
@@ -2740,9 +2775,12 @@ mod host {
         // WHP decides write tracking when guest RAM is mapped, so it is a
         // partition option rather than a switch — see `WhpOptions::track_dirty`.
         let track_dirty = super::track_dirty_requested();
+        let defaults = WhpOptions::for_guest();
         let options = WhpOptions {
             track_dirty,
-            ..WhpOptions::for_guest()
+            // The profile's, or `$ENTANGLED_WHP_IGNORE_MSRS` for a one-off run.
+            ignore_msrs: cfg.ignore_msrs || defaults.ignore_msrs,
+            ..defaults
         };
         let mut vm =
             WhpPartition::with_options(&hv, machine, options).map_err(|e| e.to_string())?;
@@ -2806,12 +2844,13 @@ mod host {
                     (MachineBus::with_virtio(serial, virtio), cmdline)
                 }
                 VirtioTransport::Pci => {
-                    let pci = VirtioPciBus::attach_userspace_with_shm(
+                    let pci = VirtioPciBus::attach_userspace_with_display(
                         Arc::clone(&mem),
                         devices,
                         &irqchip,
                         PciInterruptMode::from_env(),
                         shm(),
+                        super::framebuffer_present::config_for(cfg),
                     )
                     .map_err(|e| e.to_string())?;
                     let cmdline =

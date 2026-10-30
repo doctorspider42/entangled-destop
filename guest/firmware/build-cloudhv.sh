@@ -157,6 +157,123 @@ open(path, "wb").write(data)
 PY
 fi
 
+# ---------------------------------------------------------------------------
+# A GOP with a real framebuffer (ADR-0008 §1).
+#
+# CloudHv ships no display driver at all, so the firmware and every boot
+# loader are visible on ttyS0 only. Linux does not care; Windows draws into
+# the linear framebuffer GOP reports from the first instruction of
+# bootmgfw.efi and keeps drawing into it after ExitBootServices. QemuVideoDxe
+# (EDK2's own driver, BSD-2-Clause-Patent; the name is historical) binds the
+# Bochs-DISPI display `machine_x86::framebuffer` emulates and produces exactly
+# that GOP. Its mode comes from the device's EDID through three dynamic PCDs,
+# which CloudHv does not declare dynamic, so they are added too.
+#
+# A screen is only half a console. CloudHv has no keyboard driver either, so
+# its ConIn is the serial terminal alone, and a key pressed in the window
+# reaches the virtio keyboard and stops there. Windows' boot media asks for
+# exactly such a key ("Press any key to boot from CD or DVD"), so
+# VirtioKeyboardDxe (EDK2's, same licence) comes in the same switch.
+#
+# ENTANGLED_FW_VIDEO=0 builds the stock component list.
+VIDEO_ENABLED="${ENTANGLED_FW_VIDEO:-1}"
+platform_dsc="OvmfPkg/CloudHv/CloudHvX64.dsc"
+platform_fdf="OvmfPkg/CloudHv/CloudHvX64.fdf"
+git checkout -- "$platform_dsc" "$platform_fdf"
+if [ "$VIDEO_ENABLED" != "0" ]; then
+    echo ">> adding QemuVideoDxe and VirtioKeyboardDxe (a console on the window)" >&2
+    python3 - "$src/$platform_dsc" "$src/$platform_fdf" <<'PY'
+import sys
+
+dsc, fdf = sys.argv[1], sys.argv[2]
+
+def insert_after(path, anchor, lines):
+    # Binary, and in the file's own line ending: the EDK2 tree is CRLF.
+    data = open(path, "rb").read()
+    eol = b"\r\n" if b"\r\n" in data else b"\n"
+    needle = anchor + eol
+    if data.count(needle) != 1:
+        sys.exit(
+            "ERROR: %s does not contain exactly one line\n  %s\n"
+            "The pinned EDK2 tree changed shape; re-read ADR-0008 before trusting\n"
+            "this build." % (path, anchor.decode())
+        )
+    data = data.replace(needle, needle + b"".join(l + eol for l in lines))
+    open(path, "wb").write(data)
+
+insert_after(dsc, b"  MdeModulePkg/Universal/Console/TerminalDxe/TerminalDxe.inf",
+             [b"  OvmfPkg/QemuVideoDxe/QemuVideoDxe.inf",
+              b"  OvmfPkg/VirtioKeyboardDxe/VirtioKeyboard.inf"])
+insert_after(dsc, b"  gUefiOvmfPkgTokenSpaceGuid.PcdPciMmio64Size|0x800000000",
+             [b"  gEfiMdeModulePkgTokenSpaceGuid.PcdVideoHorizontalResolution|1280",
+              b"  gEfiMdeModulePkgTokenSpaceGuid.PcdVideoVerticalResolution|800",
+              b"  gUefiOvmfPkgTokenSpaceGuid.PcdVideoResolutionSource|0"])
+insert_after(fdf, b"INF  MdeModulePkg/Universal/Console/TerminalDxe/TerminalDxe.inf",
+             [b"INF  OvmfPkg/QemuVideoDxe/QemuVideoDxe.inf",
+              b"INF  OvmfPkg/VirtioKeyboardDxe/VirtioKeyboard.inf"])
+PY
+fi
+
+# ---------------------------------------------------------------------------
+# Install the FACS (ADR-0008 §3).
+#
+# InstallCloudHvTables() hands AcpiTableDxe every table in our XSDT and the
+# DSDT the FADT names, and never the FACS the FADT also names. AcpiTableDxe
+# then rewrites FIRMWARE_CTRL and X_FIRMWARE_CTRL to the FACS it was given,
+# which is none, so the OS sees zeroes. Cloud Hypervisor's own machine is
+# hardware-reduced and needs no FACS; ours is not (PM block, SCI, global lock),
+# and Windows stops on it with ACPI_BIOS_ERROR (0xA5, 0x11, 3: "cannot load
+# the RSDT"). Linux only warns. The patch installs the FACS the FADT points at,
+# after which AcpiTableDxe patches the FADT itself.
+platform_acpi="OvmfPkg/AcpiPlatformDxe/CloudHvAcpi.c"
+git checkout -- "$platform_acpi"
+echo ">> installing the FADT's FACS in CloudHvAcpi.c" >&2
+python3 - "$src/$platform_acpi" <<'PY'
+import sys
+
+path = sys.argv[1]
+data = open(path, "rb").read()
+eol = b"\r\n" if b"\r\n" in data else b"\n"
+edits = [
+    (b"  EFI_ACPI_DESCRIPTION_HEADER                   *DsdtTable;",
+     [b"  EFI_ACPI_DESCRIPTION_HEADER                   *FacsTable = NULL;"],
+     "after"),
+    (b"        DsdtTable = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)Fadt2Table->XDsdt;",
+     [b"        //",
+      b"        // Install the FACS the FADT points at (Entangled, ADR-0008):",
+      b"        // without it AcpiTableDxe zeroes FIRMWARE_CTRL. Installed after",
+      b"        // the FADT, so AcpiTableDxe patches the FADT to its copy.",
+      b"        //",
+      b"        FacsTable = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)",
+      b"                    (Fadt2Table->XFirmwareCtrl != 0 ?",
+      b"                     Fadt2Table->XFirmwareCtrl : Fadt2Table->FirmwareCtrl);",
+      b"        if (FacsTable != NULL) {",
+      b"          Status = AcpiProtocol->InstallAcpiTable (",
+      b"                                   AcpiProtocol,",
+      b"                                   FacsTable,",
+      b"                                   FacsTable->Length,",
+      b"                                   &TableHandle",
+      b"                                   );",
+      b"          if (EFI_ERROR (Status)) {",
+      b"            ASSERT_EFI_ERROR (Status);",
+      b"            return Status;",
+      b"          }",
+      b"        }"],
+     "after"),
+]
+for anchor, lines, where in edits:
+    needle = anchor + eol
+    if data.count(needle) != 1:
+        sys.exit(
+            "ERROR: %s does not contain exactly one line\n  %s\n"
+            "The pinned EDK2 tree changed shape; re-read ADR-0008 before trusting\n"
+            "this build." % (path, anchor.decode())
+        )
+    block = b"".join(l + eol for l in lines)
+    data = data.replace(needle, needle + block if where == "after" else block + needle)
+open(path, "wb").write(data)
+PY
+
 # -D DEBUG_ON_SERIAL_PORT routes the DebugLib to the 16550 at 0x3f8 instead of
 # the Bochs/QEMU debug I/O port 0x402 (PlatformDebugLibIoPort). Our machine
 # emulates the UART, not that port, so this is what makes the firmware log
@@ -198,6 +315,7 @@ cp "$image" "$out/CLOUDHV.fd"
     echo "target:     $EDK2_TARGET"
     echo "toolchain:  $TOOLCHAIN"
     echo "defines:    DEBUG_ON_SERIAL_PORT"
+    echo "video:      $([ "$VIDEO_ENABLED" != "0" ] && echo "QemuVideoDxe + VirtioKeyboardDxe (ADR-0008)" || echo "none (stock)")"
     echo "flash base: $flash_base ($([ "$PFLASH_ENABLED" != "0" ] && echo "pflash/NVRAM, UEFI-1804" || echo "stock, RAM-only variables"))"
     echo "size:       $(stat -c%s "$out/CLOUDHV.fd") bytes"
     echo "sha256:     $(sha256sum "$out/CLOUDHV.fd" | cut -d' ' -f1)"

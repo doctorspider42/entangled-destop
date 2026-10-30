@@ -1041,13 +1041,16 @@ mod tests {
         assert_ne!(t.status() & status::DEVICE_NEEDS_RESET, 0);
     }
 
+    /// A driver may leave queues it has no use for disabled (virtio 1.2
+    /// §4.1.4.3); EDK2's virtio keyboard never enables virtio-input's
+    /// `statusq`. The device activates and simply never sees those queues.
     #[test]
-    fn activation_without_ready_queues_needs_reset() {
+    fn activation_with_disabled_queues_activates_without_them() {
         let (mut t, _) = transport();
         bring_up_features(&mut t);
         finish_bring_up(&mut t);
-        assert!(!t.is_activated());
-        assert_ne!(t.status() & status::DEVICE_NEEDS_RESET, 0);
+        assert!(t.is_activated());
+        assert_eq!(t.status() & status::DEVICE_NEEDS_RESET, 0);
     }
 
     #[test]

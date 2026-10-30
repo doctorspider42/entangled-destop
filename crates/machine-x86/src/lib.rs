@@ -5,6 +5,11 @@ pub mod acpi;
 pub mod boot;
 pub mod bus;
 
+/// The boot framebuffer (ADR-0008 §1): a PCI display with a linear
+/// framebuffer, for guests that draw where the firmware's GOP pointed.
+/// Portable.
+pub mod framebuffer;
+
 /// The host-wake worker of a synchronous-kick machine (WHP): what serves a
 /// device's `virtio_core::HostWaker` where no ioeventfd worker exists.
 /// Portable.

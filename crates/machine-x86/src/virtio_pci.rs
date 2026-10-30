@@ -98,6 +98,7 @@ use virtio_core::pci as vpci;
 use virtio_core::transport::TransportError;
 use virtio_core::{GuestMem, PciTransport, VirtioDevice};
 
+use crate::framebuffer::{Framebuffer, FramebufferConfig};
 use crate::host_wake::HostWakeService;
 use crate::irqchip::{IrqChipError, UserspaceIrqChip};
 #[cfg(target_os = "linux")]
@@ -146,6 +147,9 @@ pub enum VirtioPciAttachError {
     #[cfg(target_os = "linux")]
     #[error(transparent)]
     Notify(#[from] NotifyError),
+
+    #[error("the boot framebuffer: {reason}")]
+    Framebuffer { reason: String },
 }
 
 /// Environment variable that forces an interrupt mode, for the INTx regression
@@ -286,6 +290,26 @@ pub struct VirtioPciBus {
     /// ([`Self::attach_userspace`]); `None` on the KVM path, whose ioeventfd
     /// workers serve wakes themselves (see [`crate::host_wake`]).
     host_wake: Option<HostWakeService<PciTransport>>,
+    /// The boot framebuffer (ADR-0008 §1), when the VM asked for one. Not a
+    /// virtio function, so not a slot: its owner token on the root is one past
+    /// the last slot.
+    framebuffer: Option<FramebufferSlot>,
+}
+
+/// The boot framebuffer on the bus: the device, its VRAM window and where
+/// the host first put its register BAR.
+pub struct FramebufferSlot {
+    /// PCI device number on bus 0.
+    pub device_number: u8,
+    /// Guest physical base the host gave the register BAR.
+    pub regs_base: u64,
+    /// The device, shared with whatever presents its VRAM.
+    pub device: Arc<Framebuffer>,
+    /// The VRAM pages behind BAR 0, which follow the BAR like a virtio
+    /// shared-memory window does.
+    window: Arc<crate::shm::ShmWindow>,
+    /// The token [`PciRoot`] knows this function by.
+    owner: usize,
 }
 
 /// One function's host-neutral pieces, built by [`VirtioPciBus::attach_function`]
@@ -308,6 +332,7 @@ impl VirtioPciBus {
             mode: QueueNotifyMode::Synchronous,
             interrupts: PciInterruptMode::default(),
             host_wake: None,
+            framebuffer: None,
         }
     }
 
@@ -362,6 +387,21 @@ impl VirtioPciBus {
         interrupts: PciInterruptMode,
         shm: Option<ShmSupport<'_>>,
     ) -> Result<Self, VirtioPciAttachError> {
+        Self::attach_with_display(vm, mem, devices, mode, interrupts, shm, None)
+    }
+
+    /// [`Self::attach_with_shm`] plus a boot framebuffer after the virtio
+    /// functions (ADR-0008 §1). `None` is exactly the bus every caller had.
+    #[cfg(target_os = "linux")]
+    pub fn attach_with_display(
+        vm: Arc<VmFd>,
+        mem: Arc<GuestMem>,
+        devices: Vec<Box<dyn VirtioDevice>>,
+        mode: QueueNotifyMode,
+        interrupts: PciInterruptMode,
+        shm: Option<ShmSupport<'_>>,
+        framebuffer: Option<FramebufferConfig>,
+    ) -> Result<Self, VirtioPciAttachError> {
         // One probe for the whole bus: whether a function publishes MSI-X must be
         // settled before any driver can walk the capability list, and a capability
         // whose interrupts silently vanish is worse than no capability.
@@ -391,6 +431,7 @@ impl VirtioPciBus {
             mode,
             interrupts,
             host_wake: None,
+            framebuffer: None,
         };
         let mut apertures = shm
             .as_ref()
@@ -460,6 +501,9 @@ impl VirtioPciBus {
                 shm: built.shm,
             });
         }
+        if let Some(config) = framebuffer {
+            bus.attach_framebuffer(&config, shm.as_ref().zip(apertures.as_mut()))?;
+        }
         Ok(bus)
     }
 
@@ -507,6 +551,20 @@ impl VirtioPciBus {
         interrupts: PciInterruptMode,
         shm: Option<ShmSupport<'_>>,
     ) -> Result<Self, VirtioPciAttachError> {
+        Self::attach_userspace_with_display(mem, devices, irqchip, interrupts, shm, None)
+    }
+
+    /// [`Self::attach_userspace_with_shm`] plus a boot framebuffer after the
+    /// virtio functions (ADR-0008 §1). `None` is exactly the bus every caller
+    /// had.
+    pub fn attach_userspace_with_display(
+        mem: Arc<GuestMem>,
+        devices: Vec<Box<dyn VirtioDevice>>,
+        irqchip: &UserspaceIrqChip,
+        interrupts: PciInterruptMode,
+        shm: Option<ShmSupport<'_>>,
+        framebuffer: Option<FramebufferConfig>,
+    ) -> Result<Self, VirtioPciAttachError> {
         let msi: Option<Arc<dyn MsiSink>> = if interrupts.is_msix() {
             Some(Arc::new(UserspaceMsiSink::new(
                 irqchip.interrupt_delivery(),
@@ -525,6 +583,7 @@ impl VirtioPciBus {
             mode: QueueNotifyMode::Synchronous,
             interrupts,
             host_wake: None,
+            framebuffer: None,
         };
         let host_wake = HostWakeService::new(devices.len());
         let mut apertures = shm
@@ -575,7 +634,84 @@ impl VirtioPciBus {
         }
         host_wake.start(bus.slots.iter().map(|s| Arc::clone(&s.transport)).collect());
         bus.host_wake = Some(host_wake);
+        if let Some(config) = framebuffer {
+            bus.attach_framebuffer(&config, shm.as_ref().zip(apertures.as_mut()))?;
+        }
         Ok(bus)
+    }
+
+    /// Puts the boot framebuffer on the bus after the virtio functions: its
+    /// register page in the next 32-bit slot, its VRAM in host pages from
+    /// `shm`, placed in the 64-bit aperture like a shared-memory window.
+    ///
+    /// Unlike a virtio device's shared memory, which degrades to "no window"
+    /// when the host cannot back it, this fails the attach: a framebuffer
+    /// with no VRAM is a display that shows nothing, and the VM asked for it.
+    fn attach_framebuffer(
+        &mut self,
+        config: &FramebufferConfig,
+        shm: Option<(&ShmSupport<'_>, &mut layout::Mmio64Allocator)>,
+    ) -> Result<(), VirtioPciAttachError> {
+        let fail = |reason: String| VirtioPciAttachError::Framebuffer { reason };
+        let bus_error = |source| VirtioPciAttachError::Bus {
+            slot: self.slots.len(),
+            source,
+        };
+        Framebuffer::validate(config).map_err(|e| fail(e.to_string()))?;
+        let owner = self.slots.len();
+        if owner as u64 >= layout::PCI_MMIO_SLOTS {
+            return Err(bus_error(PciError::BusFull));
+        }
+        let (support, aperture) =
+            shm.ok_or_else(|| fail("this machine cannot back VRAM with host memory".into()))?;
+        let vram_bytes = config.vram_bytes;
+        let vram_base = aperture
+            .allocate(vram_bytes)
+            .ok_or_else(|| fail("the 64-bit MMIO aperture has no room for VRAM".into()))?;
+        let pages = (support.allocate)(vram_bytes, false)
+            .map_err(|e| fail(format!("cannot allocate VRAM: {e}")))?;
+        let placements = vec![vpci::ShmPlacement {
+            id: 0,
+            offset: 0,
+            len: vram_bytes,
+        }];
+        let window =
+            crate::shm::ShmWindow::new(pages, vram_bytes, placements, vram_base, support.mem_bytes)
+                .map_err(|e| fail(e.to_string()))?;
+        let backing = window
+            .backing_for(0)
+            .ok_or_else(|| fail("the VRAM window has no region".into()))?;
+        let device = Framebuffer::new(config, backing).map_err(|e| fail(e.to_string()))?;
+        let regs_base = layout::pci_bar_slot(owner as u64);
+        let regs_base32 = u32::try_from(regs_base).map_err(|_| bus_error(PciError::BusFull))?;
+        let space =
+            Framebuffer::config_space(vram_bytes, vram_base, regs_base32).map_err(bus_error)?;
+        let device_number = self
+            .root
+            .lock()
+            .map_err(|_| bus_error(PciError::BusFull))?
+            .attach(space, owner)
+            .map_err(bus_error)?;
+        tracing::info!(
+            address = format_args!("00:{device_number:02x}.0"),
+            regs = format_args!("{regs_base:#x}"),
+            vram = format_args!("{vram_base:#x}"),
+            vram_bytes,
+            "attached the boot framebuffer"
+        );
+        self.framebuffer = Some(FramebufferSlot {
+            device_number,
+            regs_base,
+            device: Arc::new(device),
+            window: Arc::new(window),
+            owner,
+        });
+        Ok(())
+    }
+
+    /// The boot framebuffer, when the VM has one.
+    pub fn framebuffer(&self) -> Option<&FramebufferSlot> {
+        self.framebuffer.as_ref()
     }
 
     /// Builds and attaches one function's host-neutral pieces: the MSI-X table
@@ -834,12 +970,16 @@ impl VirtioPciBus {
         // window left mapped across a reboot is host memory visible to a guest
         // that has not yet enumerated the bus.
         self.reconcile_shm();
+        if let Some(framebuffer) = &self.framebuffer {
+            framebuffer.device.reset();
+        }
     }
 
     /// Every function on this bus whose device would refuse a snapshot now,
     /// each as its own sentence (ADR-0006).
     pub fn snapshot_refusals(&self) -> Vec<String> {
-        self.slots
+        let mut refusals: Vec<String> = self
+            .slots
             .iter()
             .filter_map(|slot| match slot.transport.lock() {
                 Ok(transport) => transport.snapshot_refusal(),
@@ -848,7 +988,14 @@ impl VirtioPciBus {
                     slot.device_number
                 )),
             })
-            .collect()
+            .collect();
+        // The registers round-trip already; VRAM has no section in the
+        // snapshot format yet (ADR-0008 §6), and a resumed guest drawing into
+        // a blank framebuffer is exactly the "subtly wrong" ADR-0006 refuses.
+        if self.framebuffer.is_some() {
+            refusals.push("the boot framebuffer's VRAM cannot be saved yet".into());
+        }
+        refusals
     }
 
     pub fn gpu_checkpoint_slots(&self) -> Result<Vec<u32>, crate::state::StateError> {
@@ -1246,6 +1393,15 @@ impl VirtioPciBus {
     ///   refuses to follow, is the one outcome that turns a device bug into a
     ///   memory-safety one for the guest.
     fn reconcile_shm(&self) {
+        // The framebuffer's VRAM is released in the same pass as every other
+        // window, before anything is claimed (see `ShmWindow::release_for`).
+        let framebuffer_target = self.framebuffer.as_ref().and_then(|fb| {
+            let window = match self.root.lock() {
+                Ok(root) => root.bar_window_of(fb.owner, crate::framebuffer::VRAM_BAR_INDEX),
+                Err(_) => return None,
+            };
+            fb.window.release_for(window.map(|(base, _)| base))
+        });
         let mut targets = [None; crate::pci::MAX_PCI_DEVICES];
         for (index, slot) in self.slots.iter().enumerate() {
             let Some(shm) = &slot.shm else {
@@ -1264,6 +1420,9 @@ impl VirtioPciBus {
                 }
             };
             *target = shm.release_for(window.map(|(base, _)| base));
+        }
+        if let (Some(fb), Some(base)) = (&self.framebuffer, framebuffer_target) {
+            fb.window.claim(base);
         }
         for (index, slot) in self.slots.iter().enumerate() {
             let Some(shm) = &slot.shm else {
@@ -1324,8 +1483,21 @@ impl VirtioPciBus {
         Some((self.slots.get(owner)?, offset))
     }
 
+    /// The framebuffer's register-page offset for `addr`, if that is where it
+    /// lands.
+    fn locate_framebuffer(&self, addr: u64) -> Option<(&Framebuffer, u64)> {
+        let fb = self.framebuffer.as_ref()?;
+        let (owner, bar, offset) = self.root.lock().ok()?.locate_mmio(addr)?;
+        (owner == fb.owner && bar == crate::framebuffer::REGS_BAR_INDEX)
+            .then_some((fb.device.as_ref(), offset))
+    }
+
     /// Guest MMIO read inside some device's BAR window.
     pub fn mmio_read(&self, addr: u64, data: &mut [u8]) {
+        if let Some((fb, offset)) = self.locate_framebuffer(addr) {
+            fb.mmio_read(offset, data);
+            return;
+        }
         let Some((slot, offset)) = self.locate(addr) else {
             return;
         };
@@ -1340,6 +1512,10 @@ impl VirtioPciBus {
 
     /// Guest MMIO write inside some device's BAR window.
     pub fn mmio_write(&self, addr: u64, data: &[u8]) {
+        if let Some((fb, offset)) = self.locate_framebuffer(addr) {
+            fb.mmio_write(offset, data);
+            return;
+        }
         let Some((slot, offset)) = self.locate(addr) else {
             return;
         };

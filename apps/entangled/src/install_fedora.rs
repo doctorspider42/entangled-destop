@@ -229,6 +229,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             width: 1280,
             height: 800,
             scale: 1.0,
+            adapter: control_api::DisplayAdapter::default(),
             virgl: false,
             virgl_isolation: control_api::VirglIsolation::default(),
             venus: false,
@@ -247,6 +248,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         sound: SoundSection::default(),
         shares: Vec::new(),
         reclaim_memory: false,
+        ignore_msrs: false,
         gamepad: GamepadSection::default(),
     };
 
@@ -365,6 +367,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         // plugged in later is picked up without restarting the VM.
         shares: Vec::new(),
         reclaim_memory: false,
+        ignore_msrs: false,
         gamepad: GamepadSection {
             enabled: true,
             // One pad. A second is a config edit away and costs another virtio

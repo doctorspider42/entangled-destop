@@ -199,3 +199,59 @@ itself tests most. KVM follows with the same profile.
   tests run only where `/dev/kvm` exists.
 - `docs/user-guide.md` keeps saying "no Windows guests" until phase A passes
   its acceptance.
+
+## Amendment, 2026-10-30: Windows Setup on WHP, and what it actually took
+
+The Windows 10 installation ISO now boots to the first Setup screen
+("Windows Setup — Language to install") on the Windows/WHP host, 2 vCPUs, in
+the window, with no virtio-win drivers and no Hyper-V enlightenments. §2 was
+**not** a blocker for getting this far. What was, in the order it was found:
+
+1. **No display (§1, as predicted).** `machine_x86::framebuffer`: the
+   Bochs-DISPI function, VRAM as a 64-bit prefetchable BAR backed by a
+   `ShmWindow`, registers in BAR **3**, not 2: EDK2's `PciBusDxe` numbers BARs
+   logically, so with a 64-bit pair at 0–1 `QemuVideoDxe`'s `PCI_BAR_IDX2` is
+   the register at `0x1c`. The EDID's preferred timing becomes the GOP mode
+   through `PcdVideoResolutionSource`, which CloudHv has to declare dynamic.
+   `[display] adapter = "framebuffer"` selects it. `framebuffer_present` polls
+   VRAM at the refresh rate and sends only the changed rows.
+2. **No keyboard in the firmware.** CloudHv ships no keyboard driver, so its
+   ConIn was the serial terminal only, and bootmgr's "Press any key to boot
+   from CD or DVD" timed out. `VirtioKeyboardDxe` goes in with
+   `QemuVideoDxe`. It still did not work, because it never enables
+   virtio-input's `statusq`, and our transport refused to activate a device
+   with a disabled queue. Virtio 1.2 §4.1.4.3 allows a driver to leave queues
+   it does not use disabled. `QueueConfig::build_for_activation` now builds a
+   never-ready queue for them, for every device.
+3. **`HAL_INITIALIZATION_FAILED` (0x5C, 0x110).** Without an HPET, Windows'
+   HAL takes the **RTC's periodic interrupt** as its clock: it sets register
+   A's rate and `PIE` and waits for IRQ 8. Our RTC never interrupted. It now
+   has `PIE`/`UIE`, register C flags cleared on read, and an `RtcTimer`
+   thread, on IOAPIC pin 8 (WHP) or an irqfd on GSI 8 (KVM).
+4. **`KMODE_EXCEPTION_NOT_HANDLED` (0x1E, `0xC0000096`).** `#GP` on `wrmsr`
+   to AMD's PerfEvtSel0–3 (`0xC0010000–3`), which WHP does not implement.
+   Further on, Windows also touches `0xC0011023`, `0xC001102C` (erratum and
+   speculation controls) and `0xC0010010` (SYSCFG). `WhpOptions::ignore_msrs`
+   (KVM's `ignore_msrs`: read 0, drop writes, log once) gets past them. For
+   now it is switched on by `ENTANGLED_WHP_IGNORE_MSRS=1`; a Windows guest
+   needs it as a profile setting.
+5. **`ACPI_BIOS_ERROR` (0xA5, 0x11, 3: cannot load the RSDT).**
+   `InstallCloudHvTables()` installs every table in our XSDT and the DSDT,
+   but never the FACS, so `AcpiTableDxe` zeroes `FIRMWARE_CTRL`. Cloud
+   Hypervisor's machine is hardware-reduced and needs no FACS. Ours is not,
+   and Windows refuses it. `build-cloudhv.sh` patches `CloudHvAcpi.c` to
+   install the FACS the FADT names. Linux had only warned.
+
+How these were found is worth keeping, because §3 said the work would be
+empirical. `$ENTANGLED_WHP_TRACE_EXITS` now prints the port, GPA or `cpuid`
+leaf with each exit. A cancelled run (pause/resume) or a write to `0xcf9`
+also dumps the registers, the code and stack around RIP, the nearest export of
+the guest PE image it is in, and, for a Windows kernel, the stop code from the
+exported `KiBugCheckData`. Every stop above was read that way, before the
+display could show anything.
+
+Still open for phase A: Hyper-V enlightenments (performance, and the 0x101
+risk under host load); `ignore_msrs` as a guest setting rather than an
+environment variable; the unattended path (§4); KVM, which needs the same
+RTC/FACS fixes and is untested here; and the boot framebuffer's VRAM in
+snapshots (refused for now, §6).

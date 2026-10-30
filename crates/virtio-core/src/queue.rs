@@ -174,6 +174,28 @@ impl QueueConfig {
         if !self.ready {
             return Err(QueueError::NotReady);
         }
+        self.build_ready(mem)
+    }
+
+    /// [`Self::build`] for activation: a queue the driver left disabled
+    /// becomes a queue that is never ready rather than an error.
+    ///
+    /// A driver may leave a queue it has no use for disabled, and the device
+    /// must then not use it (virtio 1.2 §4.1.4.3). EDK2's `VirtioKeyboardDxe`
+    /// does exactly that with virtio-input's `statusq`: it has no LEDs to set.
+    /// Refusing to activate over it left the firmware without a keyboard. The
+    /// device still gets one queue per index, so its own indexing is
+    /// unchanged; a queue that is not ready yields no chains and takes no used
+    /// entries, which is what "not used" means.
+    pub fn build_for_activation(&self, mem: &GuestMem) -> Result<Queue, QueueError> {
+        if self.ready {
+            self.build_ready(mem)
+        } else {
+            Queue::new(self.max_size).map_err(|e| QueueError::Rejected(e.to_string()))
+        }
+    }
+
+    fn build_ready(&self, mem: &GuestMem) -> Result<Queue, QueueError> {
         if self.size == 0 || !self.size.is_power_of_two() || self.size > self.max_size {
             return Err(QueueError::InvalidSize {
                 size: self.size,
@@ -268,6 +290,24 @@ mod tests {
         let mut cfg = ready_config(&ring);
         cfg.set_ready(false);
         assert_eq!(cfg.build(&mem), Err(QueueError::NotReady));
+    }
+
+    #[test]
+    fn a_disabled_queue_activates_as_one_the_device_cannot_use() {
+        use virtio_queue::QueueOwnedT as _;
+        let mem = testing::guest_memory(0x2_0000);
+        let ring = testing::SplitRing::layout(0x1000, 16);
+        let mut cfg = ready_config(&ring);
+        cfg.set_ready(false);
+        let mut queue = cfg.build_for_activation(&mem).expect("a disabled queue");
+        assert!(!queue.ready());
+        assert!(
+            queue.iter(&mem).is_err(),
+            "no chains from a queue never enabled"
+        );
+        // An enabled one is built exactly as `build` builds it.
+        cfg.set_ready(true);
+        assert_eq!(cfg.build_for_activation(&mem), cfg.build(&mem));
     }
 
     #[test]

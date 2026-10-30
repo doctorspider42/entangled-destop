@@ -683,8 +683,17 @@ impl TransportState {
 
         let mut queues = Vec::with_capacity(self.queues.len());
         for (index, config) in self.queues.iter().enumerate() {
+            if !config.is_ready() {
+                tracing::debug!(
+                    transport = self.kind,
+                    slot = self.slot,
+                    device = ?self.device_type,
+                    queue = index,
+                    "the driver left this queue disabled; the device will not use it"
+                );
+            }
             let mut queue = config
-                .build(&self.mem)
+                .build_for_activation(&self.mem)
                 .map_err(|e| format!("queue {index}: {e}"))?;
             if let Some(position) = positions.get(index) {
                 queue.set_next_avail(position.next_avail);

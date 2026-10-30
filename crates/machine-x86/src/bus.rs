@@ -78,6 +78,10 @@ pub struct MachineBus {
     /// mutability for the same reason [`Self::acpi_pm`] is: the run loop reads
     /// its latch after every exit and must take no lock to do it.
     reset: Arc<ResetControl>,
+    /// The thread that makes the RTC's interrupts happen, once the RTC has a
+    /// line ([`Self::with_rtc_interrupt`]). Shared by every clone of the bus
+    /// and joined when the last one goes.
+    rtc_timer: Option<Arc<crate::rtc::RtcTimer>>,
 }
 
 #[cfg(test)]
@@ -95,6 +99,7 @@ impl MachineBus {
             platform: None,
             pflash: None,
             reset: Arc::new(ResetControl::new()),
+            rtc_timer: None,
         }
     }
 
@@ -127,7 +132,33 @@ impl MachineBus {
     pub fn with_irqchip(mut self, irqchip: Arc<UserspaceIrqChip>) -> Self {
         // The power button's SCI is an IOAPIC pin like any other here.
         self.acpi_pm.connect_sci(irqchip.sci_line());
+        // So is the RTC's IRQ 8, when this machine has an RTC.
+        let rtc = irqchip.rtc_line();
         self.irqchip = Some(irqchip);
+        self.with_rtc_interrupt(rtc)
+    }
+
+    /// Wires the RTC to `line` (IRQ 8) and starts the thread that drives it
+    /// (ADR-0008 §3). Nothing without a firmware platform: a direct-Linux
+    /// machine has no RTC.
+    pub fn with_rtc_interrupt(mut self, line: Arc<dyn virtio_core::interrupt::IrqLine>) -> Self {
+        let Some(platform) = self.platform.clone() else {
+            return self;
+        };
+        let rtc = platform
+            .lock()
+            .map(|platform| (Arc::clone(platform.rtc.interrupts()), platform.rtc.clock()));
+        let Ok((interrupts, clock)) = rtc else {
+            tracing::error!("platform lock is poisoned; the RTC will not interrupt");
+            return self;
+        };
+        interrupts.connect(line);
+        match crate::rtc::RtcTimer::start(interrupts, clock) {
+            Ok(timer) => self.rtc_timer = Some(Arc::new(timer)),
+            Err(error) => {
+                tracing::error!(%error, "could not start the RTC timer; the RTC will not interrupt")
+            }
+        }
         self
     }
 

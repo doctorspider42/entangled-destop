@@ -906,7 +906,7 @@ impl PitTimer {
 /// See [`PitTimer`]: the one thing on this machine whose lateness the guest
 /// counts.
 #[cfg(windows)]
-fn raise_timer_thread_priority() {
+pub(crate) fn raise_timer_thread_priority() {
     use windows::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
     };
@@ -915,12 +915,12 @@ fn raise_timer_thread_priority() {
     // and it is only used here, on that thread.
     let result = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
     if let Err(e) = result {
-        tracing::warn!(error = %e, "could not raise the PIT thread's priority");
+        tracing::warn!(error = %e, "could not raise a timer thread's priority");
     }
 }
 
 #[cfg(not(windows))]
-fn raise_timer_thread_priority() {}
+pub(crate) fn raise_timer_thread_priority() {}
 
 impl Drop for PitTimer {
     fn drop(&mut self) {

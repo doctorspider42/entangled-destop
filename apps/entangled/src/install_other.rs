@@ -95,6 +95,7 @@ fn prepare(args: &InstallArgs) -> Result<(VmConfig, std::path::PathBuf), String>
         gamepad: Default::default(),
         shares: Vec::new(),
         reclaim_memory: false,
+        ignore_msrs: false,
     };
     let text = toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
     let cfg = VmConfig::from_toml(&text).map_err(|e| e.to_string())?;

@@ -125,6 +125,14 @@ pub struct VmConfig {
     /// and an existing machine keeps exactly the hardware it had.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reclaim_memory: bool,
+    /// Answer the model-specific registers the hypervisor does not implement
+    /// (reads 0, writes dropped) instead of raising `#GP` in the guest — KVM's
+    /// `ignore_msrs`. Windows on AMD needs it: it programs the PerfEvtSel
+    /// counters early in boot and bugchecks on the `#GP` (ADR-0008). Off by
+    /// default, because Linux probes MSRs expecting the fault. Honoured on
+    /// WHP; KVM already implements the registers Windows touches.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_msrs: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -626,12 +634,44 @@ impl std::fmt::Display for VirglIsolation {
     }
 }
 
+/// Which display device the guest gets (ADR-0008 §1).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DisplayAdapter {
+    /// virtio-gpu: what every Linux guest uses, 2D or 3D. The default.
+    #[default]
+    VirtioGpu,
+    /// A PCI display with a linear framebuffer the firmware's GOP reports:
+    /// what a guest that draws before it has a virtio driver needs (Windows).
+    /// PCI transport and UEFI boot only, and no 3D.
+    Framebuffer,
+}
+
+impl DisplayAdapter {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl std::fmt::Display for DisplayAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VirtioGpu => f.write_str("virtio-gpu"),
+            Self::Framebuffer => f.write_str("framebuffer"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct DisplaySection {
     pub width: u32,
     pub height: u32,
     pub scale: f32,
+    /// The display device (ADR-0008). Not written when it is the default:
+    /// an older engine denies unknown keys.
+    #[serde(skip_serializing_if = "DisplayAdapter::is_default")]
+    pub adapter: DisplayAdapter,
     /// 3D acceleration (ADR-0004): offer `VIRTIO_GPU_F_VIRGL` backed by a
     /// host virglrenderer. Off by default; a host that cannot bring the
     /// renderer up fails `entangled run` rather than silently booting 2D.
@@ -774,6 +814,7 @@ impl Default for DisplaySection {
             width: 1920,
             height: 1080,
             scale: 1.0,
+            adapter: DisplayAdapter::default(),
             virgl: false,
             virgl_isolation: VirglIsolation::default(),
             venus: false,
@@ -1128,6 +1169,22 @@ impl VmConfig {
                 "display.refresh_hz {} outside supported range {MIN_REFRESH_HZ}..={MAX_REFRESH_HZ}",
                 self.display.refresh_hz
             ));
+        }
+        if self.display.adapter == DisplayAdapter::Framebuffer {
+            if self.display.virgl || self.display.venus {
+                return err(
+                    "display.adapter = \"framebuffer\" has no 3D: virgl and venus are \
+                     renderers for virtio-gpu. Drop them, or use the virtio-gpu adapter"
+                        .into(),
+                );
+            }
+            if self.transport != VirtioTransport::Pci || self.boot.mode != BootMode::Uefi {
+                return err(
+                    "display.adapter = \"framebuffer\" is a PCI device the UEFI firmware \
+                     drives: it needs transport = \"pci\" and boot.mode = \"uefi\""
+                        .into(),
+                );
+            }
         }
         if self.display.virgl && self.display.venus {
             return err(

@@ -783,7 +783,23 @@ Both of these came out of the SMP work and are the first two things to reach for
   with `RIP` still 0.
 - `$ENTANGLED_WHP_TRACE_EXITS=1` — every exit reason and RIP, one line each. One
   `Canceled` for a whole boot means WHP is blocking inside the run call, which no
-  serial log can tell you.
+  serial log can tell you. Each line also names what the exit was about: the
+  port and direction, the GPA, or the `cpuid` leaf (and the answer given).
+- **A guest that spins without exiting** is invisible to that trace. Send
+  `pause` / `resume` on `--control-stdin`: every cancelled run is printed with
+  RIP and RFLAGS, then the GPRs, 96 bytes of code around RIP and 256 bytes of
+  stack, read through the guest's own page tables (`WHvTranslateGva`), plus the
+  enclosing PE image and its nearest export (`whp::guest_symbols`). For a
+  Windows kernel it also prints the stop code from the exported
+  `KiBugCheckData`, which is how every early Windows bugcheck in ADR-0008's
+  2026-10-30 amendment was read before the display was up. The same sample is
+  taken on a write to `0xcf9`, the moment a bugchecked guest reboots. A
+  Windows kernel stuck in `HalReturnToFirmware` has already bugchecked.
+- `$ENTANGLED_WHP_IGNORE_MSRS=1` (`WhpOptions::ignore_msrs`) — MSRs WHP does
+  not implement exit instead of raising `#GP`: reads return 0, writes are
+  dropped, each MSR is logged once at `warn`. Off by default because a Linux
+  guest probes MSRs with `rdmsr_safe` and expects the `#GP`. Windows on AMD
+  needs it (PerfEvtSel0–3, `0xC0011023`, `0xC001102C`).
 
 ## Phase 4: what it delivered, and what remains
 

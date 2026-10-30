@@ -258,6 +258,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             width: 1280,
             height: 800,
             scale: 1.0,
+            adapter: control_api::DisplayAdapter::default(),
             virgl: false,
             virgl_isolation: control_api::VirglIsolation::default(),
             // The installer itself runs in 2D whatever the machine will be:
@@ -279,6 +280,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         sound: SoundSection::default(),
         shares: Vec::new(),
         reclaim_memory: false,
+        ignore_msrs: false,
         gamepad: GamepadSection::default(),
     };
 
@@ -477,6 +479,7 @@ fn installed_profile(
         // plugged in later is picked up without restarting the VM.
         shares: Vec::new(),
         reclaim_memory: false,
+        ignore_msrs: false,
         gamepad: GamepadSection {
             enabled: true,
             // One pad. A second is a config edit away and costs another virtio

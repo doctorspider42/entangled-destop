@@ -232,7 +232,19 @@ pub struct WhpOptions {
     /// neutral [`crate::hv::DirtyLog::set_dirty_logging`] therefore accepts the
     /// answer this option already gave and refuses to change it, saying why.
     pub track_dirty: bool,
+
+    /// Trap the MSRs WHP does not implement instead of letting WHP raise
+    /// `#GP` in the guest: a read returns 0, a write is dropped, and each MSR
+    /// is logged once. KVM's `ignore_msrs`, for guests that probe model
+    /// specific registers they cannot live without (Windows, ADR-0008 §3).
+    ///
+    /// Off for a Linux guest, which probes with `rdmsr_safe` and must keep
+    /// getting the `#GP` it expects.
+    pub ignore_msrs: bool,
 }
+
+/// Environment variable that turns [`WhpOptions::ignore_msrs`] on for a run.
+pub const IGNORE_MSRS_ENV: &str = "ENTANGLED_WHP_IGNORE_MSRS";
 
 impl WhpOptions {
     /// Everything a real guest needs. The shape a boot path asks for.
@@ -245,6 +257,7 @@ impl WhpOptions {
             // snapshot it would serve is not built). `ENTANGLED_TRACK_DIRTY=1`
             // turns it on for a measurement.
             track_dirty: false,
+            ignore_msrs: std::env::var_os(IGNORE_MSRS_ENV).is_some(),
         }
     }
 }
@@ -445,8 +458,17 @@ impl WhpPartition {
         }
         // One property write, so every wanted bit goes in together; a second
         // `WHvSetPartitionProperty(ExtendedVmExits)` would clear the first.
+        let mut exits = 0;
         if options.cpuid_policy {
-            set_extended_vm_exits(handle, EXTENDED_VM_EXITS_X64_CPUID)?;
+            exits |= EXTENDED_VM_EXITS_X64_CPUID;
+        }
+        if options.ignore_msrs {
+            exits |= EXTENDED_VM_EXITS_X64_MSR;
+        }
+        if exits != 0 {
+            set_extended_vm_exits(handle, exits)?;
+        }
+        if options.cpuid_policy {
             set_cpuid_exit_list(handle)?;
         }
         // SAFETY: `handle` is a live partition with all properties set.
@@ -802,6 +824,10 @@ fn set_local_apic_emulation(handle: WHV_PARTITION_HANDLE) -> Result<(), VmmError
 /// The list in [`crate::whp::CPUID_EXIT_LEAVES`] says *which* leaves exit; this
 /// bit is what makes any of them exit at all.
 const EXTENDED_VM_EXITS_X64_CPUID: u64 = 1 << 0;
+
+/// `WHV_EXTENDED_VM_EXITS` bit 1 (`X64MsrExit`): the MSRs WHP does not
+/// implement exit to the host instead of raising `#GP` in the guest.
+const EXTENDED_VM_EXITS_X64_MSR: u64 = 1 << 1;
 
 fn set_extended_vm_exits(handle: WHV_PARTITION_HANDLE, bits: u64) -> Result<(), VmmError> {
     // SAFETY: `WHvPartitionPropertyCodeExtendedVmExits` is the `ExtendedVmExits`
