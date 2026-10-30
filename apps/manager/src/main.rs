@@ -78,6 +78,8 @@ enum ScreenshotView {
     Main,
     /// One machine's own page (the running one, when there is one).
     Machine,
+    MachineSuspending,
+    MachineResuming,
     Wizard,
     WizardFedora,
     WizardIso,

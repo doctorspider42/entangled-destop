@@ -13,7 +13,7 @@ use crate::venus::protocol::*;
 use crate::venus::shmem::RingPages;
 use crate::venus::wire::{Decoder, Encoder};
 
-const META_COST: u64 = 128;
+pub(super) const META_COST: u64 = 128;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ImportRecipe {

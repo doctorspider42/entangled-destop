@@ -756,3 +756,45 @@ Desktop writes None unless preserving an existing explicit Some(false). This avo
 removing the automatic 3D PCI mouse just by changing the capture preference.
 The choice applies at next start. Ctrl+Alt+M no longer changes it or reserves
 that chord from the guest. Keep both skill copies valid UTF-8 and equivalent.
+
+## Native ARM64 suspend (2026-10-29)
+
+Apple Silicon now implements `save` and `resume` through the native engine.
+Suspend is enabled on cards and the machine page; `cpu_lifecycle_block` only
+blocks Restart, whose native reset remains unimplemented. Snapshot host checks
+map Native on Apple Silicon to `HostKind::HvfMacos`, independently of WSL/KVM.
+The native engine retains Venus recipes whenever a snapshot destination is
+configured, before creating guest contexts. `scripts/macos-suspend-smoke.sh`
+builds and copies its own signed engine before running ignored CLI acceptance;
+never sign a Cargo output and assume its signature survives the next build.
+
+### Suspend/restore activity (2026-10-30)
+
+Status::Resuming remains distinct from Running until the engine replies
+state=Running/Paused. TaskSpec::restoring enables watcher readiness polling;
+only ONE status command can be outstanding while initialization does not read
+stdin. Starting replies permit the next poll after 500 ms. Exit clears the
+visible loading state, including failures. Keep supervision off the UI thread.
+
+The machine screen/card shows linked ice rings, a dimmed thumbnail, plain
+Saving your place/Waking your machine text, and an indeterminate activity rail.
+Never invent a percentage. ui/lifecycle.rs uses theme::animation_time, so
+disabling animations keeps it still; Supervisor forwards that preference to
+the native child via ENTANGLED_INTERFACE_MOTION. Native progress is independently
+cleared by engine readiness or save refusal. Preview both using --mock
+--screenshot /absolute.png --screenshot-view machine-suspending|machine-resuming.
+Process fixtures verify readiness, failed exit and only one outstanding probe.
+
+Native ARM64 direct-boot profiles name their verified Ubuntu kernel/initramfs;
+do not show the x86 Debian bootstrap-artifact warning when starting them.
+The real native manager on an exclusively owned clone passed Start → Suspend
+(644 MiB, 25.82 s) → Resume → Suspend (635 MiB, 20.39 s). Both manager/native
+Saving and Restoring panels were inspected, and both cleared after Running.
+The manager replaces its per-run log on Resume: preserve the first save's
+evidence before launching the next child.
+
+When copying a signed macOS .app, preserve symlinks (for example,
+shutil.copytree(..., symlinks=True)). Frameworks/libvulkan.dylib is a sealed
+symlink; dereferencing it breaks deep/strict resource verification. Verify the
+copy before changing a machine's launcher. The persistent test VM now carries
+a self-contained local release bundle and manager.sh/run.sh launchers.

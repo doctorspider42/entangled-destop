@@ -154,8 +154,8 @@ fn mismatched_saved_depth_stencil_states_are_refused_before_upload() {
 }
 
 #[test]
-fn mutable_and_extended_view_flags_keep_the_base_pixels_capturable() {
-    for flags in [8, 0x108] {
+fn view_and_alias_capability_flags_keep_nonaliased_pixels_capturable() {
+    for flags in [8, 0x108, 0x400, 0x408, 0x508] {
         let (host, mut context) = fixture_flags(None, flags);
         let mut bytes = Vec::new();
         context
@@ -189,8 +189,8 @@ fn mutable_and_extended_view_flags_keep_the_base_pixels_capturable() {
 }
 
 #[test]
-fn view_compatibility_does_not_admit_protected_sparse_or_alias_flags() {
-    for flag in [1, 2, 4, 0x400, 0x800, 0x2000, 0x4000] {
+fn copy_compatibility_does_not_admit_protected_sparse_or_special_layout_flags() {
+    for flag in [1, 2, 4, 0x800, 0x2000, 0x4000] {
         let (host, mut context) = fixture();
         context
             .objects

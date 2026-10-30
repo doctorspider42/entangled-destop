@@ -119,6 +119,7 @@ struct LogBuffer {
     /// either way, so the exit code cannot tell success from a snapshot that
     /// was never written.
     save_result: Option<Result<String, String>>,
+    runtime_state: Option<String>,
 }
 
 impl LogBuffer {
@@ -174,6 +175,11 @@ impl LogBuffer {
     }
 
     fn push_line(&mut self, text: String) {
+        if let Some(control_api::control::Reply::State(state)) =
+            control_api::control::parse_reply(&text)
+        {
+            self.runtime_state = Some(state);
+        }
         if let Some(outcome) = control_api::control::parse_reply(&text)
             .as_ref()
             .and_then(control_api::control::save_outcome)
@@ -211,6 +217,8 @@ pub struct TaskSpec {
     /// Keep the child's stdin as a pipe and use it as a lifecycle control
     /// channel (ADR-0005). Only `entangled run --control-stdin` reads one.
     pub control: bool,
+    /// This child is rebuilding an existing saved session, not cold-booting.
+    pub restoring: bool,
 }
 
 impl TaskSpec {
@@ -249,6 +257,7 @@ struct Shared {
     /// writing. The engine reports no progress while it runs — the honest thing
     /// to show is elapsed time and what to expect.
     suspend_at: Mutex<Option<Instant>>,
+    restoring: AtomicBool,
 }
 
 /// A supervised child process.
@@ -267,6 +276,10 @@ pub struct Task {
 }
 
 impl Task {
+    pub fn restoring_for(&self) -> Option<Duration> {
+        (self.is_active() && self.shared.restoring.load(Ordering::Acquire))
+            .then(|| self.started_at.elapsed())
+    }
     pub fn state(&self) -> TaskState {
         self.shared.state.lock_or_recover().clone()
     }
@@ -454,6 +467,7 @@ pub struct Supervisor {
     tasks: Vec<Task>,
     next_id: TaskId,
     waker: Waker,
+    interface_motion: bool,
 }
 
 impl Supervisor {
@@ -462,7 +476,12 @@ impl Supervisor {
             tasks: Vec::new(),
             next_id: 1,
             waker,
+            interface_motion: true,
         }
+    }
+
+    pub fn set_interface_motion(&mut self, enabled: bool) {
+        self.interface_motion = enabled;
     }
 
     pub fn tasks(&self) -> &[Task] {
@@ -505,6 +524,10 @@ impl Supervisor {
         let mut command = Command::new(&spec.program);
         command
             .args(&spec.args)
+            .env(
+                "ENTANGLED_INTERFACE_MOTION",
+                if self.interface_motion { "on" } else { "off" },
+            )
             .current_dir(&spec.cwd)
             // A pipe rather than nothing when the task asked for a control
             // channel: `entangled run --control-stdin` reads lifecycle commands
@@ -531,6 +554,7 @@ impl Supervisor {
             control: Mutex::new(child.stdin.take()),
             suspend_requested: AtomicBool::new(false),
             suspend_at: Mutex::new(None),
+            restoring: AtomicBool::new(spec.restoring),
         });
 
         let id = self.next_id;
@@ -606,9 +630,38 @@ fn watch(mut child: Child, shared: Arc<Shared>, log_path: PathBuf, waker: Waker)
     let mut reader = File::open(&log_path).ok();
     let mut term_sent: Option<Instant> = None;
     let mut killed = false;
+    let mut status_pending = false;
+    let mut last_probe: Option<Instant> = None;
 
     loop {
         let produced = drain_log(&mut reader, &shared);
+        if shared.restoring.load(Ordering::Acquire) {
+            if status_pending {
+                if let Some(state) = shared.log.lock_or_recover().runtime_state.take() {
+                    status_pending = false;
+                    if matches!(state.as_str(), "Running" | "Paused") {
+                        shared.restoring.store(false, Ordering::Release);
+                        waker();
+                    }
+                }
+            }
+            // Only one probe may be outstanding: an engine can spend a long
+            // time restoring before it reads stdin. Never fill that pipe and
+            // block stop/kill supervision behind readiness polling.
+            if shared.restoring.load(Ordering::Acquire)
+                && !status_pending
+                && last_probe.is_none_or(|at| at.elapsed() >= Duration::from_millis(500))
+            {
+                use std::io::Write as _;
+                shared.log.lock_or_recover().runtime_state = None;
+                if let Some(pipe) = shared.control.lock_or_recover().as_mut() {
+                    status_pending = writeln!(pipe, "{}", control_api::control::CMD_STATUS)
+                        .and_then(|()| pipe.flush())
+                        .is_ok();
+                }
+                last_probe = Some(Instant::now());
+            }
+        }
 
         if shared.stop.load(Ordering::Acquire) && term_sent.is_none() {
             set_state(&shared, TaskState::Stopping);
@@ -825,6 +878,7 @@ mod tests {
                 cwd: dir.clone(),
                 log_path: log_path.clone(),
                 control: true,
+                restoring: false,
             })
             .expect("native engine spawn");
         let task = supervisor.task(id).expect("spawned task");
@@ -933,6 +987,7 @@ mod tests {
             cwd: dir.to_path_buf(),
             log_path: dir.join(format!("{vm}.log")),
             control: false,
+            restoring: false,
         }
     }
 
@@ -946,6 +1001,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             log_path: PathBuf::from("/tmp/demo.log"),
             control: false,
+            restoring: false,
         };
         assert_eq!(
             spec.command_line(),
@@ -1016,6 +1072,7 @@ mod tests {
             cwd: dir.clone(),
             log_path: dir.join("ghost.log"),
             control: false,
+            restoring: false,
         };
         assert!(matches!(sup.spawn(spec), Err(ProcessError::Spawn { .. })));
         assert!(!sup.is_busy("ghost"));
@@ -1033,6 +1090,7 @@ mod tests {
             cwd: dir.clone(),
             log_path: dir.join("missing-dir").join("nolog.log"),
             control: false,
+            restoring: false,
         };
         spec.args.clear();
         assert!(matches!(sup.spawn(spec), Err(ProcessError::LogFile { .. })));
@@ -1313,5 +1371,91 @@ mod tests {
         assert!(task.suspend(), "a refusal permits a retry");
         sup.task(id).expect("task").request_kill();
         wait_until(|| !sup.any_active(), "child exit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restoring_waits_for_engine_readiness_and_finishes_without_stopping_the_child() {
+        let dir = temp_dir("restore-readiness");
+        let mut sup = Supervisor::new(no_waker());
+        let mut launch = spec(&dir, "restore", "/bin/sh", &["-c",
+            "while IFS= read -r line; do case \"$line\" in status) if [ -f ready ]; then echo 'entangled-control: state=Running'; else echo 'entangled-control: state=Starting'; fi;; quit) exit 0;; esac; done"]);
+        launch.control = true;
+        launch.restoring = true;
+        let id = sup.spawn(launch).unwrap();
+        wait_until(
+            || {
+                sup.task(id)
+                    .unwrap()
+                    .log_tail(20)
+                    .0
+                    .iter()
+                    .any(|line| line.ends_with("state=Starting"))
+            },
+            "engine starting reply",
+        );
+        assert!(sup.task(id).unwrap().restoring_for().is_some());
+        std::fs::write(dir.join("ready"), b"ready").unwrap();
+        wait_until(
+            || sup.task(id).unwrap().restoring_for().is_none(),
+            "engine running reply",
+        );
+        assert!(sup.task(id).unwrap().is_active());
+        assert!(sup.task(id).unwrap().send_control("quit"));
+        wait_until(|| !sup.any_active(), "fixture exit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_restore_has_only_one_outstanding_readiness_probe() {
+        let dir = temp_dir("restore-slow");
+        let mut sup = Supervisor::new(no_waker());
+        let mut launch = spec(&dir, "restore", "/bin/sh", &["-c",
+            "while IFS= read -r line; do case \"$line\" in status) echo probe-received;; quit) exit 0;; esac; done"]);
+        launch.control = true;
+        launch.restoring = true;
+        let id = sup.spawn(launch).unwrap();
+        wait_until(
+            || {
+                sup.task(id)
+                    .unwrap()
+                    .log_tail(20)
+                    .0
+                    .iter()
+                    .any(|line| line == "probe-received")
+            },
+            "first readiness probe",
+        );
+        // Longer than two readiness intervals. No state reply has arrived.
+        std::thread::sleep(Duration::from_millis(1200));
+        let task = sup.task(id).unwrap();
+        assert_eq!(
+            task.log_tail(20)
+                .0
+                .iter()
+                .filter(|line| line.as_str() == "probe-received")
+                .count(),
+            1
+        );
+        assert!(task.restoring_for().is_some());
+        assert!(task.send_control("quit"));
+        wait_until(|| !sup.any_active(), "slow fixture exit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_failure_cannot_leave_a_finished_child_loading() {
+        let dir = temp_dir("restore-failure");
+        let mut sup = Supervisor::new(no_waker());
+        let mut launch = spec(&dir, "restore", "/bin/sh", &["-c", "exit 3"]);
+        launch.control = true;
+        launch.restoring = true;
+        let id = sup.spawn(launch).unwrap();
+        wait_until(|| !sup.any_active(), "failed restore exit");
+        assert!(sup.task(id).unwrap().restoring_for().is_none());
+        assert!(matches!(
+            sup.task(id).unwrap().state(),
+            TaskState::Finished(Outcome { success: false, .. })
+        ));
     }
 }

@@ -612,3 +612,106 @@ fn a_device_made_late_in_a_process_runs_at_the_clocks_the_gpu_is_at() {
     std::thread::sleep(Duration::from_secs(5));
     time_one("after 5 s of an idle GPU");
 }
+
+/// Releasing a reset pool's native caches must leave its allocated command
+/// buffer reusable and preserve GPU-to-host memory visibility.
+#[test]
+fn released_command_pool_resources_can_be_recorded_and_submitted_again() {
+    use crate::venus::protocol::{
+        Command, ResetCommandPoolArgs, VkCommandPool, VkDevice, VK_SUCCESS,
+    };
+    use ash::vk::Handle;
+
+    let Some(bench) = Bench::new(true) else {
+        return;
+    };
+    let buffer = bench
+        .buffer(
+            Placement::Driver(
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            ),
+            false,
+        )
+        .expect("coherent host-visible buffer");
+    const REPEATS: u32 = 128;
+    // SAFETY: the buffer holds BYTES mapped coherent bytes. All objects belong
+    // to this device; every submission completes before its pool/fence reset.
+    // The host read follows a TRANSFER_WRITE -> HOST_READ barrier and wait.
+    unsafe {
+        let device = &bench.device;
+        let cb = device
+            .allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(bench.pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+            .expect("command buffer")[0];
+        let fence = device
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+            .expect("fence");
+        for iteration in 1..=REPEATS {
+            device
+                .begin_command_buffer(
+                    cb,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .expect("begin");
+            device.cmd_fill_buffer(cb, buffer.buffer, 0, BYTES, iteration);
+            let barrier = [vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(buffer.buffer)
+                .size(BYTES)];
+            device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barrier,
+                &[],
+            );
+            device.end_command_buffer(cb).expect("end");
+            let cbs = [cb];
+            device
+                .queue_submit(
+                    bench.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&cbs)],
+                    fence,
+                )
+                .expect("submit");
+            device
+                .wait_for_fences(&[fence], true, 5_000_000_000)
+                .expect("completed work");
+            let mut command = Command::ResetCommandPool(ResetCommandPoolArgs {
+                device: VkDevice(device.handle().as_raw()),
+                command_pool: VkCommandPool(bench.pool.as_raw()),
+                flags: 0,
+                ret: VK_SUCCESS,
+            });
+            super::command_pool_policy::invoke(&mut command, true, |command| {
+                let Command::ResetCommandPool(args) = command else {
+                    unreachable!()
+                };
+                device
+                    .reset_command_pool(
+                        vk::CommandPool::from_raw(args.command_pool.0),
+                        vk::CommandPoolResetFlags::from_raw(args.flags),
+                    )
+                    .expect("release pool resources");
+            });
+            device.reset_fences(&[fence]).expect("reset fence");
+        }
+        assert!(!buffer.mapped.is_null());
+        assert!(std::slice::from_raw_parts(buffer.mapped, N as usize)
+            .iter()
+            .all(|word| *word == REPEATS));
+        device.destroy_fence(fence, None);
+        device.free_command_buffers(bench.pool, &[cb]);
+    }
+    bench.free(buffer);
+}

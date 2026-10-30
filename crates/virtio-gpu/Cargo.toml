@@ -16,6 +16,11 @@ vm-memory.workspace = true
 # Host Vulkan for the Venus executor (`host_vulkan`), dlopened at run time.
 ash.workspace = true
 
+# Metal-backed Vulkan drivers may create autoreleased Objective-C objects on
+# our non-Cocoa ring/vCPU/restore threads. Already in the macOS dependency graph.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+
 # The real 3D renderer (ADR-0004) dlopens libvirglrenderer at runtime; the
 # loader itself is the only build-time dependency, and only on Linux.
 [target.'cfg(target_os = "linux")'.dependencies]

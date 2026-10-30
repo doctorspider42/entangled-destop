@@ -6,7 +6,8 @@
 #
 # The engine needs com.apple.security.hypervisor and a Vulkan-on-Metal driver
 # with host-pointer import support. The developer acceptance uses KosmicKrisp.
-# SMP uses native GICv3 and PSCI; ARM snapshots/reset are still in development.
+# SMP uses native GICv3 and PSCI. Suspend/resume saves the native ARM64
+# session; reset remains unavailable. See ADR-0006 for acceptance limits.
 name = "ubuntu-arm64"
 architecture = "aarch64"
 memory_mib = 4096

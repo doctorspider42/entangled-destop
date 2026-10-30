@@ -1151,3 +1151,114 @@ branch nobody can run, because the decision above is one somebody should be able
 to re-examine on another machine — on Intel, where the execute over-report does
 not happen, or on a guest whose disk is busy, where the unreported fraction will
 be larger than 16.7 %, not smaller.
+
+## Amendment (2026-10-29): native Apple Silicon suspend/restore
+
+The container adds host code 3 (`macOS/HVF`) and architecture code 2
+(`aarch64`), preserving every existing x86 code and format version. ARM64
+has its own whole-machine decoder; no ARM CPU or platform state enters
+`X86CpuState`. The common metadata, strict disk fingerprints, compressed RAM,
+virtio transport codecs and digested streamed GPU archives remain shared.
+
+Every native CPU, including a PSCI-off CPU, services a lifecycle gate on its
+owning host thread. Capture happens after a completed exit, and successful
+suspend waits for all CPUs and host device writers. It carries X0..X30, PC,
+PSTATE, FPCR/FPSR, Q0..Q31, EL0/EL1 translation/exception/thread/debug/key/timer
+registers, CPU features, ICC registers, virtual timer offset/mask and pending
+SError. SVE/SME exposure is refused by name until their state is supported.
+The GIC uses Apple's versioned `hv_gic_state` data; PSCI off/on/pending state
+and pending CPU_ON context are saved separately. PL011 is an output-only,
+stateless stub on this platform. No x86 firmware/platform sections are emitted.
+
+Restore creates every CPU in deterministic order, loads their state on their
+owning threads, then applies GIC state before releasing any guest thread.
+Virtual timer offsets and physical timer compare values are rebased against
+the saved `mach_absolute_time` counter. Resume uses saved RAM without loading
+boot images. CPU feature/register inventories and native GIC compatibility
+must match; native API failures refuse the reconstructed VM before execution.
+
+The native `save` control command, Ctrl+Alt+S and window toolbar use the same
+transaction. A successful atomic `.part` write/sync/rename stops the VM;
+any failure reopens the gates and keeps the source session alive. The manager
+recognizes HVF snapshots and enables Suspend; native Restart remains disabled.
+When a snapshot destination is configured, the engine enables Venus recipe
+retention before guest context creation and carries the mode in metadata.
+
+Native evidence on Apple M3 Pro: CPU/GIC reconstruction continues execution
+at its successor instruction, with patterned SIMD registers and a pending SPI
+retained. `scripts/macos-suspend-smoke.sh` drives refusal plus two complete
+save/resume cycles through the CLI, with exact successive guest heartbeats,
+four active CPUs or three PSCI-off CPUs, missing boot images on resume, paths
+with spaces and orderly PSCI shutdown. The real Vulkan two-process checkpoint
+restores imported memory and private buffer/image content with KosmicKrisp.
+Unified-memory checkpoint staging translates guest aliases back to native
+memory-type bits. Native shared-image export is not available and its separate
+test reports that limitation. These probes do not establish acceptance of a
+full installed Ubuntu/GNOME session or Linux/KVM and Windows/WHP hardware.
+
+### Native installed-desktop follow-up
+
+The subsequent [ARM64 GNOME acceptance](0007-macos-arm64.md#installed-gnome-gpu-suspend-acceptance-2026-10-29)
+passed two short windowed save/restore cycles with an active glmark2 process and
+fresh GPU work after each restore. It also found two separate limitations:
+private image capture was unnecessarily rejecting `ALIAS_BIT` even with disjoint
+native bindings (corrected, retaining real-overlap refusal), and an ever-growing
+history of replaced command-buffer recordings exhausted the 64 MiB recipe budget.
+
+The journal now compacts after each additional 4 MiB and on shared-budget pressure.
+It removes primary recordings superseded by Begin/reset/free/pool destruction,
+and descriptor writes which are fully overwritten or target freed sets, while
+preserving object creation/destruction order and every allocation/import generation.
+Repeated resets of the same fences and resource-0 temporary semaphore imports
+also keep only their last effective records. No submissions/waits execute during
+reconstruction; the separate synchronization section restores completed GPU state.
+Descriptor writes are dropped as whole commands only when every destination is
+superseded; exact range/type matching handles writes spanning bindings without
+inferring layout geometry. Any set used as a descriptor-copy source is pinned
+across all generations, preserving the values read by historical copies. Pool resets can disappear only when no secondary history needs them.
+Secondary buffer ids and their pools are conservatively pinned across all retained
+allocation generations, including recycled ids: an older primary may still refer
+to a secondary recording. Live recordings, including partially recorded buffers,
+remain replayable. Untrusted archives are never compacted before semantic replay.
+The initial compactor preserved the recipe format and 64 MiB core budgets.
+The subsequent generation-aware extension is described below. Irreducible object
+and secondary history can still exhaust the budget; refusal preserves the live source and
+never writes a truncated reconstruction.
+
+
+The subsequent duration acceptance passed two cycles in the same GNOME/glmark2
+session: five minutes before the first save, three additional minutes after
+restore, then another save/restore. The original process continued rendering and
+fresh GL/Vulkan work succeeded after both restores. More than 630 MiB of redundant
+recipes were discarded in the first two phases. See ADR-0007 for exact witnesses,
+build transition, timings, test counts and native-driver fixture limitations.
+
+
+### Generation-aware lifetime reclamation
+
+Recipe v3 makes allocation ordinals explicit and persists their high-water
+counter. Reachability pruning can remove closed buffer/image/memory, shader,
+pipeline, cache and synchronization-object generations while retaining every
+creation dependency and required destruction. Live pipeline caches keep their
+historical build effects; opaque template/private-data commands conservatively
+prevent lifetime pruning. Secondary recordings remain conservative. Command/descriptor pools and their
+allocation batches now participate in lifetime pruning, including explicit frees,
+implicit pool destruction and descriptor-pool reset. A reachable batch output
+keeps sibling creation/cleanup; historical references retain required pool
+cleanup in order. Regressions cover repeated pool churn under a 16 KiB budget
+and mixed live/retired batch outputs. The reader accepts v2 and reconstructs its original ordinals.
+
+The core command/import budget remains 64 MiB. The eight-byte per-record tags
+have a separately derived bound, `MAX_RECIPE_BYTES / (12 + RECORD_COST) * 8`,
+so an exactly full v2 core budget remains readable. Old vector capacity is
+released during compaction. Ordinary allocation OOM consumes its ordinal but
+creates no retained object; partial state-changing failures remain refusals.
+Tests cover all allocations retired, live survivors after 2000 allocations,
+future ordinal reuse, malformed generation tags, v2 upgrade at the original
+exact budget, metadata pressure and closed object dependencies.
+
+On macOS, each native Vulkan operation now owns a thread-local autorelease
+scope. FreeMemory drains that scope before releasing imported host pages.
+The guard's actual nested release behavior has a native Objective-C regression;
+its effect on sustained Metal memory use is evaluated separately in desktop
+endurance acceptance.

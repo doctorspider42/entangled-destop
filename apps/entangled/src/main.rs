@@ -696,7 +696,11 @@ fn resume(args: ResumeArgs) -> Result<(), String> {
         writer = %info.metadata.writer,
         "resuming a suspended VM"
     );
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(
+        target_os = "linux",
+        windows,
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
     {
         let shot = screenshot_after.map(|secs| run_vm::ScreenshotRequest {
             after: std::time::Duration::from_secs(secs),
@@ -719,7 +723,11 @@ fn resume(args: ResumeArgs) -> Result<(), String> {
             },
         )
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(
+        target_os = "linux",
+        windows,
+        all(target_os = "macos", target_arch = "aarch64")
+    )))]
     {
         let _ = (
             headless,

@@ -440,3 +440,253 @@ ARM CPU snapshots and lifecycle reset cannot use X86CpuState. Existing
 snapshot formats must refuse unsupported ARM state until a complete new
 architecture contract exists; successful CPU bring-up does not imply
 pause/reset/suspend support.
+
+## Native suspend amendment (2026-10-29)
+
+The earlier snapshot/lifecycle limitation is superseded for suspend and
+restore by the ARM64 contract in [ADR-0006](0006-suspend-restore.md#amendment-2026-10-29-native-apple-silicon-suspendrestore).
+The manager's Suspend action, native window toolbar/Ctrl+Alt+S, `save` control
+command and `entangled resume` now use it. Restart/reset remains unavailable.
+`scripts/macos-suspend-smoke.sh` is the signed native CLI regression, covering
+four active CPUs and PSCI-off CPUs across two snapshot generations. It uses
+an embedded guest probe. Installed GNOME/Venus evidence and remaining limits
+are recorded below.
+
+## Installed GNOME GPU suspend acceptance (2026-10-29)
+
+A fresh, signature/digest-verified Ubuntu 24.04.5 ARM64 installation ran in a
+native window with 4 vCPUs, 4 GiB RAM and a 2048x1536 guest desktop. Mesa 25.2.8
+reported `Accelerated: yes` and Zink/Venus on Apple M3 Pro; Vulkan enumeration
+identified the same GPU. The workload cycled glmark2 build, texture and Phong
+shading scenes. These are functional tests on an unoptimized development engine,
+not release performance measurements.
+
+The first longer capture failed at the 64 MiB reconstruction-history budget.
+The running guest continued drawing after refusal. A fresh short capture then
+exposed a separate overly strict image-flag check: the compositor used a private
+BGRA image with flags 0x508. The flag permits aliasing but does not establish it.
+The corrected copy path accepts that capability while retaining the existing
+native requirement-span checks that reject actual overlapping live bindings.
+
+After that correction, two short disk-save/fresh-process-restore cycles passed:
+
+| Witness | Before save | First restore | Second restore |
+|---|---|---|---|
+| Boot ID | `6daa9f14-d94a-41cb-adf3-e025ed97d069` | same | same |
+| GNOME Shell PID | 942 | 942 | 942 |
+| Existing glmark2 PID | 1622 | 1622 | 1622 |
+| Completed scene results | 3 | 12 | 23 |
+
+A new `glxinfo`, Vulkan enumeration and a fresh off-screen glmark2 build scene
+also succeeded after each restore. The final guest reached systemd poweroff and
+PSCI SYSTEM_OFF, and all three engine processes exited 0. Saves wrote 707 and
+717 MiB in 23.73 and 38.93 seconds respectively in this development build.
+Native checkpoint regressions passed (135 tests, including actual separate-
+process GPU pixel reconstruction), as did virtio-gpu Clippy with warnings denied
+and formatting. Native shared-image-export tests report a capability skip on
+this driver. No KVM/WHP hardware or host reboot was part of this acceptance.
+
+The follow-up compactor described in ADR-0006 removes superseded primary
+recordings, overwritten/freed descriptor writes and repeated fence-reset and
+resource-0 semaphore-import recipes. Object lifetimes and import generations
+stay ordered; secondary references and descriptor-copy sources are conservative
+retention barriers. The 64 MiB hard/shared budgets remain as safety limits for
+irreducible reconstruction state. A journal which already failed cannot be
+repaired by closing an application: its dropped records require a fresh session.
+Durable local logs, structured witnesses and images are under
+`artifacts/macos/acceptance/suspend-desktop/`. The guest witness script is
+`guest/ubuntu-arm64/gpu-suspend-acceptance.sh`.
+
+
+### History-compaction duration acceptance
+
+The follow-up ran five minutes of continuous glmark2 load before the first save,
+then three more minutes of the same workload after a fresh-process restore,
+followed by another save and fresh-process restore. Both cycles passed on M3 Pro.
+The cold writer used primary/descriptor compaction; both resumes and the second
+writer used the final compactor including fence resets and temporary imports,
+also checking compatibility of the unchanged recipe format.
+
+| Witness | First save | First restored probe | Second save | Second restored probe |
+|---|---|---|---|---|
+| Boot ID | `ba8cb59d-a4b2-4dc0-b2df-0d15991fcfba` | same | same | same |
+| GNOME / existing glmark2 PID | 948 / 1653 | same | same | same |
+| glmark2 start time | 4700 | same | same | same |
+| Completed scene results | 249 | 259 | 407 | 417 |
+
+New GL/Vulkan queries and a fresh off-screen GL scene passed after both restores.
+The first two running phases discarded more than 630 MiB of redundant recipes,
+while preserving the unchanged 64 MiB retained-state budget. The guest shut down
+normally; all three engine processes exited 0. The first save took 263.67 seconds
+under host memory pressure (the controller's 180-second timeout was extended and
+the same save completed); the second took 27.46 seconds. Both files were about
+740 MiB. These are functional results, not a performance comparison.
+
+The final change passed 2463 workspace tests (13 ignored), full-workspace Clippy
+with warnings denied, and 143 checkpoint tests with native Vulkan available.
+The broader native Vulkan suite had seven failures outside recipe retention:
+four unsupported-extension fixtures, two memory-policy assertions and a retired
+buffer-copy fixture. Their logs are preserved; the full native suite is not green.
+`history-final-cycles-result.json` is the final desktop verdict, superseding the
+initial controller timeout. The persistent test VM is powered off with its local
+signed engine updated; its now-stale test snapshot was removed after shutdown.
+
+
+### Native reliability follow-up
+
+The recipe reader now accepts v2 and v3; v3 persists explicit allocation
+ordinals and a high-water counter, allowing dead allocation/object lifetimes to
+be reclaimed without changing live imported-page/shared-payload ownership.
+Core recipes/imports retain the 64 MiB shared limit, with separately bounded
+eight-byte generation metadata. ADR-0006 describes the compatibility and
+reachability rules.
+
+The seven native fixture failures above were resolved or gated by the actual
+advertised hardware capability. UMA tests now exercise split guest memory
+heaps; optional Zink extensions are enabled only when advertised. The native
+transform-feedback execution fixture skips when the driver lacks the extension.
+The retired-buffer fixture re-records its ONE_TIME_SUBMIT command buffer before
+a second submission. Conditional rendering, triangle fan pixel rendering and
+cross-context content tests run on this driver. The resulting native suite
+passed 894 tests, including the native pool and generation/page-link edge cases.
+The full workspace passed 2478 tests (13 ignored), Clippy, formatting and cargo
+deny; the two native macOS CLI suspend tests passed too.
+
+Longer load exposed a separate issue beyond recipe retention. One old-engine
+run was killed before capture; another grew from approximately 3 GiB to
+92.6 GiB physical-footprint accounting near 19 minutes. vmmap attributed about
+89.9 GiB to IOAccelerator graphics and 266 MiB to malloc allocations. The latter
+run was powered off through the guest before completing acceptance; neither
+run is a successful long-duration suspend result. A native autorelease scope
+was added around Vulkan operations on long-lived renderer/vCPU/restore threads;
+its sustained effect must be checked by endurance acceptance, independently of
+its passing native nested-pool regression.
+
+Evidence for this follow-up is under
+`artifacts/macos/acceptance/suspend-reliability/`. An abandoned controller left
+one test VM alive; a subsequent boot briefly reused its writable disk. That
+invalidated those runs. Both VMs were stopped, the test harness gained a process
+lock and an open-disk check before touching its control socket, and the guest
+was booted read-only for forced filesystem repair. The first check requested a
+reboot; the next forced check finished successfully and reached graphical.target.
+Those preparation runs are separate from the endurance verdict.
+
+
+The pooled-lifetime extension subsequently passed 896 native Vulkan tests and
+2480 workspace tests (13 ignored), Clippy and formatting. It reduced a live
+restored context's retained recipes from about 4 MiB to 80 KiB while preserving
+its original glmark2 process and passing new GL/Vulkan work. However, that
+windowed follow-up crossed the test harness's 8 GiB footprint guard shortly
+after restoration/fresh GPU work; the controller powered the guest off normally.
+The planned 30-minute final load did not complete. Autorelease scopes alone
+therefore do not establish that the native memory-growth finding is resolved.
+Further isolated presentation and headless guest measurements are in progress.
+
+
+The isolated host-presentation diagnostic completed five minutes of full-plane
+2048x1536 uploads (about 700 MiB/s), with an observed peak physical footprint of
+356271208 bytes (about 340 MiB) and exit 0. This does not reproduce the windowed
+VM's growth on its own. The headless GPU workload on an exclusively owned APFS clone at the same
+2048x1536 resolution passed 30 minutes of continuous glmark2, a fresh-process
+restore, three further minutes of GPU work, and a second fresh-process restore.
+The boot UUID, compositor and glmark2 PID/start time remained identical;
+scene counters advanced and fresh GLX/Vulkan/offscreen GL work passed after
+both restores. All three engine processes exited 0. The source save took
+24.05 s and wrote 779 MiB; observed peak footprints were 7233358264,
+5506582008 and 2821053928 bytes (capture included). See
+`headless-cycles-result.json`; this isolates guest GPU execution from the
+native window's uploads.
+The installed runtime identifies itself as `vulkan-sdk-1.4.363 (git-269a955c89)`.
+A published command-memory patch for a different Mesa branch is a diagnostic
+lead, not an applied or verified fix for this runtime. No SDK/app installation
+was changed.
+
+
+### Hidden-window uploads and lifecycle feedback (2026-10-30)
+
+The next windowed run crossed the 8 GiB test guard during its source load
+(11110278752 bytes observed); it powered off normally and is not a passing
+suspend acceptance. Command-pool cache release alone did not fix that growth.
+
+A separate native-window reproduction identified a host presentation bug:
+`draw_frame` prepared `queue.write_texture` uploads before checking occlusion,
+then returned without `queue.submit`. Continuous frames therefore accumulated
+unsubmitted staging allocations while the native app was hidden. A bounded,
+VM-free old-engine reproduction grew from about 330 MiB to 4417933392 bytes
+within seconds after Cmd+H, then its 4 GiB guard stopped the disposable probe
+cleanly (`hidden-before-memory.json`). Check visibility and nonzero window size
+before preparation; preserve dirty damage in the CPU mirror while hidden. The
+existing unocclusion event requests a redraw and uploads the latest image.
+The identical fixed-window probe passed 120 seconds, including more than a
+minute hidden, with 4966 accepted full-plane updates, 851 rendered frames,
+356271232 bytes peak footprint and exit 0 (`hidden-after-memory.json`). No
+uploads were queued during the hidden interval; the CPU mirror kept receiving
+frames. The full windowed acceptance subsequently passed; see the final verdict below.
+
+Native VM windows show persistent Saving/Restoring feedback using the Deep Field
+panel and linked ice rings, plus an indeterminate activity rail. Completion is
+explicit, with no notice timeout or guessed percentage; save refusal clears the
+indicator and resumes the original guest. The manager has a distinct Resuming
+state, polls the existing status command with at most one outstanding request,
+and clears that state only when the engine reports Running/Paused or exits.
+The native ARM64 engine reports Starting until CPU/GPU restore is ready, and
+prints control replies on a fresh line even during PL011 output. Both loading
+surfaces respect disabled interface motion. Mock manager previews and a native
+window preview were visually inspected; process tests cover slow readiness,
+readiness completion and failed-restore exit.
+
+The real native manager was then exercised on the exclusively owned clone:
+Start → Suspend (644 MiB, 25.82 s) → Resume → Suspend again (635 MiB, 20.39 s).
+Both the manager and native VM window showed the live Saving/Restoring panels;
+both cleared them after the engine's Running reply. The restored GNOME desktop
+was visible, and the second save succeeded. Manager and children closed normally
+(`manager-live-result.json`, `manager-live-engine.log`; the manager replaces its
+run log on Resume, so the first save was recorded before that replacement).
+The unrelated x86 bootstrap-kernel warning is now omitted for native ARM64
+profiles, which name their Ubuntu kernel/initramfs directly.
+
+The presentation fix also acquires/retries the native surface before staging
+uploads, and validates the viewport before consuming CPU damage. A surface
+timeout or failed recovery therefore cannot accumulate unsubmitted writes
+either. Acquisition remains outside the scanout mutex and adds no blocking GPU
+Wait. Endurance restores use the optimized, signed local app bundle, with its
+own copied Vulkan runtime and notices; hashes are in final-package-hashes.json.
+
+### Final native acceptance verdict (2026-10-30)
+
+`occlusion-cycles-result.json` is PASS: 30 minutes of continuous accelerated
+Ubuntu/GNOME/glmark2 load with the native window hidden, save → fresh-process
+restore → fresh GLX/Vulkan/offscreen GL verification → three more minutes of
+GPU load → save → second fresh-process restore and fresh GPU verification.
+Boot UUID 1412d393-1be0-4f02-9133-153c98e2729e, compositor PID 955 and glmark2
+PID 1672/start 4658/nonce witness-1444-1793318384 stayed identical. Validated
+scene counters advanced 1564 → 1575 → 1761. Every engine exited 0; no footprint
+guard fired. Source and the two resumed processes peaked at 6769666056,
+2951319040 and 2919276128 observed bytes respectively, including capture.
+The source debug save wrote 731 MiB in 33.71 s; the optimized resumed save
+wrote 731 MiB in 2.79 s. Retained recipe storage compacted from about 4.3 MiB
+to 146336 bytes near the end of the source load.
+
+The cold process used the debug engine with the hidden-window upload gate;
+both restores used the final optimized .app bundle, including the additional
+acquire-before-upload ordering and its own Vulkan runtime. The mapped engine
+and both Vulkan libraries were verified inside that bundle
+(`package-runtime-mappings.log`, `final-package-hashes.json`). The restored
+window visibly rendered glmark2 correctly. The final presentation preview
+also passed 90 s of visible/hidden full-plane updates, peaking at 380863616
+bytes and exiting 0.
+
+Final checks: 2488 workspace tests passed, 13 ignored; the real-supported-GPU
+fixtures ran within the 899-test virtio-gpu suite. Display passed 145 tests
+plus its doc test; manager passed 144 tests. The signed packaged engine passed
+both native CLI suspend/SMP acceptance tests. Workspace Clippy, formatting and
+cargo-deny's advisories/bans/licenses/sources gates passed. This is evidence
+for the M3 Pro/runtime/workload tested, not unlimited support for every Vulkan
+state or an increase to the retained-state safety limit.
+
+The persistent test VM is powered off normally and has a self-contained local
+release bundle under its .engine directory, with run.sh and manager.sh launchers.
+Its stale test snapshots and the exclusively owned diagnostic disk clone are
+removed during task cleanup; no user media/kernel cache or installed app is
+replaced. A copied signed .app must preserve Frameworks symlinks; deep/strict
+signature verification of the persistent copy and its doctor probe passed.

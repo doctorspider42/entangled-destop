@@ -263,7 +263,7 @@ fn checkpoint_recreates_a_device_and_the_gpu_reads_the_restored_host_memory() {
         }
         const PIXELS: u64 = IMAGE + 20;
         let mut image_info = image_info();
-        image_info.flags = 0x108; // MUTABLE_FORMAT | EXTENDED_USAGE
+        image_info.flags = 0x508; // MUTABLE_FORMAT | EXTENDED_USAGE | ALIAS, with nonoverlapping backing
         image_info.extent.width = 513;
         image_info.extent.height = 513;
         image_info.usage = 7;
@@ -775,6 +775,10 @@ fn the_bring_up_runs_on_the_host_gpu_and_names_it_as_ash_does() {
     // may map, our pages (`policy::visible_vram`, ADR-0004 2026-09-26).
     let appended = guest.memory_type_count - host_memory.memory_type_count;
     assert!(appended <= 1, "{appended} types appended");
+    let unified_split = host_memory.memory_type_count == 1
+        && appended == 1
+        && guest.memory_heap_count == host_memory.memory_heap_count
+        && guest.memory_types[1].heap_index == host_memory.memory_types[0].heap_index;
     for i in 0..host_memory.memory_type_count as usize {
         let (h_ty, g_ty) = (&host_memory.memory_types[i], &guest.memory_types[i]);
         eprintln!(
@@ -782,7 +786,7 @@ fn the_bring_up_runs_on_the_host_gpu_and_names_it_as_ash_does() {
             h_ty.heap_index, h_ty.property_flags, g_ty.property_flags
         );
         assert_eq!(g_ty.heap_index, h_ty.heap_index, "indices unchanged");
-        if importable & (1 << i) != 0 {
+        if importable & (1 << i) != 0 && !unified_split {
             assert_eq!(g_ty.property_flags, h_ty.property_flags);
         } else {
             assert_eq!(
@@ -805,25 +809,37 @@ fn the_bring_up_runs_on_the_host_gpu_and_names_it_as_ash_does() {
     );
     if appended == 1 {
         let last = &guest.memory_types[host_memory.memory_type_count as usize];
-        assert_eq!(
-            last.property_flags, 0x7,
-            "DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT"
-        );
-        assert_eq!(
-            last.heap_index, host_memory.memory_heap_count,
-            "a heap of its own"
-        );
-        assert_eq!(guest.memory_heap_count, host_memory.memory_heap_count + 1);
-        let heap = &guest.memory_heaps[last.heap_index as usize];
-        assert_eq!(heap.flags, 0x1);
-        assert!(heap.size <= crate::venus::executor::policy::VISIBLE_VRAM_HEAP_BYTES);
-        eprintln!(
-            "{:>4} | {:>4} | (appended) | {:#010x}, heap of {} MiB",
-            host_memory.memory_type_count,
-            last.heap_index,
-            last.property_flags,
-            heap.size >> 20
-        );
+        if unified_split {
+            assert_eq!(
+                last.property_flags,
+                host_memory.memory_types[0].property_flags
+            );
+            assert_eq!(last.heap_index, host_memory.memory_types[0].heap_index);
+            assert_eq!(
+                guest.memory_types[0].property_flags,
+                host_memory.memory_types[0].property_flags & !MEMORY_PROPERTY_HOST_ANY
+            );
+        } else {
+            assert_eq!(
+                last.property_flags, 0x7,
+                "DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT"
+            );
+            assert_eq!(
+                last.heap_index, host_memory.memory_heap_count,
+                "a heap of its own"
+            );
+            assert_eq!(guest.memory_heap_count, host_memory.memory_heap_count + 1);
+            let heap = &guest.memory_heaps[last.heap_index as usize];
+            assert_eq!(heap.flags, 0x1);
+            assert!(heap.size <= crate::venus::executor::policy::VISIBLE_VRAM_HEAP_BYTES);
+            eprintln!(
+                "{:>4} | {:>4} | (appended) | {:#010x}, heap of {} MiB",
+                host_memory.memory_type_count,
+                last.heap_index,
+                last.property_flags,
+                heap.size >> 20
+            );
+        }
     }
     if name.contains("RTX 2070") && guest.memory_type_count >= 6 {
         // The 2026-09-23 probe: 3 and 4 import our pages, 5 (the BAR) cannot.

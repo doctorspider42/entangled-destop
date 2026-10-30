@@ -47,3 +47,23 @@ produce warnings for missing `fillModeNonSolid` and
 not graphics conformance or a guarantee for every application. The native
 presentation currently copies pixels; native image sharing and broader
 correctness/performance checks remain work in progress.
+
+## GPU suspend witness
+
+`gpu-suspend-acceptance.sh` runs from the GNOME terminal of an exclusively owned
+Entangled ARM64 test guest. Install `vulkan-tools` in addition to the graphics
+packages above. Copy the script from a read-only staging share, then unmount that
+share before capture; mounted 9p handles intentionally refuse snapshots. Allow
+the probe user to write `/dev/ttyAMA0` for its serial evidence.
+
+Run `bash /tmp/gpu-suspend-acceptance.sh start` to keep glmark2 drawing while the
+host sends `save`. Record the `GPU_SESSION` and `GPU_WITNESS` lines. After each
+fresh-process restore, require the same nonce, boot ID, compositor PID, workload
+PID and start time, with increasing heartbeat/scene counts. In a new guest terminal,
+`bash /tmp/gpu-suspend-acceptance.sh verify after1` checks fresh GL/Vulkan work.
+Shut down the guest normally after testing. This witness does not waive the
+64 MiB budget for retained reconstruction state described in ADR-0006/0007.
+For duration acceptance, keep the workload running at least five minutes before
+capture, then repeat after at least three minutes of resumed rendering. Record
+host `checkpoint=debug` compaction counts/reclaimed bytes as well as guest
+witnesses; cumulative discarded history should exceed the old budget.

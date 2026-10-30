@@ -1195,6 +1195,22 @@ impl GuestDevice {
             })
     }
 
+    /// Native memory-type bits for private coherent import staging. Guest
+    /// aliases must be translated before intersecting native requirements.
+    #[must_use]
+    pub fn coherent_import_host_types(&self) -> u32 {
+        let required = MEMORY_PROPERTY_HOST_VISIBLE | MEMORY_PROPERTY_HOST_COHERENT;
+        self.memory
+            .memory_types
+            .iter()
+            .take(self.memory.memory_type_count as usize)
+            .enumerate()
+            .filter(|(_, ty)| ty.property_flags & required == required)
+            .fold(0, |bits, (index, _)| {
+                bits | 1u32.checked_shl(self.host_type(index as u32)).unwrap_or(0)
+            })
+    }
+
     /// The host memory type an allocation of guest type `type_index` is made
     /// as: the same index, except for [`Self::visible_vram`]'s type, whose
     /// pages are imported as its backing type.
@@ -1910,6 +1926,11 @@ mod tests {
         };
         assert_eq!(device.host_type(1), 0);
         assert_eq!(device.host_visible_types(), 2);
+        assert_eq!(
+            device.coherent_import_host_types(),
+            1,
+            "native checkpoint staging uses the alias backing, not its guest index"
+        );
         assert_eq!(
             super::super::memory::guest_type_bits(&device, false, 1),
             1,

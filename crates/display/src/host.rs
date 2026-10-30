@@ -340,6 +340,9 @@ impl DisplayHost {
             typist,
             shot,
             note: None,
+            loading: crate::toolbar::lifecycle::Loading::new(
+                std::env::var("ENTANGLED_INTERFACE_MOTION").as_deref() != Ok("off"),
+            ),
             placement_file,
         };
         // Raw input is enabled only while gaming capture is active. The desktop
@@ -426,6 +429,7 @@ struct App {
     shot: DisplayHandle,
     /// A short note in the title ("screenshot saved") and when it expires.
     note: Option<(String, Instant)>,
+    loading: crate::toolbar::lifecycle::Loading,
     placement_file: Option<std::path::PathBuf>,
     /// Title text actually applied to the window.
     ///
@@ -566,6 +570,9 @@ impl App {
                 " — [desktop mouse]"
             });
         }
+        if let Some(phase) = self.loading.phase() {
+            return format!("{title} — {}…", phase.title());
+        }
         match &self.note {
             Some((note, _)) => format!("{title} — {note}"),
             None => title,
@@ -633,6 +640,15 @@ impl App {
         if self.renderer.is_none() {
             return;
         }
+        // write_texture only stages transfers until the next queue submit.
+        // Hidden/minimized windows do not present: leave damage in the CPU
+        // mirror instead of accumulating an unsubmitted GPU upload per flip.
+        let Some((win_w, win_h)) = self.window_size() else {
+            return;
+        };
+        if self.occluded || win_w == 0 || win_h == 0 {
+            return;
+        }
         // WIN-1503: during a rapid drag winit can deliver several `Resized`
         // events between two frames, and a surface configured for a size the
         // window no longer has presents a stretched or clipped frame. Asking the
@@ -642,36 +658,38 @@ impl App {
         {
             renderer.resize(win_w, win_h);
         }
+        // Surface acquisition may time out or fail recovery. Do that before
+        // prepare consumes dirty damage and allocates queue.write_texture data.
+        let frame = match self.renderer.as_mut().map(Renderer::acquire_frame) {
+            Some(Ok(Some(frame))) => frame,
+            Some(Err(error)) => {
+                self.fail(event_loop, error);
+                return;
+            }
+            _ => return,
+        };
         // The guest may have changed resolution since the last frame. The lock
         // is held only for the upload (a `memcpy` into a staging buffer). A
         // renderer's shared frame, when that is what the scanout shows, is
         // already on the GPU (ADR-0004, zero-copy presentation).
         let shared_frame = self.shared.get().and_then(|p| p.current());
         let mirror = Arc::clone(&self.scanout);
-        let (guest_size, guest_pointer) = {
+        let (guest_size, guest_pointer, viewport) = {
             let mut scanout = lock_scanout(&mirror);
             let size = scanout.size();
+            // Validate before consuming damage too: every path after prepare
+            // must reach the submission that consumes its staged transfers.
+            let Some(viewport) = ux::viewport_for(self.mode, size.0, size.1, win_w, win_h) else {
+                self.viewport = None;
+                self.capture.set_viewport(None);
+                return;
+            };
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.prepare(&mut scanout, shared_frame);
             }
-            (size, scanout.cursor_position())
+            (size, scanout.cursor_position(), viewport)
         };
         self.guest_size = guest_size;
-        if self.occluded {
-            return;
-        }
-        let Some((win_w, win_h)) = self.window_size() else {
-            return;
-        };
-        // `viewport_for` returns None for a zero-sized (minimized) window:
-        // nothing to present, and the dirty rect stays accumulated for the next
-        // frame.
-        let Some(viewport) = ux::viewport_for(self.mode, guest_size.0, guest_size.1, win_w, win_h)
-        else {
-            self.viewport = None;
-            self.capture.set_viewport(None);
-            return;
-        };
         if self.viewport != Some(viewport) {
             self.viewport = Some(viewport);
             self.capture.set_viewport(self.viewport);
@@ -680,14 +698,14 @@ impl App {
         self.reveal_toolbar_from_guest(event_loop, guest_pointer, viewport);
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_toolbar(self.toolbar.overlay());
+            let scale = self
+                .window
+                .as_ref()
+                .map_or(1.0, |window| window.scale_factor());
+            renderer.set_loading(self.loading.overlay((win_w, win_h), scale, Instant::now()));
         }
-        let outcome = match self.renderer.as_mut() {
-            Some(renderer) => renderer.render(viewport),
-            None => return,
-        };
-        if let Err(err) = outcome {
-            self.fail(event_loop, err);
-            return;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.render(viewport, frame);
         }
         let stats = self.frame_stats();
         let input = self.capture.stats();
@@ -1304,6 +1322,24 @@ impl ApplicationHandler<HostEvent> for App {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(due));
             }
         }
+        if self.loading.phase().is_some() && !self.occluded {
+            let now = Instant::now();
+            if self.loading.needs_redraw(now) {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            let next = now + self.loading.interval(self.capture.focused());
+            if !matches!(event_loop.control_flow(), ControlFlow::WaitUntil(at) if at > now && at < next)
+            {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+            }
+        }
+        // A finished/occluded operation or an expired notice must not leave
+        // a past deadline spinning the native event loop while nothing draws.
+        if matches!(event_loop.control_flow(), ControlFlow::WaitUntil(at) if at <= Instant::now()) {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -1342,6 +1378,16 @@ impl ApplicationHandler<HostEvent> for App {
             }
             // `about_to_wait` looks at the activity; the wakeup was the point.
             HostEvent::GpuActive => {}
+            HostEvent::Lifecycle(phase) => {
+                self.loading.set(phase, Instant::now());
+                if phase.is_none() {
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                }
+                self.update_title();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             HostEvent::Notice(message) => {
                 self.note = Some((message.into(), Instant::now() + Duration::from_secs(30)));
                 self.toolbar.show_notice(message);

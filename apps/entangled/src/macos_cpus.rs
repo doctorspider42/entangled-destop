@@ -1,12 +1,14 @@
 //! One owning host thread per ARM vCPU, with PSCI power state and coordinated exit.
+use machine_arm64::smp::Power;
 use machine_arm64::smp::{Action, CpuPower, CpuStart};
 use machine_arm64::virtio::MmioBus;
 use machine_arm64::{decode_mmio, Pl011, RAM_BASE, UART_BASE};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use vmm_core::hv::arm64::CpuState;
 use vmm_core::hv::arm64::{Exit, Register, SystemRegister};
 use vmm_core::hvf::{HvfCanceller, HvfVcpu, HvfVm};
 
@@ -14,9 +16,92 @@ pub(super) struct CpuGroup {
     power: CpuPower,
     cancellers: Mutex<Vec<HvfCanceller>>,
     error: Mutex<Option<String>>,
+    pause: Mutex<Pause>,
+    pause_requested: AtomicBool,
+    changed: Condvar,
+}
+
+struct Pause {
+    requested: bool,
+    parked: usize,
+    states: Vec<Option<Result<CpuState, String>>>,
 }
 
 impl CpuGroup {
+    pub fn pause(&self) -> Result<Vec<CpuState>, String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut pause = self.pause.lock().unwrap_or_else(|e| e.into_inner());
+        // A preceding failed capture/resume must have left every old gate.
+        while pause.parked != 0 {
+            if self.stopping() || Instant::now() >= deadline {
+                return Err("ARM64 previous pause did not retire".into());
+            }
+            pause = self
+                .changed
+                .wait_timeout(pause, Duration::from_millis(2))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        pause.states.fill(None);
+        pause.requested = true;
+        self.pause_requested.store(true, Ordering::Release);
+        self.power.wake();
+        loop {
+            self.kick_all();
+            if pause.parked == pause.states.len() {
+                return pause
+                    .states
+                    .iter()
+                    .map(|state| {
+                        state
+                            .clone()
+                            .ok_or_else(|| "missing ARM64 CPU capture".to_string())?
+                    })
+                    .collect();
+            }
+            if self.stopping() || Instant::now() >= deadline {
+                return Err("ARM64 CPUs did not reach the snapshot gate".into());
+            }
+            pause = self
+                .changed
+                .wait_timeout(pause, Duration::from_millis(2))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+    pub fn resume(&self) {
+        self.pause_requested.store(false, Ordering::Release);
+        self.pause
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .requested = false;
+        self.changed.notify_all();
+    }
+    fn checkpoint(&self, cpu: &HvfVcpu, index: u32) {
+        if !self.pause_requested.load(Ordering::Acquire) {
+            return;
+        }
+        let mut pause = self.pause.lock().unwrap_or_else(|e| e.into_inner());
+        if !pause.requested {
+            return;
+        }
+        pause.states[index as usize] = Some(cpu.save_state().map_err(|e| e.to_string()));
+        pause.parked += 1;
+        self.changed.notify_all();
+        while pause.requested && !self.stopping() {
+            pause = self
+                .changed
+                .wait_timeout(pause, Duration::from_millis(10))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        pause.parked -= 1;
+        self.changed.notify_all();
+    }
+    pub fn power_state(&self) -> Vec<Power> {
+        self.power.save()
+    }
+
     pub fn stopping(&self) -> bool {
         self.power.stopped()
     }
@@ -34,6 +119,7 @@ impl CpuGroup {
     }
     pub fn stop(&self) {
         self.power.stop();
+        self.changed.notify_all();
         self.kick_all();
     }
     fn fail(&self, error: String) {
@@ -71,6 +157,13 @@ impl Machine {
                 power: CpuPower::new(count, RAM_BASE, ram).map_err(|e| e.to_string())?,
                 cancellers: Mutex::new(Vec::with_capacity(count as usize)),
                 error: Mutex::new(None),
+                pause: Mutex::new(Pause {
+                    requested: false,
+                    parked: 0,
+                    states: vec![None; count as usize],
+                }),
+                changed: Condvar::new(),
+                pause_requested: AtomicBool::new(false),
             }),
             bus,
             uart: Mutex::new(Pl011::new(output)),
@@ -146,12 +239,25 @@ pub(super) fn run(
     count: u32,
     boot: CpuStart,
     machine: Arc<Machine>,
+    restored: Option<&vm_snapshot::arm64::State>,
     ready: impl FnOnce(Arc<CpuGroup>) -> Result<(), String>,
 ) -> Result<(), String> {
     // Create in deterministic order: native GIC redistributor indices and DT
     // affinities then refer to the same CPUs, regardless of host scheduling.
     let mut primary = create_cpu(vm, 0)?;
     machine.group.register(&primary);
+    if let Some(state) = restored {
+        machine
+            .group
+            .power
+            .load(&state.power)
+            .map_err(|e| e.to_string())?;
+        primary
+            .load_state(&state.cpus[0])
+            .map_err(|e| e.to_string())?;
+    }
+    // Workers cannot enter a restored guest before the coordinator restores GIC.
+    let release = Arc::new(AtomicBool::new(false));
     let mut workers = Workers {
         group: machine.group.clone(),
         workers: Vec::new(),
@@ -160,6 +266,9 @@ pub(super) fn run(
         let vm = vm.clone();
         let machine = machine.clone();
         let (tx, rx) = mpsc::sync_channel(1);
+        let release = release.clone();
+        let saved_cpu = restored.map(|state| state.cpus[index as usize].clone());
+        let saved_power = restored.map(|state| state.power[index as usize]);
         workers.workers.push(
             std::thread::Builder::new()
                 .name(format!("entangled-vcpu-{index}"))
@@ -171,16 +280,21 @@ pub(super) fn run(
                         }
                         let mut cpu = created?;
                         machine.group.register(&cpu);
+                        if let Some(state) = &saved_cpu {
+                            cpu.load_state(state).map_err(|e| e.to_string())?;
+                        }
                         tx.send(Ok(()))
                             .map_err(|_| "ARM64 CPU coordinator stopped".to_string())?;
-                        if let Some(start) = machine
-                            .group
-                            .power
-                            .wait_for_start(index)
-                            .map_err(|e| e.to_string())?
-                        {
-                            run_cpu(&mut cpu, index, start, &machine)?;
+                        while !release.load(Ordering::Acquire) && !machine.group.stopping() {
+                            std::thread::sleep(Duration::from_millis(1));
                         }
+                        run_cpu(
+                            &mut cpu,
+                            index,
+                            None,
+                            saved_power == Some(Power::On),
+                            &machine,
+                        )?;
                         Ok::<(), String>(())
                     }))
                     .map_err(|_| format!("ARM64 CPU {index} panicked"))
@@ -195,7 +309,14 @@ pub(super) fn run(
             .map_err(|e| format!("ARM64 CPU {index} creation: {e}"))??;
     }
     ready(machine.group.clone())?;
-    let result = run_cpu(&mut primary, 0, boot, &machine);
+    release.store(true, Ordering::Release);
+    let result = run_cpu(
+        &mut primary,
+        0,
+        restored.is_none().then_some(boot),
+        restored.is_some_and(|state| state.power[0] == Power::On),
+        &machine,
+    );
     machine.group.stop();
     drop(workers);
     result?;
@@ -214,82 +335,84 @@ pub(super) fn run(
 fn run_cpu(
     cpu: &mut HvfVcpu,
     index: u32,
-    start: CpuStart,
+    start: Option<CpuStart>,
+    mut running: bool,
     machine: &Machine,
 ) -> Result<(), String> {
-    let mut start = start;
-    'power: loop {
+    if let Some(start) = start {
+        reset_cpu(cpu, start)?;
+        running = true;
+    }
+    loop {
+        machine.group.checkpoint(cpu, index);
         if machine.group.stopping() {
             return Ok(());
         }
-        reset_cpu(cpu, start)?;
-        tracing::info!(cpu = index, entry = start.entry, "ARM64 vCPU running");
-        loop {
-            if machine.group.stopping() {
-                return Ok(());
+        if !running {
+            if let Some(start) = machine
+                .group
+                .power
+                .wait_for_start_interruptible(index, || {
+                    machine.group.pause_requested.load(Ordering::Acquire)
+                })
+                .map_err(|e| e.to_string())?
+            {
+                reset_cpu(cpu, start)?;
+                running = true;
+            } else {
+                continue;
             }
-            match cpu.run().map_err(|e| e.to_string())? {
-                Exit::Canceled => continue,
-                Exit::Exception {
-                    syndrome,
-                    physical_address,
-                    ..
-                } => {
-                    if syndrome >> 26 == 0x16 {
-                        let [a, b, c] = [1, 2, 3].map(|register| {
-                            cpu.register(Register::X(register))
-                                .map_err(|e| e.to_string())
-                        });
-                        let args = [a?, b?, c?];
-                        match machine.group.power.psci(
-                            index,
-                            cpu.register(Register::X(0)).map_err(|e| e.to_string())?,
-                            args,
-                        ) {
-                            Action::Return(value) => cpu
-                                .set_register(Register::X(0), value)
-                                .map_err(|e| e.to_string())?,
-                            Action::SystemOff => {
-                                if let Some(off) = &machine.powered_off {
-                                    off.store(true, Ordering::Release);
-                                }
-                                machine.group.stop();
-                                return Ok(());
+        }
+        match cpu.run().map_err(|e| e.to_string())? {
+            Exit::Canceled => continue,
+            Exit::Exception {
+                syndrome,
+                physical_address,
+                ..
+            } => {
+                if syndrome >> 26 == 0x16 {
+                    let [a, b, c] = [1, 2, 3].map(|register| {
+                        cpu.register(Register::X(register))
+                            .map_err(|e| e.to_string())
+                    });
+                    let args = [a?, b?, c?];
+                    match machine.group.power.psci(
+                        index,
+                        cpu.register(Register::X(0)).map_err(|e| e.to_string())?,
+                        args,
+                    ) {
+                        Action::Return(value) => cpu
+                            .set_register(Register::X(0), value)
+                            .map_err(|e| e.to_string())?,
+                        Action::SystemOff => {
+                            if let Some(off) = &machine.powered_off {
+                                off.store(true, Ordering::Release);
                             }
-                            Action::CpuOff => {
-                                cpu.set_system_register(SystemRegister::VirtualTimerControl, 2)
-                                    .map_err(|e| e.to_string())?;
-                                tracing::info!(cpu = index, "ARM64 vCPU powered off");
-                                match machine
-                                    .group
-                                    .power
-                                    .wait_for_start(index)
-                                    .map_err(|e| e.to_string())?
-                                {
-                                    Some(next) => {
-                                        start = next;
-                                        continue 'power;
-                                    }
-                                    None => return Ok(()),
-                                }
-                            }
+                            machine.group.stop();
+                            return Ok(());
                         }
-                        continue;
-                    }
-                    let pc = cpu.register(Register::Pc).map_err(|e| e.to_string())?;
-                    if let Some((register, read)) = machine_arm64::debug_lock_access(syndrome) {
-                        if read && register != 31 {
-                            cpu.set_register(Register::X(register), 0)
+                        Action::CpuOff => {
+                            cpu.set_system_register(SystemRegister::VirtualTimerControl, 2)
                                 .map_err(|e| e.to_string())?;
+                            tracing::info!(cpu = index, "ARM64 vCPU powered off");
+                            running = false;
                         }
-                    } else {
-                        mmio(cpu, syndrome, physical_address, machine)?;
                     }
-                    cpu.set_register(Register::Pc, pc.checked_add(4).ok_or("PC overflows")?)
-                        .map_err(|e| e.to_string())?;
+                    continue;
                 }
-                other => return Err(format!("unexpected ARM64 CPU {index} exit: {other:?}")),
+                let pc = cpu.register(Register::Pc).map_err(|e| e.to_string())?;
+                if let Some((register, read)) = machine_arm64::debug_lock_access(syndrome) {
+                    if read && register != 31 {
+                        cpu.set_register(Register::X(register), 0)
+                            .map_err(|e| e.to_string())?;
+                    }
+                } else {
+                    mmio(cpu, syndrome, physical_address, machine)?;
+                }
+                cpu.set_register(Register::Pc, pc.checked_add(4).ok_or("PC overflows")?)
+                    .map_err(|e| e.to_string())?;
             }
+            other => return Err(format!("unexpected ARM64 CPU {index} exit: {other:?}")),
         }
     }
 }

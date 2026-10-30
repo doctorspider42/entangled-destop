@@ -54,5 +54,8 @@ uefi-boot.workspace = true
 virtio-gpu.workspace = true
 display.workspace = true
 
+[build-dependencies]
+cc = "1"
+
 [lints]
 workspace = true

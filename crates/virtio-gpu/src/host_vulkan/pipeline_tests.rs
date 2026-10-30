@@ -1211,7 +1211,13 @@ fn zink_device_with(
     extra: &[&'static str],
     links: Vec<VkDeviceCreateInfoNext>,
 ) {
+    let shown = device_extension_names(h);
     let mut names: Vec<&'static str> = ZINK_DEVICE_EXTENSIONS.to_vec();
+    // This list was captured on NVIDIA. Enable only advertised optional
+    // extensions on other GPUs; features used by an individual test are
+    // required explicitly there, rather than making every fixture depend on
+    // transform feedback and dma-buf scanout.
+    names.retain(|name| shown.iter().any(|available| available == name));
     names.extend_from_slice(extra);
     let mut chain = vec![
         VkDeviceCreateInfoNext::VkPhysicalDeviceVulkan13Features(
@@ -1241,6 +1247,22 @@ fn zink_device_with(
             },
         ),
     ];
+    if !names.contains(&"VK_EXT_transform_feedback") {
+        chain.retain(|link| {
+            !matches!(
+                link,
+                VkDeviceCreateInfoNext::VkPhysicalDeviceTransformFeedbackFeaturesEXT(_)
+            )
+        });
+    }
+    if !names.contains(&"VK_EXT_conditional_rendering") {
+        chain.retain(|link| {
+            !matches!(
+                link,
+                VkDeviceCreateInfoNext::VkPhysicalDeviceConditionalRenderingFeaturesEXT(_)
+            )
+        });
+    }
     chain.extend(links);
     let mut create = create_device(PHYSICAL, DEVICE, chain);
     if let Command::CreateDevice(a) = &mut create {
@@ -1508,7 +1530,16 @@ fn the_host_gpu_is_shown_what_zink_needs() {
 fn the_host_gpu_captures_vertices_through_transform_feedback() {
     let Some(host) = host() else { return };
     let mut h = Harness::new(host);
-    setup_zink(&mut h);
+    boot(&mut h);
+    if !device_extension_names(&mut h)
+        .iter()
+        .any(|name| name == "VK_EXT_transform_feedback")
+    {
+        eprintln!("skipping transform-feedback execution: host does not advertise VK_EXT_transform_feedback");
+        teardown(h);
+        return;
+    }
+    zink_device(&mut h, &[]);
     let captured = buffer(&mut h, 0x800, 4096, USAGE_TF_BUFFER, true);
     captured.write_words(&[0xdead_beef; 1024]);
     let counter = buffer(&mut h, 0x810, 256, USAGE_TF_COUNTER, true);
@@ -1596,7 +1627,16 @@ fn the_host_gpu_skips_and_runs_a_dispatch_by_its_conditional_rendering_predicate
     const N: u32 = 64 * 64;
     let Some(host) = host() else { return };
     let mut h = Harness::new(host);
-    setup_zink(&mut h);
+    boot(&mut h);
+    if !device_extension_names(&mut h)
+        .iter()
+        .any(|name| name == "VK_EXT_conditional_rendering")
+    {
+        eprintln!("skipping conditional-rendering execution: host does not advertise VK_EXT_conditional_rendering");
+        teardown(h);
+        return;
+    }
+    zink_device(&mut h, &[]);
     let data = buffer(&mut h, 0x820, u64::from(N) * 4, USAGE_STORAGE, true);
     let predicate = buffer(&mut h, 0x830, 256, USAGE_CONDITIONAL, true);
     compute_pipeline(&mut h, &spirv(COMPUTE_WGSL), data.id);
@@ -3862,7 +3902,20 @@ fn allocating_past_the_device_local_cap_is_out_of_device_memory_and_the_gpu_keep
         })
         .expect("a device-local type");
     let heap = types.memory_heaps[types.memory_types[ty as usize].heap_index as usize].size;
-    assert_eq!(heap, CAP / 4 * 3, "the guest is told its share");
+    let heap_index = types.memory_types[ty as usize].heap_index;
+    let shared_heap = types.memory_types[..types.memory_type_count as usize]
+        .iter()
+        .any(|kind| kind.heap_index == heap_index && kind.property_flags & 0x2 != 0);
+    let host_share = if shared_heap {
+        crate::venus::executor::MAX_HOST_VISIBLE_BYTES_PER_CONTEXT
+    } else {
+        0
+    };
+    assert_eq!(
+        heap,
+        CAP / 4 * 3 + host_share,
+        "mixed heaps expose the sum of their independent native and imported-page shares"
+    );
 
     let mut made = Vec::new();
     let refused = loop {
@@ -4144,6 +4197,11 @@ fn a_buffer_destroyed_under_a_running_submit_outlives_it_and_the_destroy_waits_f
     let gpu = start.elapsed();
 
     dst.write_words(&vec![0; WORDS]);
+    // begin() uses ONE_TIME_SUBMIT. The timed submission consumed that
+    // recording; submitting it again is invalid Vulkan and some drivers
+    // discard its native commands. Record the same workload afresh so this
+    // checks object lifetime under real GPU work, rather than undefined reuse.
+    assert_eq!(h.submit_recording(&recording), Outcome::Consumed);
     h.send(&queue_submit(QUEUE, &[CB], 0)).unwrap();
     let start = std::time::Instant::now();
     h.send(&destroy_buffer(DEVICE, src.id)).unwrap();

@@ -466,7 +466,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             .device_and_guest(device)
             .map_err(|e| failed(e.to_string()))?;
         let owner = Arc::clone(&owner.host);
-        let (alignment, host_types) = (guest.import_alignment, guest.host_visible_types());
+        let (alignment, host_types) = (guest.import_alignment, guest.coherent_import_host_types());
         let queue = self
             .objects
             .queue(queue_id)

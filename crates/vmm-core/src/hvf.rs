@@ -22,6 +22,8 @@ use crate::GuestMem;
 
 pub use crate::hv::arm64::{Exit as Arm64Exit, Register};
 
+mod snapshot;
+
 static VM_EXISTS: AtomicBool = AtomicBool::new(false);
 const PAGE_SIZE: usize = 16 * 1024;
 

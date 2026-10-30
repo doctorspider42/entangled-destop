@@ -115,6 +115,7 @@ pub use input::{ControlEvent, ControlQueue, InputCapture, InputQueue, KeyOutcome
 pub use renderer::FrameStats;
 pub use scanout::{CursorImage, Scanout, ScanoutStats, SharedScanout};
 pub use shared::{SharedSlot, SharedStats};
+pub use toolbar::lifecycle::LifecyclePhase;
 pub use ux::{viewport_for, ScaleMode, WindowStatus};
 pub use viewport::{letterbox, DisplayConfig, Viewport};
 

@@ -77,6 +77,7 @@ const STREAM_CHUNK: usize = 1 << 20;
 pub enum HostKind {
     KvmLinux,
     WhpWindows,
+    HvfMacos,
 }
 
 impl HostKind {
@@ -91,7 +92,15 @@ impl HostKind {
         {
             Some(HostKind::WhpWindows)
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Some(HostKind::HvfMacos)
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            windows,
+            all(target_os = "macos", target_arch = "aarch64")
+        )))]
         {
             None
         }
@@ -101,6 +110,14 @@ impl HostKind {
         match self {
             HostKind::KvmLinux => "Linux/KVM",
             HostKind::WhpWindows => "Windows/WHP",
+            HostKind::HvfMacos => "macOS/HVF",
+        }
+    }
+
+    pub const fn architecture(self) -> Arch {
+        match self {
+            Self::HvfMacos => Arch::Aarch64,
+            Self::KvmLinux | Self::WhpWindows => Arch::X86_64,
         }
     }
 
@@ -108,6 +125,7 @@ impl HostKind {
         match self {
             HostKind::KvmLinux => 1,
             HostKind::WhpWindows => 2,
+            HostKind::HvfMacos => 3,
         }
     }
 
@@ -115,6 +133,7 @@ impl HostKind {
         match code {
             1 => Ok(HostKind::KvmLinux),
             2 => Ok(HostKind::WhpWindows),
+            3 => Ok(HostKind::HvfMacos),
             other => Err(SnapshotError::BadValue {
                 what: "snapshot host kind",
                 value: u64::from(other),
@@ -123,31 +142,40 @@ impl HostKind {
     }
 }
 
-/// Guest architecture. One value today; present so a snapshot from a future
-/// aarch64 port is refused by name rather than misread.
+/// Guest architecture, checked before an architecture-specific state decoder runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     X86_64,
+    Aarch64,
 }
 
 impl Arch {
     pub const fn current() -> Self {
-        Arch::X86_64
+        if cfg!(target_arch = "aarch64") {
+            Arch::Aarch64
+        } else {
+            Arch::X86_64
+        }
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Arch::X86_64 => "x86-64",
+            Arch::Aarch64 => "aarch64",
         }
     }
 
     const fn code(self) -> u32 {
-        1
+        match self {
+            Self::X86_64 => 1,
+            Self::Aarch64 => 2,
+        }
     }
 
     fn from_code(code: u32) -> Result<Self> {
         match code {
             1 => Ok(Arch::X86_64),
+            2 => Ok(Arch::Aarch64),
             other => Err(SnapshotError::BadValue {
                 what: "snapshot architecture",
                 value: u64::from(other),
@@ -376,7 +404,7 @@ impl<W: Write + Seek> SnapshotWriter<W> {
             .u32(VERSION)
             .u32(0)
             .u32(self.host.code())
-            .u32(Arch::current().code())
+            .u32(self.host.architecture().code())
             .u64(index_offset)
             .u64(index.len() as u64);
         header.raw(&Sha256::digest(&index));

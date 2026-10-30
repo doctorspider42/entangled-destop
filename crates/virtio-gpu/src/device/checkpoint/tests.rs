@@ -214,6 +214,15 @@ fn cold(
     mem: Arc<GuestMem>,
     legacy: &[u8],
 ) -> (GpuDevice<Sink>, Arc<h::RecordingWindow>) {
+    cold_with_archive(host, mem, legacy, true)
+}
+
+fn cold_with_archive(
+    host: Arc<FakeVulkan>,
+    mem: Arc<GuestMem>,
+    legacy: &[u8],
+    accelerated: bool,
+) -> (GpuDevice<Sink>, Arc<h::RecordingWindow>) {
     let gate = Quiesce::new();
     gate.pause();
     let window = Arc::new(h::RecordingWindow::default());
@@ -221,11 +230,49 @@ fn cold(
     renderer.set_quiesce(gate);
     renderer.set_host_visible(window.clone());
     let mut device = GpuDevice::with_renderer(Sink::default(), Box::new(renderer));
-    device.enable_accelerated_checkpoints(8 << 20).unwrap();
+    if accelerated {
+        device.enable_accelerated_checkpoints(8 << 20).unwrap();
+    }
     device.mem = Some(mem);
     device.load_device(legacy).unwrap();
     assert!(device.restored_3d_lost);
     (device, window)
+}
+
+#[test]
+fn pending_native_adoption_does_not_report_gpu_loss_but_legacy_restore_still_does() {
+    use std::sync::atomic::AtomicUsize;
+    use tracing::{span, Event, Metadata, Subscriber};
+    struct Warnings(Arc<AtomicUsize>);
+    impl Subscriber for Warnings {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, _: &Event<'_>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+    let (host, source, _) = source(true);
+    let legacy = source.save_device();
+    let mem = source.mem.clone().unwrap();
+    for accelerated in [true, false] {
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let (device, _) = tracing::subscriber::with_default(Warnings(warnings.clone()), || {
+            cold_with_archive(host.clone(), mem.clone(), &legacy, accelerated)
+        });
+        assert!(
+            device.restored_3d_lost,
+            "no guest work is admitted before native state is adopted"
+        );
+        assert_eq!(warnings.load(Ordering::Relaxed) == 0, accelerated);
+    }
 }
 
 #[test]
