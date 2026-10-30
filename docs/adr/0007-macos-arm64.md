@@ -690,3 +690,17 @@ Its stale test snapshots and the exclusively owned diagnostic disk clone are
 removed during task cleanup; no user media/kernel cache or installed app is
 replaced. A copied signed .app must preserve Frameworks symlinks; deep/strict
 signature verification of the persistent copy and its doctor probe passed.
+
+### macOS SDK compatibility during publication
+
+The macOS 26 release runner exposed a link-time regression hidden by the local
+macOS 27 SDK: hv_vcpu_get_serror and hv_vcpu_set_serror are declared
+API_AVAILABLE(macos(27.0)). Rust extern declarations do not inherit that
+availability annotation. The backend now resolves both symbols at runtime,
+caching the pair only when both exist. Older SDKs therefore link normally.
+Full CPU save/load returns SnapshotUnsupported when either entry point is
+missing, before reading or mutating CPU state; it never substitutes an empty
+pending-SError state. Normal macOS 26 VM execution retains its existing support.
+Unit fixtures cover each missing symbol, both missing, and preservation of the
+resolved functions' pending-state values and native result codes. Native CLI/SMP
+acceptance verifies the resolved path on macOS 27.

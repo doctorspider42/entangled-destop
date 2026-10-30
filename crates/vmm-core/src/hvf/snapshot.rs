@@ -1,4 +1,5 @@
 //! HVF state is captured on the owning CPU thread, between completed exits.
+use super::serror::SerrorApi;
 use super::*;
 use crate::hv::arm64::CpuState;
 
@@ -12,8 +13,6 @@ extern "C" {
     fn hv_vcpu_set_vtimer_offset(cpu: u64, value: u64) -> i32;
     fn hv_vcpu_get_vtimer_mask(cpu: u64, value: *mut bool) -> i32;
     fn hv_vcpu_set_vtimer_mask(cpu: u64, value: bool) -> i32;
-    fn hv_vcpu_get_serror(cpu: u64, value: *mut bool) -> i32;
-    fn hv_vcpu_set_serror(cpu: u64, value: bool) -> i32;
     fn hv_gic_get_icc_reg(cpu: u64, reg: u16, value: *mut u64) -> i32;
     fn hv_gic_set_icc_reg(cpu: u64, reg: u16, value: u64) -> i32;
     fn hv_gic_state_create() -> *mut c_void;
@@ -47,6 +46,7 @@ impl HvfVcpu {
         Ok(value)
     }
     pub fn save_state(&self) -> Result<CpuState, HvfError> {
+        let serror = SerrorApi::load()?;
         let features = FEATURES
             .iter()
             .map(|&r| self.sys(r))
@@ -129,12 +129,13 @@ impl HvfVcpu {
         )?;
         check(
             // SAFETY: live owning CPU and writable bool output.
-            unsafe { hv_vcpu_get_serror(self.cpu, &mut state.serror) },
+            unsafe { (serror.get)(self.cpu, &mut state.serror) },
             "hv_vcpu_get_serror",
         )?;
         Ok(state)
     }
     pub fn load_state(&mut self, state: &CpuState) -> Result<(), HvfError> {
+        let serror = SerrorApi::load()?;
         let template = self.save_state()?;
         if template.features != state.features
             || template
@@ -193,7 +194,7 @@ impl HvfVcpu {
         )?;
         check(
             // SAFETY: live owning CPU and a valid boolean pending state.
-            unsafe { hv_vcpu_set_serror(self.cpu, state.serror) },
+            unsafe { (serror.set)(self.cpu, state.serror) },
             "hv_vcpu_set_serror",
         )
     }

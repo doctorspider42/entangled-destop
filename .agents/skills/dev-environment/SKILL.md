@@ -280,3 +280,13 @@ times:
   you started shut down cleanly via Ctrl+Alt+Q / ACPI power-off. Services,
   containers and other tasks' work are out of scope by construction: see
   rule 2 above.
+
+## Native macOS SDK availability
+
+Rust extern declarations bypass Apple's SDK availability annotations: Clippy can
+pass while linking against an older SDK fails. hv_vcpu_get_serror/set_serror are
+macOS 27 APIs; the release runner is macOS 26. Resolve this pair at runtime and
+refuse complete CPU snapshots if either is absent, without inventing empty
+exception state. Ordinary macOS 26 VM execution must still link and start.
+Check real binary/test linking as well as linting; raising the deployment target
+is not a substitute for runtime availability handling on an older runner.

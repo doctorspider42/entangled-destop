@@ -1588,11 +1588,14 @@ configuration:
 
 ### Saved sessions on Apple Silicon
 
-On macOS, **Suspend** in the manager or the VM window saves the current ARM64
+On macOS 27 or newer, **Suspend** in the manager or the VM window saves the current ARM64
 session and closes the VM. Starting the suspended machine returns to that
 session; the command-line equivalent is `entangled resume <file.esnap>`.
 Snapshots belong to the same host backend and matching CPU features, VM
 configuration and disks. If saving fails, the running session remains open.
+Full native CPU snapshots require the SError state API introduced in macOS 27;
+older hosts keep the running session and report that requirement if saving is
+requested. Normal VM startup remains available on macOS 26.
 Native Restart is still unavailable. Accelerated Ubuntu/GNOME passed 30 minutes
 of continuous GPU load, a save/restore, three additional minutes of load and a
 second save/restore on an M3 Pro. The same glmark2 process continued and fresh
