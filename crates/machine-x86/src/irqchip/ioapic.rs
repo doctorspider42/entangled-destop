@@ -27,7 +27,7 @@
 //! | Bits | Field | Modelled |
 //! |---|---|---|
 //! | 7:0 | vector | yes |
-//! | 10:8 | delivery mode | Fixed / LowestPriority / NMI; SMI, INIT and ExtINT are dropped |
+//! | 10:8 | delivery mode | Fixed / LowestPriority / NMI; SMI, INIT and ExtINT are dropped. LowestPriority to a logical set goes to its lowest processor, as Fixed |
 //! | 11 | destination mode | yes (physical/logical) |
 //! | 12 | delivery status | always reads 0 — delivery here is synchronous |
 //! | 13 | interrupt input polarity | accepted, not modelled (every line we own is active-high) |
@@ -348,6 +348,11 @@ impl IoApic {
                 return Ok(());
             };
             if entry & RTE_MASK != 0 {
+                tracing::debug!(
+                    pin,
+                    entry = format_args!("{entry:#x}"),
+                    "IOAPIC pin masked; edge latched"
+                );
                 state.pending |= 1 << u32::from(pin);
                 return Ok(());
             }
@@ -364,6 +369,7 @@ impl IoApic {
             // So the local APIC reports the EOI (see the module notes).
             request.trigger = TriggerMode::Level;
         }
+        tracing::trace!(pin, ?request, "IOAPIC delivery");
         self.delivery
             .request(&request)
             .map_err(|e| InterruptError::Signal(e.to_string()))?;
@@ -527,11 +533,24 @@ fn decode(entry: u64) -> Option<InterruptRequest> {
             return None;
         }
     };
+    let logical = entry & RTE_DESTINATION_MODE != 0;
+    let mut destination = ((entry >> RTE_DESTINATION_SHIFT) & 0xff) as u32;
+    let mut kind = kind;
+    if kind == InterruptKind::LowestPriority && logical && destination != 0 {
+        // Lowest-priority arbitration may pick any processor in the set, and
+        // picking one here is what KVM does too. WHP's own arbitration does
+        // not deliver a lowest-priority request to a multi-processor logical
+        // set: Windows routes the ACPI SCI exactly so (vector, logical
+        // destination 3), and its power button went unanswered (ADR-0008).
+        // The lowest set bit is one processor in the flat logical model.
+        destination &= destination.wrapping_neg();
+        kind = InterruptKind::Fixed;
+    }
     Some(InterruptRequest {
         vector: (entry & RTE_VECTOR) as u8,
-        destination: ((entry >> RTE_DESTINATION_SHIFT) & 0xff) as u32,
+        destination,
         kind,
-        destination_mode: if entry & RTE_DESTINATION_MODE != 0 {
+        destination_mode: if logical {
             DestinationMode::Logical
         } else {
             DestinationMode::Physical
@@ -676,6 +695,27 @@ mod tests {
             }
         );
         assert_eq!(apic.delivered(), 1);
+    }
+
+    /// How Windows routes the ACPI SCI: lowest priority to logical set 3. It
+    /// goes to one processor of the set, as a fixed interrupt (ADR-0008).
+    #[test]
+    fn lowest_priority_to_a_logical_set_picks_one_processor() {
+        let (apic, rec) = chip();
+        route(&apic, 13, 0xb0);
+        write_reg(
+            &apic,
+            REG_REDIRECTION_BASE + 2 * 13,
+            0xb0 | (DELIVERY_LOWEST_PRIORITY << RTE_DELIVERY_MODE_SHIFT) as u32
+                | RTE_DESTINATION_MODE as u32
+                | RTE_TRIGGER_LEVEL as u32,
+        );
+        write_reg(&apic, REG_REDIRECTION_BASE + 2 * 13 + 1, 0b110 << 24);
+        apic.pulse(13).unwrap();
+        let requests = rec.requests.lock().unwrap();
+        assert_eq!(requests[0].kind, InterruptKind::Fixed);
+        assert_eq!(requests[0].destination, 0b010, "the lowest set bit");
+        assert_eq!(requests[0].destination_mode, DestinationMode::Logical);
     }
 
     /// The documented deviation from hardware: an edge that arrives masked is

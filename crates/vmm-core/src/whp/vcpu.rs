@@ -1107,11 +1107,10 @@ impl ExitStats {
         ports.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
         let ports: Vec<String> = ports
             .iter()
-            .take(6)
-            .map(|(port, n)| format!("{port:#06x}:{:.0}/s", *n as f64 / secs))
+            .map(|(port, n)| format!("{port:#06x}:{n}"))
             .collect();
         eprintln!(
-            "vp{} exits {:.0}/s reasons [{}] ports [{}]",
+            "vp{} exits {:.0}/s reasons [{}] ports (count) [{}]",
             self.vp,
             total as f64 / secs,
             reasons.join(" "),

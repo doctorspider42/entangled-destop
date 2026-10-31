@@ -325,3 +325,16 @@ exits/s), so that experiment was not kept. What remains for a Windows 10
 host is ours to build. The options are a reference-TSC page served from
 userspace (Hyper-V's `HV_X64_MSR_REFERENCE_TSC`, which makes the performance
 counter a memory read), and cheaper exits for the two ports.
+
+### Amendment, 2026-10-31: the power button
+
+Windows enabled `PWRBTN_EN` and then ignored every press: it never even read
+the PM block afterwards. It routes the ACPI SCI as **lowest priority** to the
+logical set `3` (both vCPUs), level-triggered. The userspace IOAPIC passed
+that through to `WHvRequestInterrupt` unchanged, and WHP does not deliver it.
+Lowest-priority arbitration may choose any member of the set, so the IOAPIC
+now sends such a request as a fixed interrupt to the set's lowest processor,
+which is also what KVM does. With it, `shutdown` on the control channel
+(the manager's Shut down) takes Windows to ACPI S5 in about five seconds.
+Linux routes its interrupts as fixed and is not affected; KVM's in-kernel
+IOAPIC never saw this.
