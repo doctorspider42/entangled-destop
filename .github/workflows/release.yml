@@ -392,7 +392,9 @@ jobs:
           # surfaces. A build without this variable refuses to download at all
           # rather than fetching something it cannot check.
           ENTANGLED_LINUX_ENGINE_SHA256: ${{ needs.linux-engine.outputs.sha256 }}
-        run: cargo build --release -p entangled -p entangled-manager
+        # entangled-agent is the Windows guest agent (the shared clipboard);
+        # `install windows` puts the one beside entangled.exe on the answer disc.
+        run: cargo build --release -p entangled -p entangled-manager -p entangled-agent
 
       - name: Install Inno Setup 7 (pinned)
         shell: pwsh

@@ -125,6 +125,8 @@ Name: "wslengine"; Description: "Also set up the Linux engine in WSL (enables th
 [Files]
 Source: "{#BinDir}\entangled-manager.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinDir}\entangled.exe"; DestDir: "{app}"; Flags: ignoreversion
+; The Windows guest agent: `install windows` copies it onto the answer disc.
+Source: "{#BinDir}\entangled-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "entangled.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion

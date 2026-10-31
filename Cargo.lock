@@ -1433,6 +1433,7 @@ name = "entangled"
 version = "0.2.0"
 dependencies = [
  "ahci",
+ "arboard",
  "clap",
  "control-api",
  "debian-media",
@@ -1457,6 +1458,7 @@ dependencies = [
  "virtio-9p",
  "virtio-balloon",
  "virtio-block",
+ "virtio-console",
  "virtio-core",
  "virtio-gpu",
  "virtio-input",
@@ -1465,6 +1467,13 @@ dependencies = [
  "vm-memory 0.17.2",
  "vm-snapshot",
  "vmm-core",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "entangled-agent"
+version = "0.2.0"
+dependencies = [
  "windows 0.62.2",
 ]
 
@@ -4657,6 +4666,17 @@ name = "virtio-block"
 version = "0.2.0"
 dependencies = [
  "disk-image",
+ "thiserror 2.0.20",
+ "tracing",
+ "virtio-core",
+ "virtio-queue",
+ "vm-memory 0.17.2",
+]
+
+[[package]]
+name = "virtio-console"
+version = "0.2.0"
+dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "virtio-core",

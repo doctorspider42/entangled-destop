@@ -32,6 +32,8 @@
 
 pub use crate::run_options::{RunOptions, ScreenshotRequest};
 
+#[path = "clipboard_bridge.rs"]
+mod clipboard_bridge;
 #[path = "framebuffer_present.rs"]
 mod framebuffer_present;
 
@@ -441,6 +443,8 @@ struct BuiltDevices {
     /// The virtio-gpu's "scanout bound" flag, for a VGA framebuffer on the
     /// same function to yield to (`adapter = "virtio-vga"`).
     gpu_scanout: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The guest agent's port, when the profile has one.
+    agent_port: Option<virtio_console::PortHandle>,
 }
 
 /// One virtio-blk device per `[[disk]]` entry, the configured network backend,
@@ -904,11 +908,25 @@ fn build_devices(
         devices.push(Box::new(mouse));
     }
 
+    // The guest agent's port (ADR-0008), after everything else for the same
+    // reason as the rest: no existing device moves.
+    let mut agent_port = None;
+    if cfg.guest_agent {
+        let console = virtio_console::ConsoleDevice::new(clipboard_bridge::PORT_NAME);
+        agent_port = Some(console.handle());
+        tracing::info!(
+            port = clipboard_bridge::PORT_NAME,
+            "attaching the guest agent's port"
+        );
+        devices.push(Box::new(console));
+    }
+
     Ok(BuiltDevices {
         devices,
         net_cmdline,
         shares_scanout,
         gpu_scanout,
+        agent_port,
     })
 }
 
@@ -1584,6 +1602,14 @@ pub fn run_with(
         share_scanout(&mut presentation, cfg.display.gpu_boost);
     }
     let gpu_scanout = built.gpu_scanout.clone();
+    // The shared clipboard: stopped on drop, at the end of the run.
+    let _clipboard = match built.agent_port.clone() {
+        Some(port) => Some(
+            clipboard_bridge::Bridge::start(port)
+                .map_err(|e| format!("cannot start the clipboard bridge: {e}"))?,
+        ),
+        None => None,
+    };
 
     // The debug screenshot timer (--screenshot-after). Detached on purpose:
     // waiting for it would hold a finished VM open for the rest of the timer.
@@ -1871,7 +1897,10 @@ pub fn run_with(
     };
     for (i, outcome) in outcomes.iter().enumerate() {
         match outcome {
-            Ok(RunOutcome::Shutdown) => {
+            // A reset storm also ends as `Shutdown`; the guest did not ask
+            // for that one, and an installer waiting for a power-off must
+            // not take it for one.
+            Ok(RunOutcome::Shutdown) if !lifecycle.stormed_out() => {
                 report.guest_shutdown = true;
                 tracing::info!(vcpu = i, "guest shut down");
             }

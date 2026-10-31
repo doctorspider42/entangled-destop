@@ -1140,6 +1140,28 @@ hypervisors refuse that. Read this before touching `vmm_core::shm`,
   interleaved chain is refused *and still acked*, and nothing that arrives
   indexes anything host-side. Fuzzed by `fuzz/fuzz_targets/input_device.rs`.
 
+### virtio-console (`crates/virtio-console`, ADR-0008)
+
+Multiport (`VIRTIO_CONSOLE_F_MULTIPORT`), two ports: port 0 the silent
+console, port 1 named at construction (`org.entangled.agent.0`, the guest
+agent's). Six queues: port 0 rx/tx, control rx/tx, port 1 rx/tx. The driver
+sends `DEVICE_READY`; the device answers `DEVICE_ADD` per port; on
+`PORT_READY(1)` it sends `PORT_NAME` (header plus the name's bytes, no NUL)
+and `PORT_OPEN(1, 1)`; the driver's `PORT_OPEN` is the guest program opening
+or closing the port (`PortHandle::is_open`). Two traps it met:
+
+- **A receive buffer is only taken when there is something to put in it.**
+  Popping a chain and returning it with 0 bytes because the host had nothing
+  hands the guest an empty message and loses its buffer; the receive drains
+  serve one chain at a time while data or control messages remain.
+- **`vioserial`'s ports admit administrators only.** A user-mode program on a
+  filtered token never gets `CreateFile` on `\\.\Global\<name>`; the guest
+  agent is started from an elevated logon task.
+
+The host writes into guest memory from `PortHandle::send` (another thread):
+it takes `Quiesce::try_enter` and, paused, leaves the bytes queued for the
+next kick or send.
+
 ## Testing
 
 - Pure-logic tests (validation, negotiation, parsing) run everywhere; queue

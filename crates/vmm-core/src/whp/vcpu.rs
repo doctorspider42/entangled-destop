@@ -603,9 +603,20 @@ impl WhpVcpu {
                         return Ok(RunOutcome::Shutdown);
                     };
                     if self.index == 0 {
+                        // The bytes at RIP: what was executing, or what it
+                        // jumped into (a corrupted image reads as garbage).
+                        let mut code = [0u8; 16];
+                        let rip = self.get_registers().map(|r| r.rip).unwrap_or(0);
+                        let _ = vm_memory::Bytes::read_slice(
+                            self.partition.memory(),
+                            &mut code,
+                            vm_memory::GuestAddress(rip),
+                        );
                         tracing::info!(
                             vcpu = self.index,
                             %site,
+                            reason = exit.ExitReason.0,
+                            code = ?code,
                             "unrecoverable exception on the boot CPU with no power-off latched:                              treating it as a reboot"
                         );
                         if !lifecycle.request_guest_reset() {

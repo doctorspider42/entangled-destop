@@ -596,3 +596,37 @@ half needs the test-signed driver and the LunarG Vulkan runtime downloaded
 into the guest, test-signing on, and is not done yet. GPU-PV through WHP is
 not possible (WHP has no GPU-partition API), and the older virgl-based
 `viogpu3d` is abandoned upstream.
+
+### Amendment, 2026-10-31: the shared clipboard
+
+Text, both ways, through a guest agent of our own. `guest_agent = true` puts
+a `virtio-console` device on the bus (the new crate; multiport, port 1 named
+`org.entangled.agent.0`, every chain bounded and read through `vm-memory`),
+which virtio-win's `vioserial` exposes as `\\.\Global\org.entangled.agent.0`.
+`entangled-agent` (`guest/windows-agent`, a workspace member that is a stub
+off Windows) opens it with overlapped I/O, watches
+`GetClipboardSequenceNumber`, sends `CF_UNICODETEXT` when it changes and sets
+what the host sends; the host side (`apps/entangled`'s `clipboard_bridge`)
+does the same with `arboard`. Both speak the agent's `protocol.rs` (a
+length, a kind, a payload; the host includes the same file), and each side
+remembers the last text exchanged so nothing echoes. `install windows` puts
+the `entangled-agent.exe` beside `entangled.exe` on the answer disc and
+`first-logon.cmd` starts it at every logon; the release builds and ships it.
+No QEMU or SPICE agent is involved.
+
+Two things the first run found. The agent is linked against the static C
+runtime (`guest/windows-agent/build.rs`): a fresh Windows has no
+`VCRUNTIME140.dll`. And `vioserial`'s ports admit administrators only — a
+filtered token's `CreateFile` never reaches the port — so the agent starts
+from a logon task at run level highest for the installed user rather than
+from `Run`. Measured on a fresh install: the agent connects ~13 s after a
+reboot, host → guest and guest → host both carry "Zażółć gęślą jaźń" intact.
+
+**Open: a rare reset failure with the console attached.** Three times in
+roughly fifteen resets of a VM with `guest_agent`, all while Windows was
+bringing `vioserial` up for the first time, the firmware faulted ~40 µs after
+the machine reset, and every reset after it faulted the same way (the reset
+storm guard then ends the VM). Never seen without the console. The WHP exit
+now logs its reason and the code bytes at RIP for the next occurrence, and
+`install windows` no longer mistakes a storm-stopped VM for a finished
+install (`Lifecycle::stormed_out`).

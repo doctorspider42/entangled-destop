@@ -25,4 +25,12 @@ copy /y "%disc%\$WinPEDriver$\viogpudo\viogpuap.exe" "%dir%\" >nul
 )
 > "%dir%\resolution.vbs" echo CreateObject("WScript.Shell").Run """%dir%\resolution.cmd""", 0, False
 reg add "HKLM\Software\Microsoft\Windows\CurrentVersion\Run" /v "Entangled display resolution" /t REG_SZ /d "\"%SystemRoot%\System32\wscript.exe\" \"%dir%\resolution.vbs\"" /f >nul
+rem The guest agent (the shared clipboard), when the installer had one to
+rem put on this disc. It has no window and reconnects by itself. vioserial's
+rem ports admit administrators only, so it starts at this user's logon with
+rem the full token (a scheduled task, run level highest), not from Run.
+if exist "%disc%\entangled\entangled-agent.exe" (
+  copy /y "%disc%\entangled\entangled-agent.exe" "%dir%\" >nul
+  powershell -NoProfile -Command "$a = New-ScheduledTaskAction -Execute '%dir%\entangled-agent.exe'; $t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest; $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName 'Entangled agent' -Action $a -Trigger $t -Principal $p -Settings $s -Force" >nul
+)
 endlocal

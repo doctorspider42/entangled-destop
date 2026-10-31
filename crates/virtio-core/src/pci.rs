@@ -511,6 +511,7 @@ pub fn class_code(device_type: DeviceType) -> u32 {
     let (base, sub): (u32, u32) = match device_type {
         DeviceType::Net => (0x02, 0x00),     // network / ethernet
         DeviceType::Block => (0x01, 0x80),   // mass storage / other
+        DeviceType::Console => (0x07, 0x80), // communication / other
         DeviceType::NineP => (0x01, 0x80),   // mass storage / other (a filesystem)
         DeviceType::Balloon => (0x05, 0x80), // memory controller / other
         DeviceType::Gpu => (0x03, 0x80),     // display / other

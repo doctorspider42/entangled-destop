@@ -16,6 +16,7 @@ use crate::GuestMem;
 pub enum DeviceType {
     Net = 1,
     Block = 2,
+    Console = 3,
     /// The memory balloon (free page reporting only).
     Balloon = 5,
     /// A 9P transport: a shared host directory.

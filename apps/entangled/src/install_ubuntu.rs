@@ -283,6 +283,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         reclaim_memory: false,
         ignore_msrs: false,
         hyperv_enlightenments: false,
+        guest_agent: false,
         gamepad: GamepadSection::default(),
     };
 
@@ -485,6 +486,7 @@ fn installed_profile(
         reclaim_memory: false,
         ignore_msrs: false,
         hyperv_enlightenments: false,
+        guest_agent: false,
         gamepad: GamepadSection {
             enabled: true,
             // One pad. A second is a config edit away and costs another virtio

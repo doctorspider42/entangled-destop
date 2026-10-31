@@ -296,6 +296,8 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
         // The Hyper-V reference clock: without it every
         // QueryPerformanceCounter is a PM timer port exit (ADR-0008 §2).
         hyperv_enlightenments: true,
+        // The clipboard, through entangled-agent (first-logon.cmd).
+        guest_agent: true,
     };
     let mut install = installed.clone();
     // Offline: Setup needs nothing from the network, and with it OOBE
@@ -371,6 +373,15 @@ fn answer_disc(
     .map_err(|e| e.to_string())?;
     disc.add_file("entangled/first-logon.cmd", crlf(FIRST_LOGON))
         .map_err(|e| e.to_string())?;
+    match guest_agent() {
+        Some(agent) => disc
+            .add_file("entangled/entangled-agent.exe", agent)
+            .map_err(|e| e.to_string())?,
+        None => tracing::warn!(
+            "no entangled-agent.exe beside this program (or at {AGENT_ENV}); the guest \
+             installs without the shared clipboard"
+        ),
+    }
     let mut virtio = optical::open(drivers_iso).map_err(|e| e.to_string())?;
     for (path, data) in driver_files(virtio.as_mut(), image.is_windows_11())
         .map_err(|e| format!("{}: {e}", drivers_iso.display()))?
@@ -379,6 +390,30 @@ fn answer_disc(
             .map_err(|e| e.to_string())?;
     }
     Ok((disc.build(), image))
+}
+
+/// Where a guest agent build may be named explicitly.
+const AGENT_ENV: &str = "ENTANGLED_WINDOWS_AGENT";
+/// Largest agent accepted.
+const MAX_AGENT: u64 = 32 << 20;
+
+/// The guest agent's bytes: `$ENTANGLED_WINDOWS_AGENT`, else
+/// `entangled-agent.exe` beside this program (where the Windows installer
+/// and a `cargo build` both put it).
+fn guest_agent() -> Option<Vec<u8>> {
+    let path = std::env::var_os(AGENT_ENV)
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let exe = std::env::current_exe().ok()?;
+            Some(exe.parent()?.join("entangled-agent.exe"))
+        })?;
+    let len = std::fs::metadata(&path).ok()?.len();
+    if len == 0 || len > MAX_AGENT {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    tracing::info!(path = %path.display(), "the guest agent goes on the answer disc");
+    Some(bytes)
 }
 
 /// `text` with CRLF line ends, whatever the checkout gave it: `cmd` reads a

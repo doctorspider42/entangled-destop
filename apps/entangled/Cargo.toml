@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 ahci.workspace = true
+# The shared clipboard's host side (the same arboard the display links).
+arboard = { version = "3.6", default-features = false }
+virtio-console.workspace = true
 clap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

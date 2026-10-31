@@ -143,10 +143,15 @@ pub struct VmConfig {
     /// Give the guest the Hyper-V enlightenments (reference TSC page,
     /// synthetic timers, APIC MSRs, hypercalls) — what Windows runs best on
     /// (ADR-0008 §2). Off by default: a Linux guest that sees them takes
-    /// Hyper-V's code paths. Honoured on WHP; ignored, with a warning, on KVM
-    /// for now.
+    /// Hyper-V's code paths. On WHP from the hypervisor where it grants them
+    /// and the clock emulated otherwise; on KVM the clock leaves.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hyperv_enlightenments: bool,
+    /// A virtio-console port for the guest agent (`entangled-agent`), which
+    /// shares the clipboard's text with the host (ADR-0008). Off by default:
+    /// it takes a device slot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guest_agent: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

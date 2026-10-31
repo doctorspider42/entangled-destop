@@ -1,0 +1,29 @@
+[package]
+name = "entangled-agent"
+description = "The Entangled guest agent for Windows guests: shares the clipboard with the host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "entangled-agent"
+path = "src/main.rs"
+
+# The agent runs inside a Windows guest; elsewhere it builds to a stub so the
+# workspace builds and tests on every host.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_Ole",
+] }
+
+[lints]
+workspace = true

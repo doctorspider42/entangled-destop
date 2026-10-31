@@ -314,6 +314,8 @@ struct Inner {
     /// keeps an untrusted guest from turning "reboot" into an unbounded loop.
     last_reset: Option<Instant>,
     storm: u32,
+    /// The VM was stopped because the guest reset faster than it could boot.
+    stormed_out: bool,
 }
 
 impl Inner {
@@ -391,6 +393,7 @@ impl Lifecycle {
                 guest_reset: false,
                 last_reset: None,
                 storm: 0,
+                stormed_out: false,
             }),
             changed: Condvar::new(),
             kickers: Mutex::new(Vec::new()),
@@ -697,6 +700,12 @@ impl Lifecycle {
     /// the only bounded answer to a guest that faults its way straight back into
     /// the reset it just came out of.
     #[must_use]
+    /// Whether the VM ended because of a reset storm — a stop the guest did
+    /// not ask for, however its vCPUs reported it.
+    pub fn stormed_out(&self) -> bool {
+        self.lock().stormed_out
+    }
+
     pub fn request_guest_reset(&self) -> bool {
         let mut inner = self.lock();
         let storming = inner
@@ -710,6 +719,7 @@ impl Lifecycle {
                     window = ?RESET_STORM_WINDOW,
                     "the guest is resetting faster than it can boot; stopping the VM instead"
                 );
+                inner.stormed_out = true;
                 return false;
             }
         } else {
@@ -1294,6 +1304,10 @@ mod tests {
             lifecycle.reset().expect("reset");
         }
         assert_eq!(refusals, 1, "the storm was never refused");
+        assert!(
+            lifecycle.stormed_out(),
+            "and it says so, for the run report"
+        );
         stop(&lifecycle, handles);
     }
 
