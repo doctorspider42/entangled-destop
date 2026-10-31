@@ -45,7 +45,8 @@ use windows::Win32::System::Hypervisor::{
     WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess,
     WHvRunVpExitReasonX64MsrAccess, WHvSetVirtualProcessorRegisters, WHvX64RegisterApicBase,
     WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
-    WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
+    WHvX64RegisterTsc, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
+    WHV_RUN_VP_EXIT_CONTEXT,
 };
 
 use crate::hv::{
@@ -86,7 +87,7 @@ impl WhpVcpu {
         create_virtual_processor(partition.handle(), index)?;
         let cpuid = CpuidPolicy::with_clocks(index, partition.clocks())
             .with_topology(partition.topology())
-            .with_hyperv(partition.options().hyperv);
+            .with_hyperv(partition.whp_hyperv());
         let mut vcpu = Self {
             index,
             partition,
@@ -563,7 +564,7 @@ impl WhpVcpu {
             }
             match exit.ExitReason {
                 WHvRunVpExitReasonX64MsrAccess => {
-                    self.handle_ignored_msr(&exit, &mut msrs_seen)?;
+                    self.handle_msr(&exit, &mut msrs_seen)?;
                     continue;
                 }
                 WHvRunVpExitReasonX64Halt => match gate {
@@ -831,10 +832,20 @@ impl WhpVcpu {
         )
     }
 
-    /// Serves an MSR WHP does not implement, the way KVM's `ignore_msrs`
-    /// does: a read is 0, a write is dropped, and the MSR is logged the first
-    /// time each vCPU sees it. Only reached with `WhpOptions::ignore_msrs`.
-    fn handle_ignored_msr(
+    /// This VP's TSC, for the emulated reference counter.
+    fn guest_tsc(&self) -> Option<u64> {
+        let mut values = Aligned16([zeroed_value(); 1]);
+        self.get_raw(&[WHvX64RegisterTsc], &mut values.0).ok()?;
+        // SAFETY: the TSC register is a 64-bit value.
+        Some(unsafe { values.0[0].Reg64 })
+    }
+
+    /// Serves an MSR WHP does not implement: one of the emulated Hyper-V
+    /// clock's (`hv_clock`), or else the way KVM's `ignore_msrs` does — a
+    /// read is 0, a write is dropped, and the MSR is logged the first time
+    /// each vCPU sees it. Reached with `WhpOptions::ignore_msrs` or the
+    /// emulated clock, which therefore implies ignored MSRs.
+    fn handle_msr(
         &self,
         exit: &WHV_RUN_VP_EXIT_CONTEXT,
         seen: &mut std::collections::BTreeSet<(u32, bool)>,
@@ -850,7 +861,17 @@ impl WhpVcpu {
                 (access.Rdx << 32) | (access.Rax & 0xffff_ffff),
             )
         };
-        if seen.insert((msr, is_write)) {
+        let mut read = 0;
+        let clock = self.partition.hv_clock();
+        let served = match clock {
+            Some(clock) if is_write => clock.write(msr, value, self.partition.memory()),
+            Some(clock) => clock
+                .read(msr, || self.guest_tsc())
+                .map(|value| read = value)
+                .is_some(),
+            None => false,
+        };
+        if !served && seen.insert((msr, is_write)) {
             tracing::warn!(
                 vcpu = self.index,
                 msr = format_args!("{msr:#x}"),
@@ -870,8 +891,8 @@ impl WhpVcpu {
             return self.set_raw(&[WHvX64RegisterRip], &values.0[..1]);
         }
         // `rdmsr` writes EDX:EAX, zero-extended into RDX and RAX.
-        values.0[1].Reg64 = 0;
-        values.0[2].Reg64 = 0;
+        values.0[1].Reg64 = read & 0xffff_ffff;
+        values.0[2].Reg64 = read >> 32;
         self.set_raw(
             &[WHvX64RegisterRip, WHvX64RegisterRax, WHvX64RegisterRdx],
             &values.0,
@@ -887,16 +908,22 @@ impl WhpVcpu {
         // SAFETY: `ExitReason == WHvRunVpExitReasonX64Cpuid` selects the
         // `CpuidAccess` arm of the exit context union.
         let access = unsafe { exit.Anonymous.CpuidAccess };
-        let result = self.cpuid.apply(
-            access.Rax as u32,
-            access.Rcx as u32,
-            CpuidResult {
-                eax: access.DefaultResultRax as u32,
-                ebx: access.DefaultResultRbx as u32,
-                ecx: access.DefaultResultRcx as u32,
-                edx: access.DefaultResultRdx as u32,
-            },
-        );
+        let emulated = self
+            .partition
+            .hv_clock()
+            .and_then(|clock| clock.cpuid(access.Rax as u32));
+        let result = emulated.unwrap_or_else(|| {
+            self.cpuid.apply(
+                access.Rax as u32,
+                access.Rcx as u32,
+                CpuidResult {
+                    eax: access.DefaultResultRax as u32,
+                    ebx: access.DefaultResultRbx as u32,
+                    ecx: access.DefaultResultRcx as u32,
+                    edx: access.DefaultResultRdx as u32,
+                },
+            )
+        });
         if std::env::var_os(TRACE_EXITS_ENV).is_some() {
             eprintln!(
                 "vp{} cpuid {:#x}/{:#x} -> {:08x} {:08x} {:08x} {:08x}",
@@ -980,7 +1007,11 @@ impl ResettableVcpu for WhpVcpu {
     /// Safe at this point and only at this point: the vCPU is parked at a
     /// lifecycle checkpoint, so nothing is inside `WHvRunVirtualProcessor` for
     /// this index, and this runs on the thread that owns the VP.
-    fn reset_arch_state(&mut self, _is_boot_cpu: bool) -> Result<(), HvError> {
+    fn reset_arch_state(&mut self, is_boot_cpu: bool) -> Result<(), HvError> {
+        // The emulated clock is the partition's; one vCPU resets it.
+        if let (true, Some(clock)) = (is_boot_cpu, self.partition.hv_clock()) {
+            clock.reset();
+        }
         match self.pristine.take() {
             Some(pristine) => {
                 let result = self.restore(&pristine);
@@ -1003,7 +1034,7 @@ impl ResettableVcpu for WhpVcpu {
         }
         self.cpuid = CpuidPolicy::with_clocks(self.index, self.partition.clocks())
             .with_topology(self.partition.topology())
-            .with_hyperv(self.partition.options().hyperv);
+            .with_hyperv(self.partition.whp_hyperv());
         Ok(())
     }
 }

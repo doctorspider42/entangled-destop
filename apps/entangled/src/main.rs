@@ -33,6 +33,8 @@ mod install_macos;
 mod install_other;
 #[cfg(any(target_os = "linux", windows))]
 mod install_ubuntu;
+#[cfg(any(target_os = "linux", windows))]
+mod install_windows;
 #[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(dead_code))]
 mod paths;
 #[cfg(any(
@@ -324,8 +326,10 @@ enum DiskCommand {
 pub struct InstallArgs {
     /// Distribution to install: "debian" (d-i, direct kernel boot), "ubuntu"
     /// (the live-server or Desktop ISO through UEFI, unattended autoinstall)
-    /// "fedora" (Everything netinst through UEFI, unattended kickstart), or
-    /// "other" (manual installation from a local x86-64 UEFI ISO).
+    /// "fedora" (Everything netinst through UEFI, unattended kickstart),
+    /// "windows" (Microsoft's Windows 10/11 ISO, unattended, with the
+    /// virtio-win drivers from --drivers), or "other" (manual installation
+    /// from a local x86-64 UEFI ISO).
     pub distro: String,
     /// Enable lifecycle and serial-console input for a manual `install other` VM.
     #[arg(long)]
@@ -420,6 +424,17 @@ pub struct InstallArgs {
     /// --autoinstall; `entangled doctor` says whether this host can serve it.
     #[arg(long)]
     pub venus: bool,
+    /// Windows only: the virtio-win driver ISO
+    /// (https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/).
+    /// The disk, network, input, balloon, serial and RNG drivers for the
+    /// installed version are copied off it onto the answer disc.
+    #[arg(long)]
+    pub drivers: Option<PathBuf>,
+    /// Windows only: the edition to install — its index in install.wim, its
+    /// edition id (`Professional`) or its name (`Windows 10 Pro`). Defaults
+    /// to Pro.
+    #[arg(long)]
+    pub edition: Option<String>,
 }
 
 fn main() -> ExitCode {

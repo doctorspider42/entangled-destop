@@ -399,3 +399,65 @@ Measured on this host: the untouched Windows 10 22H2 ISO boots from the AHCI
 drive through the firmware to the Setup language screen, with an empty
 virtio-blk disk beside it. The remaster is now only needed for the answer file
 and drivers, which an install command can put on a second, small ISO.
+
+### Amendment, 2026-10-31: `entangled install windows`, from the untouched ISO
+
+`entangled install windows --iso <Microsoft's ISO> --drivers <virtio-win ISO>`
+installs Windows 10 (and, untested, 11) with nothing remastered and no host
+tool. Measured on this host: Windows 10 22H2 Pro from the untouched ISO to an
+ACPI power-off after the first logon in **21 minutes**, one guest reboot,
+no interaction.
+
+- **Reading the ISOs.** `disk_image::optical` reads ISO 9660, Joliet and UDF.
+  Microsoft's ISO is a UDF bridge disc whose ISO 9660 side holds nothing, so
+  UDF is required: through it the installer reads the XML in the WIM header
+  of `sources/install.esd` — every image's index, edition and build — and
+  picks Pro by default (`--edition` for another). The build says Windows 10
+  or 11, which picks the `w10`/`w11` drivers off the virtio-win ISO.
+- **The answer disc.** A second `[[optical]]` ISO the installer writes
+  (`IsoBuilder`, ISO 9660 + Joliet): `Autounattend.xml` at the root, found by
+  Setup's implicit search of read-only media, and the drivers under
+  `$WinPEDriver$`, which Setup loads into Windows PE *and* installs into the
+  new system — viostor saw the disk in PE and the installed system booted
+  from it, so §4's "drivers into boot.wim" is no longer needed.
+- **The boot prompt.** The disc's loader prints "Press any key to boot from
+  CD or DVD" on the firmware console, which is ttyS0 too: the installer types
+  one key, once. After Setup's restart the firmware boots Windows Boot
+  Manager from the disk, and the prompt, if reached, times out on its own.
+- **The end.** The first logon turns hibernation off and runs `shutdown /s`;
+  the S5 is how the installer knows it finished. Only then is the profile
+  written — the same machine without the two discs — and the answer disc
+  deleted.
+- Windows 11 gets the `LabConfig` bypasses for its TPM, Secure Boot and RAM
+  checks in the Windows PE pass, until the machine has a TPM.
+
+**An AHCI interrupt bug the first run found.** The HBA sent its MSI only when
+the HBA-level `IS` bit went from 0 to 1. A command that completed while the
+driver had not yet cleared `IS` from the previous one raised nothing, and
+`storahci` found it on its ~30 ms timer: Setup read the ISO at ~30 commands a
+second and had written 588 MB after ten minutes. Every completion now raises
+(the MSI is an edge per event), and clearing `IS` with a port still pending
+raises again. After the fix the image applied at ~3 GB a minute.
+
+### Amendment, 2026-10-31: the Hyper-V reference clock, served from userspace
+
+§2's enlightenments are not available from WHP on a Windows 10 host. The
+clock half of them needs nothing from the hypervisor: it is CPUID leaves and
+MSRs, both of which exit to the host. With `hyperv_enlightenments = true` and
+no synthetic features granted, `vmm_core::whp::hv_clock` answers
+`0x4000_0000`–`0x4000_0006` as "Microsoft Hv"/`Hv#1` granting only the
+partition reference counter, the reference TSC page, the frequency MSRs and
+the hypercall MSRs; keeps `GUEST_OS_ID` and `HYPERCALL` (the hypercall page
+is `mov rax, 2; ret`, so every hypercall fails without an exit, which is the
+truth); writes the reference TSC page (scale from the partition's TSC rate,
+offset 0) and serves `TIME_REF_COUNT` from the vCPU's TSC with the same
+scale. It is KVM's `hv_time`, in userspace.
+
+Measured on the installed Windows 10, idle at the desktop, 10-second windows:
+before, ~10 000 exits a second, ~4 000 of them PM timer reads; with the
+clock, **~4 600 a second, none of them the PM timer**. What remains is the
+RTC on vCPU 0 — ports `0x70`/`0x71`, ~2 300 each a second — which is
+Windows' clock tick reading register C; a tick source without a per-tick
+register read (an HPET in edge mode, or the LAPIC timer) is the next lever.
+The MSR state is not in a snapshot yet; a VM with a framebuffer is refused
+one anyway.

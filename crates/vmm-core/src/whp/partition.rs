@@ -23,6 +23,7 @@ use crate::hv::{DirtyLog, DirtyPages, DirtyTracking, HvError, MachineConfig, DIR
 use crate::memory::{create_guest_memory, GuestMem};
 use crate::shm::SharedWindow;
 use crate::whp::cpuid::{GuestClocks, PackageTopology};
+use crate::whp::hv_clock::HvClock;
 use crate::whp::interrupt::{HaltGate, WhpInterruptDelivery};
 use crate::whp::regs::{seg_from_whp, zeroed_value, Aligned16};
 use crate::whp::vcpu::{get_regs_raw, WhpVcpu};
@@ -273,6 +274,10 @@ pub struct WhpOptions {
     /// `CLOCK_WATCHDOG_TIMEOUT` on a loaded host (ADR-0008 §2). The CPUID
     /// policy then leaves the hypervisor leaves to WHP instead of hiding them.
     ///
+    /// Where the host grants WHP partitions none (Windows 10), the reference
+    /// clock alone is emulated instead (`whp::hv_clock`), and with it MSR
+    /// exits are on and unknown MSRs ignored, as with [`Self::ignore_msrs`].
+    ///
     /// Off by default: a Linux guest that sees `Hv#1` takes Hyper-V's paths,
     /// and the Linux machine is tested without them.
     pub hyperv: bool,
@@ -350,6 +355,12 @@ pub struct Partition {
     /// backing store is released only after the GPA mappings are gone. Behind a
     /// `Mutex` because mapping happens through the `Arc` every vCPU shares.
     roms: Mutex<Vec<WhpRom>>,
+    /// [`WhpOptions::hyperv`] granted by WHP itself: the CPUID policy leaves
+    /// the hypervisor leaves to it.
+    whp_hyperv: bool,
+    /// [`WhpOptions::hyperv`] on a host that grants WHP partitions no
+    /// synthetic features: the reference clock, emulated here.
+    hv_clock: Option<HvClock>,
 }
 
 /// A firmware image mapped into the partition outside guest RAM.
@@ -385,6 +396,14 @@ impl Partition {
 
     pub(super) fn topology(&self) -> Option<PackageTopology> {
         self.topology
+    }
+
+    pub(super) fn whp_hyperv(&self) -> bool {
+        self.whp_hyperv
+    }
+
+    pub(super) fn hv_clock(&self) -> Option<&HvClock> {
+        self.hv_clock.as_ref()
     }
 }
 
@@ -496,18 +515,40 @@ impl WhpPartition {
                 return Err(e);
             }
         };
+        let clocks = options.cpuid_policy.then(|| hv.guest_clocks()).flatten();
+        // The enlightenments from WHP where the host grants them; otherwise
+        // the clock half of them, emulated (`hv_clock`).
+        let whp_hyperv = options.hyperv && synthetic_features().is_some();
+        let hv_clock = if options.hyperv && !whp_hyperv && options.cpuid_policy {
+            let clock = HvClock::new(clocks);
+            match &clock {
+                Some(_) => tracing::info!(
+                    "this host grants WHP guests no Hyper-V enlightenments; \
+                     serving the Hyper-V reference clock from userspace"
+                ),
+                None => tracing::warn!(
+                    "no Hyper-V enlightenments on this host, and no TSC rate to \
+                     emulate the reference clock with; the guest runs without"
+                ),
+            }
+            clock
+        } else {
+            None
+        };
         let partition = Arc::new(Partition {
             handle,
             memory,
             options,
             halt_gate: Arc::new(HaltGate::default()),
             vcpu_count: cfg.vcpu_count,
-            clocks: options.cpuid_policy.then(|| hv.guest_clocks()).flatten(),
+            clocks,
             topology: options
                 .cpuid_policy
                 .then(|| hv.guest_topology(cfg.vcpu_count))
                 .flatten(),
             roms: Mutex::new(Vec::new()),
+            whp_hyperv,
+            hv_clock,
         });
 
         set_processor_count(handle, cfg.vcpu_count)?;
@@ -520,13 +561,13 @@ impl WhpPartition {
         if options.cpuid_policy {
             exits |= EXTENDED_VM_EXITS_X64_CPUID;
         }
-        if options.ignore_msrs {
+        if options.ignore_msrs || partition.hv_clock.is_some() {
             exits |= EXTENDED_VM_EXITS_X64_MSR;
         }
         if exits != 0 {
             set_extended_vm_exits(handle, exits)?;
         }
-        if options.hyperv {
+        if whp_hyperv {
             set_hyperv_features(handle)?;
         }
         if options.cpuid_policy {
@@ -844,6 +885,21 @@ unsafe fn set_property<T: Copy>(
     // reads, and the caller promised `T` matches `code`.
     unsafe { WHvSetPartitionProperty(handle, code, (value as *const T).cast(), size) }
         .map_err(|e| whp_err(call, e))
+}
+
+/// The synthetic processor features this host grants WHP partitions, or
+/// `None` where it grants none (a Windows 10 host).
+fn synthetic_features() -> Option<u64> {
+    // SAFETY: as in `set_hyperv_features`: the capability is a plain struct of
+    // integers for which all-zero is valid.
+    let banks = unsafe {
+        get_capability::<WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS>(
+            WHvCapabilityCodeSyntheticProcessorFeaturesBanks,
+        )
+    }
+    .ok()?;
+    // SAFETY: both arms of the bank union are the same `u64`.
+    Some(unsafe { banks.Anonymous.AsUINT64[0] })
 }
 
 /// Gives the partition the [`HYPERV_FEATURES`] this host supports.

@@ -17,6 +17,8 @@
 //!   (through the same verified sparse copy), its NVRAM and a new profile.
 //! * [`rename`] — a machine's name changed everywhere it is spelled: the
 //!   profile's file name, and the disks and NVRAM named after it.
+//! * [`optical`] — the files on an installer ISO (ISO 9660, Joliet, UDF) and
+//!   a writer for small ISO 9660 + Joliet images (ADR-0008 §4).
 //!
 //! Portable by design (ADR-0002): the platform-specific parts (allocated
 //! size, sparse marking, allocated-range enumeration, free space) live behind
@@ -27,6 +29,7 @@ pub mod clone;
 pub mod inspect;
 pub mod layout;
 pub mod ops;
+pub mod optical;
 pub mod refs;
 pub mod relocate;
 pub mod rename;

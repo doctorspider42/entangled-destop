@@ -304,6 +304,9 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     if args.distro.eq_ignore_ascii_case("ubuntu") {
         return crate::install_ubuntu::run(args);
     }
+    if args.distro.eq_ignore_ascii_case("windows") {
+        return crate::install_windows::run(args);
+    }
     // The GPU desktop is set up by subiquity's late-commands; the other two
     // installers have their own automation languages and nothing written
     // for them yet. Refused rather than ignored: a profile that says
@@ -323,7 +326,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
     }
     if !args.distro.eq_ignore_ascii_case("debian") {
         return Err(format!(
-            "unknown distro '{}': expected debian, ubuntu, fedora or other",
+            "unknown distro '{}': expected debian, ubuntu, fedora, windows or other",
             args.distro
         ));
     }
@@ -967,6 +970,8 @@ mod tests {
             name: name.map(str::to_string),
             headless: true,
             venus: false,
+            drivers: None,
+            edition: None,
         };
 
         // A disk path in this host's spelling, with a space in it — the shape

@@ -831,6 +831,8 @@ mod tests {
             name: None,
             headless: true,
             venus,
+            drivers: None,
+            edition: None,
         }
     }
 

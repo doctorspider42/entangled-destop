@@ -325,9 +325,12 @@ impl Ahci {
                     return;
                 }
                 self.ghc = GHC_AE | (merged & GHC_IE);
-                self.update_interrupt(0);
+                self.reassert_interrupts();
             }
-            IS => self.is &= !written,
+            IS => {
+                self.is &= !written;
+                self.reassert_interrupts();
+            }
             o if o >= PORTS => {
                 let index = ((o - PORTS) / PORT_SIZE) as usize;
                 if index >= self.ports.len() {
@@ -607,21 +610,34 @@ impl Ahci {
     }
 
     /// Sets the port's `IS` bit when an enabled port interrupt is pending,
-    /// and raises the line on a new one.
+    /// and raises the interrupt.
+    ///
+    /// Every time, not only when the HBA's `IS` bit is new: the interrupt is
+    /// an MSI, an edge, and a command completing while the driver has not yet
+    /// cleared `IS` from the previous one is still an event it must hear
+    /// about. Raising only on a new bit lost exactly that completion — the
+    /// driver then found it on its ~30 ms timer, and Windows Setup read its
+    /// ISO at 30 commands a second.
     fn update_interrupt(&mut self, index: usize) {
         let Some(port) = self.ports.get(index) else {
             return;
         };
-        let bit = 1 << index;
         if port.regs.is & port.regs.ie == 0 {
             return;
         }
-        let new = self.is & bit == 0;
-        self.is |= bit;
-        if new && self.ghc & GHC_IE != 0 {
+        self.is |= 1 << index;
+        if self.ghc & GHC_IE != 0 {
             if let Some(raise) = &self.raise {
                 raise();
             }
+        }
+    }
+
+    /// After the driver cleared `IS` or turned interrupts on: a port whose
+    /// enabled interrupt is still pending raises again, as a level would.
+    fn reassert_interrupts(&mut self) {
+        for index in 0..self.ports.len() {
+            self.update_interrupt(index);
         }
     }
 }
@@ -759,6 +775,26 @@ mod tests {
         let mut fis = [0u8; 4];
         h.mem.read_slice(&mut fis, GuestAddress(FB + 0x40)).unwrap();
         assert_eq!(fis[0], 0x34);
+    }
+
+    /// A command that completes before the driver cleared `IS` from the last
+    /// one still interrupts: the MSI is an edge per event, not a level.
+    #[test]
+    fn every_completion_interrupts_even_before_is_is_cleared() {
+        let mut h = harness(4);
+        h.start();
+        h.issue(0xa1, None, 512);
+        h.issue(0xa1, None, 512);
+        assert_eq!(h.raised.load(Ordering::Relaxed), 2);
+        // Clearing the HBA's IS with the port's still pending raises again.
+        h.write(IS, 1);
+        assert_eq!(h.raised.load(Ordering::Relaxed), 3);
+        assert_eq!(h.read(IS), 1);
+        // Clearing the port first, then the HBA, leaves nothing pending.
+        h.write(PORTS + P_IS, u32::MAX);
+        h.write(IS, 1);
+        assert_eq!(h.read(IS), 0);
+        assert_eq!(h.raised.load(Ordering::Relaxed), 3);
     }
 
     #[test]

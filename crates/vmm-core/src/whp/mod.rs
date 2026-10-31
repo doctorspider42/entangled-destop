@@ -43,6 +43,7 @@
 pub(crate) mod cpuid;
 mod emulator;
 mod guest_symbols;
+mod hv_clock;
 mod interrupt;
 mod partition;
 mod regs;
