@@ -51,6 +51,13 @@ vkGetPhysicalDeviceExternalSemaphoreProperties  # SYNC_FD synthesized (5b.3)
 vkGetPhysicalDeviceExternalBufferProperties     # DMA_BUF emulated (5c)
 vkGetPhysicalDeviceFormatProperties2
 vkGetPhysicalDeviceImageFormatProperties2
+# The 1.0 forms, through the `2` handlers: the Windows Venus driver asks
+# them (ADR-0008).
+vkGetPhysicalDeviceFeatures
+vkGetPhysicalDeviceQueueFamilyProperties
+vkGetPhysicalDeviceMemoryProperties
+vkGetPhysicalDeviceFormatProperties
+vkGetPhysicalDeviceImageFormatProperties
 # Queries answered without the host (S2b): no sparse residency is shown, so
 # no entries; no external fence is served, so nothing.
 vkGetPhysicalDeviceSparseImageFormatProperties
@@ -263,12 +270,6 @@ vkGetImageSparseMemoryRequirements
 vkGetImageSparseMemoryRequirements2
 vkGetDeviceImageSparseMemoryRequirements
 vkQueueBindSparse
-# The 1.0 forms of queries Mesa only ever asks in their 1.1 form.
-vkGetPhysicalDeviceFeatures
-vkGetPhysicalDeviceQueueFamilyProperties
-vkGetPhysicalDeviceMemoryProperties
-vkGetPhysicalDeviceFormatProperties
-vkGetPhysicalDeviceImageFormatProperties
 # Answered by the guest driver itself; vkr refuses vkGetDeviceQueue too.
 vkEnumerateInstanceLayerProperties
 vkEnumerateInstanceExtensionProperties

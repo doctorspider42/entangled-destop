@@ -634,7 +634,17 @@ took:
   `SinkFactory::execute_context_command`; the executor runs it if it answers
   nothing and waits for nothing, and anything else still poisons the context.
 
-Not yet tried: D3D and OpenGL applications, and a game. A guest that was
+- **Exportable memory under plain resources.** The driver allocates its
+  device-local memory exportable and creates most images and buffers without
+  an external handle type. Binding exportable memory to such a resource is now
+  accepted (`VUID-...-02728` is the host driver's to enforce, and NVIDIA's
+  does not); *imported* memory still binds only to a resource created for its
+  handle type.
+
+D3D11 works too: Edge's `edge://gpu` reports compositing, canvas, video
+decode, WebGL and WebGL2 hardware accelerated through ANGLE's D3D11 backend on
+the Mesa UMD, with no Venus refusal in the log. Not yet tried: OpenGL
+applications and a game. A guest that was
 force-stopped twice boots into WinRE, which has no virtio-input driver and so
 takes no keyboard; a hard `reset` gets it back to Windows.
 

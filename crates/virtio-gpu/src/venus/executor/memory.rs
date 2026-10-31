@@ -1670,13 +1670,16 @@ impl<H: HostVulkan> VulkanContext<H> {
                 ),
             ));
         }
-        // Stage S1: exportable or imported device-local memory binds only to
-        // a resource created for its handle type (`VUID-vkBindBufferMemory-memory-02727`,
-        // `-02985`).
-        if memory.handle.is_handle() && !buffer.handle {
+        // Stage S1: imported device-local memory binds only to a resource
+        // created for its handle type (`VUID-vkBindBufferMemory-memory-02985`).
+        // Exportable memory binds to anything: the Windows Venus driver
+        // (ADR-0008) allocates its device-local memory exportable and creates
+        // most resources without an external handle type, and an export is
+        // only ever imported into a resource that was created for it.
+        if memory.handle == MemoryHandle::Imported && !buffer.handle {
             return Err(invalid(
                 command,
-                "shared device-local memory bound to a buffer not created for DMA_BUF",
+                "imported device-local memory bound to a buffer not created for DMA_BUF",
             ));
         }
         match memory.dedicated {
@@ -2167,12 +2170,11 @@ impl<H: HostVulkan> VulkanContext<H> {
                 ),
             ));
         }
-        // Stage S1, as for a buffer (`VUID-vkBindImageMemory-memory-02728`,
-        // `-02989`).
-        if memory.handle.is_handle() && !image.handle {
+        // Stage S1, as for a buffer (`VUID-vkBindImageMemory-memory-02989`).
+        if memory.handle == MemoryHandle::Imported && !image.handle {
             return Err(invalid(
                 command,
-                "shared device-local memory bound to an image not created for DMA_BUF",
+                "imported device-local memory bound to an image not created for DMA_BUF",
             ));
         }
         match memory.dedicated {

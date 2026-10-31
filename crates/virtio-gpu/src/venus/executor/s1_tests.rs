@@ -590,11 +590,10 @@ fn a_dma_buf_buffer_that_cannot_take_our_pages_is_created_for_a_handle() {
         vec![dma_buf_export()],
     ))
     .unwrap();
-    fatal_on(
-        &mut h,
-        &bind_buffers(DEVICE, &[(0x602, 0x603, 0)]),
-        "exportable memory bound to a plain buffer",
-    );
+    // A plain buffer takes exportable memory too: the Windows Venus driver
+    // allocates its device-local memory exportable (ADR-0008).
+    h.send(&bind_buffers(DEVICE, &[(0x602, 0x603, 0)])).unwrap();
+    assert!(!h.fatal(), "exportable memory bound to a plain buffer");
 }
 
 // ------------------------------------------------------ imports of a handle

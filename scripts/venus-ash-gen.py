@@ -129,6 +129,10 @@ EXECUTOR_COMMANDS = [
     'GetPhysicalDeviceFormatProperties2', 'GetPhysicalDeviceImageFormatProperties2',
     'CreateDevice', 'DestroyDevice', 'GetDeviceQueue2', 'CreateCommandPool',
     'DestroyCommandPool', 'CreateImage', 'DestroyImage', 'GetImageMemoryRequirements2',
+    # the Vulkan 1.0 queries, answered through the `2` handlers (ADR-0008)
+    'GetPhysicalDeviceFeatures', 'GetPhysicalDeviceQueueFamilyProperties',
+    'GetPhysicalDeviceMemoryProperties', 'GetPhysicalDeviceFormatProperties',
+    'GetPhysicalDeviceImageFormatProperties',
     # stage 5b.1: memory, buffers, image binding, views
     'AllocateMemory', 'FreeMemory', 'GetDeviceMemoryCommitment', 'CreateBuffer',
     'DestroyBuffer', 'GetBufferMemoryRequirements', 'GetBufferMemoryRequirements2',
