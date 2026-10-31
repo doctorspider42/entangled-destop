@@ -656,6 +656,16 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::GetPhysicalDeviceFeatures2(args) => self.features2(args),
             Command::GetPhysicalDeviceQueueFamilyProperties2(args) => self.queue_families(args),
             Command::GetPhysicalDeviceMemoryProperties2(args) => self.memory_properties(args),
+            // The Vulkan 1.0 forms of the queries above. Mesa on Linux only
+            // ever sends the `2` ones; the Windows Venus driver (ADR-0008)
+            // sends these too, and the answer is the `2` one without a chain.
+            Command::GetPhysicalDeviceFeatures(args) => self.features_v1(args),
+            Command::GetPhysicalDeviceQueueFamilyProperties(args) => self.queue_families_v1(args),
+            Command::GetPhysicalDeviceMemoryProperties(args) => self.memory_properties_v1(args),
+            Command::GetPhysicalDeviceFormatProperties(args) => self.format_properties_v1(args),
+            Command::GetPhysicalDeviceImageFormatProperties(args) => {
+                self.image_format_properties_v1(args)
+            }
             Command::EnumerateDeviceExtensionProperties(args) => self.device_extensions(args),
             Command::GetPhysicalDeviceExternalSemaphoreProperties(args) => {
                 self.external_semaphore_properties(args)
@@ -1128,6 +1138,115 @@ impl<H: HostVulkan> VulkanContext<H> {
                 args.p_queue_family_property_count = Some(u32::try_from(n).unwrap_or(0));
             }
         }
+        Ok(())
+    }
+
+    /// `vkGetPhysicalDeviceFeatures`: [`Self::features2`]'s core block.
+    fn features_v1(
+        &mut self,
+        args: &mut crate::venus::protocol::GetPhysicalDeviceFeaturesArgs,
+    ) -> Result<(), ExecError> {
+        let mut v2 = GetPhysicalDeviceFeatures2Args {
+            physical_device: args.physical_device,
+            p_features: args.p_features.as_ref().map(|_| Default::default()),
+        };
+        self.features2(&mut v2)?;
+        args.p_features = v2.p_features.map(|f| f.features);
+        Ok(())
+    }
+
+    /// `vkGetPhysicalDeviceQueueFamilyProperties`: [`Self::queue_families`]
+    /// without the chains, same count protocol.
+    fn queue_families_v1(
+        &mut self,
+        args: &mut crate::venus::protocol::GetPhysicalDeviceQueueFamilyPropertiesArgs,
+    ) -> Result<(), ExecError> {
+        let mut v2 = GetPhysicalDeviceQueueFamilyProperties2Args {
+            physical_device: args.physical_device,
+            p_queue_family_property_count: args.p_queue_family_property_count,
+            // The 1.0 array decodes as an empty skeleton (it has no chains to
+            // carry), so its capacity is the guest's count — bounded, since a
+            // device has a handful of families and the count is the guest's.
+            p_queue_family_properties: args.p_queue_family_properties.as_ref().map(|_| {
+                let capacity = args.p_queue_family_property_count.unwrap_or(0).min(64);
+                vec![VkQueueFamilyProperties2::default(); capacity as usize]
+            }),
+        };
+        self.queue_families(&mut v2)?;
+        args.p_queue_family_property_count = v2.p_queue_family_property_count;
+        args.p_queue_family_properties = v2.p_queue_family_properties.map(|families| {
+            families
+                .into_iter()
+                .map(|f| f.queue_family_properties)
+                .collect()
+        });
+        Ok(())
+    }
+
+    /// `vkGetPhysicalDeviceMemoryProperties`: [`Self::memory_properties`]'s
+    /// core block.
+    fn memory_properties_v1(
+        &mut self,
+        args: &mut crate::venus::protocol::GetPhysicalDeviceMemoryPropertiesArgs,
+    ) -> Result<(), ExecError> {
+        let mut v2 = GetPhysicalDeviceMemoryProperties2Args {
+            physical_device: args.physical_device,
+            p_memory_properties: args
+                .p_memory_properties
+                .as_ref()
+                .map(|_| Default::default()),
+        };
+        self.memory_properties(&mut v2)?;
+        args.p_memory_properties = v2.p_memory_properties.map(|m| m.memory_properties);
+        Ok(())
+    }
+
+    /// `vkGetPhysicalDeviceFormatProperties`: [`Self::format_properties`]'s
+    /// core block.
+    fn format_properties_v1(
+        &mut self,
+        args: &mut crate::venus::protocol::GetPhysicalDeviceFormatPropertiesArgs,
+    ) -> Result<(), ExecError> {
+        let mut v2 = GetPhysicalDeviceFormatProperties2Args {
+            physical_device: args.physical_device,
+            format: args.format,
+            p_format_properties: args
+                .p_format_properties
+                .as_ref()
+                .map(|_| Default::default()),
+        };
+        self.format_properties(&mut v2)?;
+        args.p_format_properties = v2.p_format_properties.map(|f| f.format_properties);
+        Ok(())
+    }
+
+    /// `vkGetPhysicalDeviceImageFormatProperties`:
+    /// [`Self::image_format_properties`] with an unchained info.
+    fn image_format_properties_v1(
+        &mut self,
+        args: &mut crate::venus::protocol::GetPhysicalDeviceImageFormatPropertiesArgs,
+    ) -> Result<(), ExecError> {
+        let mut v2 = GetPhysicalDeviceImageFormatProperties2Args {
+            physical_device: args.physical_device,
+            p_image_format_info: Some(VkPhysicalDeviceImageFormatInfo2 {
+                p_next: Vec::new(),
+                format: args.format,
+                type_: args.type_,
+                tiling: args.tiling,
+                usage: args.usage,
+                flags: args.flags,
+            }),
+            p_image_format_properties: args
+                .p_image_format_properties
+                .as_ref()
+                .map(|_| Default::default()),
+            ret: VK_SUCCESS,
+        };
+        self.image_format_properties(&mut v2)?;
+        args.ret = v2.ret;
+        args.p_image_format_properties = v2
+            .p_image_format_properties
+            .map(|p| p.image_format_properties);
         Ok(())
     }
 
@@ -1746,6 +1865,16 @@ impl<H: HostVulkan> VulkanContext<H> {
         let group_size = request.group.as_ref().map_or(1, |members| {
             u32::try_from(members.len()).unwrap_or(1).max(1)
         });
+        // The emulated dma-buf counts as enabled on every device of a physical
+        // device that advertises it. Mesa on Linux enables it whenever it
+        // names DMA_BUF; the Windows Venus driver (ADR-0008) names DMA_BUF,
+        // the renderer's handle type, on every exportable buffer and image
+        // without enabling anything. Nothing of it reaches the host.
+        if policy::has_extension(&guest.extensions, policy::EXTERNAL_MEMORY_DMA_BUF)
+            && !enabled.iter().any(|e| e == policy::EXTERNAL_MEMORY_DMA_BUF)
+        {
+            enabled.push(policy::EXTERNAL_MEMORY_DMA_BUF.to_owned());
+        }
         let (instance, _) = self.objects.physical(physical).map_err(id_error(NAME))?;
         match self.host.create_device(instance, host_physical, &request) {
             Ok(device) => {

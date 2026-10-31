@@ -1377,6 +1377,45 @@ impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
         Ok(ExecutingSink::new(env, context))
     }
 
+    fn execute_context_command(&mut self, ctx_id: u32, bytes: &[u8]) -> Result<usize, String> {
+        let context = self
+            .contexts
+            .get(&ctx_id)
+            .map(Arc::clone)
+            .ok_or_else(|| format!("venus context {ctx_id} holds no Vulkan objects"))?;
+        let pool = Arc::clone(
+            lock(&context)
+                .objects
+                .limits()
+                .share(limits::Class::DecodeBytes),
+        );
+        let mut dec = Decoder::with_pool(bytes, limits::MAX_COMMAND_DECODE_BYTES, &pool);
+        let (header, mut command) = Command::decode_next(&mut dec).map_err(|e| e.to_string())?;
+        let used = dec.position();
+        let name = command.name();
+        // Only what `vkr_context_submit_cmd` is sent in practice: work that
+        // answers nothing and waits for nothing. A reply has no stream to go
+        // to here, and a wait would stall every ring of the context behind
+        // the renderer thread.
+        if header.wants_reply() {
+            return Err(format!("{name} asks for a reply off a ring"));
+        }
+        if submit::is_wait(&command) {
+            return Err(format!("{name} would wait on the context's own stream"));
+        }
+        let mut context = lock(&context);
+        if context.is_fatal() {
+            return Err(ExecError::ContextFatal(ctx_id).to_string());
+        }
+        context.stop = Some(StopSignal::never());
+        context.command_bytes = used;
+        context.execute(&mut command).map_err(|e| e.to_string())?;
+        if context.take_lost() {
+            return Err(format!("{name} lost the device"));
+        }
+        Ok(used)
+    }
+
     fn context_created(&mut self, ctx_id: u32) {
         self.graveyard.reap(&self.host);
         let _ = self.context(ctx_id);

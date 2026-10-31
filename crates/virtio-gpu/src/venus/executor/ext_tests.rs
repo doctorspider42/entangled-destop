@@ -1041,12 +1041,19 @@ fn a_dma_buf_buffer_asks_for_our_pages_alone() {
         Some(&("buffer", true)),
         "created for host allocations on the host"
     );
-    // On a device that did not enable dma-buf, the handle type is refused.
+    // A device that did not name dma-buf still has it, because its physical
+    // device advertises it: the Windows Venus driver names DMA_BUF on every
+    // exportable buffer without enabling anything (ADR-0008).
     let (mut h, _) = zink_with(&["VK_EXT_transform_feedback"]);
-    fatal_on(
-        &mut h,
-        &create_buffer(DEVICE, 0x600, external_buffer(SIZE, 0x3)),
-        "DMA_BUF on a device that did not enable it",
+    let Command::CreateBuffer(b) = h
+        .call(&create_buffer(DEVICE, 0x600, external_buffer(SIZE, 0x3)))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        b.ret, VK_SUCCESS,
+        "DMA_BUF on a device that did not name it"
     );
     let (mut h, _) = zink();
     let Command::CreateBuffer(mut other) = create_buffer(DEVICE, 0x600, external_buffer(SIZE, 0x3))
@@ -1278,7 +1285,8 @@ fn imports_of_anything_but_our_memory_are_refused_in_vulkan_terms() {
             "resource {resource}"
         );
     }
-    // A device that did not enable dma-buf imports nothing.
+    // A device that did not name dma-buf imports our own pages all the same:
+    // the advertised dma-buf counts as enabled.
     let (mut h, host) = zink_with(&["VK_EXT_transform_feedback"]);
     h.send(&allocate(DEVICE, EXPORTED, SIZE, HOST_TYPE, Vec::new()))
         .unwrap();
@@ -1292,11 +1300,8 @@ fn imports_of_anything_but_our_memory_are_refused_in_vulkan_terms() {
         vec![import_info(EXPORTED_RES)],
     ))
     .unwrap();
-    assert_eq!(host.live("memory"), before);
-    assert_eq!(
-        properties_of(&mut h, EXPORTED_RES).0,
-        VK_ERROR_INVALID_EXTERNAL_HANDLE
-    );
+    assert_eq!(host.live("memory"), before + 1);
+    assert_eq!(properties_of(&mut h, EXPORTED_RES).0, VK_SUCCESS);
 }
 
 /// A second guest process: context 2, its own instance and Zink device.

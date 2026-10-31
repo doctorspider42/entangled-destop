@@ -545,6 +545,14 @@ fn dsdt(vcpu_count: u32, mmio64_base: u64) -> Vec<u8> {
         &aml::resource_template(&[
             aml::word_bus_number(0, 0),
             aml::io_port(crate::platform::PCI_CONFIG_ADDRESS, 8),
+            // The legacy VGA ranges, ports 0x3b0-0x3df and memory
+            // 0xa0000-0xbffff (ADR-0008): a VGA-class function is entitled
+            // to them, and Windows gives a full WDDM driver of one (the 3D
+            // virtio-gpu driver) code 12, "not enough free resources", when
+            // the root bridge does not pass them down. Nothing decodes them;
+            // BasicDisplay and the display-only driver never asked.
+            aml::word_io(0x03b0, 0x03df),
+            aml::dword_memory(0x000a_0000, 0x0002_0000),
             aml::dword_memory(
                 layout::PCI_MMIO_HOLE_BASE as u32,
                 layout::PCI_MMIO_HOLE_SIZE as u32,
@@ -933,11 +941,20 @@ mod tests {
             4,
         ) as usize;
         let dsdt = tables.table_at(tables.dsdt_address(), len).unwrap();
-        // Find the DWordMemory descriptor (tag 0x87, payload length 0x17).
-        let at = find(dsdt, &[0x87, 0x17, 0x00]).expect("no DWordMemory in _CRS");
-        let min = u32_at(dsdt, at + 10);
-        let max = u32_at(dsdt, at + 14);
-        assert_eq!(u64::from(min), layout::PCI_MMIO_HOLE_BASE);
+        // Every DWordMemory descriptor (tag 0x87, payload length 0x17): the
+        // legacy VGA range first, then the 32-bit hole.
+        let tag = [0x87, 0x17, 0x00];
+        let windows: Vec<(u32, u32)> = dsdt
+            .windows(tag.len())
+            .enumerate()
+            .filter(|(_, w)| *w == tag)
+            .map(|(at, _)| (u32_at(dsdt, at + 10), u32_at(dsdt, at + 14)))
+            .collect();
+        assert_eq!(windows.first(), Some(&(0xa_0000, 0xb_ffff)), "{windows:x?}");
+        let &(min, max) = windows
+            .iter()
+            .find(|(min, _)| u64::from(*min) == layout::PCI_MMIO_HOLE_BASE)
+            .expect("no 32-bit PCI hole in _CRS");
         assert!(
             u64::from(max) < layout::VIRTIO_MMIO_BASE,
             "PCI window {min:#x}..{max:#x} overlaps the virtio-mmio window"

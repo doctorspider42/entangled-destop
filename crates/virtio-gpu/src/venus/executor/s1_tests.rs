@@ -739,7 +739,8 @@ fn imports_of_a_handle_blob_are_refused_in_vulkan_terms() {
         assert!(!h.fatal(), "{what}");
     }
     assert!(host.handle_imports().is_empty());
-    // A device that did not enable dma-buf imports nothing either.
+    // A device that did not name dma-buf still sees our blob: its physical
+    // device advertises dma-buf, which counts as enabled.
     h.use_context(3);
     device_on(
         &mut h,
@@ -748,10 +749,7 @@ fn imports_of_a_handle_blob_are_refused_in_vulkan_terms() {
         &["VK_KHR_external_semaphore_fd"],
     );
     h.renderer.ctx_attach_blob(3, EXPORTED_RES, true);
-    assert_eq!(
-        resource_properties(&mut h, EXPORTED_RES).0,
-        VK_ERROR_INVALID_EXTERNAL_HANDLE
-    );
+    assert_eq!(resource_properties(&mut h, EXPORTED_RES).0, VK_SUCCESS);
 }
 
 // ------------------------------------------- the modifier, as it is queried

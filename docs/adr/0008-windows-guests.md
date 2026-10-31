@@ -597,6 +597,47 @@ into the guest, test-signing on, and is not done yet. GPU-PV through WHP is
 not possible (WHP has no GPU-partition API), and the older virgl-based
 `viogpu3d` is abandoned upstream.
 
+### Amendment, 2026-10-31: Vulkan in a Windows guest, on the host GPU
+
+The guest half works as a proof of concept. On a Windows 10 22H2 guest with
+`adapter = "virtio-vga"` and `venus = true`, the Yttrium
+`viogpu3d-experimental-2026-09-27` driver (test-signed, `bcdedit testsigning
+on`) and the LunarG Vulkan runtime 1.4.363, DWM composites on the GPU (the
+scanout is a renderer blob) and `vk-smoke` passes 9 of 9 — device, host
+memory, transfer, compute, a render pass, dynamic rendering, timeline
+semaphores and 1000 fenced submits — on the host's RTX 2070. What it
+took:
+
+- **The subsystem.** The INF matches
+  `PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01`; `virtio-vga` now reports
+  subsystem `0x1100` (`VIRTIO_VGA_SUBSYSTEM_DEVICE_ID`).
+- **The legacy VGA ranges in `PCI0._CRS`** (I/O `0x3b0–0x3df`, memory
+  `0xa0000–0xbffff`): a VGA-class function decodes them, and without them in
+  the bridge's window Windows reports a resource conflict (code 12).
+- **Interrupts.** The INF sets `MSISupported = 0`, and our DSDT has no `_PRT`,
+  so the line-based fallback has nowhere to go. The PoC guest forces MSI in
+  its registry (`Interrupt Management\MessageSignaledInterruptProperties`,
+  `MSISupported = 1`). **Open:** a `_PRT` for the root bus, or shipping that
+  override with the driver install, before this is more than a PoC.
+- **Vulkan 1.0 queries.** The Windows ICD asks
+  `vkGetPhysicalDevice{Features,QueueFamilyProperties,MemoryProperties,
+  FormatProperties,ImageFormatProperties}` without the `2` suffix; the
+  executor answers them through the `2` handlers.
+- **dma-buf without enabling it.** The driver names `DMA_BUF` — the renderer's
+  handle type — on exportable buffers and images without enabling
+  `VK_EXT_external_memory_dma_buf`. The emulated dma-buf now counts as enabled
+  on every device of a physical device that advertises it.
+- **Vulkan commands on the context stream.** A submission whose fence rides a
+  `ring_idx` timeline arrives as `vkWaitRingSeqnoMESA` + `vkQueueSubmit` in a
+  `SUBMIT_3D`, not on the ring — `vkr_context_submit_cmd` executes those. The
+  renderer now hands a non-transport command there to
+  `SinkFactory::execute_context_command`; the executor runs it if it answers
+  nothing and waits for nothing, and anything else still poisons the context.
+
+Not yet tried: D3D and OpenGL applications, and a game. A guest that was
+force-stopped twice boots into WinRE, which has no virtio-input driver and so
+takes no keyboard; a hard `reset` gets it back to Windows.
+
 ### Amendment, 2026-10-31: the shared clipboard
 
 Text, both ways, through a guest agent of our own. `guest_agent = true` puts

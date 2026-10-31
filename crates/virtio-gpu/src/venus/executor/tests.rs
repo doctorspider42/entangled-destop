@@ -185,6 +185,31 @@ fn the_whole_vulkaninfo_bring_up_is_answered_the_way_mesa_decodes_it() {
     assert_eq!(families[0].queue_family_properties.queue_count, 16);
     assert_eq!(families[1].queue_family_properties.queue_flags, 0xc);
 
+    // The Vulkan 1.0 form, which the Windows driver sends (ADR-0008): the
+    // same answer without the chains.
+    let v1 = Command::GetPhysicalDeviceQueueFamilyProperties(
+        crate::venus::protocol::GetPhysicalDeviceQueueFamilyPropertiesArgs {
+            physical_device: VkPhysicalDevice(PHYSICAL),
+            p_queue_family_property_count: Some(2),
+            p_queue_family_properties: Some(vec![Default::default(); 2]),
+        },
+    );
+    let Command::GetPhysicalDeviceQueueFamilyProperties(q) = h.call(&v1).unwrap() else {
+        panic!()
+    };
+    let families = q.p_queue_family_properties.unwrap();
+    assert_eq!(families[0].queue_count, 16);
+    assert_eq!(families[1].queue_flags, 0xc);
+    let features =
+        Command::GetPhysicalDeviceFeatures(crate::venus::protocol::GetPhysicalDeviceFeaturesArgs {
+            physical_device: VkPhysicalDevice(PHYSICAL),
+            p_features: Some(Default::default()),
+        });
+    assert!(matches!(
+        h.call(&features).unwrap(),
+        Command::GetPhysicalDeviceFeatures(f) if f.p_features.is_some()
+    ));
+
     // Row 13: the memory policy. Indices unchanged; the BAR type (5) is no
     // longer host visible; 3 and 4, which import our pages, still are; and
     // 6, in a heap of its own, is device-local memory the guest may map —
@@ -854,19 +879,6 @@ fn a_decodable_command_this_stage_does_not_implement_is_fatal_and_left_unconsume
 
 #[test]
 fn a_decodable_command_without_a_handler_is_refused_as_not_implemented() {
-    let mut ctx = super::VulkanContext::new(CTX, Arc::new(FakeVulkan::standard()));
-    let mut command = Command::GetPhysicalDeviceFeatures(GetPhysicalDeviceFeaturesArgs {
-        physical_device: VkPhysicalDevice(PHYSICAL),
-        p_features: Some(VkPhysicalDeviceFeatures::default()),
-    });
-    assert_eq!(
-        ctx.execute(&mut command),
-        Err(super::ExecError::NotImplemented {
-            command: "vkGetPhysicalDeviceFeatures"
-        })
-    );
-    assert!(ctx.is_fatal(), "the context is done, as for any refusal");
-
     // An extension's command buffer command (no extension is advertised):
     // refused, not silently recorded.
     let mut ctx = super::VulkanContext::new(CTX, Arc::new(FakeVulkan::standard()));

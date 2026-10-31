@@ -663,6 +663,8 @@ pub const EXTERNAL_SEMAPHORE_FD: &str = "VK_KHR_external_semaphore_fd";
 /// whose blob is our pages, and imports (`VkImportMemoryResourceInfoMESA`)
 /// of a blob of this renderer's own pages. Its handle-type bit is the only
 /// external-memory value outside core 1.3 a device that enabled it may name.
+/// Every device of a physical device that advertises it counts as having
+/// enabled it: the Windows Venus driver names DMA_BUF without enabling it.
 pub const EXTERNAL_MEMORY_DMA_BUF: &str = "VK_EXT_external_memory_dma_buf";
 
 /// `VK_KHR_external_memory_fd`: **emulated**. Never needed by the guest

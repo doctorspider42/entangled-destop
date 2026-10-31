@@ -394,6 +394,23 @@ pub trait SinkFactory: Send {
     /// file that could not be created.
     fn sink_for(&mut self, ctx_id: u32, ring: u64) -> io::Result<Self::Sink>;
 
+    /// One Vulkan command at the front of `bytes`, sent on the context's own
+    /// stream (`SUBMIT_3D`) rather than on a ring — Mesa does that with a
+    /// `vkQueueSubmit` whose fence rides a `ring_idx` timeline (the Windows
+    /// Venus driver, ADR-0008), and `vkr_context_submit_cmd` executes it.
+    /// Answers how many bytes the command was. The default executes nothing,
+    /// so the stream is refused and the context poisoned, as before.
+    ///
+    /// # Errors
+    ///
+    /// Why the command was not executed; the renderer poisons the context.
+    fn execute_context_command(&mut self, ctx_id: u32, bytes: &[u8]) -> Result<usize, String> {
+        let _ = bytes;
+        Err(format!(
+            "venus context {ctx_id}: this renderer executes no Vulkan command off a ring"
+        ))
+    }
+
     /// The sink for a ring, given everything the renderer can hand it beyond
     /// the bytes: the context's host blobs, where an executing sink writes
     /// its replies. The renderer calls this, never
@@ -3293,16 +3310,61 @@ impl<F: SinkFactory> VenusRenderer<F> {
             Some(_) => {}
         }
 
-        let mut stream = TransportStream::new(stream);
+        let bytes = stream;
+        let mut at = 0;
         let mut refused: Option<VenusError> = None;
-        while let Some(next) = stream.next_command() {
+        while at < bytes.len() {
+            let rest = &bytes[at..];
+            let opcode = rest
+                .get(..4)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(u32::from_le_bytes);
+            // A Vulkan command on the context's own stream, not a transport
+            // one: Mesa sends a `vkQueueSubmit` here, behind a
+            // `vkWaitRingSeqnoMESA`, when the submission carries a fence on a
+            // `ring_idx` timeline, and `vkr_context_submit_cmd` executes it.
+            if let Some(opcode) = opcode.filter(|op| Opcode::from_u32(*op).is_none()) {
+                match self.sinks.execute_context_command(ctx_id, rest) {
+                    Ok(used) if used > 0 => {
+                        at += used;
+                        continue;
+                    }
+                    result => {
+                        let why = match result {
+                            Err(why) => why,
+                            Ok(_) => "the command was empty".to_owned(),
+                        };
+                        let head: String =
+                            rest.iter().take(128).map(|b| format!("{b:02x}")).collect();
+                        tracing::warn!(
+                            ctx_id,
+                            opcode,
+                            command = super::protocol::command_type_name(opcode)
+                                .unwrap_or("an unknown command"),
+                            why,
+                            at,
+                            len = bytes.len(),
+                            head,
+                            "a venus context stream was refused; the context is poisoned"
+                        );
+                        if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
+                            ctx.poisoned = true;
+                        }
+                        return Err(TransportError::UnknownOpcode { opcode }.into());
+                    }
+                }
+            }
+            let mut stream = TransportStream::new(rest);
+            let Some(next) = stream.next_command() else {
+                break;
+            };
             let request = match next {
                 Ok(request) => request,
                 Err(error) => {
                     tracing::warn!(
                         ctx_id,
                         %error,
-                        at = stream.position(),
+                        at = at + stream.position(),
                         "a venus transport stream was refused; the context is poisoned"
                     );
                     if let Some(ctx) = self.contexts.get_mut(&ctx_id) {
@@ -3311,6 +3373,7 @@ impl<F: SinkFactory> VenusRenderer<F> {
                     return Err(error.into());
                 }
             };
+            at += stream.position();
             if let Err(error) = self.execute(ctx_id, request.command) {
                 tracing::warn!(
                     ctx_id,

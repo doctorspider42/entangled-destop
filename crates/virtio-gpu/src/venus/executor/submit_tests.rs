@@ -128,6 +128,35 @@ fn a_recording_submitted_with_a_fence_is_translated_and_waited_for_as_mesa_does(
     assert_eq!(host.submitted(), vec![vec![cb]]);
 }
 
+/// The Windows Venus driver (ADR-0008) sends a fenced `vkQueueSubmit` on the
+/// context's own stream, behind a `vkWaitRingSeqnoMESA`, as
+/// `vkr_context_submit_cmd` allows: it runs there as it would on the ring.
+/// What the context stream cannot carry — a reply, a wait — poisons it.
+#[test]
+fn a_submit_on_the_context_stream_runs_and_a_reply_there_is_refused() {
+    let (mut h, host) = setup();
+    buffer(&mut h, BUF);
+    record_fill(&mut h, CB, BUF);
+    h.send(&create_fence(DEVICE, FENCE, false)).unwrap();
+    let stream = async_bytes(&queue_submit(QUEUE, &[CB], FENCE));
+    h.renderer
+        .submit(h.ctx, &stream)
+        .expect("the context stream");
+    let cb = raw(&h, Kind::CommandBuffer, CB);
+    assert_eq!(host.submitted(), vec![vec![cb]]);
+    assert!(!h.fatal());
+
+    let reply = call_bytes(&fence_status(DEVICE, FENCE));
+    assert!(
+        h.renderer.submit(h.ctx, &reply).is_err(),
+        "a reply off a ring"
+    );
+    assert!(
+        h.renderer.submit(h.ctx, &stream).is_err(),
+        "the context stays poisoned"
+    );
+}
+
 /// Mesa 26.0.8's fence feedback, as `vn_queue.c` and `vn_feedback.c` do it:
 /// the fence's own command buffer (recorded once when the fence is created)
 /// appended to the batch, resubmitted unchanged after a reset.

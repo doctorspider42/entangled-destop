@@ -228,6 +228,22 @@ pub fn word_bus_number(min: u16, max: u16) -> Vec<u8> {
     out
 }
 
+/// `WordIO (…, min, max, 0, len)` — 16 bytes: an I/O window the bridge
+/// decodes for its children, entire ISA range.
+pub fn word_io(min: u16, max: u16) -> Vec<u8> {
+    let mut out = vec![0x88];
+    out.extend_from_slice(&0x000du16.to_le_bytes()); // payload length
+    out.push(0x01); // resource type: I/O range
+    out.push(RES_GENERAL_FLAGS);
+    out.push(0x03); // type-specific flags: entire range
+    out.extend_from_slice(&0u16.to_le_bytes()); // granularity
+    out.extend_from_slice(&min.to_le_bytes());
+    out.extend_from_slice(&max.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // translation offset
+    out.extend_from_slice(&(max - min + 1).to_le_bytes());
+    out
+}
+
 /// `IO (Decode16, base, base, align, len)` — 8 bytes.
 pub fn io_port(base: u16, len: u8) -> Vec<u8> {
     let mut out = vec![0x47];
