@@ -105,6 +105,13 @@ pub struct VmConfig {
     /// bytes should say what it means with a read-only `[[disk]]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdrom: Option<CdromSection>,
+    /// Optical drives on an AHCI controller (`[[optical]]`), each holding an
+    /// ISO read-only (ADR-0008 §4). Unlike [`Self::cdrom`], which is a
+    /// virtio-blk disk, these are DVD-ROM drives every OS has an in-box driver
+    /// for — what a Windows installation needs before it has virtio drivers.
+    /// PCI transport and UEFI boot only; at most four.
+    #[serde(default, rename = "optical", skip_serializing_if = "Vec::is_empty")]
+    pub optical: Vec<OpticalSection>,
     pub network: Option<NetworkSection>,
     #[serde(default)]
     pub display: DisplaySection,
@@ -352,6 +359,16 @@ pub struct DiskSection {
 pub struct CdromSection {
     pub path: PathBuf,
 }
+
+/// One `[[optical]]` drive: an ISO on the AHCI controller.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OpticalSection {
+    pub path: PathBuf,
+}
+
+/// Most `[[optical]]` drives one VM may have: the AHCI controller's ports.
+pub const MAX_OPTICAL: usize = 4;
 
 /// How the guest's virtio-net device reaches a real network (EPIC 5, WHP-1704).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1176,6 +1193,20 @@ impl VmConfig {
                 "display.refresh_hz {} outside supported range {MIN_REFRESH_HZ}..={MAX_REFRESH_HZ}",
                 self.display.refresh_hz
             ));
+        }
+        if !self.optical.is_empty() {
+            if self.optical.len() > MAX_OPTICAL {
+                return err(format!(
+                    "{} [[optical]] drives, but the AHCI controller has {MAX_OPTICAL} ports",
+                    self.optical.len()
+                ));
+            }
+            if self.transport != VirtioTransport::Pci || self.boot.mode != BootMode::Uefi {
+                return err("[[optical]] drives sit on a PCI AHCI controller the UEFI \
+                     firmware boots from: they need transport = \"pci\" and \
+                     boot.mode = \"uefi\""
+                    .into());
+            }
         }
         if self.display.adapter == DisplayAdapter::Framebuffer {
             if self.display.virgl || self.display.venus {

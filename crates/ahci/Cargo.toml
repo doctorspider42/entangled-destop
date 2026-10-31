@@ -1,0 +1,20 @@
+[package]
+name = "ahci"
+description = "AHCI SATA controller with ATAPI optical drives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+virtio-core.workspace = true
+vm-memory.workspace = true
+
+[dev-dependencies]
+vm-memory = { workspace = true, features = ["backend-mmap"] }
+
+[lints]
+workspace = true

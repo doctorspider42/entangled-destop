@@ -35,6 +35,29 @@ pub use crate::run_options::{RunOptions, ScreenshotRequest};
 #[path = "framebuffer_present.rs"]
 mod framebuffer_present;
 
+/// Puts the profile's `[[optical]]` drives on an AHCI controller (ADR-0008
+/// §4). Nothing for a profile without any.
+fn attach_optical(
+    pci: &mut machine_x86::virtio_pci::VirtioPciBus,
+    cfg: &VmConfig,
+    mem: &Arc<virtio_core::GuestMem>,
+) -> Result<(), String> {
+    if cfg.optical.is_empty() {
+        return Ok(());
+    }
+    let drives = cfg
+        .optical
+        .iter()
+        .enumerate()
+        .map(|(n, drive)| {
+            ahci::Atapi::open(&drive.path, &format!("ENTANGLED-OPT{n}"))
+                .map_err(|e| format!("cannot open optical drive {}: {e}", drive.path.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    pci.attach_ahci(drives, Arc::clone(mem))
+        .map_err(|e| e.to_string())
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2517,7 +2540,7 @@ mod host {
                     (MachineBus::with_virtio(serial, virtio), cmdline)
                 }
                 VirtioTransport::Pci => {
-                    let pci = VirtioPciBus::attach_with_display(
+                    let mut pci = VirtioPciBus::attach_with_display(
                         vm.fd_shared(),
                         Arc::clone(&mem),
                         devices,
@@ -2527,6 +2550,7 @@ mod host {
                         super::framebuffer_present::config_for(cfg),
                     )
                     .map_err(|e| e.to_string())?;
+                    super::attach_optical(&mut pci, cfg, &mem)?;
                     let cmdline =
                         direct_linux_cmdline(&cfg.boot.cmdline, net_cmdline.as_deref(), "");
                     (MachineBus::with_virtio_pci(serial, pci), cmdline)
@@ -2868,6 +2892,7 @@ mod host {
                     if !synchronous {
                         pci.offload_kicks();
                     }
+                    super::attach_optical(&mut pci, cfg, &mem)?;
                     let cmdline =
                         direct_linux_cmdline(&cfg.boot.cmdline, net_cmdline.as_deref(), "");
                     (MachineBus::with_virtio_pci(serial, pci), cmdline)

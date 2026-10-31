@@ -425,6 +425,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             writable: true,
         }],
         cdrom: None,
+        optical: vec![],
         network: network.clone(),
         display: DisplaySection::default(),
         // The installer has nothing to say; the *installed* profile below is
@@ -497,6 +498,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             writable: true,
         }],
         cdrom: None,
+        optical: vec![],
         network,
         display: DisplaySection {
             refresh_hz: installed_refresh_hz_here(args),

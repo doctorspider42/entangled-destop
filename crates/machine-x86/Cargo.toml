@@ -17,6 +17,7 @@ tracing.workspace = true
 vm-memory.workspace = true
 vmm-core.workspace = true
 virtio-core.workspace = true
+ahci.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-ioctls.workspace = true

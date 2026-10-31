@@ -368,3 +368,34 @@ like `notify`'s do. `ENTANGLED_QUEUE_NOTIFY=sync` restores the old path.
 
 Measured on the installed Windows 10, headless, screenshots every 5 s: the
 desktop appears **~38 s** after start with the worker and **~68 s** without.
+
+### Amendment, 2026-10-31: an AHCI controller, so the ISO boots untouched
+
+The correction to §4 left the install depending on a remastered FAT32 disk,
+because Windows PE has no virtio driver and the only storage it could read was
+what the firmware handed over. A real fix is a controller Windows has an in-box
+driver for: `crates/ahci` is an AHCI 1.3 HBA (Intel ICH9 identity, `8086:2922`,
+ABAR in BAR 5, one MSI) with ATAPI DVD-ROM drives behind it, each holding an
+ISO read-only. `storahci` and `cdrom.sys` drive it in WinPE; the firmware side
+was already in CloudHv (`SataControllerDxe`, `AtaAtapiPassThru`, `ScsiBus`,
+`ScsiDisk`), so no firmware change.
+
+- Configuration is `[[optical]] path = "…"`, up to four, PCI transport and UEFI
+  only. It works the same on both hosts — the HBA is portable and the bus
+  owns it like the framebuffer.
+- MSI, not INTx: this DSDT has no `_PRT`, so Windows could not route a pin.
+  The firmware polls and never needs the interrupt.
+- The command set is the minimum WinPE and Linux use: IDENTIFY PACKET DEVICE,
+  PACKET, and a few no-data ATA commands acknowledged; everything else aborts.
+  The MMC set covers TEST UNIT READY, INQUIRY, REQUEST SENSE, MODE SENSE,
+  READ CAPACITY, READ(10/12), READ TOC, GET CONFIGURATION, GET EVENT STATUS,
+  READ DISC/TRACK INFORMATION, READ DVD STRUCTURE and the media-lock commands.
+  Reads are streamed in 1 MiB chunks into the PRDT; a guest's PRDT and transfer
+  length are bounded (1024 entries, 64 MiB).
+- Snapshots refuse a VM with the controller until it gets a save/load pair;
+  an install is never snapshotted, and a finished VM has no optical drives.
+
+Measured on this host: the untouched Windows 10 22H2 ISO boots from the AHCI
+drive through the firmware to the Setup language screen, with an empty
+virtio-blk disk beside it. The remaster is now only needed for the answer file
+and drivers, which an install command can put on a second, small ISO.

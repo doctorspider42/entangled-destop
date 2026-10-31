@@ -2,6 +2,10 @@
 //! vCPU register/CPUID/GDT setup (backlog EPIC 1/2).
 
 pub mod acpi;
+
+/// The AHCI controller with ATAPI optical drives as a PCI function
+/// (ADR-0008 §4). Portable.
+pub mod ahci_function;
 pub mod boot;
 pub mod bus;
 

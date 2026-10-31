@@ -119,7 +119,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
                 boot: BootSection { mode: BootMode::DirectLinux, kernel: Some(kernel), initramfs: Some(initramfs),
                     cmdline: "console=tty0 console=ttyAMA0 earlycon=pl011,0x9000000 root=/dev/vda rw rootwait net.ifnames=0".into(),
                     ..Default::default() },
-                disks: vec![DiskSection { path: target.clone(), writable: true }], cdrom: None,
+                disks: vec![DiskSection { path: target.clone(), writable: true }], cdrom: None, optical: vec![],
                 network: Some(NetworkSection { backend: NetworkBackend::Usernet,
                     mac: Some(control_api::new_machine_mac(&name, &target)), interface: None, forward: vec![] }),
                 display: DisplaySection { venus: true, width: 1024, height: 768,

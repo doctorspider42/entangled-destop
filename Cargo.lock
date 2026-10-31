@@ -83,6 +83,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ahci"
+version = "0.2.0"
+dependencies = [
+ "thiserror 2.0.20",
+ "tracing",
+ "virtio-core",
+ "vm-memory 0.17.2",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1422,6 +1432,7 @@ dependencies = [
 name = "entangled"
 version = "0.2.0"
 dependencies = [
+ "ahci",
  "clap",
  "control-api",
  "debian-media",
@@ -2444,6 +2455,7 @@ dependencies = [
 name = "machine-x86"
 version = "0.2.0"
 dependencies = [
+ "ahci",
  "kvm-bindings",
  "kvm-ioctls",
  "thiserror 2.0.20",

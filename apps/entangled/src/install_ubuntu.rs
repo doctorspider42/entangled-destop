@@ -251,6 +251,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         .flatten()
         .collect(),
         cdrom: None,
+        optical: vec![],
         // Offline by design (see the module docs): the machine gets its NIC,
         // the installer does not.
         network: None,
@@ -465,6 +466,7 @@ fn installed_profile(
             writable: true,
         }],
         cdrom: None,
+        optical: vec![],
         network,
         display: installed_display(args.venus, refresh_hz),
         // A desktop with no sound is not a desktop (GAME-2102). `auto` never

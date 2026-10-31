@@ -224,6 +224,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         .flatten()
         .collect(),
         cdrom: None,
+        optical: vec![],
         network: network.clone(),
         display: DisplaySection {
             width: 1280,
@@ -346,6 +347,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             writable: true,
         }],
         cdrom: None,
+        optical: vec![],
         network,
         // 1920x1080, the size the project targets (CLAUDE.md) and what the
         // Debian profile always had. 1280x800 was the installer's size carried

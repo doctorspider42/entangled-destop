@@ -297,6 +297,22 @@ pub struct VirtioPciBus {
     /// virtio function, so not a slot: its owner token on the root is one past
     /// the last slot.
     framebuffer: Option<FramebufferSlot>,
+    /// The AHCI controller with the VM's optical drives (ADR-0008 §4), after
+    /// the virtio functions and the framebuffer.
+    ahci: Option<AhciSlot>,
+    /// The MSI sink the virtio functions use, kept for functions attached
+    /// after construction (the AHCI controller).
+    msi: Option<Arc<dyn MsiSink>>,
+}
+
+/// The AHCI controller on the bus.
+pub struct AhciSlot {
+    /// PCI device number on bus 0.
+    pub device_number: u8,
+    /// The controller.
+    pub device: Arc<crate::ahci_function::AhciFunction>,
+    /// The token [`PciRoot`] knows this function by.
+    owner: usize,
 }
 
 /// The boot framebuffer on the bus: the device, its VRAM window and where
@@ -336,6 +352,8 @@ impl VirtioPciBus {
             interrupts: PciInterruptMode::default(),
             host_wake: None,
             framebuffer: None,
+            ahci: None,
+            msi: None,
         }
     }
 
@@ -435,6 +453,8 @@ impl VirtioPciBus {
             interrupts,
             host_wake: None,
             framebuffer: None,
+            ahci: None,
+            msi: msi.clone(),
         };
         let mut apertures = shm
             .as_ref()
@@ -588,6 +608,8 @@ impl VirtioPciBus {
             interrupts,
             host_wake: None,
             framebuffer: None,
+            ahci: None,
+            msi: msi.clone(),
         };
         let host_wake = HostWakeService::new(devices.len());
         let mut apertures = shm
@@ -717,6 +739,54 @@ impl VirtioPciBus {
     /// The boot framebuffer, when the VM has one.
     pub fn framebuffer(&self) -> Option<&FramebufferSlot> {
         self.framebuffer.as_ref()
+    }
+
+    /// Puts an AHCI controller with `drives` on the bus, after every other
+    /// function (ADR-0008 §4). Its ABAR takes the next 32-bit slot, its
+    /// interrupt is MSI through the sink the virtio functions use.
+    pub fn attach_ahci(
+        &mut self,
+        drives: Vec<ahci::Atapi>,
+        mem: Arc<GuestMem>,
+    ) -> Result<(), VirtioPciAttachError> {
+        let owner = self.slots.len() + usize::from(self.framebuffer.is_some());
+        let bus_error = |source| VirtioPciAttachError::Bus {
+            slot: owner,
+            source,
+        };
+        if owner as u64 >= layout::PCI_MMIO_SLOTS {
+            return Err(bus_error(PciError::BusFull));
+        }
+        let abar = u32::try_from(layout::pci_bar_slot(owner as u64))
+            .map_err(|_| bus_error(PciError::BusFull))?;
+        let drives_count = drives.len();
+        let device = crate::ahci_function::AhciFunction::new(drives);
+        device.connect(mem, self.msi.clone());
+        let space = device.config_space(abar).map_err(bus_error)?;
+        let device_number = self
+            .root
+            .lock()
+            .map_err(|_| bus_error(PciError::BusFull))?
+            .attach(space, owner)
+            .map_err(bus_error)?;
+        tracing::info!(
+            address = format_args!("00:{device_number:02x}.0"),
+            abar = format_args!("{abar:#x}"),
+            drives = drives_count,
+            msi = self.msi.is_some(),
+            "attached the AHCI controller"
+        );
+        self.ahci = Some(AhciSlot {
+            device_number,
+            device,
+            owner,
+        });
+        Ok(())
+    }
+
+    /// The AHCI controller, when the VM has one.
+    pub fn ahci(&self) -> Option<&AhciSlot> {
+        self.ahci.as_ref()
     }
 
     /// Builds and attaches one function's host-neutral pieces: the MSI-X table
@@ -984,6 +1054,9 @@ impl VirtioPciBus {
         if let Some(framebuffer) = &self.framebuffer {
             framebuffer.device.reset();
         }
+        if let Some(ahci) = &self.ahci {
+            ahci.device.reset();
+        }
     }
 
     /// Every function on this bus whose device would refuse a snapshot now,
@@ -1005,6 +1078,11 @@ impl VirtioPciBus {
         // a blank framebuffer is exactly the "subtly wrong" ADR-0006 refuses.
         if self.framebuffer.is_some() {
             refusals.push("the boot framebuffer's VRAM cannot be saved yet".into());
+        }
+        if self.ahci.is_some() {
+            refusals.push(
+                "the AHCI controller cannot be saved; detach the optical drives first".into(),
+            );
         }
         refusals
     }
@@ -1548,8 +1626,20 @@ impl VirtioPciBus {
             .then_some((fb.device.as_ref(), offset))
     }
 
+    /// The AHCI controller's ABAR offset for `addr`, if that is where it
+    /// lands.
+    fn locate_ahci(&self, addr: u64) -> Option<(&crate::ahci_function::AhciFunction, u64)> {
+        let slot = self.ahci.as_ref()?;
+        let (owner, bar, offset) = self.root.lock().ok()?.locate_mmio(addr)?;
+        (owner == slot.owner && bar == ahci::ABAR_INDEX).then_some((slot.device.as_ref(), offset))
+    }
+
     /// Guest MMIO read inside some device's BAR window.
     pub fn mmio_read(&self, addr: u64, data: &mut [u8]) {
+        if let Some((ahci, offset)) = self.locate_ahci(addr) {
+            ahci.mmio_read(offset, data);
+            return;
+        }
         if let Some((fb, offset)) = self.locate_framebuffer(addr) {
             fb.mmio_read(offset, data);
             return;
@@ -1574,6 +1664,10 @@ impl VirtioPciBus {
             .iter()
             .any(|slot| slot.kicks.as_ref().is_some_and(|kicks| kicks.kick(addr)))
         {
+            return;
+        }
+        if let Some((ahci, offset)) = self.locate_ahci(addr) {
+            ahci.mmio_write(offset, data);
             return;
         }
         if let Some((fb, offset)) = self.locate_framebuffer(addr) {

@@ -12,6 +12,7 @@ name = "entangled"
 path = "src/main.rs"
 
 [dependencies]
+ahci.workspace = true
 clap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

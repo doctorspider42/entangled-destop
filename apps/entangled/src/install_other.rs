@@ -86,6 +86,7 @@ fn prepare(args: &InstallArgs) -> Result<(VmConfig, std::path::PathBuf), String>
             writable: true,
         }],
         cdrom: Some(CdromSection { path: iso }),
+        optical: vec![],
         network: net.machine_section(&name, &target),
         display: DisplaySection {
             refresh_hz: install::installed_refresh_hz_here(args),
