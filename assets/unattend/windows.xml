@@ -16,9 +16,10 @@
     TIMEZONE       a Windows time zone name (the host's, else "UTC")
     PE_COMMANDS    RunSynchronous commands for Windows PE (Windows 11's
                    hardware checks, which this machine cannot yet pass)
+    PRODUCT_KEY    the product key the installer was given, or empty
 
-  No product key: the edition is chosen by index and the installed system is
-  simply not activated. The account is local, `entangled`, without a
+  Without a product key the edition is chosen by index and the installed
+  system is simply not activated. The account is local, `entangled`, without a
   password, and logs on automatically; its first logon turns hibernation off
   and powers the machine off, which is how the installer knows it finished.
 -->
@@ -95,7 +96,7 @@
              ("Windows cannot read the <ProductKey> setting"); empty, the
              edition comes from /IMAGE/INDEX and nothing is asked. -->
         <ProductKey>
-          <Key></Key>
+          <Key>@PRODUCT_KEY@</Key>
           <WillShowUI>Never</WillShowUI>
         </ProductKey>
       </UserData>

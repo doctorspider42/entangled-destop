@@ -973,6 +973,7 @@ mod tests {
             venus: false,
             drivers: None,
             edition: None,
+            product_key: None,
         };
 
         // A disk path in this host's spelling, with a space in it — the shape

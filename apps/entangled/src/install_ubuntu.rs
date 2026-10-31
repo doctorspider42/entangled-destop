@@ -834,6 +834,7 @@ mod tests {
             venus,
             drivers: None,
             edition: None,
+            product_key: None,
         }
     }
 

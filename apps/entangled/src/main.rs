@@ -435,6 +435,10 @@ pub struct InstallArgs {
     /// to Pro.
     #[arg(long)]
     pub edition: Option<String>,
+    /// Windows only: a product key for the edition, `XXXXX-XXXXX-XXXXX-XXXXX-XXXXX`.
+    /// Without one the system installs unactivated, which Windows allows.
+    #[arg(long)]
+    pub product_key: Option<String>,
 }
 
 fn main() -> ExitCode {

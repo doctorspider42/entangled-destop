@@ -241,6 +241,11 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
         args.edition.as_deref(),
         &computer_name(&name),
         &timezone(),
+        args.product_key
+            .as_deref()
+            .map(product_key)
+            .transpose()?
+            .as_deref(),
     )?;
     let firmware = crate::firmware::resolve(args.firmware.as_deref()).map_err(|e| e.to_string())?;
     tracing::info!(
@@ -346,6 +351,7 @@ fn answer_disc(
     edition: Option<&str>,
     computer_name: &str,
     timezone: &str,
+    product_key: Option<&str>,
 ) -> Result<(Vec<u8>, WimImage), String> {
     let mut windows = optical::open(windows_iso).map_err(|e| e.to_string())?;
     let images =
@@ -360,7 +366,7 @@ fn answer_disc(
     let mut disc = IsoBuilder::new("ENTANGLED");
     disc.add_file(
         "Autounattend.xml",
-        answer_file(&image, computer_name, timezone).into_bytes(),
+        answer_file(&image, computer_name, timezone, product_key).into_bytes(),
     )
     .map_err(|e| e.to_string())?;
     disc.add_file("entangled/first-logon.cmd", crlf(FIRST_LOGON))
@@ -531,7 +537,12 @@ fn driver_files(
 }
 
 /// The answer file for `image`.
-fn answer_file(image: &WimImage, computer_name: &str, timezone: &str) -> String {
+fn answer_file(
+    image: &WimImage,
+    computer_name: &str,
+    timezone: &str,
+    product_key: Option<&str>,
+) -> String {
     // Windows 11 Setup checks for a TPM 2.0 and Secure Boot, neither of which
     // this machine has yet; these are Microsoft's own bypass values.
     let pe_commands = if image.is_windows_11() {
@@ -556,6 +567,26 @@ fn answer_file(image: &WimImage, computer_name: &str, timezone: &str) -> String 
         .replace("@IMAGE_INDEX@", &image.index.to_string())
         .replace("@COMPUTER_NAME@", computer_name)
         .replace("@TIMEZONE@", &xml_escape(timezone))
+        .replace("@PRODUCT_KEY@", product_key.unwrap_or(""))
+}
+
+/// A product key as the answer file wants it: five groups of five letters
+/// and digits, upper case.
+fn product_key(key: &str) -> Result<String, String> {
+    let key = key.trim().to_ascii_uppercase();
+    let groups: Vec<&str> = key.split('-').collect();
+    let valid = groups.len() == 5
+        && groups
+            .iter()
+            .all(|g| g.len() == 5 && g.chars().all(|c| c.is_ascii_alphanumeric()));
+    if valid {
+        Ok(key)
+    } else {
+        Err(format!(
+            "--product-key {key:?} is not a product key: it is five groups of five \
+             letters and digits, XXXXX-XXXXX-XXXXX-XXXXX-XXXXX"
+        ))
+    }
 }
 
 fn xml_escape(text: &str) -> String {
@@ -725,6 +756,17 @@ impl BootKey {
 mod tests {
     use super::*;
 
+    /// XML forbids `--` inside a comment, and Setup refuses a malformed
+    /// answer file with a dialog nobody is there to read. It has happened
+    /// twice (`--headless`, `--product-key`).
+    #[test]
+    fn the_template_comments_have_no_double_hyphen() {
+        for comment in TEMPLATE.split("<!--").skip(1) {
+            let body = comment.split("-->").next().unwrap_or_default();
+            assert!(!body.contains("--"), "a comment holds `--`: {body}");
+        }
+    }
+
     #[test]
     fn iana_zones_map_to_windows_names() {
         assert_eq!(
@@ -780,7 +822,7 @@ mod tests {
     #[test]
     fn the_answer_file_is_filled_in_and_windows_11_skips_its_hardware_checks() {
         let mut image = parse_wim_xml(XML).remove(1);
-        let ten = answer_file(&image, "WIN10", "Central European Standard Time");
+        let ten = answer_file(&image, "WIN10", "Central European Standard Time", None);
         for placeholder in [
             "@IMAGE_INDEX@",
             "@COMPUTER_NAME@",
@@ -794,7 +836,20 @@ mod tests {
         assert!(ten.contains("<TimeZone>Central European Standard Time</TimeZone>"));
         assert!(!ten.contains("LabConfig"));
         image.build = 22631;
-        let eleven = answer_file(&image, "WIN11", "UTC");
+        let eleven = answer_file(
+            &image,
+            "WIN11",
+            "UTC",
+            Some("ABCDE-12345-FGHIJ-67890-KLMNO"),
+        );
+        assert!(eleven.contains("<Key>ABCDE-12345-FGHIJ-67890-KLMNO</Key>"));
+        assert!(ten.contains("<Key></Key>"));
+        assert_eq!(
+            product_key(" abcde-12345-fghij-67890-klmno ").unwrap(),
+            "ABCDE-12345-FGHIJ-67890-KLMNO"
+        );
+        assert!(product_key("ABCDE-12345").is_err());
+        assert!(product_key("ABCDE-12345-FGHIJ-67890-KLM<>").is_err());
         assert_eq!(eleven.matches("LabConfig").count(), 3);
         assert!(eleven.contains("<RunSynchronous>"));
     }
@@ -851,7 +906,8 @@ mod tests {
         let virtio_iso = dir.join("virtio.iso");
         std::fs::write(&virtio_iso, virtio.build()).unwrap();
 
-        let (disc, image) = answer_disc(&windows_iso, &virtio_iso, None, "WIN10", "UTC").unwrap();
+        let (disc, image) =
+            answer_disc(&windows_iso, &virtio_iso, None, "WIN10", "UTC", None).unwrap();
         assert_eq!(image.index, 6);
         let mut answers = optical::iso9660::IsoImage::new(std::io::Cursor::new(disc)).unwrap();
         let root = answers.root().clone();
@@ -884,7 +940,7 @@ mod tests {
         let mut empty = IsoBuilder::new("EMPTY");
         empty.add_file("README", b"x".to_vec()).unwrap();
         std::fs::write(&virtio_iso, empty.build()).unwrap();
-        let error = answer_disc(&windows_iso, &virtio_iso, None, "W", "UTC").unwrap_err();
+        let error = answer_disc(&windows_iso, &virtio_iso, None, "W", "UTC", None).unwrap_err();
         assert!(error.contains("viostor/w10/amd64"), "{error}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
