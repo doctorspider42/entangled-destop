@@ -338,3 +338,15 @@ which is also what KVM does. With it, `shutdown` on the control channel
 (the manager's Shut down) takes Windows to ACPI S5 in about five seconds.
 Linux routes its interrupts as fixed and is not affected; KVM's in-kernel
 IOAPIC never saw this.
+
+### Releasing the firmware (open until the merge to `main`)
+
+The GOP, keyboard and FACS changes live in `build-cloudhv.sh`; every
+`CLOUDHV.fd` in use so far was built locally. Published firmware comes only
+from `firmware.yml`, which runs on a push to `main` that touches that script.
+So, at the merge: let the workflow publish, then put the **published**
+asset's SHA-256 in `guest/firmware/pinned.toml` (never a local build's — the
+2026-09-10 lesson in the dev-environment skill). Until then a fetched firmware
+has no GOP, and `adapter = "framebuffer"` shows nothing before the guest
+draws. Regression check done on WHP with the new local firmware: the Ubuntu
+26.04 desktop ISO boots to its live GNOME session on virtio-gpu as before.
