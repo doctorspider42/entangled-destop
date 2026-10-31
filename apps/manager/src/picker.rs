@@ -33,6 +33,8 @@ pub enum PickTarget {
     WorkDir,
     /// The new-machine wizard's optional installer image.
     WizardIso,
+    /// The new-machine wizard's virtio-win driver image (Windows).
+    WizardDrivers,
     /// The new-machine wizard's existing disk image.
     WizardDisk,
     EditorKernel,
@@ -87,6 +89,11 @@ fn spec(target: PickTarget) -> Spec {
         },
         PickTarget::WizardIso => Spec {
             title: "Choose an installer image",
+            kind: Kind::File,
+            filter: Some(ISO_FILTER),
+        },
+        PickTarget::WizardDrivers => Spec {
+            title: "Choose the virtio-win driver image",
             kind: Kind::File,
             filter: Some(ISO_FILTER),
         },
@@ -248,6 +255,7 @@ mod tests {
             PickTarget::EngineBinary,
             PickTarget::WorkDir,
             PickTarget::WizardIso,
+            PickTarget::WizardDrivers,
             PickTarget::WizardDisk,
             PickTarget::EditorKernel,
             PickTarget::EditorInitramfs,

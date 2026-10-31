@@ -77,7 +77,19 @@ pub struct RomRegion {
 
 impl Vm {
     pub fn new(hv: &Hypervisor, cfg: &MachineConfig) -> Result<Self, VmmError> {
+        Self::new_with(hv, cfg, crate::hv::KvmOptions::default())
+    }
+
+    /// [`Self::new`] with the Windows-guest options (ADR-0008).
+    pub fn new_with(
+        hv: &Hypervisor,
+        cfg: &MachineConfig,
+        options: crate::hv::KvmOptions,
+    ) -> Result<Self, VmmError> {
         let fd = Arc::new(hv.kvm().create_vm()?);
+        if options.ignore_msrs {
+            enable_user_space_msr(&fd);
+        }
         let readonly_mem = hv.kvm().check_extension(Cap::ReadonlyMem);
         let memory = create_guest_memory(cfg.memory_mib << 20)?;
         let ram_slots = register_memory(&fd, &memory)?;
@@ -92,7 +104,7 @@ impl Vm {
 
         let mut vcpus = Vec::with_capacity(cfg.vcpu_count as usize);
         for index in 0..cfg.vcpu_count {
-            vcpus.push(Vcpu::new(&fd, hv.kvm(), index)?);
+            vcpus.push(Vcpu::new(&fd, hv.kvm(), index, options.hyperv)?);
         }
         let next_slot = AtomicU32::new(memory.num_regions() as u32);
         let nr_memslots = u32::try_from(hv.kvm().get_nr_memslots()).unwrap_or(u32::MAX);
@@ -731,5 +743,25 @@ impl DirtyLog for KvmDirtyLog {
             out.push(DirtyPages::new(slot.gpa, slot.len, bits)?);
         }
         Ok(out)
+    }
+}
+
+/// Asks KVM to hand accesses to MSRs it does not know to userspace
+/// (`KVM_CAP_X86_USER_SPACE_MSR` with `KVM_MSR_EXIT_REASON_UNKNOWN`), where the
+/// run loop serves them the way the `ignore_msrs` module parameter would.
+/// A kernel without the capability keeps raising `#GP`; that is logged.
+fn enable_user_space_msr(fd: &VmFd) {
+    let mut cap = kvm_bindings::kvm_enable_cap {
+        cap: kvm_bindings::KVM_CAP_X86_USER_SPACE_MSR,
+        ..Default::default()
+    };
+    cap.args[0] = u64::from(kvm_bindings::KVM_MSR_EXIT_REASON_UNKNOWN);
+    match fd.enable_cap(&cap) {
+        Ok(()) => tracing::info!("unknown MSRs read 0 and ignore writes (ignore_msrs)"),
+        Err(error) => tracing::warn!(
+            %error,
+            "this kernel cannot hand unknown MSRs to userspace \
+             (KVM_CAP_X86_USER_SPACE_MSR); a guest that touches one gets #GP"
+        ),
     }
 }

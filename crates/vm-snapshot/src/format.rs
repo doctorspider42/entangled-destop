@@ -196,6 +196,8 @@ pub enum SectionKind {
     /// Streamed accelerated GPU state. Instance is its virtio slot, distinct
     /// from the small transport/device-register section for that same slot.
     Gpu,
+    /// The boot framebuffer's registers and VRAM (ADR-0008).
+    Display,
 }
 
 impl SectionKind {
@@ -215,6 +217,7 @@ impl SectionKind {
             SectionKind::ResetControl => 12,
             SectionKind::HostIrqChip => 13,
             SectionKind::Gpu => 14,
+            SectionKind::Display => 15,
         }
     }
 
@@ -234,6 +237,7 @@ impl SectionKind {
             12 => SectionKind::ResetControl,
             13 => SectionKind::HostIrqChip,
             14 => SectionKind::Gpu,
+            15 => SectionKind::Display,
             other => return Err(SnapshotError::UnknownSection { kind: other }),
         })
     }
@@ -254,6 +258,7 @@ impl SectionKind {
             SectionKind::ResetControl => "reset-control",
             SectionKind::HostIrqChip => "host-irqchip",
             SectionKind::Gpu => "gpu",
+            SectionKind::Display => "display",
         }
     }
 }

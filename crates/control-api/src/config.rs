@@ -669,6 +669,11 @@ pub enum DisplayAdapter {
     /// what a guest that draws before it has a virtio driver needs (Windows).
     /// PCI transport and UEFI boot only, and no 3D.
     Framebuffer,
+    /// Both in one function: a virtio-gpu of class VGA with the framebuffer
+    /// in BAR 0. The firmware and `BasicDisplay` draw into the framebuffer,
+    /// and virtio-win's `viogpudo` takes the same device over, after which
+    /// the guest's resolution follows the window. PCI and UEFI only, no 3D.
+    VirtioVga,
 }
 
 impl DisplayAdapter {
@@ -682,6 +687,7 @@ impl std::fmt::Display for DisplayAdapter {
         match self {
             Self::VirtioGpu => f.write_str("virtio-gpu"),
             Self::Framebuffer => f.write_str("framebuffer"),
+            Self::VirtioVga => f.write_str("virtio-vga"),
         }
     }
 }
@@ -1208,20 +1214,19 @@ impl VmConfig {
                     .into());
             }
         }
-        if self.display.adapter == DisplayAdapter::Framebuffer {
+        if self.display.adapter != DisplayAdapter::VirtioGpu {
+            let adapter = self.display.adapter;
             if self.display.virgl || self.display.venus {
-                return err(
-                    "display.adapter = \"framebuffer\" has no 3D: virgl and venus are \
-                     renderers for virtio-gpu. Drop them, or use the virtio-gpu adapter"
-                        .into(),
-                );
+                return err(format!(
+                    "display.adapter = \"{adapter}\" has no 3D: virgl and venus are \
+                     renderers for the plain virtio-gpu adapter. Drop them, or use that one"
+                ));
             }
             if self.transport != VirtioTransport::Pci || self.boot.mode != BootMode::Uefi {
-                return err(
-                    "display.adapter = \"framebuffer\" is a PCI device the UEFI firmware \
+                return err(format!(
+                    "display.adapter = \"{adapter}\" is a PCI device the UEFI firmware \
                      drives: it needs transport = \"pci\" and boot.mode = \"uefi\""
-                        .into(),
-                );
+                ));
             }
         }
         if self.display.virgl && self.display.venus {

@@ -71,7 +71,6 @@ use crate::interrupt::{
 };
 use crate::pci::{
     MSIX_PBA_LEN, MSIX_PBA_OFFSET, MSIX_TABLE_LEN, MSIX_TABLE_OFFSET, VIRTIO_MSI_NO_VECTOR,
-    VIRTIO_PCI_BAR_INDEX,
 };
 
 // ------------------------------------------------------------- the capability
@@ -142,14 +141,20 @@ pub fn table_size_for(queues: usize) -> Option<u16> {
 /// Message control starts at 0 apart from the table size — MSI-X disabled,
 /// function not masked — which is the reset state of real hardware.
 pub fn capability_record(table_size: u16) -> Vec<u8> {
+    capability_record_at(table_size, crate::pci::RegsPlacement::PLAIN)
+}
+
+/// [`capability_record`] for a register file placed elsewhere — virtio-vga's
+/// ([`crate::pci::RegsPlacement::VGA`]).
+pub fn capability_record_at(table_size: u16, regs: crate::pci::RegsPlacement) -> Vec<u8> {
     let table_size = table_size.clamp(1, MAX_MSIX_VECTORS);
     let control = (table_size - 1) & MSIX_CTRL_TABLE_SIZE_MASK;
     // Both offsets are BIR-relative and QWORD-aligned, with the BAR indicator
     // register in the low three bits. Our regions are page-aligned, so the low
     // bits are free for the BIR.
-    let bir = u32::from(VIRTIO_PCI_BAR_INDEX) & 0x7;
-    let table = (MSIX_TABLE_OFFSET as u32) | bir;
-    let pba = (MSIX_PBA_OFFSET as u32) | bir;
+    let bir = u32::from(regs.bar) & 0x7;
+    let table = ((regs.offset + MSIX_TABLE_OFFSET) as u32) | bir;
+    let pba = ((regs.offset + MSIX_PBA_OFFSET) as u32) | bir;
     let mut record = Vec::with_capacity(usize::from(MSIX_CAP_LEN));
     record.push(PCI_CAP_ID_MSIX);
     record.push(0); // cap_next, patched by the PCI layer
@@ -879,8 +884,16 @@ mod tests {
 
         let table = u32::from_le_bytes([record[4], record[5], record[6], record[7]]);
         let pba = u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-        assert_eq!(u32::from(VIRTIO_PCI_BAR_INDEX), table & 0x7, "table BIR");
-        assert_eq!(u32::from(VIRTIO_PCI_BAR_INDEX), pba & 0x7, "PBA BIR");
+        assert_eq!(
+            u32::from(crate::pci::VIRTIO_PCI_BAR_INDEX),
+            table & 0x7,
+            "table BIR"
+        );
+        assert_eq!(
+            u32::from(crate::pci::VIRTIO_PCI_BAR_INDEX),
+            pba & 0x7,
+            "PBA BIR"
+        );
         assert_eq!(u64::from(table & !0x7), MSIX_TABLE_OFFSET);
         assert_eq!(u64::from(pba & !0x7), MSIX_PBA_OFFSET);
         // Both regions must fit in the BAR that claims to hold them.

@@ -37,6 +37,17 @@
 //! ([`Framebuffer::scanout`] and [`Framebuffer::read_vram`]), which is the
 //! whole presentation path: the guest has no "flush" to tell us when it drew.
 //!
+//! # On a virtio-gpu ("virtio-vga")
+//!
+//! The same VRAM and DISPI page can instead belong to the machine's
+//! virtio-gpu function ([`FramebufferConfig::on_virtio_gpu`]): one function
+//! of class VGA, VRAM in its BAR 0, and the register page as the first page
+//! ([`VGA_WINDOW`]) of the virtio register BAR, the virtio regions after it
+//! (`virtio_core::pci::RegsPlacement::VGA`). The firmware and `BasicDisplay` draw into VRAM as
+//! above; once virtio-win's `viogpudo` binds the very same function, the
+//! guest draws through virtio-gpu, resizes with the window, and the VRAM
+//! simply stops changing. One adapter, one monitor, whichever driver has it.
+//!
 //! Only 32 bpp is presented. The other depths are accepted as register values,
 //! because a driver probing them must not be refused, but a mode in one of
 //! them shows nothing; GOP and `BasicDisplay` only use 32 bpp.
@@ -126,6 +137,9 @@ pub struct FramebufferConfig {
     /// mode `QemuVideoDxe` makes the GOP default. `None` reads as zeroes, and
     /// the firmware falls back to its own default mode.
     pub edid: Option<[u8; 128]>,
+    /// Part of the virtio-gpu function rather than a function of its own
+    /// (the module docs' "virtio-vga").
+    pub on_virtio_gpu: bool,
 }
 
 impl Default for FramebufferConfig {
@@ -133,9 +147,15 @@ impl Default for FramebufferConfig {
         Self {
             vram_bytes: DEFAULT_VRAM_BYTES,
             edid: None,
+            on_virtio_gpu: false,
         }
     }
 }
+
+/// Where the register page shows through a virtio-vga function's register
+/// BAR: its first page, offsets as in the standalone BAR. After it is
+/// virtio's.
+pub const VGA_WINDOW: std::ops::Range<u64> = 0..REGS_BAR_SIZE as u64;
 
 /// Errors building the device.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -424,6 +444,30 @@ impl Framebuffer {
         }
     }
 
+    /// All of VRAM, for a snapshot (ADR-0006): what the guest drew is guest
+    /// state, and a resumed `BasicDisplay` would not redraw it.
+    pub fn save_vram(&self) -> Result<Vec<u8>, ShmAccessError> {
+        let mut vram = vec![0; self.vram_bytes as usize];
+        self.vram.read(0, &mut vram)?;
+        Ok(vram)
+    }
+
+    /// Puts saved VRAM back. It must be exactly this device's size.
+    pub fn load_vram(&self, vram: &[u8]) -> Result<(), crate::state::StateError> {
+        if vram.len() as u64 != self.vram_bytes {
+            return Err(crate::state::StateError::Count {
+                what: "framebuffer VRAM bytes",
+                snapshot: vram.len(),
+                current: self.vram_bytes as usize,
+            });
+        }
+        self.vram
+            .write(0, vram)
+            .map_err(|_| crate::state::StateError::Poisoned("the framebuffer's VRAM"))?;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
     /// The register file, for a snapshot (ADR-0006).
     pub fn save_registers(&self) -> Vec<u16> {
         self.lock().regs.to_vec()
@@ -479,6 +523,7 @@ mod tests {
         let config = FramebufferConfig {
             vram_bytes: MIN_VRAM_BYTES,
             edid: Some([0xab; 128]),
+            ..FramebufferConfig::default()
         };
         let backing: Arc<dyn ShmBacking> = vram.clone();
         (Framebuffer::new(&config, backing).unwrap(), vram)
@@ -676,7 +721,7 @@ mod tests {
         ] {
             let config = FramebufferConfig {
                 vram_bytes: bytes,
-                edid: None,
+                ..FramebufferConfig::default()
             };
             assert!(Framebuffer::validate(&config).is_err(), "{bytes}");
         }

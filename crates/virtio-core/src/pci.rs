@@ -157,6 +157,45 @@ pub const VIRTIO_PCI_BAR_INDEX: u8 = 0;
 /// from 16 KiB to 32 KiB costs 128 KiB of a 256 MiB aperture.
 pub const VIRTIO_PCI_BAR_SIZE: u64 = 0x8000;
 
+/// Where a function's register file sits: which BAR, and from which offset
+/// inside it the six regions in the table above begin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegsPlacement {
+    pub bar: u8,
+    pub offset: u64,
+}
+
+impl RegsPlacement {
+    /// Every function but one: BAR 0, from offset 0.
+    pub const PLAIN: Self = Self {
+        bar: VIRTIO_PCI_BAR_INDEX,
+        offset: 0,
+    };
+
+    /// A virtio-gpu function that is also the machine's VGA display
+    /// (ADR-0008 §1, "virtio-vga").
+    ///
+    /// A VGA-class virtio-gpu is what both of its consumers expect to find
+    /// VRAM in BAR 0: EDK2's `QemuVideoDxe` binds `1af4:1050` of class VGA as
+    /// a Bochs display with the framebuffer in BAR 0 and the Bochs register
+    /// page (EDID at 0, DISPI at `0x500`) at the start of its *logical* BAR 2,
+    /// and virtio-win's `viogpudo` maps the first memory resource of a
+    /// VGA-subclass function as the POST framebuffer. With VRAM a 64-bit pair
+    /// in registers 0–1, `PciBusDxe`'s logical BAR 2 is register 3. So the
+    /// register file goes there, one page in: the first page is the Bochs
+    /// page (`machine_x86::framebuffer`), and the six regions end at `0x7000`,
+    /// inside the same [`VIRTIO_PCI_BAR_SIZE`].
+    pub const VGA: Self = Self {
+        bar: 3,
+        offset: 0x1000,
+    };
+
+    /// Where queue `index`'s notification slot is, from the BAR's base.
+    pub const fn queue_notify_offset(self, index: u16) -> u64 {
+        self.offset + queue_notify_offset(index)
+    }
+}
+
 /// Offset and length of the common configuration structure inside the BAR.
 pub const COMMON_CFG_OFFSET: u64 = 0x0000;
 pub const COMMON_CFG_LEN: u64 = 0x1000;
@@ -244,7 +283,7 @@ pub const VIRTIO_PCI_SHM_BAR_INDEX: u8 = 2;
 /// patches the link when it places the record in config space. Everything else
 /// — which BAR, which offset, how long, and the notify multiplier — is
 /// transport knowledge and belongs here.
-fn encode_cap(cfg_type: u8, offset: u64, length: u64, multiplier: Option<u32>) -> Vec<u8> {
+fn encode_cap(bar: u8, cfg_type: u8, offset: u64, length: u64, multiplier: Option<u32>) -> Vec<u8> {
     let len = match multiplier {
         Some(_) => VIRTIO_PCI_NOTIFY_CAP_LEN,
         None => VIRTIO_PCI_CAP_LEN,
@@ -254,7 +293,7 @@ fn encode_cap(cfg_type: u8, offset: u64, length: u64, multiplier: Option<u32>) -
     record.push(0); // cap_next, patched by the PCI layer
     record.push(len);
     record.push(cfg_type);
-    record.push(VIRTIO_PCI_BAR_INDEX);
+    record.push(bar);
     record.push(0); // id: only one structure of each type
     record.extend_from_slice(&[0, 0]); // padding
     record.extend_from_slice(&(offset as u32).to_le_bytes());
@@ -272,23 +311,39 @@ fn encode_cap(cfg_type: u8, offset: u64, length: u64, multiplier: Option<u32>) -
 /// looking for it and falls back to "leaving for legacy driver" when it is
 /// absent, so it is the record that decides whether the modern driver binds.
 pub fn capability_records() -> Vec<Vec<u8>> {
+    capability_records_at(RegsPlacement::PLAIN)
+}
+
+/// [`capability_records`] for a register file placed elsewhere
+/// ([`RegsPlacement::VGA`]).
+pub fn capability_records_at(regs: RegsPlacement) -> Vec<Vec<u8>> {
+    let RegsPlacement { bar, offset: base } = regs;
     vec![
         encode_cap(
+            bar,
             VIRTIO_PCI_CAP_COMMON_CFG,
-            COMMON_CFG_OFFSET,
+            base + COMMON_CFG_OFFSET,
             COMMON_CFG_LEN,
             None,
         ),
         encode_cap(
+            bar,
             VIRTIO_PCI_CAP_NOTIFY_CFG,
-            NOTIFY_CFG_OFFSET,
+            base + NOTIFY_CFG_OFFSET,
             NOTIFY_CFG_LEN,
             Some(NOTIFY_OFF_MULTIPLIER),
         ),
-        encode_cap(VIRTIO_PCI_CAP_ISR_CFG, ISR_CFG_OFFSET, ISR_CFG_LEN, None),
         encode_cap(
+            bar,
+            VIRTIO_PCI_CAP_ISR_CFG,
+            base + ISR_CFG_OFFSET,
+            ISR_CFG_LEN,
+            None,
+        ),
+        encode_cap(
+            bar,
             VIRTIO_PCI_CAP_DEVICE_CFG,
-            DEVICE_CFG_OFFSET,
+            base + DEVICE_CFG_OFFSET,
             DEVICE_CFG_LEN,
             None,
         ),

@@ -12,6 +12,11 @@
 //! byte order. The X byte is not alpha, so every row sent gets an opaque
 //! alpha.
 //!
+//! On a virtio-vga function the VRAM is only the display until the guest's
+//! virtio-gpu driver binds a scanout; from then on virtio-gpu presents and
+//! this thread stays quiet, and it takes the display back, whole, when the
+//! scanout goes away (a disable, or the device reset of a reboot).
+//!
 //! The thread takes the VM's pause gate (ADR-0005) before each read. It
 //! only reads, so a paused VM loses nothing by it, but the rule is that no
 //! host thread touches guest-visible memory while the VM is paused.
@@ -29,9 +34,11 @@ use virtio_core::Quiesce;
 /// framebuffer. The EDID's preferred timing is the profile's resolution, which
 /// is the mode the firmware's GOP and so Windows' `BasicDisplay` come up in.
 pub(super) fn config_for(cfg: &VmConfig) -> Option<FramebufferConfig> {
-    if cfg.display.adapter != DisplayAdapter::Framebuffer {
-        return None;
-    }
+    let on_virtio_gpu = match cfg.display.adapter {
+        DisplayAdapter::VirtioGpu => return None,
+        DisplayAdapter::Framebuffer => false,
+        DisplayAdapter::VirtioVga => true,
+    };
     let edid = virtio_gpu::edid::edid_block(
         cfg.display.width,
         cfg.display.height,
@@ -46,6 +53,7 @@ pub(super) fn config_for(cfg: &VmConfig) -> Option<FramebufferConfig> {
     }
     Some(FramebufferConfig {
         edid,
+        on_virtio_gpu,
         ..FramebufferConfig::default()
     })
 }
@@ -63,6 +71,7 @@ impl Presenter {
         display: display::DisplayHandle,
         quiesce: Arc<Quiesce>,
         refresh_hz: u32,
+        virtio_scanout: Option<Arc<AtomicBool>>,
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let period = Duration::from_secs(1) / refresh_hz.max(1);
@@ -71,7 +80,16 @@ impl Presenter {
             let quiesce = Arc::clone(&quiesce);
             std::thread::Builder::new()
                 .name("framebuffer-present".into())
-                .spawn(move || run(&device, &display, &quiesce, &stop, period))?
+                .spawn(move || {
+                    run(
+                        &device,
+                        &display,
+                        &quiesce,
+                        &stop,
+                        period,
+                        virtio_scanout.as_deref(),
+                    )
+                })?
         };
         Ok(Self {
             stop,
@@ -99,6 +117,7 @@ fn run(
     quiesce: &Quiesce,
     stop: &AtomicBool,
     period: Duration,
+    virtio_scanout: Option<&AtomicBool>,
 ) {
     let keep_going = || !stop.load(Ordering::Acquire);
     let mut frame = Frame::default();
@@ -115,6 +134,11 @@ fn run(
         let Some(_pass) = quiesce.wait_while_paused(keep_going) else {
             break;
         };
+        if virtio_scanout.is_some_and(|bound| bound.load(Ordering::Acquire)) {
+            // virtio-gpu has the display; when it lets go, start over.
+            frame.mode = None;
+            continue;
+        }
         let Some(mode) = device.scanout() else {
             continue;
         };
@@ -214,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_framebuffer_adapter_gets_a_device() {
+    fn only_the_vga_adapters_get_a_device() {
         let mut cfg: VmConfig = VmConfig::from_toml(
             "name = \"t\"\nmemory_mib = 512\nvcpus = 1\ntransport = \"pci\"\n\
              [boot]\nmode = \"uefi\"\nfirmware = \"CLOUDHV.fd\"\n",
@@ -225,5 +249,9 @@ mod tests {
         let config = config_for(&cfg).expect("a framebuffer");
         let edid = config.edid.expect("1920x1080 has an EDID");
         assert_eq!(&edid[..8], &[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
+        assert!(!config.on_virtio_gpu);
+        cfg.display.adapter = DisplayAdapter::VirtioVga;
+        let config = config_for(&cfg).expect("a framebuffer on the virtio-gpu");
+        assert!(config.on_virtio_gpu);
     }
 }

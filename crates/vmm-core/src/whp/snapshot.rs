@@ -175,6 +175,14 @@ const FLAGS_PENDING: u32 = 1 << 9;
 /// half-the-time-safe.
 const MAX_BATCH: usize = 64;
 
+/// The emulated Hyper-V clock's guest-written MSRs, in restore order
+/// (`crate::whp::hv_clock`).
+const HV_CLOCK_MSRS: [u32; 3] = [
+    crate::whp::hv_clock::HV_X64_MSR_GUEST_OS_ID,
+    crate::whp::hv_clock::HV_X64_MSR_HYPERCALL,
+    crate::whp::hv_clock::HV_X64_MSR_REFERENCE_TSC,
+];
+
 impl WhpVcpu {
     /// This processor's multiprocessing state, as the neutral [`MpState`].
     ///
@@ -378,7 +386,16 @@ impl WhpVcpu {
         let registers = self.get_registers()?;
         let special_registers = self.get_special_registers()?;
 
-        let (msrs, refused) = self.read_msrs();
+        let (mut msrs, refused) = self.read_msrs();
+        // The emulated Hyper-V clock's MSRs are this process's, not WHP's;
+        // they travel with the rest so a resumed Windows keeps its clock.
+        if let Some(clock) = self.partition().hv_clock() {
+            for index in HV_CLOCK_MSRS {
+                if let Some(data) = clock.read(index, || None) {
+                    msrs.push(X86Msr { index, data });
+                }
+            }
+        }
         if !refused.is_empty() {
             tracing::debug!(
                 vcpu = self.index,
@@ -452,7 +469,30 @@ impl WhpVcpu {
         self.write_u64s(&[WHvX64RegisterXCr0], &[state.xcr0])?;
         self.set_xsave_blob(state.xsave.expect(BlobFormat::XsaveArea)?)?;
 
-        let refused = self.write_msrs(&state.msrs);
+        let (clock_msrs, whp_msrs): (Vec<X86Msr>, Vec<X86Msr>) = state
+            .msrs
+            .iter()
+            .partition(|msr| HV_CLOCK_MSRS.contains(&msr.index));
+        let refused = self.write_msrs(&whp_msrs);
+        match self.partition().hv_clock() {
+            // In `HV_CLOCK_MSRS` order: the guest id before the hypercall
+            // MSR it gates. The pages they name are rewritten, with the same
+            // bytes the restored memory already holds.
+            Some(clock) => {
+                for index in HV_CLOCK_MSRS {
+                    if let Some(msr) = clock_msrs.iter().find(|msr| msr.index == index) {
+                        clock.write(index, msr.data, self.partition().memory());
+                    }
+                }
+            }
+            None if clock_msrs.iter().any(|msr| msr.data != 0) => {
+                return Err(HvError::Registers(
+                    "the snapshot's guest uses the Hyper-V reference clock, which this                      partition does not emulate (hyperv_enlightenments is off, or WHP                      grants the enlightenments itself)"
+                        .into(),
+                ))
+            }
+            None => {}
+        }
         if !refused.is_empty() {
             tracing::warn!(
                 vcpu = self.index,

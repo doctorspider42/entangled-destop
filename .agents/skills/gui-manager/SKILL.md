@@ -130,6 +130,15 @@ The console offers named `serial-key` controls (shared vocabulary in control-api
 for the serial-only firmware/bootloader menus. ISO drag-and-drop selects this
 manual path; native Apple Silicon keeps its Ubuntu ARM64-only provisioning.
 
+**Windows 10 / 11** (`GuestFamily::Windows`, ADR-0008) is a full-width card
+under the Linux pairs. It needs two images, both required at submit time: the
+untouched Microsoft ISO (`iso_path`, `PickTarget::WizardIso`) and the virtio-win
+ISO (`drivers_path`, `PickTarget::WizardDrivers`), which become `install
+windows --iso … --drivers …`. Never `--auto`: Windows is always unattended and
+the engine refuses the flag. Choosing the card raises the disk to 64 GiB and
+memory to 4 GiB, the engine's own Windows minimums for comfort. Pre-flight is
+the UEFI firmware, as for Ubuntu. Its screenshot surface is `wizard-windows`.
+
 The four-stage wizard collects system/media, name/resources, storage and a
 review before it launches anything. It supports Debian's verified variants and
 Ubuntu through the verified cache or an explicit local `--iso`. Storage is an

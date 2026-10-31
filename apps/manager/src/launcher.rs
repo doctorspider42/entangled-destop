@@ -219,6 +219,9 @@ pub enum GuestFamily {
     Ubuntu,
     Fedora,
     OtherLinux,
+    /// Microsoft's Windows 10/11 ISO, unattended, with the virtio-win drivers
+    /// (ADR-0008).
+    Windows,
 }
 
 impl GuestFamily {
@@ -228,6 +231,7 @@ impl GuestFamily {
             Self::Ubuntu => "ubuntu",
             Self::Fedora => "fedora",
             Self::OtherLinux => "other",
+            Self::Windows => "windows",
         }
     }
 
@@ -237,6 +241,7 @@ impl GuestFamily {
             Self::Ubuntu => "Ubuntu",
             Self::Fedora => "Fedora",
             Self::OtherLinux => "Other Linux / own ISO",
+            Self::Windows => "Windows 10 / 11",
         }
     }
 
@@ -282,8 +287,11 @@ pub struct NewMachine {
     pub disk_path: String,
     pub disk_mode: DiskMode,
     pub family: GuestFamily,
-    /// Local ISO; required for Other Linux, otherwise empty uses the verified cache.
+    /// Local ISO; required for Other Linux and Windows, otherwise empty uses
+    /// the verified cache.
     pub iso_path: String,
+    /// The virtio-win driver ISO; Windows only, and required there.
+    pub drivers_path: String,
     pub variant: String,
     pub automated: bool,
     pub headless: bool,
@@ -355,7 +363,10 @@ pub fn install_spec(
             args.push("--variant".to_string());
             args.push(machine.variant.clone());
         }
-        GuestFamily::Ubuntu | GuestFamily::Fedora | GuestFamily::OtherLinux => {
+        GuestFamily::Ubuntu
+        | GuestFamily::Fedora
+        | GuestFamily::OtherLinux
+        | GuestFamily::Windows => {
             if !machine.iso_path.trim().is_empty() {
                 args.push("--iso".to_string());
                 args.push(runner.path_arg(Path::new(machine.iso_path.trim()))?);
@@ -374,7 +385,24 @@ pub fn install_spec(
             machine.refresh_hz.to_string(),
         ]);
     }
-    if machine.automated && machine.family != GuestFamily::OtherLinux {
+    if machine.family == GuestFamily::Windows {
+        if machine.iso_path.trim().is_empty() {
+            return Err("Choose the Windows 10 or 11 installation ISO first.".into());
+        }
+        if machine.drivers_path.trim().is_empty() {
+            return Err("Choose the virtio-win driver ISO first.".into());
+        }
+        args.push("--drivers".to_string());
+        args.push(runner.path_arg(Path::new(machine.drivers_path.trim()))?);
+    }
+    // Windows is always unattended, from its own answer file, and refuses
+    // `--auto`.
+    if machine.automated
+        && !matches!(
+            machine.family,
+            GuestFamily::OtherLinux | GuestFamily::Windows
+        )
+    {
         args.push("--auto".to_string());
     }
     if machine.headless && machine.family != GuestFamily::OtherLinux {
@@ -633,7 +661,10 @@ pub fn missing_install_artifact(cwd: &Path, family: GuestFamily) -> Option<Strin
 
 fn missing_install_artifact_x86(cwd: &Path, family: GuestFamily) -> Option<String> {
     match family {
-        GuestFamily::Ubuntu | GuestFamily::Fedora | GuestFamily::OtherLinux => {
+        GuestFamily::Ubuntu
+        | GuestFamily::Fedora
+        | GuestFamily::OtherLinux
+        | GuestFamily::Windows => {
             if locate_firmware(cwd).is_some() {
                 return None;
             }
@@ -716,6 +747,7 @@ mod tests {
             disk_mode: DiskMode::CreateNew,
             family: GuestFamily::Debian,
             iso_path: String::new(),
+            drivers_path: String::new(),
             variant: "text-netboot".into(),
             automated: true,
             headless: false,
@@ -790,6 +822,36 @@ mod tests {
         );
         // The one default on both hosts, spelled out for an older engine.
         assert!(line.contains("--network usernet"), "{line}");
+    }
+
+    /// Windows: both images on the command line, and no `--auto`, which
+    /// `install windows` refuses (it is always unattended).
+    #[test]
+    fn windows_passes_both_images_and_never_auto() {
+        let mut m = machine();
+        m.family = GuestFamily::Windows;
+        m.automated = true;
+        let spec = |m: &NewMachine| {
+            install_spec(
+                &native("entangled"),
+                Path::new("/vms"),
+                PathBuf::from("/srv"),
+                m,
+            )
+        };
+        assert!(spec(&m).is_err(), "no Windows ISO");
+        m.iso_path = "/isos/Win10.iso".into();
+        assert!(spec(&m).is_err(), "no driver ISO");
+        m.drivers_path = "/isos/virtio-win.iso".into();
+        let line = spec(&m).expect("spec").command_line();
+        for needle in [
+            "install windows",
+            "--iso /isos/Win10.iso",
+            "--drivers /isos/virtio-win.iso",
+        ] {
+            assert!(line.contains(needle), "missing {needle} in {line}");
+        }
+        assert!(!line.contains("--auto"), "{line}");
     }
 
     #[test]

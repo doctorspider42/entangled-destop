@@ -43,21 +43,6 @@ pub const HV_X64_MSR_REFERENCE_TSC: u32 = 0x4000_0021;
 pub const HV_X64_MSR_TSC_FREQUENCY: u32 = 0x4000_0022;
 pub const HV_X64_MSR_APIC_FREQUENCY: u32 = 0x4000_0023;
 
-/// Highest hypervisor leaf this interface answers.
-const MAX_LEAF: u32 = 0x4000_0006;
-/// "Microsoft Hv" as `0x4000_0000` EBX, ECX, EDX.
-const VENDOR: [u32; 3] = [0x7263_694d, 0x666f_736f, 0x7648_2074];
-/// "Hv#1" as `0x4000_0001` EAX.
-const INTERFACE_HV1: u32 = 0x3123_7648;
-
-/// `0x4000_0003` EAX: the partition privileges granted.
-const PRIVILEGES: u32 = (1 << 1) // AccessPartitionReferenceCounter
-    | (1 << 5) // AccessHypercallMsrs
-    | (1 << 9) // AccessPartitionReferenceTsc
-    | (1 << 11); // AccessFrequencyMsrs
-/// `0x4000_0003` EDX bit 8: the frequency MSRs are there to read.
-const FEATURE_FREQUENCY_MSRS: u32 = 1 << 8;
-
 /// The hypercall page: `mov rax, 2` (`HV_STATUS_INVALID_HYPERCALL_CODE`),
 /// `ret`.
 const HYPERCALL_PAGE: [u8; 8] = [0x48, 0xc7, 0xc0, 0x02, 0x00, 0x00, 0x00, 0xc3];
@@ -98,36 +83,8 @@ impl HvClock {
     /// The hypervisor leaves, or `None` for a leaf this interface does not
     /// own.
     pub fn cpuid(&self, leaf: u32) -> Option<CpuidResult> {
-        let zero = CpuidResult {
-            eax: 0,
-            ebx: 0,
-            ecx: 0,
-            edx: 0,
-        };
-        Some(match leaf {
-            0x4000_0000 => CpuidResult {
-                eax: MAX_LEAF,
-                ebx: VENDOR[0],
-                ecx: VENDOR[1],
-                edx: VENDOR[2],
-            },
-            0x4000_0001 => CpuidResult {
-                eax: INTERFACE_HV1,
-                ..zero
-            },
-            0x4000_0003 => CpuidResult {
-                eax: PRIVILEGES,
-                edx: FEATURE_FREQUENCY_MSRS,
-                ..zero
-            },
-            // Recommendations: none, and never notify on spinlocks.
-            0x4000_0004 => CpuidResult {
-                ebx: u32::MAX,
-                ..zero
-            },
-            0x4000_0002 | 0x4000_0005..=MAX_LEAF => zero,
-            _ => return None,
-        })
+        let [eax, ebx, ecx, edx] = crate::hv::hyperv::clock_leaf(leaf)?;
+        Some(CpuidResult { eax, ebx, ecx, edx })
     }
 
     /// `rdmsr`: `Some(value)` for an MSR of this interface. `tsc` reads the
@@ -244,7 +201,7 @@ mod tests {
             .flat_map(|r| r.to_le_bytes())
             .collect();
         assert_eq!(name, b"Microsoft Hv");
-        assert_eq!(vendor.eax, MAX_LEAF);
+        assert_eq!(vendor.eax, crate::hv::hyperv::MAX_LEAF);
         assert_eq!(
             &clock.cpuid(0x4000_0001).unwrap().eax.to_le_bytes(),
             b"Hv#1"

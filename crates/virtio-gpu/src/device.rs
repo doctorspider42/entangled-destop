@@ -362,6 +362,10 @@ pub struct GpuDevice<S: ScanoutSink> {
     blob_support: BlobSupport,
     accelerated_checkpoints: bool,
     scanout: Option<ScanoutBinding>,
+    /// Whether `scanout` is bound, for a host thread outside the device:
+    /// what lets a VGA framebuffer sharing this function stop presenting
+    /// once the guest's driver draws through virtio (virtio-vga, ADR-0008).
+    scanout_active: Arc<std::sync::atomic::AtomicBool>,
     /// The displayed cursor may outlive the resource it was copied from.
     saved_cursor: Option<crate::save::SavedCursor>,
     /// `events_read` of `struct virtio_gpu_config`: `VIRTIO_GPU_EVENT_DISPLAY`
@@ -457,6 +461,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             blob_support: BlobSupport::NONE,
             accelerated_checkpoints: false,
             scanout: None,
+            scanout_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saved_cursor: None,
             events_read: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             // EDID (MVP-811) because GNOME/mutter builds its outputs from it;
@@ -593,6 +598,17 @@ impl<S: ScanoutSink> GpuDevice<S> {
     /// Number of live 2D resources (diagnostics, `entangled doctor`).
     pub fn resource_count(&self) -> usize {
         self.resources.len()
+    }
+
+    /// Set while a resource is bound to scanout 0, cleared by a disable and
+    /// a reset; shared, so another thread can watch it.
+    pub fn scanout_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.scanout_active)
+    }
+
+    fn publish_scanout(&self) {
+        self.scanout_active
+            .store(self.scanout.is_some(), std::sync::atomic::Ordering::Release);
     }
 
     /// Resource currently bound to scanout 0, if any.
@@ -2862,6 +2878,7 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
                 let mut queue = self.control.take().ok_or(DeviceError::NotActivated)?;
                 let result = self.drain_control(&mut queue, &mem, interrupt.as_ref());
                 self.control = Some(queue);
+                self.publish_scanout();
                 result
             }
             CURSOR_QUEUE => {
@@ -3124,6 +3141,7 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
                 shown = self.present_whole_scanout();
             }
         }
+        self.publish_scanout();
 
         if let Some(cursor) = state.cursor {
             self.display
@@ -3205,6 +3223,7 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         self.events_read
             .store(0, std::sync::atomic::Ordering::Release);
         self.scanout = None;
+        self.publish_scanout();
         self.saved_cursor = None;
         let _ = self.display.hide_cursor();
         self.resources.clear();

@@ -312,9 +312,11 @@ impl MachineBus {
     pub fn save_state(&self) -> crate::state::MachineState {
         let mut virtio = self.virtio.save_state();
         let mut pci_root = None;
+        let mut framebuffer = None;
         if let Some(pci) = &self.pci {
             virtio = pci.save_state();
             pci_root = pci.save_config();
+            framebuffer = pci.save_framebuffer();
         }
         crate::state::MachineState {
             serial: match self.serial.lock() {
@@ -346,6 +348,7 @@ impl MachineBus {
             pci_root,
             irqchip: self.irqchip.as_ref().map(|chip| chip.save_state()),
             virtio,
+            framebuffer,
         }
     }
 
@@ -404,8 +407,18 @@ impl MachineBus {
         self.reset.load_state(&state.reset);
 
         match (&self.pci, &state.pci_root) {
-            (Some(pci), Some(config)) => pci.load_state(config, &state.virtio)?,
-            _ => self.virtio.load_state(&state.virtio)?,
+            (Some(pci), Some(config)) => {
+                pci.load_state(config, &state.virtio)?;
+                pci.load_framebuffer(state.framebuffer.as_ref())?;
+            }
+            _ => {
+                crate::state::require_same_presence(
+                    "boot framebuffer",
+                    state.framebuffer.as_ref(),
+                    false,
+                )?;
+                self.virtio.load_state(&state.virtio)?;
+            }
         }
 
         if let (Some(chip), Some(saved)) = (&self.irqchip, &state.irqchip) {

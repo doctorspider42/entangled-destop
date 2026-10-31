@@ -302,29 +302,11 @@ fn run_inner(
                 } else if let Some(text) = command.strip_prefix("type ") {
                     typist.type_text(text);
                 } else if let Some(chord) = command.strip_prefix("chord ") {
-                    let keys: Option<Vec<u16>> = chord
-                        .split_whitespace()
-                        .take(9)
-                        .map(|key| match key {
-                            "ctrl" => Some(29),
-                            "alt" => Some(56),
-                            "shift" => Some(42),
-                            "super" => Some(125),
-                            "enter" => Some(28),
-                            "escape" => Some(1),
-                            letter if letter.chars().count() == 1 => letter
-                                .chars()
-                                .next()
-                                .and_then(virtio_input::typing::key_for)
-                                .map(|(code, _)| code),
-                            _ => None,
-                        })
-                        .collect();
-                    match keys {
-                        Some(keys) if !keys.is_empty() && keys.len() <= 8 => {
+                    match virtio_input::typing::parse_chord(chord) {
+                        Some(keys) => {
                             typist.chord(&keys);
                         }
-                        _ => tracing::warn!(%chord, "unsupported keyboard chord"),
+                        None => tracing::warn!(%chord, "unsupported keyboard chord"),
                     }
                 } else if command == "stop" {
                     STOP.store(true, Ordering::Relaxed);

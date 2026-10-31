@@ -2756,7 +2756,7 @@ fn wizard_step(
             wizard_heading(
                 ui,
                 "Choose an operating system",
-                "Choose a supported installer or install another Linux from your own ISO.",
+                "Choose a supported installer, Windows, or another Linux from your own ISO.",
             );
             ui.add_space(14.0);
             // An installer this backend cannot run is greyed out
@@ -2829,6 +2829,25 @@ fn wizard_step(
                         }
                     }
                 });
+                ui.add_space(8.0);
+                let card_width = ui.available_width();
+                if option_card(
+                    ui,
+                    card_width,
+                    launcher::GuestFamily::Windows.label(),
+                    "Unattended, from Microsoft's ISO and the virtio-win drivers",
+                    state.machine.family == launcher::GuestFamily::Windows,
+                    true,
+                    theme::ACCENT,
+                )
+                .clicked()
+                {
+                    state.machine.family = launcher::GuestFamily::Windows;
+                    // What Windows needs to be comfortable, as the engine's
+                    // own defaults are (install windows).
+                    state.machine.disk_gib = state.machine.disk_gib.max(64);
+                    state.machine.memory_mib = state.machine.memory_mib.max(4096);
+                }
             }
             ui.add_space(16.0);
             match state.machine.family {
@@ -2901,6 +2920,38 @@ fn wizard_step(
                     if manual {
                         ui.label(ui::dim("Manual install. After installing, power off and eject the ISO under Settings > Startup."));
                     }
+                }
+                launcher::GuestFamily::Windows => {
+                    // Two path rows: one measured width for both, or the
+                    // second ends a few pixels right of the first.
+                    ui::form_scope(ui);
+                    if ui::path_row(
+                        ui,
+                        "WINDOWS ISO",
+                        "Microsoft's Windows 10 or 11 installation ISO, as downloaded \
+                         from Microsoft. It is used untouched; the edition is Pro unless \
+                         the disc has no Pro.",
+                        &mut state.machine.iso_path,
+                        "choose the Windows ISO",
+                        true,
+                    ) {
+                        actions.push(Action::PickPath(PickTarget::WizardIso));
+                    }
+                    if ui::path_row(
+                        ui,
+                        "DRIVERS",
+                        "The virtio-win driver ISO (fedorapeople.org/groups/virt/virtio-win). \
+                         Windows cannot see this machine's disk or network without it; \
+                         the drivers are installed during setup.",
+                        &mut state.machine.drivers_path,
+                        "choose virtio-win.iso",
+                        true,
+                    ) {
+                        actions.push(Action::PickPath(PickTarget::WizardDrivers));
+                    }
+                    ui.label(ui::dim(
+                        "Installs on its own and powers off when it is done. No product key is entered.",
+                    ));
                 }
             }
             ui.add_space(16.0);

@@ -461,3 +461,95 @@ Windows' clock tick reading register C; a tick source without a per-tick
 register read (an HPET in edge mode, or the LAPIC timer) is the next lever.
 The MSR state is not in a snapshot yet; a VM with a framebuffer is refused
 one anyway.
+
+### Amendment, 2026-10-31: one display adapter, `virtio-vga`
+
+§1 left `viogpudo` as an optional second step. Done as a second PCI display
+it would have been a second monitor: `BasicDisplay` keeps the POST adapter,
+`viogpudo` gets the other one, and Windows extends the desktop across both.
+`viogpudo` itself says how it wants it: it takes the POST display over only
+from a virtio-gpu of **VGA subclass**, and maps that function's first memory
+resource as the POST framebuffer. EDK2's `QemuVideoDxe` already binds the
+same thing (`1af4:1050`, class VGA, "QEMU VirtIO VGA") as a Bochs display.
+
+`[display] adapter = "virtio-vga"` is that function. The virtio-gpu device is
+unchanged; the bus gives its function class `0300`, VRAM as BARs 0–1 (64-bit,
+prefetchable, the framebuffer's `ShmWindow`) and the virtio register file in
+BAR 3 — EDK2's logical BAR 2, where `QemuVideoDxe` looks for the Bochs page.
+The first page of that BAR **is** the Bochs page (EDID at 0, DISPI at
+`0x500`), and the six virtio regions start one page in
+(`virtio_core::pci::RegsPlacement::VGA`); the capabilities, the MSI-X table
+and every notify address (ioeventfds, kick workers) carry the offset. The
+VRAM presenter yields while the device has a scanout bound
+(`GpuDevice::scanout_flag`) and takes the display back, whole, when a reset
+or a disable drops it.
+
+`entangled install windows` now writes `virtio-vga` profiles and puts
+`viogpudo` on the answer disc. Measured: the firmware, Setup and the first
+boot draw through VRAM; on the installed system's first logon `viogpudo`
+binds the same function and the scanout becomes the window's size
+(1920×1016 in a maximised window) — one adapter, one monitor. Windows PE does
+not load the display driver from `$WinPEDriver$`, so Setup stays on
+`BasicDisplay`, which is fine. A 3D renderer is refused beside it for now:
+the shared-memory BAR would need the 64-bit pair at BARs 4–5.
+
+**Following the window at runtime** needs one more piece. On
+`VIRTIO_GPU_EVENT_DISPLAY`, `viogpudo` re-reads the display info and reports
+the monitor still connected, but nothing in the kernel driver changes the
+mode; it signals a named event for user mode instead. virtio-win's
+`viogpuap.exe` waits on that event, asks the driver for the size and applies
+it with `SetDisplayConfig` — but virtio-win 0.1.302 does not ship the service
+(`viogpusc.exe`) that is meant to start it. So the answer file copies
+`viogpuap.exe` off the answer disc into `%ProgramFiles%\Entangled` and
+starts it at every logon from `HKLM\…\Run` through `wscript`, hidden, in a
+loop that restarts it 10 s after it exits (straight at logon the driver's
+event may not exist yet). A scheduled task and a headless `conhost` were both
+tried first; neither stayed up at logon. Measured on the installed system:
+`display 1600x900`, `1280x720`, `1440x900`, `1680x1050`, `1360x850` each
+became the scanout within a second or two, across reboots, with no manual
+step. A boot with the window maximised starts at the window's size
+(3840×1972 here) because the EDID's preferred mode is the window.
+
+The firmware now finds the EDID too: the virtio regions start one page into
+the register BAR (`RegsPlacement::VGA`), the first page is the whole Bochs
+page, and `QemuVideoDxe` reports "blob found", so the GOP — and Setup, and
+`BasicDisplay` before `viogpudo` binds — come up at the profile's resolution
+instead of 1280×800.
+
+The installer VM now runs **without a network**. With one, OOBE fetched
+"zero-day" updates, restarted the machine between the unattended passes and
+stopped at "Why did my PC restart?" waiting for a click — seen once, on the
+second run. Setup needs nothing from the network; the installed profile keeps
+its `[network]`.
+
+### Amendment, 2026-10-31: snapshots of a Windows guest
+
+Two of §6's refusals are gone. The boot framebuffer (standalone or
+virtio-vga) is a `display` section in the snapshot — its DISPI registers and
+all of VRAM (16 MiB), restored after the PCI bus has put the VRAM window back
+where the restored BAR says. The emulated Hyper-V clock's three guest-written
+MSRs (`GUEST_OS_ID`, `HYPERCALL`, `REFERENCE_TSC`) ride in each vCPU's MSR
+list and are put back through the clock, guest id first, which rewrites the
+pages they name with the bytes the restored memory already holds; restoring
+them into a partition that does not emulate the clock is refused by name.
+The AHCI controller still refuses: an installed Windows has no optical drive,
+and an install is not something to suspend.
+
+Measured: the installed Windows 10 on virtio-vga with the emulated clock,
+4 GiB, 8 vCPUs — `save` wrote 808 MiB in 3.9 s (1.8 GiB of RAM in use,
+lz4); `entangled resume` brought it back to the same desktop with the same
+clock, every virtio slot restored, and the scanout presented.
+
+### Amendment, 2026-10-31: the KVM half of §2 and §3 (untested)
+
+`vmm_core::hv::KvmOptions` (additive; `Vm::new` is `new_with` the defaults)
+carries the two machine-level needs to KVM. `hyperv` puts the same Hyper-V
+leaves WHP's userspace clock answers (`vmm_core::hv::hyperv`, now shared) at
+`0x4000_0000` through `KVM_SET_CPUID2` and moves KVM's own paravirtual leaves
+to `0x4000_0100`, where Linux still finds them; KVM then serves the clock
+MSRs in the kernel. `ignore_msrs` enables `KVM_CAP_X86_USER_SPACE_MSR` for
+`KVM_MSR_EXIT_REASON_UNKNOWN`, and the run loop answers those exits as the
+module parameter would: 0 on read, writes dropped, each MSR logged once.
+This is built, linted and unit-tested on Linux, but **no Windows guest has
+run on KVM yet**: this machine's WSL has no `/dev/kvm`. A real Linux host is
+the acceptance.

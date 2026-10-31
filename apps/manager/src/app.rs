@@ -744,6 +744,17 @@ impl ManagerApp {
                     }
                 }
             }
+            ScreenshotView::WizardWindows => {
+                app.open_wizard();
+                if let Modal::Wizard(state) = &mut app.modal {
+                    state.machine.family = launcher::GuestFamily::Windows;
+                    state.machine.name = "windows-1".into();
+                    state.machine.disk_gib = state.machine.disk_gib.max(64);
+                    state.machine.memory_mib = state.machine.memory_mib.max(4096);
+                    state.machine.iso_path = r"C:\Images\Win10_22H2_English_x64.iso".into();
+                    state.machine.drivers_path = r"C:\Images\virtio-win.iso".into();
+                }
+            }
             ScreenshotView::WizardMore => {
                 app.open_wizard();
                 if let Modal::Wizard(state) = &mut app.modal {
@@ -938,6 +949,7 @@ impl ManagerApp {
                 disk_mode: launcher::DiskMode::CreateNew,
                 family: launcher::GuestFamily::default_for_host(),
                 iso_path: String::new(),
+                drivers_path: String::new(),
                 variant: self.settings.default_variant.clone(),
                 automated: true,
                 headless: self.settings.headless_install,
@@ -3160,6 +3172,9 @@ impl ManagerApp {
             (Modal::Settings(form), PickTarget::EngineBinary) => Some(&mut form.entangled_binary),
             (Modal::Settings(form), PickTarget::WorkDir) => Some(&mut form.work_dir),
             (Modal::Wizard(state), PickTarget::WizardIso) => Some(&mut state.machine.iso_path),
+            (Modal::Wizard(state), PickTarget::WizardDrivers) => {
+                Some(&mut state.machine.drivers_path)
+            }
             (Modal::Wizard(state), PickTarget::WizardDisk) => Some(&mut state.machine.disk_path),
             (Modal::MoveDisk(state), PickTarget::MoveDestination) => Some(&mut state.dest),
             (Modal::EditVm(state), target) => match target {

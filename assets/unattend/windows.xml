@@ -13,7 +13,7 @@
   The installer fills in the placeholders (each name between at signs):
     IMAGE_INDEX    the edition, as its index in install.wim/install.esd
     COMPUTER_NAME  the VM name, cut to what NetBIOS allows
-    TIMEZONE       a Windows time zone name ("UTC" unless asked otherwise)
+    TIMEZONE       a Windows time zone name (the host's, else "UTC")
     PE_COMMANDS    RunSynchronous commands for Windows PE (Windows 11's
                    hardware checks, which this machine cannot yet pass)
 
@@ -162,10 +162,20 @@
           <Order>1</Order>
           <CommandLine>powercfg /hibernate off</CommandLine>
         </SynchronousCommand>
+        <!-- The rest of the first-logon setup is a script on this disc
+             (entangled\first-logon.cmd, from assets/unattend), given the
+             disc's drive: a command line here goes through two quoting
+             languages, and the PowerShell one-liner that did this silently
+             did nothing at first logon. Today it makes the desktop follow
+             the window (viogpuap.exe; the script says how). -->
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <CommandLine>cmd /c for %d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist %d:\entangled\first-logon.cmd call %d:\entangled\first-logon.cmd %d:</CommandLine>
+        </SynchronousCommand>
         <!-- The end of the installation: an ACPI power-off the installer
              waits for. -->
         <SynchronousCommand wcm:action="add">
-          <Order>2</Order>
+          <Order>3</Order>
           <CommandLine>shutdown /s /t 5 /c "Entangled: installation finished"</CommandLine>
         </SynchronousCommand>
       </FirstLogonCommands>

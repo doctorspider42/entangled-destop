@@ -178,6 +178,11 @@ impl WhpVcpu {
         self.partition.handle()
     }
 
+    /// The partition itself, for the snapshot path's emulated clock.
+    pub(super) fn partition(&self) -> &Partition {
+        &self.partition
+    }
+
     /// Reads an arbitrary register batch. `names` and `values` must be the same
     /// length; the caller decides which union arm each value carries.
     pub(super) fn get_raw(

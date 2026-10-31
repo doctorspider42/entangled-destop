@@ -10,8 +10,8 @@
 //! format change is a change to this file and nowhere else.
 
 use machine_x86::state::{
-    MachineState, SavedAcpiPm, SavedIoApic, SavedIrqChip, SavedPciFunction, SavedPciRoot,
-    SavedPflash, SavedPic, SavedPicChip, SavedPit, SavedPitChannel, SavedPlatform,
+    MachineState, SavedAcpiPm, SavedFramebuffer, SavedIoApic, SavedIrqChip, SavedPciFunction,
+    SavedPciRoot, SavedPflash, SavedPic, SavedPicChip, SavedPit, SavedPitChannel, SavedPlatform,
     SavedResetControl, SavedRtc, SavedSerial, SavedVirtioSlot,
 };
 use virtio_core::save::{
@@ -46,6 +46,10 @@ pub const PCI_ROOT_VERSION: u32 = 1;
 pub const IRQCHIP_VERSION: u32 = 1;
 /// Version of the reset-control section's encoding.
 pub const RESET_VERSION: u32 = 1;
+/// Version of the boot-framebuffer section's encoding.
+pub const DISPLAY_VERSION: u32 = 1;
+/// DISPI registers a framebuffer may carry (it has eleven).
+const MAX_DISPLAY_REGISTERS: usize = 64;
 
 /// Queues one virtio device may have. Far above the two or three real ones.
 const MAX_QUEUES: usize = 64;
@@ -328,6 +332,34 @@ pub fn decode_acpi_pm(bytes: &[u8]) -> Result<SavedAcpiPm> {
     Ok(state)
 }
 
+// -------------------------------------------------------------- framebuffer
+
+/// Encodes the boot framebuffer: its registers, then its VRAM.
+pub fn encode_framebuffer(state: &SavedFramebuffer) -> Vec<u8> {
+    let mut w = Writer::with_capacity(16 + state.registers.len() * 2 + state.vram.len());
+    w.count(state.registers.len());
+    for register in &state.registers {
+        w.u16(*register);
+    }
+    w.blob(&state.vram);
+    w.into_bytes()
+}
+
+/// Decodes it.
+pub fn decode_framebuffer(bytes: &[u8]) -> Result<SavedFramebuffer> {
+    let mut r = Reader::new(bytes);
+    let count = r.count("framebuffer registers", MAX_DISPLAY_REGISTERS, 2)?;
+    let mut registers = Vec::with_capacity(count);
+    for _ in 0..count {
+        registers.push(r.u16("framebuffer register")?);
+    }
+    let vram = r
+        .blob("framebuffer VRAM", crate::format::MAX_SECTION_BYTES)?
+        .to_vec();
+    r.finish("display section")?;
+    Ok(SavedFramebuffer { registers, vram })
+}
+
 // ------------------------------------------------------------------- pflash
 
 /// Encodes the CFI command state machine.
@@ -591,6 +623,14 @@ pub fn encode_machine(state: &MachineState) -> Vec<(crate::SectionKind, u32, u32
     if let Some(chip) = &state.irqchip {
         out.push((K::IrqChip, IRQCHIP_VERSION, 0, encode_irqchip(chip)));
     }
+    if let Some(framebuffer) = &state.framebuffer {
+        out.push((
+            K::Display,
+            DISPLAY_VERSION,
+            0,
+            encode_framebuffer(framebuffer),
+        ));
+    }
     for slot in &state.virtio {
         out.push((
             K::Virtio,
@@ -638,6 +678,9 @@ pub fn decode_machine<R: std::io::Read + std::io::Seek + std::fmt::Debug>(
     let irqchip = optional(reader, K::IrqChip, IRQCHIP_VERSION)?
         .map(|bytes| decode_irqchip(&bytes))
         .transpose()?;
+    let framebuffer = optional(reader, K::Display, DISPLAY_VERSION)?
+        .map(|bytes| decode_framebuffer(&bytes))
+        .transpose()?;
 
     let mut virtio = Vec::new();
     for slot in reader.instances(K::Virtio) {
@@ -658,6 +701,7 @@ pub fn decode_machine<R: std::io::Read + std::io::Seek + std::fmt::Debug>(
         pci_root,
         irqchip,
         virtio,
+        framebuffer,
     })
 }
 
@@ -816,6 +860,10 @@ mod tests {
                 slot: 0,
                 state: sample_virtio(),
             }],
+            framebuffer: Some(SavedFramebuffer {
+                registers: vec![0xb0c5, 1920, 1080, 32, 0x41, 0, 1920, 2184, 0, 0, 256],
+                vram: (0..4096u32).map(|i| i as u8).collect(),
+            }),
         }
     }
 
@@ -868,6 +916,14 @@ mod tests {
         assert_eq!(decode_pci_root(&encode_pci_root(&pci)).unwrap(), pci);
         let chip = machine.irqchip.clone().unwrap();
         assert_eq!(decode_irqchip(&encode_irqchip(&chip)).unwrap(), chip);
+        let framebuffer = machine.framebuffer.clone().unwrap();
+        assert_eq!(
+            decode_framebuffer(&encode_framebuffer(&framebuffer)).unwrap(),
+            framebuffer
+        );
+        let mut truncated = encode_framebuffer(&framebuffer);
+        truncated.truncate(truncated.len() - 1);
+        assert!(decode_framebuffer(&truncated).is_err());
     }
 
     /// The half-written PIT reload and the latched count are `Option`s, and an

@@ -80,6 +80,8 @@ enum ScreenshotView {
     Machine,
     Wizard,
     WizardFedora,
+    /// The system step with Windows chosen and both images filled in.
+    WizardWindows,
     WizardIso,
     WizardIsoReview,
     /// The wizard's sizing step with "More options" open: taller than a laptop

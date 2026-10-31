@@ -415,6 +415,9 @@ struct BuiltDevices {
     /// (ADR-0004, zero-copy presentation): the Venus executor on a Windows
     /// host, unless [`virtio_gpu::SCANOUT_PATH_ENV`] asked for the copy path.
     shares_scanout: bool,
+    /// The virtio-gpu's "scanout bound" flag, for a VGA framebuffer on the
+    /// same function to yield to (`adapter = "virtio-vga"`).
+    gpu_scanout: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// One virtio-blk device per `[[disk]]` entry, the configured network backend,
@@ -559,6 +562,7 @@ fn build_devices(
     // no Vulkan at all — so a guest that gets a reply from us gets nothing and
     // waits. It is how the protocol is studied, never a thing a profile should
     // be able to ask for by accident. The precedent is `ENTANGLED_GPU_FENCES`.
+    let mut gpu_scanout = None;
     if cfg.display.adapter == control_api::DisplayAdapter::Framebuffer {
         // No virtio-gpu: the boot framebuffer is the display (ADR-0008 §1),
         // attached by the machine after the virtio functions and presented
@@ -748,6 +752,9 @@ fn build_devices(
         let mut gpu = virtio_gpu::GpuDevice::new(display_handle);
         gpu.set_refresh_hz(cfg.display.refresh_hz);
         gpu.set_frame_stats(cfg.display.frame_stats.clone());
+        if cfg.display.adapter == control_api::DisplayAdapter::VirtioVga {
+            gpu_scanout = Some(gpu.scanout_flag());
+        }
         devices.push(Box::new(gpu));
     }
 
@@ -867,6 +874,7 @@ fn build_devices(
         devices,
         net_cmdline,
         shares_scanout,
+        gpu_scanout,
     })
 }
 
@@ -1069,7 +1077,7 @@ fn spawn_control_channel(
                 // the writer at the other end of the pipe and the reader here
                 // cannot drift apart.
                 use control_api::control::{
-                    CMD_DISPLAY, CMD_PASTE, CMD_PAUSE, CMD_RESET, CMD_RESUME, CMD_SAVE,
+                    CMD_CHORD, CMD_DISPLAY, CMD_PASTE, CMD_PAUSE, CMD_RESET, CMD_RESUME, CMD_SAVE,
                     CMD_SHUTDOWN, CMD_STATUS, CMD_THUMBNAIL, CMD_TYPE,
                 };
                 match command {
@@ -1091,6 +1099,11 @@ fn spawn_control_channel(
                             }
                         }
                     }
+                    CMD_CHORD => match virtio_input::typing::parse_chord(argument) {
+                        Some(keys) if typist.chord(&keys) => {}
+                        Some(_) => println!("{CONTROL_PREFIX} error chord: the keyboard is busy"),
+                        None => println!("{CONTROL_PREFIX} error chord {argument}: unknown key"),
+                    },
                     CMD_PASTE => {
                         // `\n` in the argument is a newline: the channel is one
                         // line per command.
@@ -1536,6 +1549,7 @@ pub fn run_with(
     if built.shares_scanout {
         share_scanout(&mut presentation, cfg.display.gpu_boost);
     }
+    let gpu_scanout = built.gpu_scanout.clone();
 
     // The debug screenshot timer (--screenshot-after). Detached on purpose:
     // waiting for it would hold a finished VM open for the rest of the timer.
@@ -1606,6 +1620,7 @@ pub fn run_with(
                 display_handle.clone(),
                 Arc::clone(&quiesce),
                 cfg.display.refresh_hz,
+                gpu_scanout,
             )
             .map_err(|e| format!("cannot start the framebuffer presenter: {e}"))?,
         ),
@@ -2463,13 +2478,6 @@ mod host {
             lifecycle,
             restore,
         } = request;
-        if cfg.hyperv_enlightenments {
-            // KVM implements them in the kernel (KVM_CAP_HYPERV_*); wiring
-            // that up is ADR-0008 §2's KVM half, not done yet.
-            tracing::warn!(
-                "hyperv_enlightenments is not implemented on KVM yet; the guest gets none"
-            );
-        }
         // The VM's pause gate (ADR-0005), created before the devices so every
         // worker thread that is about to be spawned can be handed it.
         let quiesce = virtio_core::Quiesce::new();
@@ -2477,7 +2485,14 @@ mod host {
             quiesce.pause();
         }
         let hv = Hypervisor::open().map_err(|e| e.to_string())?;
-        let mut vm = Vm::new(&hv, machine).map_err(|e| e.to_string())?;
+        // A Windows guest's two machine-level needs (ADR-0008): KVM serves
+        // the Hyper-V clock MSRs in the kernel once the CPUID leaves say
+        // Hyper-V, and the MSRs it does not know come to userspace.
+        let options = vmm_core::hv::KvmOptions {
+            ignore_msrs: cfg.ignore_msrs,
+            hyperv: cfg.hyperv_enlightenments,
+        };
+        let mut vm = Vm::new_with(&hv, machine, options).map_err(|e| e.to_string())?;
 
         // A restored VM writes **none** of the firmware tables. They are
         // already in the snapshot's guest memory, byte for byte as the running

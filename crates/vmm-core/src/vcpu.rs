@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
+use kvm_bindings::CpuId;
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use vmm_sys_util::signal::{register_signal_handler, Killable};
 
@@ -67,9 +68,12 @@ pub struct Vcpu {
 }
 
 impl Vcpu {
-    pub(crate) fn new(vm: &VmFd, kvm: &Kvm, index: u32) -> Result<Self, VmmError> {
+    pub(crate) fn new(vm: &VmFd, kvm: &Kvm, index: u32, hyperv: bool) -> Result<Self, VmmError> {
         let fd = vm.create_vcpu(u64::from(index))?;
         let mut cpuid = kvm.get_supported_cpuid(256)?;
+        if hyperv {
+            cpuid = with_hyperv_leaves(&cpuid)?;
+        }
         for entry in cpuid.as_mut_slice() {
             match entry.function {
                 // Leaf 1: ECX bit 31 tells the guest it runs under a
@@ -132,6 +136,61 @@ impl Vcpu {
             .map(|state| crate::snapshot_kvm::mp_state_from_kvm(state.mp_state))
             .map_err(|e| HvError::Registers(format!("KVM_GET_MP_STATE: {e}")))
     }
+}
+
+/// Notes an MSR KVM handed over because it does not know it
+/// ([`crate::hv::KvmOptions::ignore_msrs`]); the caller has already made the
+/// read 0 or dropped the write. Logged the first time each vCPU sees it.
+fn note_ignored_msr(
+    vcpu: u32,
+    msr: u32,
+    write: Option<u64>,
+    seen: &mut std::collections::BTreeSet<(u32, bool)>,
+) {
+    if seen.insert((msr, write.is_some())) {
+        tracing::warn!(
+            vcpu,
+            msr = format_args!("{msr:#x}"),
+            write = ?write,
+            "guest touched an MSR KVM does not implement; ignoring it"
+        );
+    }
+}
+
+/// `cpuid` with the Hyper-V clock leaves at `0x4000_0000` and KVM's own
+/// paravirtual leaves moved up to `0x4000_0100`, where Linux still finds
+/// them (it scans the hypervisor range in steps of `0x100`) and Windows,
+/// which only looks at `0x4000_0000`, sees Hyper-V.
+fn with_hyperv_leaves(cpuid: &CpuId) -> Result<CpuId, VmmError> {
+    let mut entries: Vec<kvm_bindings::kvm_cpuid_entry2> = Vec::new();
+    for entry in cpuid.as_slice() {
+        match entry.function {
+            0x4000_0000..=0x4000_00ff => {
+                let mut moved = *entry;
+                moved.function += 0x100;
+                if entry.function == 0x4000_0000 {
+                    // Its EAX is the highest KVM leaf, which moved too.
+                    moved.eax = moved.eax.max(0x4000_0001) + 0x100;
+                }
+                entries.push(moved);
+            }
+            _ => entries.push(*entry),
+        }
+    }
+    for (function, [eax, ebx, ecx, edx]) in crate::hv::hyperv::clock_leaves() {
+        entries.push(kvm_bindings::kvm_cpuid_entry2 {
+            function,
+            eax,
+            ebx,
+            ecx,
+            edx,
+            ..Default::default()
+        });
+    }
+    CpuId::from_entries(&entries).map_err(|e| VmmError::Vcpu {
+        index: 0,
+        message: format!("cannot build the Hyper-V CPUID leaves: {e:?}"),
+    })
 }
 
 // ---- hypervisor-neutral register access (WHP-1701, ADR-0002) --------------
@@ -319,6 +378,7 @@ impl Vcpu {
             index: index as usize,
             message,
         };
+        let mut msrs_seen = std::collections::BTreeSet::new();
         while running.load(Ordering::Acquire) {
             if let Some(lifecycle) = lifecycle {
                 if lifecycle.attention() {
@@ -420,6 +480,17 @@ impl Vcpu {
                 Ok(VcpuExit::InternalError) => {
                     return Err(fail("KVM_EXIT_INTERNAL_ERROR".into()));
                 }
+                // Only reached with `KvmOptions::ignore_msrs`, which asked for
+                // the MSRs KVM does not know and nothing else.
+                Ok(VcpuExit::X86Rdmsr(exit)) => {
+                    *exit.data = 0;
+                    *exit.error = 0;
+                    note_ignored_msr(index, exit.index, None, &mut msrs_seen);
+                }
+                Ok(VcpuExit::X86Wrmsr(exit)) => {
+                    *exit.error = 0;
+                    note_ignored_msr(index, exit.index, Some(exit.data), &mut msrs_seen);
+                }
                 Ok(exit) => return Err(fail(format!("unhandled VM exit: {exit:?}"))),
                 // Kicked by the stop signal (or spurious wakeup): re-check
                 // the running flag and continue.
@@ -491,6 +562,13 @@ impl Vcpu {
                 Ok(VcpuExit::IoIn(port, data)) => handler.io_in(port, data),
                 Ok(VcpuExit::MmioWrite(addr, data)) => handler.mmio_write(addr, data),
                 Ok(VcpuExit::MmioRead(addr, data)) => handler.mmio_read(addr, data),
+                // An ignored MSR completes on the next entry with what is
+                // written here, so it is answered like the run loop does.
+                Ok(VcpuExit::X86Rdmsr(exit)) => {
+                    *exit.data = 0;
+                    *exit.error = 0;
+                }
+                Ok(VcpuExit::X86Wrmsr(exit)) => *exit.error = 0,
                 // Anything else (a halt, a shutdown) is not a pending
                 // completion; leave it for the run loop to see again.
                 Ok(_) => break,
@@ -985,4 +1063,49 @@ fn ensure_kick_signal_handler() -> Result<(), VmmError> {
             index: 0,
             message: format!("failed to register vCPU kick signal handler (errno {code})"),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(function: u32, eax: u32) -> kvm_bindings::kvm_cpuid_entry2 {
+        kvm_bindings::kvm_cpuid_entry2 {
+            function,
+            eax,
+            ..Default::default()
+        }
+    }
+
+    /// Hyper-V takes `0x4000_0000`; KVM's leaves survive one block up, with
+    /// their highest-leaf word following them.
+    #[test]
+    fn the_hyperv_leaves_go_first_and_kvms_move_up() {
+        let host = CpuId::from_entries(&[
+            entry(0, 0x10),
+            entry(0x4000_0000, 0x4000_0001),
+            entry(0x4000_0001, 0x1234),
+        ])
+        .unwrap();
+        let cpuid = with_hyperv_leaves(&host).unwrap();
+        let find = |function: u32| {
+            cpuid
+                .as_slice()
+                .iter()
+                .find(|e| e.function == function)
+                .copied()
+        };
+        assert_eq!(find(0).unwrap().eax, 0x10);
+        assert_eq!(find(0x4000_0000).unwrap().eax, crate::hv::hyperv::MAX_LEAF);
+        assert_eq!(find(0x4000_0100).unwrap().eax, 0x4000_0101);
+        assert_eq!(find(0x4000_0101).unwrap().eax, 0x1234);
+        assert_eq!(
+            cpuid
+                .as_slice()
+                .iter()
+                .filter(|e| e.function == 0x4000_0000)
+                .count(),
+            1
+        );
+    }
 }

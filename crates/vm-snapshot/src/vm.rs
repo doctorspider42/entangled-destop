@@ -592,6 +592,7 @@ mod tests {
             SectionKind::ResetControl => 12,
             SectionKind::HostIrqChip => 13,
             SectionKind::Gpu => 14,
+            SectionKind::Display => 15,
         }
     }
 

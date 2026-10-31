@@ -319,8 +319,44 @@ impl Typist {
     }
 }
 
+/// The key codes of a chord written as words, `ctrl alt t` or `super r`:
+/// modifiers and a few named keys by name, anything else one character
+/// [`key_for`] knows. `None` for an unknown word, an empty chord or one of
+/// more than eight keys.
+pub fn parse_chord(chord: &str) -> Option<Vec<u16>> {
+    let keys = chord
+        .split_whitespace()
+        .take(9)
+        .map(|key| match key {
+            "ctrl" => Some(29),
+            "alt" => Some(56),
+            "shift" => Some(42),
+            "super" | "win" => Some(125),
+            "enter" => Some(28),
+            "escape" => Some(1),
+            "tab" => Some(15),
+            letter if letter.chars().count() == 1 => letter
+                .chars()
+                .next()
+                .and_then(key_for)
+                .map(|(code, _)| code),
+            _ => None,
+        })
+        .collect::<Option<Vec<u16>>>()?;
+    (!keys.is_empty() && keys.len() <= 8).then_some(keys)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chords_parse_from_words() {
+        assert_eq!(parse_chord("super r"), Some(vec![125, 19]));
+        assert_eq!(parse_chord("ctrl alt t"), Some(vec![29, 56, 20]));
+        assert_eq!(parse_chord(""), None);
+        assert_eq!(parse_chord("hyper r"), None);
+        assert_eq!(parse_chord("a b c d e f g h i"), None);
+    }
+
     use super::*;
 
     fn keys(text: &str) -> Vec<(u16, u32)> {

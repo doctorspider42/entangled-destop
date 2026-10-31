@@ -34,6 +34,8 @@ use crate::{install, InstallArgs};
 
 /// The answer file, compiled in so the command works from anywhere.
 const TEMPLATE: &str = include_str!("../../../assets/unattend/windows.xml");
+/// The first-logon setup script, run from the answer disc (see the template).
+const FIRST_LOGON: &str = include_str!("../../../assets/unattend/first-logon.cmd");
 
 /// The WIM header's magic.
 const WIM_MAGIC: &[u8; 8] = b"MSWIM\0\0\0";
@@ -52,10 +54,13 @@ const WINDOWS_11_BUILD: u32 = 22000;
 const MAX_DRIVER_FILE: u64 = 64 << 20;
 /// The virtio-win drivers the answer disc carries, and whether the install
 /// cannot work without them: the disk's and the network's are what Setup and
-/// the first boot need; the rest make the installed system whole.
+/// the first boot need; the rest make the installed system whole —
+/// `viogpudo` among them, which takes the virtio-vga display over from
+/// `BasicDisplay` and lets the desktop follow the window.
 const DRIVERS: &[(&str, bool)] = &[
     ("viostor", true),
     ("NetKVM", true),
+    ("viogpudo", false),
     ("vioinput", false),
     ("Balloon", false),
     ("vioserial", false),
@@ -264,7 +269,9 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
         optical: vec![],
         network: net.machine_section(&name, &target),
         display: DisplaySection {
-            adapter: DisplayAdapter::Framebuffer,
+            // One adapter for the firmware, Setup and the installed system:
+            // `BasicDisplay` draws into its VRAM until `viogpudo` binds it.
+            adapter: DisplayAdapter::VirtioVga,
             refresh_hz: install::installed_refresh_hz_here(args),
             ..Default::default()
         },
@@ -280,6 +287,11 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
         hyperv_enlightenments: true,
     };
     let mut install = installed.clone();
+    // Offline: Setup needs nothing from the network, and with it OOBE
+    // fetches "zero-day" updates, restarts in the middle of the unattended
+    // passes and stops at "Why did my PC restart?" waiting for a click.
+    // The installed machine gets its network back.
+    install.network = None;
     install.optical = vec![
         OpticalSection { path: iso },
         OpticalSection {
@@ -345,6 +357,8 @@ fn answer_disc(
         answer_file(&image, computer_name, timezone).into_bytes(),
     )
     .map_err(|e| e.to_string())?;
+    disc.add_file("entangled/first-logon.cmd", crlf(FIRST_LOGON))
+        .map_err(|e| e.to_string())?;
     let mut virtio = optical::open(drivers_iso).map_err(|e| e.to_string())?;
     for (path, data) in driver_files(virtio.as_mut(), image.is_windows_11())
         .map_err(|e| format!("{}: {e}", drivers_iso.display()))?
@@ -353,6 +367,14 @@ fn answer_disc(
             .map_err(|e| e.to_string())?;
     }
     Ok((disc.build(), image))
+}
+
+/// `text` with CRLF line ends, whatever the checkout gave it: `cmd` reads a
+/// batch file with LF ends wrongly (labels and `goto` misfire).
+fn crlf(text: &str) -> Vec<u8> {
+    text.replace("\r\n", "\n")
+        .replace('\n', "\r\n")
+        .into_bytes()
 }
 
 /// The images listed in the Windows ISO's `install.wim` or `install.esd`.
@@ -555,13 +577,123 @@ fn computer_name(vm: &str) -> String {
 }
 
 /// The Windows time zone the guest gets: `ENTANGLED_WIN_TIMEZONE` when set
-/// (a Windows name, such as `Central European Standard Time`), else UTC.
+/// (a Windows name, such as `Central European Standard Time`), else the
+/// host's own, else UTC.
 fn timezone() -> String {
     std::env::var("ENTANGLED_WIN_TIMEZONE")
         .ok()
         .filter(|tz| !tz.trim().is_empty())
+        .or_else(host_timezone)
         .unwrap_or_else(|| "UTC".into())
 }
+
+/// This host's time zone as a Windows time zone name: what `tzutil /g`
+/// says on Windows.
+#[cfg(windows)]
+fn host_timezone() -> Option<String> {
+    let out = std::process::Command::new("tzutil")
+        .arg("/g")
+        .output()
+        .ok()?;
+    let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    // A name, not an error message: letters, digits, spaces and the
+    // punctuation Windows' names use.
+    let plausible = out.status.success()
+        && !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " ()+-.".contains(c));
+    plausible.then_some(name)
+}
+
+/// This host's IANA zone (`/etc/localtime`'s target, or `/etc/timezone`),
+/// mapped to Windows' name for it where [`IANA_TO_WINDOWS`] knows it.
+#[cfg(not(windows))]
+fn host_timezone() -> Option<String> {
+    let iana = std::fs::read_link("/etc/localtime")
+        .ok()
+        .and_then(|target| {
+            let target = target.to_string_lossy().into_owned();
+            target
+                .split_once("zoneinfo/")
+                .map(|(_, zone)| zone.to_string())
+        })
+        .or_else(|| {
+            std::fs::read_to_string("/etc/timezone")
+                .ok()
+                .map(|zone| zone.trim().to_string())
+        })?;
+    windows_zone_for(&iana).map(str::to_string)
+}
+
+/// The Windows name of an IANA zone, for the zones people are most likely
+/// to be in (CLDR's `windowsZones`, abridged). An unknown zone is `None`,
+/// and the guest gets UTC.
+#[cfg_attr(windows, allow(dead_code))]
+fn windows_zone_for(iana: &str) -> Option<&'static str> {
+    IANA_TO_WINDOWS
+        .iter()
+        .find(|(zone, _)| *zone == iana)
+        .map(|(_, windows)| *windows)
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+const IANA_TO_WINDOWS: &[(&str, &str)] = &[
+    ("Etc/UTC", "UTC"),
+    ("UTC", "UTC"),
+    ("Europe/London", "GMT Standard Time"),
+    ("Europe/Dublin", "GMT Standard Time"),
+    ("Europe/Lisbon", "GMT Standard Time"),
+    ("Europe/Warsaw", "Central European Standard Time"),
+    ("Europe/Prague", "Central Europe Standard Time"),
+    ("Europe/Budapest", "Central Europe Standard Time"),
+    ("Europe/Bratislava", "Central Europe Standard Time"),
+    ("Europe/Berlin", "W. Europe Standard Time"),
+    ("Europe/Amsterdam", "W. Europe Standard Time"),
+    ("Europe/Rome", "W. Europe Standard Time"),
+    ("Europe/Vienna", "W. Europe Standard Time"),
+    ("Europe/Zurich", "W. Europe Standard Time"),
+    ("Europe/Stockholm", "W. Europe Standard Time"),
+    ("Europe/Oslo", "W. Europe Standard Time"),
+    ("Europe/Paris", "Romance Standard Time"),
+    ("Europe/Madrid", "Romance Standard Time"),
+    ("Europe/Brussels", "Romance Standard Time"),
+    ("Europe/Copenhagen", "Romance Standard Time"),
+    ("Europe/Helsinki", "FLE Standard Time"),
+    ("Europe/Kiev", "FLE Standard Time"),
+    ("Europe/Kyiv", "FLE Standard Time"),
+    ("Europe/Vilnius", "FLE Standard Time"),
+    ("Europe/Riga", "FLE Standard Time"),
+    ("Europe/Tallinn", "FLE Standard Time"),
+    ("Europe/Athens", "GTB Standard Time"),
+    ("Europe/Bucharest", "GTB Standard Time"),
+    ("Europe/Istanbul", "Turkey Standard Time"),
+    ("Europe/Moscow", "Russian Standard Time"),
+    ("America/New_York", "Eastern Standard Time"),
+    ("America/Toronto", "Eastern Standard Time"),
+    ("America/Chicago", "Central Standard Time"),
+    ("America/Denver", "Mountain Standard Time"),
+    ("America/Phoenix", "US Mountain Standard Time"),
+    ("America/Los_Angeles", "Pacific Standard Time"),
+    ("America/Vancouver", "Pacific Standard Time"),
+    ("America/Anchorage", "Alaskan Standard Time"),
+    ("Pacific/Honolulu", "Hawaiian Standard Time"),
+    ("America/Sao_Paulo", "E. South America Standard Time"),
+    ("America/Mexico_City", "Central Standard Time (Mexico)"),
+    ("Asia/Tokyo", "Tokyo Standard Time"),
+    ("Asia/Seoul", "Korea Standard Time"),
+    ("Asia/Shanghai", "China Standard Time"),
+    ("Asia/Hong_Kong", "China Standard Time"),
+    ("Asia/Singapore", "Singapore Standard Time"),
+    ("Asia/Kolkata", "India Standard Time"),
+    ("Asia/Dubai", "Arabian Standard Time"),
+    ("Asia/Jerusalem", "Israel Standard Time"),
+    ("Australia/Sydney", "AUS Eastern Standard Time"),
+    ("Australia/Melbourne", "AUS Eastern Standard Time"),
+    ("Australia/Perth", "W. Australia Standard Time"),
+    ("Pacific/Auckland", "New Zealand Standard Time"),
+];
 
 /// Presses a key at the disc's "boot from CD" prompt — once. After Setup's
 /// first restart the firmware boots Windows Boot Manager from the disk, and
@@ -586,6 +718,20 @@ impl BootKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iana_zones_map_to_windows_names() {
+        assert_eq!(
+            windows_zone_for("Europe/Warsaw"),
+            Some("Central European Standard Time")
+        );
+        assert_eq!(windows_zone_for("Etc/UTC"), Some("UTC"));
+        assert_eq!(windows_zone_for("Mars/Olympus_Mons"), None);
+        for (iana, windows) in IANA_TO_WINDOWS {
+            assert!(iana.contains('/') || *iana == "UTC", "{iana}");
+            assert!(!windows.is_empty() && windows.len() <= 64, "{windows}");
+        }
+    }
 
     const XML: &str = "<WIM><TOTALBYTES>1</TOTALBYTES>\
         <IMAGE INDEX=\"1\"><NAME>Windows 10 Home</NAME><WINDOWS><ARCH>9</ARCH>\
@@ -629,7 +775,14 @@ mod tests {
     fn the_answer_file_is_filled_in_and_windows_11_skips_its_hardware_checks() {
         let mut image = parse_wim_xml(XML).remove(1);
         let ten = answer_file(&image, "WIN10", "Central European Standard Time");
-        assert!(!ten.contains('@'), "an unfilled placeholder");
+        for placeholder in [
+            "@IMAGE_INDEX@",
+            "@COMPUTER_NAME@",
+            "@TIMEZONE@",
+            "@PE_COMMANDS@",
+        ] {
+            assert!(!ten.contains(placeholder), "{placeholder} left unfilled");
+        }
         assert!(ten.contains("<Value>6</Value>"));
         assert!(ten.contains("<ComputerName>WIN10</ComputerName>"));
         assert!(ten.contains("<TimeZone>Central European Standard Time</TimeZone>"));
@@ -705,10 +858,19 @@ mod tests {
                 "$WinPEDriver$/vioinput/vioinput.inf",
                 "$WinPEDriver$/viostor/viostor.inf",
                 "Autounattend.xml",
+                "entangled/first-logon.cmd",
             ]
         );
         let inf = &files[2].1;
         assert_eq!(answers.read_file(&inf.file, 16).unwrap(), b"w10");
+        let script = answers.read_file(&files[4].1.file, 1 << 20).unwrap();
+        let script = String::from_utf8(script).unwrap();
+        assert!(script.contains("viogpuap.exe"));
+        assert_eq!(
+            script.matches('\n').count(),
+            script.matches("\r\n").count(),
+            "CRLF throughout"
+        );
         let xml = answers.read_file(&files[3].1.file, 1 << 20).unwrap();
         assert!(String::from_utf8(xml).unwrap().contains("<Value>6</Value>"));
 

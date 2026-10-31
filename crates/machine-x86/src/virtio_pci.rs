@@ -246,6 +246,10 @@ pub struct VirtioPciSlot {
     pub device_number: u8,
     /// Guest physical base of the device's BAR window, as the host assigned it.
     pub bar_base: u64,
+    /// Which BAR register that window is, and where the virtio regions start
+    /// in it: [`vpci::RegsPlacement::PLAIN`], or `VGA` on a virtio-vga
+    /// function.
+    pub regs: vpci::RegsPlacement,
     /// GSI the device's INTx line is wired to. Still wired under MSI-X: it is the
     /// fallback the driver starts on and returns to.
     pub irq: u32,
@@ -329,6 +333,11 @@ pub struct FramebufferSlot {
     window: Arc<crate::shm::ShmWindow>,
     /// The token [`PciRoot`] knows this function by.
     owner: usize,
+    /// Part of the virtio-gpu function `owner` (virtio-vga) rather than a
+    /// function of its own: its register page is then
+    /// [`crate::framebuffer::VGA_WINDOW`] of that function's register BAR,
+    /// and `regs_base` is that BAR's.
+    embedded: bool,
 }
 
 /// One function's host-neutral pieces, built by [`VirtioPciBus::attach_function`]
@@ -339,6 +348,38 @@ struct BuiltFunction {
     device_type: virtio_core::DeviceType,
     transport: Arc<Mutex<PciTransport>>,
     shm: Option<Arc<crate::shm::ShmWindow>>,
+    regs: vpci::RegsPlacement,
+    /// The display half of a virtio-vga function.
+    vga: Option<FramebufferSlot>,
+}
+
+/// VRAM for a boot framebuffer: host pages placed in the 64-bit aperture,
+/// and the device over them.
+struct BackedVram {
+    window: Arc<crate::shm::ShmWindow>,
+    device: Framebuffer,
+    base: u64,
+}
+
+/// A second use of an optional aperture borrow.
+fn reborrow<'a, 'b, 'c>(
+    shm: &'a mut Option<(&'b ShmSupport<'c>, &mut layout::Mmio64Allocator)>,
+) -> Option<(&'b ShmSupport<'c>, &'a mut layout::Mmio64Allocator)> {
+    shm.as_mut()
+        .map(|(support, aperture)| (*support, &mut **aperture))
+}
+
+/// Hands `config` to the first virtio-gpu among the devices when the VGA
+/// display is to live on it, and to nothing else.
+fn vga_for(
+    vga: &mut Option<FramebufferConfig>,
+    device: &dyn VirtioDevice,
+) -> Option<FramebufferConfig> {
+    if device.device_type() == virtio_core::DeviceType::Gpu {
+        vga.take()
+    } else {
+        None
+    }
 }
 
 impl VirtioPciBus {
@@ -459,6 +500,10 @@ impl VirtioPciBus {
         let mut apertures = shm
             .as_ref()
             .map(|s| layout::Mmio64Allocator::for_guest(s.mem_bytes));
+        let (mut vga, framebuffer) = match framebuffer {
+            Some(config) if config.on_virtio_gpu => (Some(config), None),
+            standalone => (None, standalone),
+        };
         for (slot, mut device) in devices.into_iter().enumerate() {
             let bar_base = layout::pci_bar_slot(slot as u64);
             // Not `first + slot`: the pins that skips are ones this machine's own
@@ -478,6 +523,7 @@ impl VirtioPciBus {
             let waker = virtio_core::DeferredWaker::new();
             device.set_host_waker(Arc::clone(&waker) as Arc<dyn virtio_core::HostWaker>);
 
+            let vga_config = vga_for(&mut vga, device.as_ref());
             let built = bus.attach_function(
                 slot,
                 device,
@@ -487,13 +533,14 @@ impl VirtioPciBus {
                 bar_base,
                 gsi,
                 shm.as_ref().zip(apertures.as_mut()),
+                vga_config,
             )?;
 
             let notifier = if mode.is_offloaded() {
                 // Every queue has its own notification address, so the offload
                 // needs no datamatch (see `crate::notify`).
                 let addressing = NotifyAddressing::PerQueue {
-                    base: bar_base.saturating_add(vpci::NOTIFY_CFG_OFFSET),
+                    base: bar_base.saturating_add(built.regs.queue_notify_offset(0)),
                     stride: u64::from(vpci::NOTIFY_OFF_MULTIPLIER),
                 };
                 DeviceNotifier::attach(Arc::clone(&vm), slot, addressing, &built.transport)?
@@ -517,12 +564,21 @@ impl VirtioPciBus {
             bus.slots.push(VirtioPciSlot {
                 device_number: built.device_number,
                 bar_base,
+                regs: built.regs,
                 irq: gsi,
                 msix_vectors: built.msix_vectors,
                 transport: built.transport,
                 notifier,
                 kicks: None,
                 shm: built.shm,
+            });
+            if built.vga.is_some() {
+                bus.framebuffer = built.vga;
+            }
+        }
+        if vga.is_some() {
+            return Err(VirtioPciAttachError::Framebuffer {
+                reason: "a VGA display on virtio-gpu needs a virtio-gpu device".into(),
             });
         }
         if let Some(config) = framebuffer {
@@ -615,6 +671,10 @@ impl VirtioPciBus {
         let mut apertures = shm
             .as_ref()
             .map(|s| layout::Mmio64Allocator::for_guest(s.mem_bytes));
+        let (mut vga, framebuffer) = match framebuffer {
+            Some(config) if config.on_virtio_gpu => (Some(config), None),
+            standalone => (None, standalone),
+        };
         for (slot, mut device) in devices.into_iter().enumerate() {
             let bar_base = layout::pci_bar_slot(slot as u64);
             let gsi = layout::virtio_irq(slot).ok_or(VirtioPciAttachError::Bus {
@@ -628,6 +688,7 @@ impl VirtioPciBus {
             // path's `DeferredWaker`; a wake before the thread starts is kept.
             device.set_host_waker(host_wake.waker(slot));
 
+            let vga_config = vga_for(&mut vga, device.as_ref());
             let built = bus.attach_function(
                 slot,
                 device,
@@ -637,6 +698,7 @@ impl VirtioPciBus {
                 bar_base,
                 gsi,
                 shm.as_ref().zip(apertures.as_mut()),
+                vga_config,
             )?;
             tracing::info!(
                 slot,
@@ -650,6 +712,7 @@ impl VirtioPciBus {
             bus.slots.push(VirtioPciSlot {
                 device_number: built.device_number,
                 bar_base,
+                regs: built.regs,
                 irq: gsi,
                 msix_vectors: built.msix_vectors,
                 transport: built.transport,
@@ -658,9 +721,17 @@ impl VirtioPciBus {
                 kicks: None,
                 shm: built.shm,
             });
+            if built.vga.is_some() {
+                bus.framebuffer = built.vga;
+            }
         }
         host_wake.start(bus.slots.iter().map(|s| Arc::clone(&s.transport)).collect());
         bus.host_wake = Some(host_wake);
+        if vga.is_some() {
+            return Err(VirtioPciAttachError::Framebuffer {
+                reason: "a VGA display on virtio-gpu needs a virtio-gpu device".into(),
+            });
+        }
         if let Some(config) = framebuffer {
             bus.attach_framebuffer(&config, shm.as_ref().zip(apertures.as_mut()))?;
         }
@@ -679,36 +750,20 @@ impl VirtioPciBus {
         config: &FramebufferConfig,
         shm: Option<(&ShmSupport<'_>, &mut layout::Mmio64Allocator)>,
     ) -> Result<(), VirtioPciAttachError> {
-        let fail = |reason: String| VirtioPciAttachError::Framebuffer { reason };
         let bus_error = |source| VirtioPciAttachError::Bus {
             slot: self.slots.len(),
             source,
         };
-        Framebuffer::validate(config).map_err(|e| fail(e.to_string()))?;
         let owner = self.slots.len();
         if owner as u64 >= layout::PCI_MMIO_SLOTS {
             return Err(bus_error(PciError::BusFull));
         }
-        let (support, aperture) =
-            shm.ok_or_else(|| fail("this machine cannot back VRAM with host memory".into()))?;
+        let BackedVram {
+            window,
+            device,
+            base: vram_base,
+        } = Self::back_vram(config, shm)?;
         let vram_bytes = config.vram_bytes;
-        let vram_base = aperture
-            .allocate(vram_bytes)
-            .ok_or_else(|| fail("the 64-bit MMIO aperture has no room for VRAM".into()))?;
-        let pages = (support.allocate)(vram_bytes, false)
-            .map_err(|e| fail(format!("cannot allocate VRAM: {e}")))?;
-        let placements = vec![vpci::ShmPlacement {
-            id: 0,
-            offset: 0,
-            len: vram_bytes,
-        }];
-        let window =
-            crate::shm::ShmWindow::new(pages, vram_bytes, placements, vram_base, support.mem_bytes)
-                .map_err(|e| fail(e.to_string()))?;
-        let backing = window
-            .backing_for(0)
-            .ok_or_else(|| fail("the VRAM window has no region".into()))?;
-        let device = Framebuffer::new(config, backing).map_err(|e| fail(e.to_string()))?;
         let regs_base = layout::pci_bar_slot(owner as u64);
         let regs_base32 = u32::try_from(regs_base).map_err(|_| bus_error(PciError::BusFull))?;
         let space =
@@ -730,10 +785,46 @@ impl VirtioPciBus {
             device_number,
             regs_base,
             device: Arc::new(device),
-            window: Arc::new(window),
+            window,
             owner,
+            embedded: false,
         });
         Ok(())
+    }
+
+    /// Allocates and places a framebuffer's VRAM (see
+    /// [`Self::attach_framebuffer`] for why its absence fails the attach).
+    fn back_vram(
+        config: &FramebufferConfig,
+        shm: Option<(&ShmSupport<'_>, &mut layout::Mmio64Allocator)>,
+    ) -> Result<BackedVram, VirtioPciAttachError> {
+        let fail = |reason: String| VirtioPciAttachError::Framebuffer { reason };
+        Framebuffer::validate(config).map_err(|e| fail(e.to_string()))?;
+        let (support, aperture) =
+            shm.ok_or_else(|| fail("this machine cannot back VRAM with host memory".into()))?;
+        let vram_bytes = config.vram_bytes;
+        let base = aperture
+            .allocate(vram_bytes)
+            .ok_or_else(|| fail("the 64-bit MMIO aperture has no room for VRAM".into()))?;
+        let pages = (support.allocate)(vram_bytes, false)
+            .map_err(|e| fail(format!("cannot allocate VRAM: {e}")))?;
+        let placements = vec![vpci::ShmPlacement {
+            id: 0,
+            offset: 0,
+            len: vram_bytes,
+        }];
+        let window =
+            crate::shm::ShmWindow::new(pages, vram_bytes, placements, base, support.mem_bytes)
+                .map_err(|e| fail(e.to_string()))?;
+        let backing = window
+            .backing_for(0)
+            .ok_or_else(|| fail("the VRAM window has no region".into()))?;
+        let device = Framebuffer::new(config, backing).map_err(|e| fail(e.to_string()))?;
+        Ok(BackedVram {
+            window: Arc::new(window),
+            device,
+            base,
+        })
     }
 
     /// The boot framebuffer, when the VM has one.
@@ -749,7 +840,8 @@ impl VirtioPciBus {
         drives: Vec<ahci::Atapi>,
         mem: Arc<GuestMem>,
     ) -> Result<(), VirtioPciAttachError> {
-        let owner = self.slots.len() + usize::from(self.framebuffer.is_some());
+        let standalone_framebuffer = self.framebuffer.as_ref().is_some_and(|fb| !fb.embedded);
+        let owner = self.slots.len() + usize::from(standalone_framebuffer);
         let bus_error = |source| VirtioPciAttachError::Bus {
             slot: owner,
             source,
@@ -803,11 +895,33 @@ impl VirtioPciBus {
         msi: Option<Arc<dyn MsiSink>>,
         bar_base: u64,
         gsi: u32,
-        shm: Option<(&ShmSupport<'_>, &mut layout::Mmio64Allocator)>,
+        mut shm: Option<(&ShmSupport<'_>, &mut layout::Mmio64Allocator)>,
+        vga: Option<FramebufferConfig>,
     ) -> Result<BuiltFunction, VirtioPciAttachError> {
         // Before anything else, because it decides whether the configuration
         // space grows a second BAR and a fifth virtio capability.
-        let shm = crate::shm::back_regions(slot, device.as_mut(), shm);
+        let window = crate::shm::back_regions(slot, device.as_mut(), reborrow(&mut shm));
+        // A virtio-vga function's VRAM is BAR 0–1 and its registers BAR 3,
+        // which leaves no 64-bit pair for a shared-memory window: 3D and the
+        // VGA display are refused together by the config, and this is the
+        // backstop.
+        let vram = match vga {
+            Some(config) if window.is_none() => {
+                Some((Self::back_vram(&config, reborrow(&mut shm))?, config))
+            }
+            Some(_) => {
+                return Err(VirtioPciAttachError::Framebuffer {
+                    reason: "a virtio-gpu with shared memory cannot also be the VGA display".into(),
+                })
+            }
+            None => None,
+        };
+        let shm = window;
+        let regs = if vram.is_some() {
+            vpci::RegsPlacement::VGA
+        } else {
+            vpci::RegsPlacement::PLAIN
+        };
 
         // How many MSI-X vectors this function needs: one per queue plus one
         // for configuration changes. A device with more queues than the table
@@ -835,6 +949,7 @@ impl VirtioPciBus {
             device.as_ref(),
             table_size,
             shm.as_deref(),
+            vram.as_ref().map(|(v, c)| (v.base, c.vram_bytes)),
         )?;
         let line = Arc::new(IntxLine {
             line: inner_line,
@@ -872,12 +987,30 @@ impl VirtioPciBus {
                 })
             }
         };
+        let vga = vram.map(|(vram, _)| {
+            tracing::info!(
+                address = format_args!("00:{device_number:02x}.0"),
+                vram = format_args!("{:#x}", vram.base),
+                vram_bytes = vram.device.vram_bytes(),
+                "the virtio-gpu is also the VGA display (virtio-vga)"
+            );
+            FramebufferSlot {
+                device_number,
+                regs_base: bar_base,
+                device: Arc::new(vram.device),
+                window: vram.window,
+                owner: slot,
+                embedded: true,
+            }
+        });
         Ok(BuiltFunction {
             device_number,
             msix_vectors,
             device_type,
             transport,
             shm,
+            regs,
+            vga,
         })
     }
 
@@ -902,6 +1035,7 @@ impl VirtioPciBus {
         device: &dyn VirtioDevice,
         msix_table_size: Option<u16>,
         shm: Option<&crate::shm::ShmWindow>,
+        vga: Option<(u64, u64)>,
     ) -> Result<(ConfigSpace, Option<u8>), VirtioPciAttachError> {
         let bus_error = |source| VirtioPciAttachError::Bus { slot, source };
         // The aperture and the BAR size are both host constants far below 4 GiB,
@@ -914,10 +1048,22 @@ impl VirtioPciBus {
         })?;
         let size = u32::try_from(vpci::VIRTIO_PCI_BAR_SIZE).unwrap_or(u32::MAX);
 
+        // A virtio-vga function is a VGA controller to everything that
+        // matches on class: the firmware's `QemuVideoDxe`, Windows'
+        // `BasicDisplay`, and `viogpudo`, which takes the POST display over
+        // only from a VGA-subclass function.
+        let class = match vga {
+            Some(_) => crate::framebuffer::CLASS_DISPLAY_VGA,
+            None => vpci::class_code(device.device_type()),
+        };
+        let regs = match vga {
+            Some(_) => vpci::RegsPlacement::VGA,
+            None => vpci::RegsPlacement::PLAIN,
+        };
         let mut config = ConfigSpace::type0(
             vpci::VIRTIO_PCI_VENDOR_ID,
             vpci::device_id(device.device_type()),
-            vpci::class_code(device.device_type()),
+            class,
             vpci::VIRTIO_PCI_REVISION,
         )
         // Linux reads the virtio *vendor* id out of the PCI subsystem vendor;
@@ -927,7 +1073,7 @@ impl VirtioPciBus {
             vpci::VIRTIO_PCI_SUBSYSTEM_VENDOR_ID,
             vpci::VIRTIO_PCI_SUBSYSTEM_DEVICE_ID,
         )
-        .with_memory_bar(vpci::VIRTIO_PCI_BAR_INDEX, base, size)
+        .with_memory_bar(regs.bar, base, size)
         .map_err(bus_error)?
         .with_interrupt(
             vpci::VIRTIO_PCI_INTERRUPT_PIN,
@@ -936,6 +1082,11 @@ impl VirtioPciBus {
         // BAR 2/3, the 64-bit prefetchable shared-memory window, when this
         // device has one. BAR 0 cannot carry it: it is 32 KiB, 32-bit and sized
         // to the register file (`virtio_core::pci`).
+        if let Some((vram_base, vram_bytes)) = vga {
+            config = config
+                .with_memory_bar64(crate::framebuffer::VRAM_BAR_INDEX, vram_base, vram_bytes)
+                .map_err(bus_error)?;
+        }
         if let Some(shm) = shm {
             config = config
                 .with_memory_bar64(
@@ -945,7 +1096,7 @@ impl VirtioPciBus {
                 )
                 .map_err(bus_error)?;
         }
-        for record in vpci::capability_records() {
+        for record in vpci::capability_records_at(regs) {
             config.add_capability(&record).map_err(bus_error)?;
         }
         // The shared-memory capabilities go after the four structure locators
@@ -968,7 +1119,7 @@ impl VirtioPciBus {
             Some(table_size) => Some(
                 config
                     .add_capability_writable(
-                        &msix::capability_record(table_size),
+                        &msix::capability_record_at(table_size, regs),
                         // Only the enable and function-mask bits of message
                         // control are the guest's; the table size in the same
                         // halfword must stay read-only.
@@ -1073,12 +1224,6 @@ impl VirtioPciBus {
                 )),
             })
             .collect();
-        // The registers round-trip already; VRAM has no section in the
-        // snapshot format yet (ADR-0008 §6), and a resumed guest drawing into
-        // a blank framebuffer is exactly the "subtly wrong" ADR-0006 refuses.
-        if self.framebuffer.is_some() {
-            refusals.push("the boot framebuffer's VRAM cannot be saved yet".into());
-        }
         if self.ahci.is_some() {
             refusals.push(
                 "the AHCI controller cannot be saved; detach the optical drives first".into(),
@@ -1203,6 +1348,37 @@ impl VirtioPciBus {
                 }
             })
             .collect()
+    }
+
+    /// The boot framebuffer's registers and VRAM, when there is one. `None`
+    /// from a framebuffer whose VRAM cannot be read is logged; the load then
+    /// refuses the snapshot for missing it, which is the honest outcome.
+    pub fn save_framebuffer(&self) -> Option<crate::state::SavedFramebuffer> {
+        let fb = self.framebuffer.as_ref()?;
+        match fb.device.save_vram() {
+            Ok(vram) => Some(crate::state::SavedFramebuffer {
+                registers: fb.device.save_registers(),
+                vram,
+            }),
+            Err(error) => {
+                tracing::error!(%error, "cannot read the framebuffer's VRAM; not saving it");
+                None
+            }
+        }
+    }
+
+    /// Puts the boot framebuffer back. Called after [`Self::load_state`], so
+    /// the VRAM window is already where the restored BAR says.
+    pub fn load_framebuffer(
+        &self,
+        saved: Option<&crate::state::SavedFramebuffer>,
+    ) -> Result<(), crate::state::StateError> {
+        crate::state::require_same_presence("boot framebuffer", saved, self.framebuffer.is_some())?;
+        if let (Some(fb), Some(saved)) = (&self.framebuffer, saved) {
+            fb.device.load_registers(&saved.registers)?;
+            fb.device.load_vram(&saved.vram)?;
+        }
+        Ok(())
     }
 
     /// The bus's configuration spaces.
@@ -1432,7 +1608,7 @@ impl VirtioPciBus {
                 break;
             };
             let window = match self.root.lock() {
-                Ok(root) => root.bar_window_of(index, vpci::VIRTIO_PCI_BAR_INDEX),
+                Ok(root) => root.bar_window_of(index, slot.regs.bar),
                 Err(_) => {
                     tracing::error!("PCI root lock is poisoned; not reconciling notify addresses");
                     return;
@@ -1444,7 +1620,7 @@ impl VirtioPciBus {
             match window {
                 // The BAR decodes somewhere; that is where the kicks will land.
                 Some((bar_base, _)) => {
-                    let notify_base = bar_base.saturating_add(vpci::NOTIFY_CFG_OFFSET);
+                    let notify_base = bar_base.saturating_add(slot.regs.queue_notify_offset(0));
                     if notifier.notify_base() != Some(notify_base) {
                         notifier.unregister(&slot.transport);
                         *target = Some(notify_base);
@@ -1480,7 +1656,8 @@ impl VirtioPciBus {
             };
             slot.kicks = crate::kick_worker::KickWorker::attach(
                 index,
-                slot.bar_base.saturating_add(vpci::NOTIFY_CFG_OFFSET),
+                slot.bar_base
+                    .saturating_add(slot.regs.queue_notify_offset(0)),
                 u64::from(vpci::NOTIFY_OFF_MULTIPLIER),
                 &slot.transport,
             );
@@ -1496,10 +1673,12 @@ impl VirtioPciBus {
                 continue;
             };
             let window = match self.root.lock() {
-                Ok(root) => root.bar_window_of(index, vpci::VIRTIO_PCI_BAR_INDEX),
+                Ok(root) => root.bar_window_of(index, slot.regs.bar),
                 Err(_) => return,
             };
-            kicks.rebase(window.map(|(base, _)| base.saturating_add(vpci::NOTIFY_CFG_OFFSET)));
+            kicks.rebase(
+                window.map(|(base, _)| base.saturating_add(slot.regs.queue_notify_offset(0))),
+            );
         }
     }
 
@@ -1608,13 +1787,14 @@ impl VirtioPciBus {
                 return None;
             }
         };
-        // Only BAR 0 exists on a virtio function, but a device could in
-        // principle grow another one; refusing rather than assuming keeps the
-        // dispatch honest.
-        if bar != vpci::VIRTIO_PCI_BAR_INDEX {
-            return None;
-        }
-        Some((self.slots.get(owner)?, offset))
+        // Only the register BAR is the transport's (a shared-memory window or
+        // VRAM is guest memory, never an exit); refusing rather than assuming
+        // keeps the dispatch honest.
+        let slot = self.slots.get(owner)?;
+        // The transport decodes its own six regions from 0; whatever precedes
+        // them in the BAR (virtio-vga's Bochs page) is not its.
+        let offset = offset.checked_sub(slot.regs.offset)?;
+        (bar == slot.regs.bar).then_some((slot, offset))
     }
 
     /// The framebuffer's register-page offset for `addr`, if that is where it
@@ -1622,6 +1802,14 @@ impl VirtioPciBus {
     fn locate_framebuffer(&self, addr: u64) -> Option<(&Framebuffer, u64)> {
         let fb = self.framebuffer.as_ref()?;
         let (owner, bar, offset) = self.root.lock().ok()?.locate_mmio(addr)?;
+        if fb.embedded {
+            // virtio-vga: the page shows through a window of the virtio
+            // register BAR, at the offsets it has standalone.
+            return (owner == fb.owner
+                && bar == vpci::RegsPlacement::VGA.bar
+                && crate::framebuffer::VGA_WINDOW.contains(&offset))
+            .then_some((fb.device.as_ref(), offset));
+        }
         (owner == fb.owner && bar == crate::framebuffer::REGS_BAR_INDEX)
             .then_some((fb.device.as_ref(), offset))
     }
@@ -1860,6 +2048,7 @@ mod tests {
             device,
             msix_table_size,
             shm,
+            None,
         )
         .expect("the host's own aperture and GSI are valid")
     }
@@ -1924,6 +2113,84 @@ mod tests {
         assert_eq!(u64::from(pba & 0x7), u64::from(vpci::VIRTIO_PCI_BAR_INDEX));
         assert_eq!(u64::from(table & !0x7), vpci::MSIX_TABLE_OFFSET);
         assert_eq!(u64::from(pba & !0x7), vpci::MSIX_PBA_OFFSET);
+    }
+
+    /// virtio-vga: the identity `QemuVideoDxe` and `viogpudo` match on (class
+    /// VGA), VRAM as the 64-bit pair in registers 0–1, and every virtio
+    /// structure and the MSI-X table pointing at register 3, which is EDK2's
+    /// logical BAR 2 — where `QemuVideoDxe` looks for the DISPI page.
+    #[test]
+    fn a_virtio_vga_function_is_a_vga_controller_with_vram_in_bar0() {
+        let device = IdentityOnly(virtio_core::DeviceType::Gpu);
+        let vram_base = 0x8_0000_0000u64;
+        let vram_bytes = crate::framebuffer::DEFAULT_VRAM_BYTES;
+        let (config, at) = VirtioPciBus::build_config_space(
+            0,
+            layout::pci_bar_slot(0),
+            layout::PCI_FIRST_IRQ,
+            &device,
+            Some(3),
+            None,
+            Some((vram_base, vram_bytes)),
+        )
+        .expect("a valid function");
+        assert_eq!(
+            config.read_dword(pci::reg::CLASS_REVISION) >> 8,
+            crate::framebuffer::CLASS_DISPLAY_VGA >> 8
+        );
+        assert_eq!(config.read_dword(pci::reg::ID) >> 16, 0x1050);
+        assert_eq!(
+            config.bar_window(crate::framebuffer::VRAM_BAR_INDEX),
+            None,
+            "decodes nothing until memory space is enabled"
+        );
+        let bar = |index: u8| config.read_dword(pci::reg::BAR0 + 4 * index);
+        assert_eq!(bar(0) & !0xf, vram_base as u32);
+        assert_eq!(bar(0) & 0x6, 0x4, "64-bit");
+        assert_eq!(bar(1), (vram_base >> 32) as u32);
+        assert_eq!(bar(2), 0, "logical BAR 1 is empty");
+        assert_eq!(
+            u64::from(bar(3) & !0xf),
+            layout::pci_bar_slot(0),
+            "the register file"
+        );
+        let list = capability_list(&config);
+        let vga = vpci::RegsPlacement::VGA;
+        for &(id, offset) in &list[..4] {
+            assert_eq!(id, vpci::PCI_CAP_ID_VNDR);
+            let bar_byte = (config.read_dword(offset + 4) & 0xff) as u8;
+            assert_eq!(bar_byte, vga.bar);
+            let start = u64::from(config.read_dword(offset + 8));
+            assert!(start >= vga.offset, "every structure after the Bochs page");
+        }
+        let at = at.expect("MSI-X");
+        assert_eq!(
+            u64::from(config.read_dword(at + 4)),
+            (vga.offset + vpci::MSIX_TABLE_OFFSET) | u64::from(vga.bar)
+        );
+        assert_eq!(
+            u64::from(config.read_dword(at + 8)),
+            (vga.offset + vpci::MSIX_PBA_OFFSET) | u64::from(vga.bar)
+        );
+        // The Bochs page and the virtio regions share the BAR without
+        // overlapping, and both fit it.
+        const {
+            assert!(crate::framebuffer::VGA_WINDOW.end <= vpci::RegsPlacement::VGA.offset);
+            assert!(
+                vpci::RegsPlacement::VGA.offset + vpci::MSIX_PBA_OFFSET + vpci::MSIX_PBA_LEN
+                    <= vpci::VIRTIO_PCI_BAR_SIZE
+            );
+        }
+    }
+
+    /// The Bochs page answers in the first page of a virtio-vga function's
+    /// register BAR — the EDID `QemuVideoDxe` reads at 0 included — and the
+    /// transport's regions one page in.
+    #[test]
+    fn a_virtio_vga_bar_splits_between_the_bochs_page_and_virtio() {
+        assert_eq!(crate::framebuffer::VGA_WINDOW, 0..0x1000);
+        assert_eq!(vpci::RegsPlacement::VGA.queue_notify_offset(2), 0x3008);
+        assert_eq!(vpci::RegsPlacement::PLAIN.queue_notify_offset(2), 0x2008);
     }
 
     /// Only the enable and function-mask bits are the guest's. A guest that could

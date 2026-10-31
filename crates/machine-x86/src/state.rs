@@ -238,6 +238,13 @@ pub struct SavedVirtioSlot {
     pub state: virtio_core::TransportSaveState,
 }
 
+/// The boot framebuffer (ADR-0008 §1): its DISPI registers and VRAM.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedFramebuffer {
+    pub registers: Vec<u16>,
+    pub vram: Vec<u8>,
+}
+
 /// Everything on the machine bus.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MachineState {
@@ -254,6 +261,8 @@ pub struct MachineState {
     pub irqchip: Option<SavedIrqChip>,
     /// Every attached virtio slot, in bus order.
     pub virtio: Vec<SavedVirtioSlot>,
+    /// Present only with a boot framebuffer, standalone or virtio-vga.
+    pub framebuffer: Option<SavedFramebuffer>,
 }
 
 /// Checks that two optional halves of the machine agree about existing.

@@ -17,6 +17,7 @@
 use thiserror::Error;
 
 pub mod arm64;
+pub mod hyperv;
 
 /// Hardware shape of a VM, independent of what it boots and of which
 /// hypervisor runs it.
@@ -24,6 +25,19 @@ pub mod arm64;
 pub struct MachineConfig {
     pub memory_mib: u64,
     pub vcpu_count: u32,
+}
+
+/// What a KVM VM is asked for beyond its shape (ADR-0008): additive, and
+/// all off by default — the VM every Linux guest has always had.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvmOptions {
+    /// KVM's `ignore_msrs`, per VM: an MSR KVM does not know reads 0 and
+    /// drops writes instead of raising `#GP`, through
+    /// `KVM_CAP_X86_USER_SPACE_MSR`. Windows needs it on AMD hosts.
+    pub ignore_msrs: bool,
+    /// The Hyper-V clock leaves ([`hyperv`]) at `0x4000_0000`, KVM's own
+    /// moved to `0x4000_0100`; KVM serves the MSRs they grant.
+    pub hyperv: bool,
 }
 
 /// General-purpose register state for an x86-64 vCPU, hypervisor-neutral.

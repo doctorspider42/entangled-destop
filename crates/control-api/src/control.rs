@@ -70,6 +70,10 @@ pub const CMD_THUMBNAIL: &str = "thumbnail";
 /// Enter; answered with how many characters were typed, skipped (no key) and
 /// truncated (past `virtio_input::typing::MAX_TYPED_CHARS`).
 pub const CMD_PASTE: &str = "paste";
+/// Press keys together on the guest's keyboard, `chord super r`: modifiers
+/// and named keys by name, other keys as one character
+/// (`virtio_input::typing::parse_chord`).
+pub const CMD_CHORD: &str = "chord";
 
 /// Where a machine's card picture lives: `.thumbnails/<name>.png` beside its
 /// profile. The engine derives it from the default snapshot path (which sits
