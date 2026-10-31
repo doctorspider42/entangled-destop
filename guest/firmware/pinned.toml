@@ -60,16 +60,17 @@
 #   with an empty cache and no token, which is the check that would have caught
 #   this on the day it happened.
 
-tag = "firmware-edk2-stable202602-2"
+tag = "firmware-edk2-stable202602-4"
 edk2_tag = "edk2-stable202602"
 base_url = "https://github.com/doctorspider42/entangled-destop/releases/download"
-source = "https://github.com/doctorspider42/entangled-destop/releases/tag/firmware-edk2-stable202602-2"
+source = "https://github.com/doctorspider42/entangled-destop/releases/tag/firmware-edk2-stable202602-4"
 
 [[assets]]
 name = "CLOUDHV.fd"
 # The published build: OvmfPkg/CloudHv/CloudHvX64.dsc, DEBUG/GCC5,
-# DEBUG_ON_SERIAL_PORT, flash base 0xFFC00000, EDK2 commit
-# b7a715f7c03c45c6b4575bf88596bfd79658b8ce, built 2026-09-09T20:21:34Z. The
+# DEBUG_ON_SERIAL_PORT, QemuVideoDxe + VirtioKeyboardDxe (ADR-0008, the GOP
+# Windows draws into), flash base 0xFFC00000, EDK2 commit
+# b7a715f7c03c45c6b4575bf88596bfd79658b8ce, built 2026-10-31T19:44:52Z. The
 # release's own SHA256SUMS and CLOUDHV.fd.provenance both say the same thing.
-sha256 = "0f8db260025fdac81fceb0c17555ea8a33e1f63a4ac41ed8aac8856fc6e6a425"
+sha256 = "857fe28fe06da51034dd9cb8f8d5ce4864c3a61b364cb889787d3fc814911aa5"
 bytes = 4194304

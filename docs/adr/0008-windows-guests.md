@@ -339,7 +339,7 @@ which is also what KVM does. With it, `shutdown` on the control channel
 Linux routes its interrupts as fixed and is not affected; KVM's in-kernel
 IOAPIC never saw this.
 
-### Releasing the firmware (open until the merge to `main`)
+### Releasing the firmware (done 2026-10-31: `firmware-edk2-stable202602-4`, pinned)
 
 The GOP, keyboard and FACS changes live in `build-cloudhv.sh`; every
 `CLOUDHV.fd` in use so far was built locally. Published firmware comes only

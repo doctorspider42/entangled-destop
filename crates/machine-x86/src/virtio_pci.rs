@@ -1153,7 +1153,10 @@ impl VirtioPciBus {
         // 0x40, which is what the spec asks a non-transitional device to publish.
         .with_subsystem(
             vpci::VIRTIO_PCI_SUBSYSTEM_VENDOR_ID,
-            vpci::VIRTIO_PCI_SUBSYSTEM_DEVICE_ID,
+            match vga {
+                Some(_) => vpci::VIRTIO_VGA_SUBSYSTEM_DEVICE_ID,
+                None => vpci::VIRTIO_PCI_SUBSYSTEM_DEVICE_ID,
+            },
         )
         .with_memory_bar(regs.bar, base, size)
         .map_err(bus_error)?
@@ -2239,6 +2242,11 @@ mod tests {
             crate::framebuffer::CLASS_DISPLAY_VGA >> 8
         );
         assert_eq!(config.read_dword(pci::reg::ID) >> 16, 0x1050);
+        assert_eq!(
+            config.read_dword(pci::reg::SUBSYSTEM),
+            0x1100_1af4,
+            "the subsystem Windows' virtio-gpu INFs match on"
+        );
         assert_eq!(
             config.bar_window(crate::framebuffer::VRAM_BAR_INDEX),
             None,

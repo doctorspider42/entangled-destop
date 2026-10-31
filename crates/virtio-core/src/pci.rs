@@ -131,6 +131,12 @@ pub const VIRTIO_PCI_SUBSYSTEM_VENDOR_ID: u16 = 0x1af4;
 /// virtio-pci acceptance boot. QEMU writes the same `0x40`.
 pub const VIRTIO_PCI_SUBSYSTEM_DEVICE_ID: u16 = 0x40;
 
+/// The subsystem device id of a virtio-vga function: `0x1100`, which is what
+/// Windows' virtio-gpu drivers name in their INF (`viogpu3d` matches
+/// `PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01` and nothing else). Still
+/// at least `0x40`, so `Virtio10Dxe` binds it as above. ADR-0008.
+pub const VIRTIO_VGA_SUBSYSTEM_DEVICE_ID: u16 = 0x1100;
+
 /// Written into the PCI `interrupt_pin` register: INTA#. Nonzero is what tells a
 /// driver the device has a legacy interrupt at all.
 pub const VIRTIO_PCI_INTERRUPT_PIN: u8 = 1;
