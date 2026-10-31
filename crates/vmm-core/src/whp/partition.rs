@@ -5,15 +5,18 @@ use std::sync::{Arc, Mutex};
 use vm_memory::{Address, GuestMemory, GuestMemoryRegion, MemoryRegionAddress, MmapRegion};
 use windows::Win32::System::Hypervisor::{
     WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeInterruptClockFrequency,
-    WHvCapabilityCodeProcessorClockFrequency, WHvCapabilityCodeProcessorVendor, WHvCreatePartition,
+    WHvCapabilityCodeProcessorClockFrequency, WHvCapabilityCodeProcessorVendor,
+    WHvCapabilityCodeSyntheticProcessorFeaturesBanks, WHvCreatePartition,
     WHvCreateVirtualProcessor, WHvDeletePartition, WHvGetCapability, WHvMapGpaRange,
     WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagTrackDirtyPages,
     WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidExitList,
     WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode,
-    WHvPartitionPropertyCodeProcessorCount, WHvProcessorVendorAmd, WHvProcessorVendorHygon,
-    WHvProcessorVendorIntel, WHvQueryGpaRangeDirtyBitmap, WHvSetPartitionProperty,
-    WHvSetupPartition, WHvUnmapGpaRange, WHvX64LocalApicEmulationModeXApic, WHV_PARTITION_HANDLE,
-    WHV_PROCESSOR_VENDOR,
+    WHvPartitionPropertyCodeProcessorCount,
+    WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks, WHvProcessorVendorAmd,
+    WHvProcessorVendorHygon, WHvProcessorVendorIntel, WHvQueryGpaRangeDirtyBitmap,
+    WHvSetPartitionProperty, WHvSetupPartition, WHvUnmapGpaRange,
+    WHvX64LocalApicEmulationModeXApic, WHV_PARTITION_HANDLE, WHV_PROCESSOR_VENDOR,
+    WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS, WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS_COUNT,
 };
 
 use crate::hv::{DirtyLog, DirtyPages, DirtyTracking, HvError, MachineConfig, DIRTY_PAGE_SIZE};
@@ -51,6 +54,11 @@ pub struct WhpCapabilities {
     /// (`WHvCapabilityCodeInterruptClockFrequency`), `None` when this WHP does
     /// not report it.
     pub apic_timer_hz: Option<u64>,
+    /// Bank 0 of the Hyper-V enlightenments this WHP can give a guest
+    /// (`WHvCapabilityCodeSyntheticProcessorFeaturesBanks`), `None` when it
+    /// cannot. Windows 10 22H2 (19045) cannot: the call fails with
+    /// `WHV_E_UNKNOWN_CAPABILITY`, measured on the development host.
+    pub synthetic_features: Option<u64>,
 }
 
 impl WhpCapabilities {
@@ -164,11 +172,27 @@ impl WhpHypervisor {
             })
             .and_then(Result::ok)
             .filter(|&hz| hz != 0);
+        let synthetic_features = hypervisor_present
+            .then(|| {
+                // SAFETY: `WHvCapabilityCodeSyntheticProcessorFeaturesBanks` is
+                // documented to write a `WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS`,
+                // a plain struct of integers for which all-zero is valid.
+                unsafe {
+                    get_capability::<WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS>(
+                        WHvCapabilityCodeSyntheticProcessorFeaturesBanks,
+                    )
+                }
+            })
+            .and_then(Result::ok)
+            .filter(|banks| banks.BanksCount >= 1)
+            // SAFETY: both arms of the bank union are the same `u64`.
+            .map(|banks| unsafe { banks.Anonymous.AsUINT64[0] });
         Ok(WhpCapabilities {
             hypervisor_present,
             processor_vendor,
             tsc_hz,
             apic_timer_hz,
+            synthetic_features,
         })
     }
 
@@ -241,7 +265,40 @@ pub struct WhpOptions {
     /// Off for a Linux guest, which probes with `rdmsr_safe` and must keep
     /// getting the `#GP` it expects.
     pub ignore_msrs: bool,
+
+    /// Give the guest the Hyper-V enlightenments ([`HYPERV_FEATURES`], as far
+    /// as this WHP supports them): the reference TSC page, synthetic timers,
+    /// the APIC through MSRs, hypercalls. Windows runs on them far better than
+    /// on emulated timers, and they are what keeps a Windows guest out of
+    /// `CLOCK_WATCHDOG_TIMEOUT` on a loaded host (ADR-0008 §2). The CPUID
+    /// policy then leaves the hypervisor leaves to WHP instead of hiding them.
+    ///
+    /// Off by default: a Linux guest that sees `Hv#1` takes Hyper-V's paths,
+    /// and the Linux machine is tested without them.
+    pub hyperv: bool,
 }
+
+/// Environment variable that turns [`WhpOptions::hyperv`] on for a run.
+pub const HYPERV_ENV: &str = "ENTANGLED_WHP_HYPERV";
+
+/// The Hyper-V enlightenments [`WhpOptions::hyperv`] asks for, as bits of
+/// `WHV_SYNTHETIC_PROCESSOR_FEATURES` (WinHvPlatformDefs.h); the partition
+/// gets the ones the host supports.
+pub const HYPERV_FEATURES: u64 = (1 << 0) // HypervisorPresent
+    | (1 << 1) // Hv1
+    | (1 << 2) // AccessVpRunTimeReg
+    | (1 << 3) // AccessPartitionReferenceCounter
+    | (1 << 4) // AccessSynicRegs
+    | (1 << 5) // AccessSyntheticTimerRegs
+    | (1 << 6) // AccessIntrCtrlRegs
+    | (1 << 7) // AccessHypercallRegs
+    | (1 << 8) // AccessVpIndex
+    | (1 << 9) // AccessPartitionReferenceTsc
+    | (1 << 10) // AccessGuestIdleReg
+    | (1 << 11) // AccessFrequencyRegs
+    | (1 << 22) // DirectSyntheticTimers
+    | (1 << 25) // TbFlushHypercalls
+    | (1 << 26); // SyntheticClusterIpi
 
 /// Environment variable that turns [`WhpOptions::ignore_msrs`] on for a run.
 pub const IGNORE_MSRS_ENV: &str = "ENTANGLED_WHP_IGNORE_MSRS";
@@ -258,6 +315,7 @@ impl WhpOptions {
             // turns it on for a measurement.
             track_dirty: false,
             ignore_msrs: std::env::var_os(IGNORE_MSRS_ENV).is_some(),
+            hyperv: std::env::var_os(HYPERV_ENV).is_some(),
         }
     }
 }
@@ -467,6 +525,9 @@ impl WhpPartition {
         }
         if exits != 0 {
             set_extended_vm_exits(handle, exits)?;
+        }
+        if options.hyperv {
+            set_hyperv_features(handle)?;
         }
         if options.cpuid_policy {
             set_cpuid_exit_list(handle)?;
@@ -783,6 +844,49 @@ unsafe fn set_property<T: Copy>(
     // reads, and the caller promised `T` matches `code`.
     unsafe { WHvSetPartitionProperty(handle, code, (value as *const T).cast(), size) }
         .map_err(|e| whp_err(call, e))
+}
+
+/// Gives the partition the [`HYPERV_FEATURES`] this host supports.
+fn set_hyperv_features(handle: WHV_PARTITION_HANDLE) -> Result<(), VmmError> {
+    // SAFETY: `WHvCapabilityCodeSyntheticProcessorFeaturesBanks` is documented
+    // to write a `WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS`, a plain struct of
+    // integers for which all-zero is valid.
+    let banks = unsafe {
+        get_capability::<WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS>(
+            WHvCapabilityCodeSyntheticProcessorFeaturesBanks,
+        )
+    }
+    .map_err(|e| {
+        VmmError::WhpUnavailable(format!(
+            "this Windows offers no Hyper-V enlightenments to WHP guests: {e}"
+        ))
+    })?;
+    // SAFETY: both arms of the bank union are the same `u64`.
+    let supported = unsafe { banks.Anonymous.AsUINT64[0] };
+    let granted = HYPERV_FEATURES & supported;
+    tracing::info!(
+        requested = format_args!("{HYPERV_FEATURES:#x}"),
+        supported = format_args!("{supported:#x}"),
+        granted = format_args!("{granted:#x}"),
+        "giving the guest the Hyper-V enlightenments"
+    );
+    let mut banks = WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS {
+        BanksCount: WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS_COUNT,
+        ..Default::default()
+    };
+    banks.Anonymous.AsUINT64 = [granted];
+    // SAFETY: `WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks` is
+    // the `SyntheticProcessorFeaturesBanks` arm of `WHV_PARTITION_PROPERTY`,
+    // i.e. a `WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS`, and this runs before
+    // `WHvSetupPartition`.
+    unsafe {
+        set_property(
+            handle,
+            WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks,
+            "WHvSetPartitionProperty(SyntheticProcessorFeaturesBanks)",
+            &banks,
+        )
+    }
 }
 
 fn set_processor_count(handle: WHV_PARTITION_HANDLE, count: u32) -> Result<(), VmmError> {

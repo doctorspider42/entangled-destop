@@ -6,8 +6,8 @@
   because Windows PE sees no virtio device until those drivers are loaded,
   so a separate answer-file volume would be invisible to it.
 
-  @INDEX@ is the install.esd/install.wim image index (the edition), filled in
-  by remaster-iso.sh. No product key: the edition is chosen by index, and the
+  @INDEX@ is the install.esd/install.wim image index (the edition) and
+  @TIMEZONE@ the Windows time zone name, both filled in by remaster-iso.sh. No product key: the edition is chosen by index, and the
   installed system is simply not activated.
 -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend"
@@ -107,6 +107,23 @@
           <Path>X:\drivers</Path>
         </PathAndCredentials>
       </DriverPaths>
+    </component>
+  </settings>
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <TimeZone>@TIMEZONE@</TimeZone>
+    </component>
+    <!-- The machine's RTC keeps UTC, as Linux expects (machine_x86::rtc), and
+         Windows reads the RTC as local time unless told otherwise. -->
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation /v RealTimeIsUniversal /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
     </component>
   </settings>
   <settings pass="oobeSystem">

@@ -281,6 +281,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         shares: Vec::new(),
         reclaim_memory: false,
         ignore_msrs: false,
+        hyperv_enlightenments: false,
         gamepad: GamepadSection::default(),
     };
 
@@ -480,6 +481,7 @@ fn installed_profile(
         shares: Vec::new(),
         reclaim_memory: false,
         ignore_msrs: false,
+        hyperv_enlightenments: false,
         gamepad: GamepadSection {
             enabled: true,
             // One pad. A second is a config edit away and costs another virtio

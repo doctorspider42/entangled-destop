@@ -297,3 +297,31 @@ system, specialize, OOBE, and auto-logon to a desktop with NetKVM networking.
 Consumer media also refuse an answer file with no `<ProductKey>` element; an
 empty key with `WillShowUI` `Never` satisfies it, so the system is installed
 unactivated.
+
+### Amendment, 2026-10-31: §2 on this host, and where the time goes
+
+The installed Windows 10 desktop, idle, in a 2-vCPU guest on WHP, measured
+with `$ENTANGLED_WHP_EXIT_STATS` (exit counts per vCPU, cheap enough not to
+change what it measures): **~10 000 exits a second on vCPU 0**, almost all
+port I/O. About 4 000/s are the ACPI PM timer (`0x608`, the
+performance counter) and about 3 000/s each are `0x70`/`0x71` (the RTC's
+periodic interrupt, the system clock, and the register C read that
+acknowledges it). Each of those is a full exit served in this process. That
+is the most likely cause of the uneven frame pacing and the generally sluggish
+feel the first interactive session showed.
+
+§2's answer was the Hyper-V enlightenments. `WhpOptions::hyperv` /
+`hyperv_enlightenments = true` now asks WHP for them
+(`WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks`, `HYPERV_FEATURES`
+intersected with what the host reports), and the CPUID policy then leaves the
+hypervisor leaves to WHP. **This host cannot use it**: on Windows 10 22H2
+(19045) `WHvCapabilityCodeSyntheticProcessorFeaturesBanks` fails with
+`WHV_E_UNKNOWN_CAPABILITY`, so a profile that asks is refused with that
+error. It needs a newer Windows host and is untested.
+
+Reporting ARAT (`0x6.EAX[2]`) and an invariant TSC (`0x8000_0007.EDX[8]`)
+in CPUID did not move Windows off the PM timer and the RTC (the same ~11 000
+exits/s), so that experiment was not kept. What remains for a Windows 10
+host is ours to build. The options are a reference-TSC page served from
+userspace (Hyper-V's `HV_X64_MSR_REFERENCE_TSC`, which makes the performance
+counter a memory read), and cheaper exits for the two ports.

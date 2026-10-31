@@ -124,7 +124,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
                     mac: Some(control_api::new_machine_mac(&name, &target)), interface: None, forward: vec![] }),
                 display: DisplaySection { venus: true, width: 1024, height: 768,
                     refresh_hz: args.refresh_hz.unwrap_or(60), ..Default::default() },
-                sound: Default::default(), gamepad: Default::default(), shares: vec![], reclaim_memory: false, ignore_msrs: false,
+                sound: Default::default(), gamepad: Default::default(), shares: vec![], reclaim_memory: false, ignore_msrs: false, hyperv_enlightenments: false,
             };
             VmConfig::from_toml(&toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;

@@ -2440,6 +2440,13 @@ mod host {
             lifecycle,
             restore,
         } = request;
+        if cfg.hyperv_enlightenments {
+            // KVM implements them in the kernel (KVM_CAP_HYPERV_*); wiring
+            // that up is ADR-0008 §2's KVM half, not done yet.
+            tracing::warn!(
+                "hyperv_enlightenments is not implemented on KVM yet; the guest gets none"
+            );
+        }
         // The VM's pause gate (ADR-0005), created before the devices so every
         // worker thread that is about to be spawned can be handed it.
         let quiesce = virtio_core::Quiesce::new();
@@ -2780,6 +2787,7 @@ mod host {
             track_dirty,
             // The profile's, or `$ENTANGLED_WHP_IGNORE_MSRS` for a one-off run.
             ignore_msrs: cfg.ignore_msrs || defaults.ignore_msrs,
+            hyperv: cfg.hyperv_enlightenments || defaults.hyperv,
             ..defaults
         };
         let mut vm =

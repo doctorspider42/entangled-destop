@@ -52,7 +52,8 @@ mod vcpu;
 pub use cpuid::{tsc_crystal_ratio, CpuidPolicy, CpuidResult, GuestClocks, CPUID_EXIT_LEAVES};
 pub use interrupt::{HaltGate, WhpInterruptDelivery, HALT_POLL};
 pub use partition::{
-    WhpCapabilities, WhpHypervisor, WhpOptions, WhpPartition, IGNORE_MSRS_ENV, WHP_ENABLE_HINT,
+    WhpCapabilities, WhpHypervisor, WhpOptions, WhpPartition, HYPERV_ENV, HYPERV_FEATURES,
+    IGNORE_MSRS_ENV, WHP_ENABLE_HINT,
 };
 pub use vcpu::{
     spawn_vcpus, spawn_vcpus_with, VcpuCanceller, WhpVcpu, WhpVcpuThreads, TRACE_EXITS_ENV,

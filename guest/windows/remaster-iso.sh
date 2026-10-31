@@ -29,6 +29,8 @@ windows_iso="$1"
 virtio_iso="$2"
 out_iso="$3"
 index="${4:-6}"
+# The Windows time zone name, e.g. "Central European Standard Time".
+timezone="${ENTANGLED_WIN_TIMEZONE:-UTC}"
 here="$(cd "$(dirname "$0")" && pwd)"
 
 work="$(mktemp -d)"
@@ -64,7 +66,7 @@ if [ "$disk" = 1 ]; then
     index=1
 fi
 
-sed "s/@INDEX@/$index/" "$here/autounattend.xml" > "$work/Autounattend.xml"
+sed -e "s/@INDEX@/$index/" -e "s/@TIMEZONE@/$timezone/" "$here/autounattend.xml" > "$work/Autounattend.xml"
 
 echo ">> adding drivers and answer file to boot.wim image 2" >&2
 wimupdate "$work/iso/sources/boot.wim" 2 <<EOF

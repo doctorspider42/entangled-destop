@@ -231,6 +231,9 @@ pub struct CpuidPolicy {
     vp_index: u32,
     clocks: Option<GuestClocks>,
     topology: Option<PackageTopology>,
+    /// The partition has the Hyper-V enlightenments (`WhpOptions::hyperv`):
+    /// leaves `0x4000_0000`–`0x4000_000f` are WHP's, not hidden.
+    hyperv: bool,
 }
 
 impl CpuidPolicy {
@@ -241,6 +244,7 @@ impl CpuidPolicy {
             vp_index,
             clocks: None,
             topology: None,
+            hyperv: false,
         }
     }
 
@@ -250,6 +254,7 @@ impl CpuidPolicy {
             vp_index,
             clocks,
             topology: None,
+            hyperv: false,
         }
     }
 
@@ -257,6 +262,13 @@ impl CpuidPolicy {
     /// `None` leaves WHP's own answers there.
     pub fn with_topology(self, topology: Option<PackageTopology>) -> Self {
         Self { topology, ..self }
+    }
+
+    /// The same policy for a partition with the Hyper-V enlightenments: the
+    /// hypervisor leaves are left as WHP answers them, because they are how
+    /// the guest finds the enlightenments it was given.
+    pub fn with_hyperv(self, hyperv: bool) -> Self {
+        Self { hyperv, ..self }
     }
 
     /// Applies the policy to what WHP would have reported for `leaf`/`subleaf`.
@@ -302,6 +314,7 @@ impl CpuidPolicy {
                     result.ecx &= !0x7ff;
                 }
             }
+            0x4000_0000..=0x4000_000f if self.hyperv => {}
             0x4000_0000 => {
                 result = CpuidResult {
                     eax: if self.clocks.is_some() {
@@ -411,6 +424,16 @@ mod tests {
     #[test]
     fn leaf_1_subleaf_1_is_untouched() {
         assert_eq!(CpuidPolicy::new(3).apply(1, 1, DEFAULT), DEFAULT);
+    }
+
+    #[test]
+    fn with_hyperv_the_hypervisor_leaves_are_whps() {
+        let policy = CpuidPolicy::new(0).with_hyperv(true);
+        for leaf in 0x4000_0000..=0x4000_000f {
+            assert_eq!(policy.apply(leaf, 0, DEFAULT), DEFAULT, "{leaf:#x}");
+        }
+        // Without it they are hidden, as before.
+        assert_ne!(CpuidPolicy::new(0).apply(0x4000_0001, 0, DEFAULT), DEFAULT);
     }
 
     #[test]

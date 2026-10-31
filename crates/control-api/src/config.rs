@@ -133,6 +133,13 @@ pub struct VmConfig {
     /// WHP; KVM already implements the registers Windows touches.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ignore_msrs: bool,
+    /// Give the guest the Hyper-V enlightenments (reference TSC page,
+    /// synthetic timers, APIC MSRs, hypercalls) — what Windows runs best on
+    /// (ADR-0008 §2). Off by default: a Linux guest that sees them takes
+    /// Hyper-V's code paths. Honoured on WHP; ignored, with a warning, on KVM
+    /// for now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hyperv_enlightenments: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

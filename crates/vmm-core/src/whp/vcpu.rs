@@ -84,8 +84,9 @@ pub struct WhpVcpu {
 impl WhpVcpu {
     pub(super) fn new(partition: Arc<Partition>, index: u32) -> Result<Self, VmmError> {
         create_virtual_processor(partition.handle(), index)?;
-        let cpuid =
-            CpuidPolicy::with_clocks(index, partition.clocks()).with_topology(partition.topology());
+        let cpuid = CpuidPolicy::with_clocks(index, partition.clocks())
+            .with_topology(partition.topology())
+            .with_hyperv(partition.options().hyperv);
         let mut vcpu = Self {
             index,
             partition,
@@ -523,6 +524,10 @@ impl WhpVcpu {
         // The MSRs already logged, so a guest that polls one does not flood
         // the log (`WhpOptions::ignore_msrs`).
         let mut msrs_seen = std::collections::BTreeSet::new();
+        // `$ENTANGLED_WHP_EXIT_STATS`: exits per reason and per port, printed
+        // every few seconds. Cheap enough to leave the guest's speed alone,
+        // unlike the full trace, so it is what a performance comparison uses.
+        let mut stats = std::env::var_os(EXIT_STATS_ENV).map(|_| ExitStats::new(self.index));
 
         while running.load(Ordering::Acquire) {
             if let Some(lifecycle) = lifecycle {
@@ -538,6 +543,9 @@ impl WhpVcpu {
             // observed must not be slept through.
             let epoch = gate.map_or(0, |gate| gate.epoch());
             let exit = self.run_once()?;
+            if let Some(stats) = stats.as_mut() {
+                stats.count(&exit);
+            }
             if trace_exits {
                 eprintln!(
                     "vp{} exit={} rip={:#x}{}",
@@ -994,7 +1002,8 @@ impl ResettableVcpu for WhpVcpu {
             }
         }
         self.cpuid = CpuidPolicy::with_clocks(self.index, self.partition.clocks())
-            .with_topology(self.partition.topology());
+            .with_topology(self.partition.topology())
+            .with_hyperv(self.partition.options().hyperv);
         Ok(())
     }
 }
@@ -1052,6 +1061,66 @@ pub const TRACE_EXITS_ENV: &str = "ENTANGLED_WHP_TRACE_EXITS";
 /// address, or the `cpuid` leaf. A RIP alone tells which instruction looped;
 /// this tells what it was waiting for, which is what bringing up a guest the
 /// machine has never run (Windows, ADR-0008 §3) needs.
+/// Environment variable that prints exit counts per vCPU every few seconds.
+pub const EXIT_STATS_ENV: &str = "ENTANGLED_WHP_EXIT_STATS";
+
+/// Exit counts for [`EXIT_STATS_ENV`]: by reason, and by port for port I/O,
+/// which is where an emulated timer shows up.
+struct ExitStats {
+    vp: u32,
+    since: Instant,
+    reasons: std::collections::BTreeMap<i32, u64>,
+    ports: std::collections::BTreeMap<u16, u64>,
+}
+
+impl ExitStats {
+    const PERIOD: Duration = Duration::from_secs(10);
+
+    fn new(vp: u32) -> Self {
+        Self {
+            vp,
+            since: Instant::now(),
+            reasons: Default::default(),
+            ports: Default::default(),
+        }
+    }
+
+    fn count(&mut self, exit: &WHV_RUN_VP_EXIT_CONTEXT) {
+        *self.reasons.entry(exit.ExitReason.0).or_default() += 1;
+        if exit.ExitReason == WHvRunVpExitReasonX64IoPortAccess {
+            // SAFETY: the exit reason selects the `IoPortAccess` arm.
+            let port = unsafe { exit.Anonymous.IoPortAccess.PortNumber };
+            *self.ports.entry(port).or_default() += 1;
+        }
+        let elapsed = self.since.elapsed();
+        if elapsed < Self::PERIOD {
+            return;
+        }
+        let secs = elapsed.as_secs_f64();
+        let total: u64 = self.reasons.values().sum();
+        let reasons: Vec<String> = self
+            .reasons
+            .iter()
+            .map(|(reason, n)| format!("{reason:#x}:{:.0}/s", *n as f64 / secs))
+            .collect();
+        let mut ports: Vec<(u16, u64)> = self.ports.iter().map(|(p, n)| (*p, *n)).collect();
+        ports.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        let ports: Vec<String> = ports
+            .iter()
+            .take(6)
+            .map(|(port, n)| format!("{port:#06x}:{:.0}/s", *n as f64 / secs))
+            .collect();
+        eprintln!(
+            "vp{} exits {:.0}/s reasons [{}] ports [{}]",
+            self.vp,
+            total as f64 / secs,
+            reasons.join(" "),
+            ports.join(" ")
+        );
+        *self = Self::new(self.vp);
+    }
+}
+
 /// Whether `exit` is a write to the PC reset control register (`0xcf9`).
 fn is_reset_port_write(exit: &WHV_RUN_VP_EXIT_CONTEXT) -> bool {
     if exit.ExitReason != WHvRunVpExitReasonX64IoPortAccess {
