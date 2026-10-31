@@ -54,6 +54,10 @@ pub mod notify;
 /// inside the module.
 pub mod msi;
 
+/// Queue kicks served by a worker thread instead of the vCPU, for a machine
+/// without ioeventfds (WHP). Portable.
+pub mod kick_worker;
+
 /// The PCI bus carrying virtio functions — **portable** since EPIC 17 phase 4,
 /// by the same split [`virtio`] got in phase 3: `attach` keeps the KVM wiring
 /// (irqfds, `KVM_SIGNAL_MSI`, ioeventfds), `attach_userspace` wires the same

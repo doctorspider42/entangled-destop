@@ -259,6 +259,9 @@ pub struct VirtioPciSlot {
     /// worker thread; `None` means every kick runs inline on the vCPU.
     #[cfg(target_os = "linux")]
     notifier: Option<DeviceNotifier<PciTransport>>,
+    /// The worker serving this device's kicks off the vCPU thread, once
+    /// [`VirtioPciBus::offload_kicks`] has run; `None` keeps them inline.
+    kicks: Option<crate::kick_worker::KickWorker>,
     /// The host memory behind this function's shared-memory regions, when it
     /// declared any and the machine could back them (VEN-2001).
     ///
@@ -498,6 +501,7 @@ impl VirtioPciBus {
                 msix_vectors: built.msix_vectors,
                 transport: built.transport,
                 notifier,
+                kicks: None,
                 shm: built.shm,
             });
         }
@@ -629,6 +633,7 @@ impl VirtioPciBus {
                 transport: built.transport,
                 #[cfg(target_os = "linux")]
                 notifier: None,
+                kicks: None,
                 shm: built.shm,
             });
         }
@@ -924,6 +929,11 @@ impl VirtioPciBus {
                 notifier.set_quiesce(Arc::clone(&quiesce));
             }
         }
+        for slot in &self.slots {
+            if let Some(kicks) = &slot.kicks {
+                kicks.set_quiesce(Arc::clone(&quiesce));
+            }
+        }
         if let Some(host_wake) = &self.host_wake {
             host_wake.set_quiesce(quiesce);
         }
@@ -964,6 +974,7 @@ impl VirtioPciBus {
         }
         #[cfg(target_os = "linux")]
         self.reconcile_notify();
+        self.reconcile_kicks();
         // A reset puts every command register back to "decodes nothing", so
         // this takes every shared-memory window out of the guest's address
         // space — which is exactly what a rebooting machine owes ADR-0005. A
@@ -1176,6 +1187,7 @@ impl VirtioPciBus {
         }
         #[cfg(target_os = "linux")]
         self.reconcile_notify();
+        self.reconcile_kicks();
         Ok(())
     }
 
@@ -1209,6 +1221,11 @@ impl VirtioPciBus {
         for slot in &self.slots {
             if let Some(notifier) = &slot.notifier {
                 notifier.shutdown();
+            }
+        }
+        for slot in &self.slots {
+            if let Some(kicks) = &slot.kicks {
+                kicks.shutdown();
             }
         }
         if let Some(host_wake) = &self.host_wake {
@@ -1280,6 +1297,9 @@ impl VirtioPciBus {
         // something else.
         if write.decode_changed {
             self.reconcile_shm();
+        }
+        if write.decode_changed {
+            self.reconcile_kicks();
         }
         if write.mirror_changed {
             if let Some(owner) = write.owner {
@@ -1366,6 +1386,42 @@ impl VirtioPciBus {
             if let Some(notifier) = slot.notifier() {
                 notifier.rebase(notify_base, &slot.transport);
             }
+        }
+    }
+
+    /// Moves every device's queue kicks off the vCPU thread, onto a worker
+    /// per device (`crate::kick_worker`, ADR-0008): the exit remains, the
+    /// device work does not run on the vCPU any more.
+    ///
+    /// For a synchronous-kick bus ([`Self::attach_userspace`]); a bus never
+    /// asked keeps serving kicks inline, exactly as before.
+    pub fn offload_kicks(&mut self) {
+        for index in 0..self.slots.len() {
+            let Some(slot) = self.slots.get_mut(index) else {
+                continue;
+            };
+            slot.kicks = crate::kick_worker::KickWorker::attach(
+                index,
+                slot.bar_base.saturating_add(vpci::NOTIFY_CFG_OFFSET),
+                u64::from(vpci::NOTIFY_OFF_MULTIPLIER),
+                &slot.transport,
+            );
+        }
+        self.reconcile_kicks();
+    }
+
+    /// Points every kick worker at wherever its device's BAR now decodes
+    /// (EDK2 reassigns them all), or at nothing while it decodes nothing.
+    fn reconcile_kicks(&self) {
+        for (index, slot) in self.slots.iter().enumerate() {
+            let Some(kicks) = &slot.kicks else {
+                continue;
+            };
+            let window = match self.root.lock() {
+                Ok(root) => root.bar_window_of(index, vpci::VIRTIO_PCI_BAR_INDEX),
+                Err(_) => return,
+            };
+            kicks.rebase(window.map(|(base, _)| base.saturating_add(vpci::NOTIFY_CFG_OFFSET)));
         }
     }
 
@@ -1512,6 +1568,14 @@ impl VirtioPciBus {
 
     /// Guest MMIO write inside some device's BAR window.
     pub fn mmio_write(&self, addr: u64, data: &[u8]) {
+        // A queue kick a worker serves: hand it over and let the vCPU go.
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.kicks.as_ref().is_some_and(|kicks| kicks.kick(addr)))
+        {
+            return;
+        }
         if let Some((fb, offset)) = self.locate_framebuffer(addr) {
             fb.mmio_write(offset, data);
             return;

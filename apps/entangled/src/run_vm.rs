@@ -2852,7 +2852,7 @@ mod host {
                     (MachineBus::with_virtio(serial, virtio), cmdline)
                 }
                 VirtioTransport::Pci => {
-                    let pci = VirtioPciBus::attach_userspace_with_display(
+                    let mut pci = VirtioPciBus::attach_userspace_with_display(
                         Arc::clone(&mem),
                         devices,
                         &irqchip,
@@ -2861,6 +2861,13 @@ mod host {
                         super::framebuffer_present::config_for(cfg),
                     )
                     .map_err(|e| e.to_string())?;
+                    // Queue kicks off the vCPU thread (ADR-0008), unless
+                    // `ENTANGLED_QUEUE_NOTIFY=sync` asks for the old path.
+                    let synchronous = std::env::var("ENTANGLED_QUEUE_NOTIFY")
+                        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("sync"));
+                    if !synchronous {
+                        pci.offload_kicks();
+                    }
                     let cmdline =
                         direct_linux_cmdline(&cfg.boot.cmdline, net_cmdline.as_deref(), "");
                     (MachineBus::with_virtio_pci(serial, pci), cmdline)

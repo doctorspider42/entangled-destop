@@ -350,3 +350,21 @@ asset's SHA-256 in `guest/firmware/pinned.toml` (never a local build's — the
 has no GOP, and `adapter = "framebuffer"` shows nothing before the guest
 draws. Regression check done on WHP with the new local firmware: the Ubuntu
 26.04 desktop ISO boots to its live GNOME session on virtio-gpu as before.
+
+### Amendment, 2026-10-31: queue kicks off the vCPU
+
+On WHP every virtio-pci kick was a full exit **and** the device ran inline
+on the vCPU that made it, so a disk read held a guest CPU for as long as the
+host took to serve it. WHP's ioeventfd peer, `WHvRegisterPartitionDoorbellEvent`,
+cannot be used on this host. With a zero length the **second** registration
+fails fast inside `winhvplatform.dll` (`0xc0000409`, 10.0.19041.6093), with
+a length it does so whether or not the length is matched, and a length without
+`MatchOnLength` is `E_INVALIDARG`. So the exit stays and only the work moves.
+`machine_x86::kick_worker` recognises a write to an offloaded queue's
+notification address in the bus's MMIO handler, sets the queue's bit, wakes
+the device's worker and returns to the guest. The worker takes the pause gate,
+then the transport lock, and runs the queue. The registrations follow the BAR
+like `notify`'s do. `ENTANGLED_QUEUE_NOTIFY=sync` restores the old path.
+
+Measured on the installed Windows 10, headless, screenshots every 5 s: the
+desktop appears **~38 s** after start with the worker and **~68 s** without.
