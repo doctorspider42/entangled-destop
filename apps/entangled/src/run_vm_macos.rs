@@ -15,6 +15,8 @@ use vm_memory::{Bytes, GuestAddress};
 use vmm_core::hvf::{HvfGic, HvfOptions, HvfVm};
 #[path = "macos_cpus.rs"]
 mod cpus;
+#[path = "macos_snapshot.rs"]
+mod snapshot;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn stop_signal(_: i32) {
@@ -51,7 +53,7 @@ impl Drop for Signals {
     }
 }
 
-fn validate(cfg: &VmConfig, options: &RunOptions) -> Result<(), String> {
+fn validate(cfg: &VmConfig, _options: &RunOptions) -> Result<(), String> {
     if cfg.architecture != GuestArchitecture::Aarch64 {
         return Err("Apple Silicon requires architecture = \"aarch64\"; x86 guests cannot be hardware-virtualized here".into());
     }
@@ -71,9 +73,6 @@ fn validate(cfg: &VmConfig, options: &RunOptions) -> Result<(), String> {
             "ARM64 audio, gamepad, memory reclaim and ISO boot are not connected yet".into(),
         );
     }
-    if options.restore.is_some() {
-        return Err("ARM64 saved CPU state is not supported by the x86 snapshot format".into());
-    }
     if cfg
         .network
         .as_ref()
@@ -89,6 +88,7 @@ type Ready = (
     virtio_input::InputHandle,
     virtio_input::InputHandle,
     Arc<virtio_core::Quiesce>,
+    Arc<snapshot::Session>,
 );
 
 /// Running guest CPUs must keep progressing when their window is occluded.
@@ -184,14 +184,19 @@ impl<W: Write> Write for MarkerWriter<W> {
 }
 
 fn run_inner(
-    cfg: VmConfig,
+    mut cfg: VmConfig,
     options: RunOptions,
     marker: Option<SerialMarker>,
 ) -> Result<(), String> {
     validate(&cfg, &options)?;
+    // Retain reconstruction recipes before the first accelerated context.
+    if cfg.display.venus && options.snapshot.is_some() {
+        cfg.display.venus_checkpoints = true;
+    }
     let _activity = VmActivity::begin();
     let _signals = Signals::install()?;
-    tracing::debug!(snapshot = ?options.snapshot, "ARM64 snapshots remain unavailable");
+    let snapshot_default = options.snapshot.clone();
+    let restore = options.restore.clone();
     let thumbnail_default = options.snapshot.as_ref().and_then(|path| {
         Some(control_api::control::thumbnail_path(
             path.parent().unwrap_or(std::path::Path::new(".")),
@@ -220,6 +225,9 @@ fn run_inner(
         None => DisplayHandle::detached(cfg.display.width, cfg.display.height)
             .map_err(|e| e.to_string())?,
     };
+    if restore.is_some() {
+        display.set_lifecycle_progress(Some(display::LifecyclePhase::Restoring));
+    }
     let input = host.as_ref().map(DisplayHost::input_queue);
     let control = host.as_ref().map(DisplayHost::control_queue);
     let done = Arc::new(AtomicBool::new(false));
@@ -228,7 +236,13 @@ fn run_inner(
     let finished = done.clone();
     let worker = std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            machine(cfg, vm_display.clone(), ready_tx, marker)
+            machine(
+                cfg,
+                vm_display.clone(),
+                ready_tx,
+                marker,
+                restore.as_deref(),
+            )
         }))
         .map_err(|_| "ARM64 VM worker panicked".to_string())
         .and_then(|result| result.map_err(|e| e.to_string()));
@@ -288,15 +302,21 @@ fn run_inner(
         let mut ready: Option<Ready> = None;
         let mut stop_at = None;
         let mut power_requested = false;
+        let mut save_requested = None;
         while !monitor_done.load(Ordering::Acquire) {
             if ready.is_none() {
                 ready = ready_rx.try_recv().ok();
+                if ready.is_none() {
+                    if let Some(input) = &input {
+                        input.drain_batches();
+                    }
+                }
             }
             for command in command_rx.try_iter() {
                 if let Some(text) = command.strip_prefix(&format!("{CMD_PASTE} ")) {
                     let outcome = typist.type_text(&text.replace("\\n", "\n"));
                     println!(
-                        "{PREFIX} ok {CMD_PASTE} typed={} skipped={} truncated={}",
+                        "\n{PREFIX} ok {CMD_PASTE} typed={} skipped={} truncated={}",
                         outcome.typed, outcome.skipped, outcome.truncated
                     );
                 } else if let Some(text) = command.strip_prefix("type ") {
@@ -312,8 +332,23 @@ fn run_inner(
                     STOP.store(true, Ordering::Relaxed);
                 } else if command == CMD_SHUTDOWN {
                     power_requested = true;
+                } else if command == "save" || command.starts_with("save ") {
+                    let argument = command.strip_prefix("save").unwrap_or_default().trim();
+                    save_requested = if argument.is_empty() {
+                        snapshot_default.clone()
+                    } else {
+                        Some(std::path::PathBuf::from(argument))
+                    };
+                    if save_requested.is_none() {
+                        println!("\n{PREFIX} error save needs a path");
+                    }
                 } else if command == CMD_STATUS {
-                    println!("{PREFIX} state=Running");
+                    let state = if ready.is_some() {
+                        "Running"
+                    } else {
+                        "Starting"
+                    };
+                    println!("\n{PREFIX} state={state}");
                 } else if let Some(argument) =
                     command.strip_prefix(CMD_THUMBNAIL).filter(|argument| {
                         argument.is_empty() || argument.starts_with(char::is_whitespace)
@@ -328,20 +363,20 @@ fn run_inner(
                     if let Some(path) = path {
                         if let Some(parent) = path.parent() {
                             if let Err(error) = std::fs::create_dir_all(parent) {
-                                println!("{PREFIX} error thumbnail {error}");
+                                println!("\n{PREFIX} error thumbnail {error}");
                                 continue;
                             }
                         }
                         if let Err(error) =
                             display.write_thumbnail(path, display::thumbnail::MAX_WIDTH)
                         {
-                            println!("{PREFIX} error thumbnail {error}");
+                            println!("\n{PREFIX} error thumbnail {error}");
                         }
                     } else {
-                        println!("{PREFIX} error thumbnail needs a path");
+                        println!("\n{PREFIX} error thumbnail needs a path");
                     }
                 } else {
-                    println!("{PREFIX} error {command} unsupported ARM64 control");
+                    println!("\n{PREFIX} error {command} unsupported ARM64 control");
                 }
             }
             if let Some(control) = &control {
@@ -351,7 +386,13 @@ fn run_inner(
                             STOP.store(true, Ordering::Relaxed)
                         }
                         ControlEvent::PowerButtonRequested => power_requested = true,
-                        ControlEvent::ResetRequested | ControlEvent::SaveRequested => {
+                        ControlEvent::SaveRequested => {
+                            save_requested = snapshot_default.clone();
+                            if save_requested.is_none() {
+                                println!("\n{PREFIX} error save needs a path");
+                            }
+                        }
+                        ControlEvent::ResetRequested => {
                             tracing::warn!(
                                 ?event,
                                 "ARM64 lifecycle operation is not implemented yet"
@@ -361,7 +402,10 @@ fn run_inner(
                     }
                 }
             }
-            if let Some((group, keyboard, pointer, quiesce)) = &ready {
+            if let Some((group, keyboard, pointer, quiesce, session)) = &ready {
+                if let Some(path) = save_requested.take() {
+                    session.suspend(group, &path);
+                }
                 if group.stopping() {
                     group.kick_all();
                     std::thread::sleep(Duration::from_millis(4));
@@ -391,8 +435,8 @@ fn run_inner(
                 }
                 if power_requested {
                     match press_power_button(keyboard) {
-                        Ok(()) => println!("{PREFIX} ok {CMD_SHUTDOWN}"),
-                        Err(e) => println!("{PREFIX} error {CMD_SHUTDOWN} {e}"),
+                        Ok(()) => println!("\n{PREFIX} ok {CMD_SHUTDOWN}"),
+                        Err(e) => println!("\n{PREFIX} error {CMD_SHUTDOWN} {e}"),
                     }
                     power_requested = false;
                 }
@@ -474,6 +518,7 @@ fn machine(
     display: DisplayHandle,
     ready: mpsc::Sender<Ready>,
     marker: Option<SerialMarker>,
+    restore: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let maximum = HvfVm::max_vcpu_count()?.min(machine_arm64::MAX_CPUS);
     if cfg.vcpus > maximum {
@@ -484,11 +529,16 @@ fn machine(
         .checked_mul(1 << 20)
         .ok_or("RAM size overflow")?;
     let mem = vmm_core::GuestMem::from_ranges(&[(GuestAddress(RAM_BASE), usize::try_from(ram)?)])?;
-    let entry = boot::load_kernel(&mem, &boot::read_image(cfg.boot.require_kernel()?)?)?;
+    let entry = if restore.is_none() {
+        boot::load_kernel(&mem, &boot::read_image(cfg.boot.require_kernel()?)?)?
+    } else {
+        RAM_BASE
+    };
     let initrd = cfg
         .boot
         .initramfs
         .as_ref()
+        .filter(|_| restore.is_none())
         .map(|path| boot::read_image(path).and_then(|bytes| boot::write_initrd(&mem, &bytes, ram)))
         .transpose()?;
     let vm = HvfVm::with_options(
@@ -561,10 +611,13 @@ fn machine(
                     .unwrap_or(control_api::DEFAULT_HOST_VISIBLE_MIB),
             ) << 20,
         );
-        virtio_gpu::GpuDevice::with_renderer(display, Box::new(renderer))
+        virtio_gpu::GpuDevice::with_renderer(display.clone(), Box::new(renderer))
     } else {
-        virtio_gpu::GpuDevice::new(display)
+        virtio_gpu::GpuDevice::new(display.clone())
     };
+    if cfg.display.venus && cfg.display.venus_checkpoints {
+        gpu.enable_accelerated_checkpoints(64 << 20)?;
+    }
     gpu.set_refresh_hz(cfg.display.refresh_hz);
     gpu.set_frame_stats(cfg.display.frame_stats.clone());
     let shm = if let Some(region) = gpu.shm_region() {
@@ -608,7 +661,47 @@ fn machine(
         cmdline: &cfg.boot.cmdline,
     })?;
     let dtb = RAM_BASE + ram - boot::DTB_RESERVE;
-    vm.memory().write_slice(&tree, GuestAddress(dtb))?;
+    let gate = bus.quiesce();
+    gate.pause();
+    let restored = if let Some(path) = restore {
+        let current = bus
+            .save()?
+            .into_iter()
+            .enumerate()
+            .map(|(slot, state)| machine_x86::state::SavedVirtioSlot {
+                slot: slot as u32,
+                state,
+            })
+            .collect::<Vec<_>>();
+        let shape = crate::snapshot::shape(&cfg, snapshot::device_slots(&current));
+        let (mut state, mut gpu) =
+            vm_snapshot::arm64::restore(path, vm.memory(), &shape, &bus.gpu_checkpoint_slots()?)?;
+        bus.load(
+            &state
+                .devices
+                .iter()
+                .map(|d| d.state.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        for slot in gpu.slots().to_vec() {
+            let mut archive = gpu.section(slot)?;
+            bus.load_streamed_state(slot, &mut archive)?;
+        }
+        let elapsed = HvfVm::counter().wrapping_sub(state.counter);
+        for cpu in &mut state.cpus {
+            cpu.timer_offset = cpu.timer_offset.wrapping_add(elapsed);
+            // Physical timer's compare uses the host counter, without CNTVOFF.
+            for (reg, value) in &mut cpu.system {
+                if *reg == 0xdf12 {
+                    *value = value.wrapping_add(elapsed);
+                }
+            }
+        }
+        Some(state)
+    } else {
+        vm.memory().write_slice(&tree, GuestAddress(dtb))?;
+        None
+    };
     let guest_poweroff = marker.as_ref().map(|marker| marker.powered_off.clone());
     let output: Box<dyn Write + Send> = match marker {
         Some(marker) => Box::new(MarkerWriter {
@@ -629,9 +722,32 @@ fn machine(
             context: dtb,
         },
         machine,
+        restored.as_ref(),
         |group| {
+            if let Some(state) = &restored {
+                gic.load_state(&state.gic).map_err(|e| e.to_string())?;
+            }
+            gate.resume();
+            let session = Arc::new(snapshot::Session {
+                vm: vm.clone(),
+                gic: gic.clone(),
+                bus: bus.clone(),
+                cfg: cfg.clone(),
+                display: display.clone(),
+            });
+            if restored.is_some() {
+                // Clear before publishing readiness: a queued save must not
+                // have its newer progress event cleared by this restore.
+                display.set_lifecycle_progress(None);
+            }
             ready
-                .send((group, keyboard_handle, pointer_handle, bus.quiesce()))
+                .send((
+                    group,
+                    keyboard_handle,
+                    pointer_handle,
+                    bus.quiesce(),
+                    session,
+                ))
                 .map_err(|_| "VM monitor stopped before CPU initialization".to_string())
         },
     );
@@ -675,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_architecture_and_cpu_state_are_refused_before_host_setup() {
+    fn unsupported_platform_is_refused_and_restore_reaches_native_validation() {
         let mut cfg = arm_profile();
         let options = RunOptions::default();
         assert!(validate(&cfg, &options).is_ok());
@@ -692,10 +808,10 @@ mod tests {
         }
         cfg = arm_profile();
         let restore = RunOptions {
-            restore: Some("x86.esnap".into()),
+            restore: Some("arm64.esnap".into()),
             ..Default::default()
         };
-        assert!(validate(&cfg, &restore).unwrap_err().contains("snapshot"));
+        assert!(validate(&cfg, &restore).is_ok());
         cfg.boot.mode = BootMode::Uefi;
         assert!(validate(&cfg, &options).is_err());
     }

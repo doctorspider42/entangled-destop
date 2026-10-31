@@ -1585,3 +1585,27 @@ configuration:
 | the control channel's replies | `cargo test -p entangled --test suspend_restore -- --nocapture`, which passes; the `saved …` line is one of its own, with the path shortened |
 | `[gamepad] enabled = true`, `players = 2`, and what the guest makes of the pads | `cargo test -p boot-tests --test gamepad -- --nocapture` was re-run here against a bootstrap kernel built **with** `CONFIG_INPUT_JOYDEV=y`, and all four boots pass. The two-player and `js0` claims are that run’s own guest output: `inputmap devices=Entangled_Keyboard:-:event0:-,Entangled_Tablet:-:event1:-,Entangled_Gamepad:player-1:event2:js0,Entangled_Gamepad:player-2:event3:js1` |
 | that rumble is unreachable rather than merely unimplemented | the same run: the guest kernel publishes `evbits=b` (no `EV_FF`), `EVIOCGBIT(EV_FF)` reports nothing, the guest driver never once selects the device’s `EV_FF` capability while probing, and an `EV_FF` event written to the event node is accepted by evdev and never reaches the device |
+
+### Saved sessions on Apple Silicon
+
+On macOS 27 or newer, **Suspend** in the manager or the VM window saves the current ARM64
+session and closes the VM. Starting the suspended machine returns to that
+session; the command-line equivalent is `entangled resume <file.esnap>`.
+Snapshots belong to the same host backend and matching CPU features, VM
+configuration and disks. If saving fails, the running session remains open.
+Full native CPU snapshots require the SError state API introduced in macOS 27;
+older hosts keep the running session and report that requirement if saving is
+requested. Normal VM startup remains available on macOS 26.
+Native Restart is still unavailable. Accelerated Ubuntu/GNOME passed 30 minutes
+of continuous GPU load, a save/restore, three additional minutes of load and a
+second save/restore on an M3 Pro. The same glmark2 process continued and fresh
+GPU work passed after both restores. Saved GPU sessions remain experimental.
+
+During saving and waking, the manager and VM window show linked rings and an
+activity bar until the operation completes. Turning off interface animations
+keeps the indicator still.
+The Vulkan journal discards superseded command recordings, descriptor writes
+and repeated synchronization recipes, as well as unreachable closed object
+lifetimes. Retained reconstruction state still has
+a 64 MiB safety budget; exceeding it refuses saving while keeping the machine
+running. A previously exhausted journal needs a fresh session.

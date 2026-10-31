@@ -32,6 +32,7 @@ pub(crate) enum HostEvent {
     GpuActive,
     /// A bounded, host-generated lifecycle notice, including in fullscreen.
     Notice(&'static str),
+    Lifecycle(Option<crate::LifecyclePhase>),
     /// Tear the window down and return from [`crate::DisplayHost::run`].
     Shutdown,
 }
@@ -210,6 +211,12 @@ pub struct DisplayHandle {
 }
 
 impl DisplayHandle {
+    /// Persistent host feedback until completion or failure clears it.
+    pub fn set_lifecycle_progress(&self, phase: Option<crate::LifecyclePhase>) {
+        if let Some(proxy) = &self.waker.proxy {
+            let _ = proxy.send_event(HostEvent::Lifecycle(phase));
+        }
+    }
     /// Shows a host-generated notice in the title and fullscreen toolbar.
     pub fn notify(&self, message: &'static str) {
         if let Some(proxy) = &self.waker.proxy {

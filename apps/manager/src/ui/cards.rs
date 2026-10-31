@@ -135,11 +135,13 @@ fn heading(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
 
 /// "One running, one saved for later, one installing." — the page in words.
 fn summary(app: &ManagerApp) -> String {
-    let mut counts = [0usize; 4];
+    let mut counts = [0usize; 6];
     for vm in &app.scan.vms {
         match app.status_of(&vm.name) {
             Status::Running | Status::Stopping => counts[0] += 1,
-            Status::Suspended | Status::Suspending => counts[1] += 1,
+            Status::Resuming => counts[4] += 1,
+            Status::Suspended => counts[1] += 1,
+            Status::Suspending => counts[5] += 1,
             Status::Installing => counts[2] += 1,
             Status::Stopped => counts[3] += 1,
         }
@@ -152,15 +154,22 @@ fn summary(app: &ManagerApp) -> String {
     summarise(counts)
 }
 
-/// The sentence for `[running, saved, installing, off]`.
-fn summarise(counts: [usize; 4]) -> String {
+/// The sentence for `[running, saved, installing, off, waking, saving]`.
+fn summarise(counts: [usize; 6]) -> String {
     let word = |n: usize| match n {
         1 => "one".to_string(),
         2 => "two".to_string(),
         3 => "three".to_string(),
         n => n.to_string(),
     };
-    let labels = ["running", "saved for later", "installing", "off"];
+    let labels = [
+        "running",
+        "saved for later",
+        "installing",
+        "off",
+        "waking up",
+        "saving",
+    ];
     let parts: Vec<String> = counts
         .iter()
         .zip(labels)
@@ -259,12 +268,9 @@ pub(crate) fn running_controls(
     actions: &mut Vec<Action>,
 ) {
     let controllable = app.has_control(&vm.name);
-    let cpu_block = app.backend_of(&vm.name).cpu_lifecycle_block();
     let suspend = |ui: &mut egui::Ui| {
-        ui::primary_button_enabled(ui, "Suspend", controllable && cpu_block.is_none())
-            .on_hover_text(if let Some(reason) = cpu_block {
-                reason
-            } else if !controllable {
+        ui::primary_button_enabled(ui, "Suspend", controllable)
+            .on_hover_text(if !controllable {
                 "This VM was not started from here"
             } else {
                 "Save the session to disk and stop the machine. Resume returns to this session."
@@ -620,6 +626,16 @@ pub(crate) fn screen_well(
         Corners::All => egui::CornerRadius::same(r),
     };
     ui.painter().rect_filled(rect, radius, theme::INSET);
+    if matches!(status, Status::Suspending | Status::Resuming) {
+        if let Some(texture) = app.thumbs.get(name) {
+            egui::Image::new(texture)
+                .corner_radius(radius)
+                .tint(theme::TEXT_FAINT.gamma_multiply(0.25))
+                .paint_at(ui, rect);
+        }
+        crate::ui::lifecycle::paint(ui, rect, status);
+        return;
+    }
     let live = status == Status::Running;
     if let Some(texture) = app.thumbs.get(name) {
         let size = texture.size_vec2();
@@ -652,6 +668,7 @@ pub(crate) fn screen_well(
         Status::Stopped => "Off",
         Status::Suspended => "Saved session",
         Status::Suspending => "Saving…",
+        Status::Resuming => "Waking…",
         Status::Installing => "Installing",
         Status::Stopping => "Shutting down",
     };
@@ -960,11 +977,15 @@ mod tests {
     #[test]
     fn the_summary_reads_as_a_sentence() {
         assert_eq!(
-            summarise([1, 1, 1, 0]),
+            summarise([1, 1, 1, 0, 0, 0]),
             "One running, one saved for later, one installing."
         );
-        assert_eq!(summarise([0, 0, 0, 4]), "4 off.");
-        assert_eq!(summarise([0, 2, 0, 1]), "Two saved for later, one off.");
-        assert_eq!(summarise([0, 0, 0, 0]), "");
+        assert_eq!(summarise([0, 0, 0, 4, 0, 0]), "4 off.");
+        assert_eq!(
+            summarise([0, 2, 0, 1, 0, 0]),
+            "Two saved for later, one off."
+        );
+        assert_eq!(summarise([0, 0, 0, 0, 0, 0]), "");
+        assert_eq!(summarise([0, 0, 0, 0, 1, 1]), "One waking up, one saving.");
     }
 }

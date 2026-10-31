@@ -650,3 +650,55 @@ aggregate callback/forwarding counts at release, never text. Test the real VM
 with two guest windows as well: an armed title alone does not prove delivery.
 For native computer-use tests, explicit `Control_L`, `Alt_L` modifiers and the
 window's Raise action worked; generic modifier aliases were unreliable here.
+
+
+### Native presentation memory diagnostic (2026-10-29)
+
+`cargo run -p display --example memory_soak -- 300` repeatedly uploads the full
+2048x1536 CPU scanout at approximately 60 Hz with no VM or Vulkan guest device.
+It exits after 1..=3600 requested seconds (default 300), accepts `stop` on stdin,
+and handles the normal close/quit events. The fixed calm plane keeps desktop
+measurements readable without flashing. A five-minute M3 Pro run uploaded about
+700 MiB/s with an observed peak footprint of 356271208 bytes and exit 0. This
+isolates presentation; it does not prove the combined VM/guest-driver path.
+
+wgpu-core 26.0.1 already calls nonblocking device maintain/Poll from Queue::submit.
+The copy renderer's lack of an explicit device.poll call alone is not evidence
+of deferred-resource leakage. Never add a blocking Wait to the frame hot path
+on that assumption. The separate long-running VM test still had a graphics
+memory-growth finding, so its acceptance remains distinct from this probe.
+
+### Hidden windows must keep dirty data on the CPU (2026-10-30)
+
+Check occlusion/nonzero window size BEFORE renderer.prepare. queue.write_texture
+stages uploads until submit; returning after preparation for an invisible window
+accumulates GPU allocations on each guest frame. Cmd+H reproduced growth from
+~330 MiB to 4417933392 bytes within seconds in the old memory_soak example,
+which its memory guard stopped cleanly. This is distinct from native Vulkan
+recipe retention. Preserve the dirty mirror while hidden; unocclusion already
+requests the redraw that uploads its current contents. The fixed probe passed 120 s, including more than a minute hidden: 4966 CPU
+updates, 851 rendered frames, peak 356271232 bytes, exit 0. The windowed VM
+acceptance remains a separate check.
+
+DisplayHandle::set_lifecycle_progress(Some(LifecyclePhase::{Saving,Restoring}))
+shows a persistent navy/ice linked-ring activity panel over a dimmed scanout.
+Only explicit None clears it; do not reuse timed notices for long operations.
+ENTANGLED_INTERFACE_MOTION=off keeps it static. The image is cached per phase,
+DPI, viewport and 40 ms animation tick; hidden windows do not animate/upload.
+memory_soak accepts an optional second argument saving|restoring for visual QA.
+Tests cover operation lifetime, reduced motion, bounded DPI and premultiplied
+output.
+
+The same ordering applies when surface acquisition times out or recovery fails:
+Renderer::acquire_frame runs before prepare consumes damage or stages transfers.
+Validate the viewport before prepare too. Once uploads exist, the acquired frame
+must reach Renderer::render and its submit. Keep acquisition outside the CPU
+mirror mutex; no blocking GPU Wait was added. Unavailable surfaces preserve
+CPU damage for the next drawable instead of accumulating pending writes.
+
+Final M3 Pro windowed acceptance passed 30 minutes of accelerated GPU load,
+a fresh-process restore, three further minutes and a second restore. Same
+glmark2 PID/start/boot/compositor survived; fresh GPU work passed after both.
+The final renderer preview passed another 90 s visible/hidden workload at
+380863616 bytes peak. See ADR-0007 and occlusion-cycles-result.json; recipe
+retention and hidden-window staging were separate defects.

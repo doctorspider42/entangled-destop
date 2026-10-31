@@ -18,12 +18,25 @@ use crate::venus::wire::{Decoder, Encoder, WireError};
 
 use super::{HostVulkan, VulkanContext};
 
+#[path = "checkpoint_compact.rs"]
+mod compact;
+
 const VERSION: u32 = 1;
-const RECIPE_VERSION: u32 = 2;
-/// Total retained recipe storage, including record headers and vector entries.
+const RECIPE_VERSION: u32 = 3;
+/// Core recipe storage, including record headers and vector entries. Each
+/// record additionally has an eight-byte generation tag. Tags have a separate
+/// derived bound (below), so upgrading a full v2 journal does not consume its
+/// existing command budget or reject a previously valid snapshot.
 pub const MAX_RECIPE_BYTES: u64 = 64 << 20;
+const COMPACT_INTERVAL: u64 = 4 << 20;
 const MAX_RECORD_BYTES: usize = 8 << 20;
+const MAX_FRAMED_RECORD_BYTES: usize = MAX_RECORD_BYTES + 8;
 const RECORD_COST: u64 = 4 + std::mem::size_of::<Vec<u8>>() as u64;
+const GENERATION_BYTES: u64 = 8;
+/// At least 12 original frame bytes plus RECORD_COST are charged per tag.
+/// The same proof holds across contexts sharing the core recipe budget.
+pub const MAX_RECIPE_GENERATION_BYTES: u64 =
+    MAX_RECIPE_BYTES / (12 + RECORD_COST) * GENERATION_BYTES;
 
 /// These checkpoint codecs use the checked Venus byte decoder, whose blobs
 /// carry four-byte padding. Streaming writers must emit that padding too,
@@ -101,21 +114,28 @@ pub(super) fn encode_recipe(command: &Command<'_>) -> Result<Option<Vec<u8>>, Re
     Ok(Some(encoder.finish()?))
 }
 
-/// A bounded journal. Crossing its budget disables *checkpointing*, leaving
-/// ordinary guest execution alone. No truncated journal can be saved.
+/// A bounded journal which periodically removes superseded primary command
+/// recordings. Object lifetimes, allocation generations and secondary history
+/// remain ordered. If the remaining state exceeds the budget, checkpointing
+/// is disabled while ordinary guest execution continues. No truncated journal
+/// can be saved.
 pub struct RecipeJournal {
     records: Vec<Vec<u8>>,
     pub(super) imports: BTreeMap<u64, super::checkpoint_imports::ImportRecipe>,
     pub(super) charge: Charge,
     failure: Option<RecipeError>,
+    next_compaction: u64,
+    allocation_serial: u64,
 }
 
 impl RecipeJournal {
     pub(super) fn clear(&mut self) {
-        self.records.clear();
+        self.records = Vec::new();
         self.imports.clear();
         self.charge.shrink_to(0);
         self.failure = None;
+        self.next_compaction = COMPACT_INTERVAL;
+        self.allocation_serial = 0;
     }
     pub(super) fn recording(&self) -> bool {
         self.failure.is_none()
@@ -127,6 +147,8 @@ impl RecipeJournal {
             // Zero bytes cannot cross a budget, including a zero-sized one.
             charge: budget.charge_anyway(0),
             failure: None,
+            next_compaction: COMPACT_INTERVAL,
+            allocation_serial: 0,
         }
     }
 
@@ -138,6 +160,16 @@ impl RecipeJournal {
         if self.failure.is_some() {
             return;
         }
+        let allocation_serial = if matches!(completed, Command::AllocateMemory(_)) {
+            let Some(serial) = self.allocation_serial.checked_add(1) else {
+                self.fail(RecipeError::Invalid("allocation ordinal exhausted"));
+                return;
+            };
+            self.allocation_serial = serial;
+            serial
+        } else {
+            0
+        };
         let request = match encoded {
             Ok(Some(record)) => record,
             Ok(None) => return,
@@ -150,6 +182,20 @@ impl RecipeJournal {
         // error. Until their rollback is represented, neither skipping them
         // nor replaying their original inputs is a reconstruction recipe.
         if super::context::result_of(completed).is_some_and(|ret| ret < 0) {
+            // A refused single allocation creates no object. Preserve the
+            // ordinal consumed by the executor, without replaying the OOM on
+            // a host whose available memory can now be different.
+            if matches!(completed, Command::AllocateMemory(_))
+                && matches!(
+                    super::context::result_of(completed),
+                    Some(
+                        crate::venus::protocol::VK_ERROR_OUT_OF_HOST_MEMORY
+                            | crate::venus::protocol::VK_ERROR_OUT_OF_DEVICE_MEMORY
+                    )
+                )
+            {
+                return;
+            }
             self.fail(RecipeError::Invalid("a state-changing command failed"));
             return;
         }
@@ -157,7 +203,8 @@ impl RecipeJournal {
             let mut reply = Encoder::with_limit(MAX_RECORD_BYTES);
             completed.encode_reply(&mut reply)?;
             let reply = reply.finish()?;
-            let mut record = Encoder::with_limit(MAX_RECORD_BYTES);
+            let mut record = Encoder::with_limit(MAX_FRAMED_RECORD_BYTES);
+            record.u64(allocation_serial)?;
             record.u32(u32::try_from(request.len()).map_err(|_| RecipeError::Budget)?)?;
             record.blob(&request)?;
             record.blob(&reply)?;
@@ -170,17 +217,50 @@ impl RecipeJournal {
 
     pub(super) fn fail(&mut self, error: RecipeError) {
         self.failure = Some(error);
-        self.records.clear();
+        self.records = Vec::new();
         self.imports.clear();
         self.charge.shrink_to(0);
     }
 
+    /// A live import appends metadata after its allocation command. Pressure
+    /// can arise in that gap even if the command itself fit. Archive decoding
+    /// uses note_import directly: untrusted records must survive until replay.
+    pub(super) fn note_live_import(
+        &mut self,
+        meta: super::checkpoint_imports::ImportRecipe,
+    ) -> Result<(), RecipeError> {
+        match self.note_import(meta) {
+            Err(RecipeError::Budget) => {
+                self.compact_recordings()?;
+                self.note_import(meta)
+            }
+            result => result,
+        }
+    }
+
     fn append(&mut self, bytes: Vec<u8>) -> Result<(), RecipeError> {
-        let cost = (bytes.len() as u64).saturating_add(RECORD_COST);
+        self.append_record(bytes, true)
+    }
+
+    fn append_record(&mut self, bytes: Vec<u8>, compact: bool) -> Result<(), RecipeError> {
+        if !(20..=MAX_FRAMED_RECORD_BYTES).contains(&bytes.len()) {
+            return Err(RecipeError::Invalid("command length is outside its bounds"));
+        }
+        let cost = bytes.len() as u64 + RECORD_COST - GENERATION_BYTES;
+        let projected = self.charge.amount().saturating_add(cost);
+        if compact && (projected >= self.next_compaction || projected > MAX_RECIPE_BYTES) {
+            self.compact_recordings()?;
+        }
         if self.charge.amount().saturating_add(cost) > MAX_RECIPE_BYTES {
             return Err(RecipeError::Budget);
         }
-        self.charge.grow(cost).map_err(|_| RecipeError::Budget)?;
+        if self.charge.grow(cost).is_err() {
+            if !compact {
+                return Err(RecipeError::Budget);
+            }
+            self.compact_recordings()?;
+            self.charge.grow(cost).map_err(|_| RecipeError::Budget)?;
+        }
         self.records
             .try_reserve(1)
             .map_err(|_| RecipeError::Budget)?;
@@ -197,6 +277,7 @@ impl RecipeJournal {
         }
         let mut encoder = Encoder::with_limit(MAX_RECIPE_BYTES as usize);
         encoder.u32(RECIPE_VERSION)?;
+        encoder.u64(self.allocation_serial)?;
         encoder.u32(u32::try_from(self.records.len()).map_err(|_| RecipeError::Budget)?)?;
         for record in &self.records {
             encoder.u32(u32::try_from(record.len()).map_err(|_| RecipeError::Budget)?)?;
@@ -217,9 +298,10 @@ impl RecipeJournal {
         }
         let mut decoder = Decoder::new(bytes);
         let version = decoder.u32()?;
-        if version != RECIPE_VERSION {
+        if version != 2 && version != RECIPE_VERSION {
             return Err(RecipeError::Version(version));
         }
+        let high_water = if version >= 3 { decoder.u64()? } else { 0 };
         let count = decoder.u32()? as usize;
         if count > decoder.remaining() / 12 {
             return Err(RecipeError::Invalid("record count exceeds the file"));
@@ -229,11 +311,21 @@ impl RecipeJournal {
         let mut allocation_serial = 0u64;
         for _ in 0..count {
             let len = decoder.u32()? as usize;
-            if !(12..=MAX_RECORD_BYTES).contains(&len) {
+            let bounds = if version >= 3 {
+                20..=MAX_FRAMED_RECORD_BYTES
+            } else {
+                12..=MAX_RECORD_BYTES
+            };
+            if !bounds.contains(&len) {
                 return Err(RecipeError::Invalid("command length is outside its bounds"));
             }
             let record = decoder.blob(len)?;
             let mut record_decoder = Decoder::new(record);
+            let recorded_serial = if version >= 3 {
+                record_decoder.u64()?
+            } else {
+                0
+            };
             let request_len = record_decoder.u32()? as usize;
             let mut command_decoder = Decoder::new(record_decoder.blob(request_len)?);
             let (header, command) = Command::decode_next(&mut command_decoder)?;
@@ -243,7 +335,16 @@ impl RecipeJournal {
                 ));
             }
             if let Command::AllocateMemory(args) = &command {
-                allocation_serial += 1;
+                if version >= 3 {
+                    if recorded_serial <= allocation_serial || recorded_serial > high_water {
+                        return Err(RecipeError::Invalid(
+                            "allocation generations are not ordered",
+                        ));
+                    }
+                    allocation_serial = recorded_serial;
+                } else {
+                    allocation_serial += 1;
+                }
                 if super::checkpoint_imports::is_import(args) {
                     let info = args
                         .p_allocate_info
@@ -258,13 +359,28 @@ impl RecipeJournal {
                         ),
                     );
                 }
+            } else if recorded_serial != 0 {
+                return Err(RecipeError::Invalid(
+                    "generation on a non-allocation command",
+                ));
             }
             let mut owned = Vec::new();
             owned
-                .try_reserve_exact(record.len())
+                .try_reserve_exact(record.len() + if version == 2 { 8 } else { 0 })
                 .map_err(|_| RecipeError::Budget)?;
+            if version == 2 {
+                owned.extend_from_slice(
+                    &if matches!(command, Command::AllocateMemory(_)) {
+                        allocation_serial
+                    } else {
+                        0
+                    }
+                    .to_le_bytes(),
+                );
+            }
             owned.extend_from_slice(record);
-            journal.append(owned)?;
+            // Never erase untrusted archive commands before semantic replay.
+            journal.append_record(owned, false)?;
         }
         let imports = decoder.u32()? as usize;
         if imports != expected_imports.len() || imports > decoder.remaining() / 36 {
@@ -288,6 +404,11 @@ impl RecipeJournal {
         if decoder.remaining() != 0 {
             return Err(RecipeError::Invalid("trailing bytes"));
         }
+        journal.allocation_serial = if version >= 3 {
+            high_water
+        } else {
+            allocation_serial
+        };
         Ok(journal)
     }
 
@@ -418,13 +539,15 @@ impl<H: HostVulkan> VulkanContext<H> {
         let journal = RecipeJournal::decode(bytes, budget)?;
         for record in journal.records() {
             let mut framing = Decoder::new(record);
+            let allocation_serial = framing.u64()?;
             let request_len = framing.u32()? as usize;
             let mut decoder = Decoder::new(framing.blob(request_len)?);
             let (_, mut command) = Command::decode_next(&mut decoder)?;
             let expected_reply = framing.blob(framing.remaining())?;
             self.command_bytes = request_len;
             self.restoring_import = if matches!(command, Command::AllocateMemory(_)) {
-                journal.imports.get(&(self.memory_sequence + 1)).copied()
+                self.memory_sequence = allocation_serial - 1;
+                journal.imports.get(&allocation_serial).copied()
             } else {
                 None
             };
@@ -461,6 +584,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                 }
             }
         }
+        self.memory_sequence = journal.allocation_serial;
         if self
             .objects
             .checkpoint_memories()
@@ -556,7 +680,7 @@ mod tests {
             assert_eq!(host.live_objects(), 0);
             assert_eq!(budget.used(), 0);
         }
-        for (offset, value) in [(0, 99u32), (4, u32::MAX), (8, u32::MAX)] {
+        for (offset, value) in [(0, 99u32), (12, u32::MAX), (16, u32::MAX)] {
             let mut bad = bytes.clone();
             bad[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             assert!(RecipeJournal::decode(&bad, &budget).is_err());
@@ -598,9 +722,24 @@ mod tests {
         assert!(encode_recipe(&command).unwrap().is_none());
         let mut encoder = Encoder::new();
         command.encode_command(&mut encoder, 0).unwrap();
+        let request = encoder.finish().unwrap();
+        let mut encoder = Encoder::new();
+        command.encode_reply(&mut encoder).unwrap();
+        let reply = encoder.finish().unwrap();
+        let mut encoder = Encoder::new();
+        encoder.u64(0).unwrap();
+        encoder.u32(request.len() as u32).unwrap();
+        encoder.blob(&request).unwrap();
+        encoder.blob(&reply).unwrap();
         journal.append(encoder.finish().unwrap()).unwrap();
         let bytes = journal.encode().unwrap();
         drop(journal);
+        assert!(matches!(
+            RecipeJournal::decode(&bytes, &budget),
+            Err(RecipeError::Invalid(
+                "record is not one reconstruction command"
+            ))
+        ));
         let host = Arc::new(FakeVulkan::standard());
         let mut restored = VulkanContext::new(1, Arc::clone(&host));
         assert!(restored.restore_object_recipes(&bytes, &budget).is_err());

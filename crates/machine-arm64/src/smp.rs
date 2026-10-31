@@ -18,7 +18,7 @@ pub struct CpuStart {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Power {
+pub enum Power {
     Off,
     Pending(CpuStart),
     On,
@@ -69,6 +69,37 @@ impl CpuPower {
         })
     }
 
+    /// Only called with all CPU threads parked at the lifecycle gate.
+    pub fn save(&self) -> Vec<Power> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cpus
+            .clone()
+    }
+
+    pub fn load(&self, cpus: &[Power]) -> Result<(), MachineError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if cpus.len() != inner.cpus.len() {
+            return Err(MachineError::Invalid("PSCI CPU inventory differs".into()));
+        }
+        for state in cpus {
+            if let Power::Pending(start) = state {
+                if start.entry & 3 != 0
+                    || start.entry < self.ram_start
+                    || start
+                        .entry
+                        .checked_add(4)
+                        .is_none_or(|end| end > self.ram_end)
+                {
+                    return Err(MachineError::Invalid("invalid saved PSCI entry".into()));
+                }
+            }
+        }
+        inner.cpus.copy_from_slice(cpus);
+        Ok(())
+    }
+
     pub fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
     }
@@ -80,11 +111,26 @@ impl CpuPower {
         self.changed.notify_all();
     }
 
+    pub fn wake(&self) {
+        let _inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.changed.notify_all();
+    }
+
     /// Park a powered-off host thread. A pending entry is consumed once only.
     pub fn wait_for_start(&self, cpu: u32) -> Result<Option<CpuStart>, MachineError> {
+        self.wait_for_start_interruptible(cpu, || false)
+    }
+
+    /// Wake a parked CPU to service a lifecycle request without powering it on.
+    /// The predicate must be nonblocking (typically an atomic lifecycle flag).
+    pub fn wait_for_start_interruptible(
+        &self,
+        cpu: u32,
+        interrupted: impl Fn() -> bool,
+    ) -> Result<Option<CpuStart>, MachineError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if inner.stopped {
+            if inner.stopped || interrupted() {
                 return Ok(None);
             }
             match inner.cpus.get_mut(cpu as usize) {
@@ -337,5 +383,53 @@ mod tests {
             power.psci(0, 0xc4000003, [2, BASE, 0]),
             Action::Return(DENIED)
         );
+    }
+    #[test]
+    fn restored_psci_state_keeps_pending_context_and_powered_off_cpus() {
+        let source = power();
+        assert_eq!(
+            source.psci(0, 0xc4000003, [2, BASE + 4, 42]),
+            Action::Return(0)
+        );
+        let saved = source.save();
+        let restored = power();
+        restored.load(&saved).unwrap();
+        assert_eq!(restored.psci(0, 0xc4000004, [1, 0, 0]), Action::Return(1));
+        assert_eq!(restored.psci(0, 0xc4000004, [2, 0, 0]), Action::Return(2));
+        assert_eq!(
+            restored.wait_for_start(2).unwrap(),
+            Some(CpuStart {
+                entry: BASE + 4,
+                context: 42
+            })
+        );
+        assert_eq!(restored.psci(0, 0xc4000004, [2, 0, 0]), Action::Return(0));
+        let mut damaged = saved;
+        damaged[2] = Power::Pending(CpuStart {
+            entry: BASE - 4,
+            context: 0,
+        });
+        let before = restored.save();
+        assert!(restored.load(&damaged).is_err());
+        assert_eq!(restored.save(), before);
+    }
+    #[test]
+    fn lifecycle_interrupt_wakes_a_psci_wait_without_powering_the_cpu_on() {
+        let power = std::sync::Arc::new(power());
+        let interrupted = std::sync::Arc::new(AtomicBool::new(false));
+        let worker = {
+            let power = power.clone();
+            let interrupted = interrupted.clone();
+            std::thread::spawn(move || {
+                power
+                    .wait_for_start_interruptible(1, || interrupted.load(Ordering::Acquire))
+                    .unwrap()
+            })
+        };
+        interrupted.store(true, Ordering::Release);
+        power.wake();
+        assert_eq!(worker.join().unwrap(), None);
+        assert_eq!(power.psci(0, 0xc4000004, [1, 0, 0]), Action::Return(1));
+        assert!(!power.stopped());
     }
 }

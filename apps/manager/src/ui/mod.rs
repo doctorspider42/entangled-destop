@@ -5,6 +5,7 @@ pub mod cards;
 pub mod diagnostics;
 pub mod dialogs;
 pub mod disks;
+pub mod lifecycle;
 pub mod logpane;
 pub mod machine;
 pub mod sidebar;
@@ -586,7 +587,9 @@ pub fn status_pill(ui: &mut Ui, status: crate::app::Status, text: &str, time: f6
     );
     let center = indicator_rect.center();
     match status {
-        crate::app::Status::Installing | crate::app::Status::Suspending => {
+        crate::app::Status::Installing
+        | crate::app::Status::Suspending
+        | crate::app::Status::Resuming => {
             crate::logo::paint_spinner(painter, indicator_rect, time, color)
         }
         crate::app::Status::Running => {

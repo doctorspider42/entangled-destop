@@ -3120,13 +3120,20 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         let mut shown = false;
         if let Some(saved) = state.scanout {
             if saved.source.is_host_owned() {
-                tracing::warn!(
-                    resource = saved.resource_id,
-                    source = ?saved.source,
-                    "the suspended guest was scanning out a resource whose pixels live on the \
-                     host; the window keeps its initial frame until the driver programs a new \
-                     scanout"
-                );
+                if self.accelerated_checkpoints {
+                    tracing::debug!(
+                        resource = saved.resource_id,
+                        "restored GPU frontend is awaiting its native scanout archive"
+                    );
+                } else {
+                    tracing::warn!(
+                        resource = saved.resource_id,
+                        source = ?saved.source,
+                        "the suspended guest was scanning out a resource whose pixels live on the \
+                         host; the window keeps its initial frame until the driver programs a new \
+                         scanout"
+                    );
+                }
             } else if self.resources.get(saved.resource_id).is_some() {
                 if self.display.resolution() != (saved.rect.width, saved.rect.height) {
                     self.display
@@ -3164,21 +3171,25 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         }
 
         if state.live_3d_contexts > 0 || state.live_blobs > 0 {
-            // Nothing in virglrenderer, or in GL, hands a live rendering
-            // context back in a form another process could reload; and a blob
-            // is a mapping into a host-visible window this process did not
-            // exist to make (VEN-2001). The driver is told to start again — the
-            // same signal, and the same recovery, as a renderer that crashed
-            // (ADR-0004 GPU-012).
+            // Keep the device fail-closed until its native archive is adopted.
+            // Legacy renderers have no such archive and require a driver reset.
             self.restored_3d_lost = true;
             self.restored_3d_reported = false;
-            tracing::warn!(
-                contexts = state.live_3d_contexts,
-                blobs = state.live_blobs,
-                "the suspended guest had host-side GPU state open (3D contexts, blob \
-                 resources); it cannot be restored, so the driver will be told the device \
-                 needs a reset"
-            );
+            if self.accelerated_checkpoints {
+                tracing::debug!(
+                    contexts = state.live_3d_contexts,
+                    blobs = state.live_blobs,
+                    "restored GPU frontend is awaiting its native checkpoint archive"
+                );
+            } else {
+                tracing::warn!(
+                    contexts = state.live_3d_contexts,
+                    blobs = state.live_blobs,
+                    "the suspended guest had host-side GPU state open (3D contexts, blob \
+                     resources); it cannot be restored, so the driver will be told the device \
+                     needs a reset"
+                );
+            }
         }
 
         tracing::info!(

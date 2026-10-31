@@ -41,7 +41,7 @@ fn write_gpu(path: &Path, gpu: &mut dyn GpuSave) -> Result<SaveReport> {
         &mem,
         SaveRequest {
             metadata,
-            host: HostKind::current().unwrap_or(HostKind::KvmLinux),
+            host: fixture_host(),
             cpus: &[cpu_state(0, 42)],
             clock: None,
             host_irqchip: None,

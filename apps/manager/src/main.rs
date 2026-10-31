@@ -78,6 +78,8 @@ enum ScreenshotView {
     Main,
     /// One machine's own page (the running one, when there is one).
     Machine,
+    MachineSuspending,
+    MachineResuming,
     Wizard,
     WizardFedora,
     /// The system step with Windows chosen and both images filled in.

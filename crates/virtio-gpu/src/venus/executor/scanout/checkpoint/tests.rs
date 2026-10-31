@@ -311,7 +311,11 @@ fn shared_image_checkpoint_process_stage() {
         }
     };
     match host.usable_devices() {
-        Ok(devices) if !devices.is_empty() => {}
+        Ok(devices) if devices.first().is_some_and(|device| device.memory_export) => {}
+        Ok(devices) if !devices.is_empty() => {
+            eprintln!("skipping: host GPU has no native shared-image export path");
+            return;
+        }
         Ok(_) => {
             eprintln!("skipping: no usable host GPU");
             return;

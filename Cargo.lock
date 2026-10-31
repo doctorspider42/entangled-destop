@@ -4702,6 +4702,7 @@ dependencies = [
  "display",
  "libloading",
  "naga 26.0.0",
+ "objc2 0.6.4",
  "png",
  "thiserror 2.0.20",
  "tracing",
@@ -4796,6 +4797,7 @@ dependencies = [
  "control-api",
  "disk-image",
  "lz4_flex",
+ "machine-arm64",
  "machine-x86",
  "sha2",
  "thiserror 2.0.20",
@@ -4809,6 +4811,7 @@ dependencies = [
 name = "vmm-core"
 version = "0.2.0"
 dependencies = [
+ "cc",
  "display",
  "kvm-bindings",
  "kvm-ioctls",

@@ -33,7 +33,7 @@ use crate::format::{HostKind, SectionKind, SnapshotReader, SnapshotWriter};
 use crate::memory::{self, MemoryStats};
 use crate::meta::{MachineShape, Metadata};
 
-mod gpu;
+pub(crate) mod gpu;
 pub use gpu::{GpuArchives, GpuSave};
 
 /// Everything [`save`] needs besides guest memory and a path.
@@ -133,6 +133,11 @@ fn save_impl<M: GuestMemory>(
 where
     M::R: Sync,
 {
+    if request.host == HostKind::HvfMacos {
+        return Err(SnapshotError::Restore(
+            "ARM64 snapshots require the ARM64 save path".into(),
+        ));
+    }
     let partial = partial_path(path);
     let outcome = save_partial(path, &partial, mem, request, gpu);
     if outcome.is_err() {
@@ -204,7 +209,7 @@ where
     for (kind, version, instance, payload) in devices::encode_machine(request.machine) {
         writer.put(kind, version, instance, &payload)?;
     }
-    gpu::save_sections(&mut writer, request.machine, gpu)?;
+    gpu::save_sections(&mut writer, &request.machine.virtio, gpu)?;
     let stats = memory::save_with(mem, &mut writer, options)?;
     let (bytes, file) = writer.finish()?;
     file.sync_all()
@@ -276,6 +281,11 @@ pub fn restore<M: GuestMemory>(path: &Path, mem: &M, shape: &MachineShape) -> Re
     let file = std::fs::File::open(path).map_err(SnapshotError::io("opening the snapshot"))?;
     let reader = SnapshotReader::open(file)?;
     reader.require_native()?;
+    if reader.arch() != crate::Arch::X86_64 {
+        return Err(SnapshotError::Restore(
+            "ARM64 snapshots require the ARM64 restore path".into(),
+        ));
+    }
     restore_contents(reader, mem, shape, started)
 }
 
@@ -291,6 +301,11 @@ pub fn restore_with_gpu<M: GuestMemory>(
     let file = std::fs::File::open(path).map_err(SnapshotError::io("opening the snapshot"))?;
     let reader = SnapshotReader::open(file)?;
     reader.require_native()?;
+    if reader.arch() != crate::Arch::X86_64 {
+        return Err(SnapshotError::Restore(
+            "ARM64 snapshots require the ARM64 restore path".into(),
+        ));
+    }
     restore_contents_with_gpu(reader, mem, shape, started, Some(expected_gpu_slots))
 }
 
@@ -369,7 +384,8 @@ fn restore_contents_with_gpu<M: GuestMemory>(
     }
     .check(shape)?;
 
-    let gpu_slots = gpu::validate_sections(&mut reader, &machine, expected_gpu_slots.is_some())?;
+    let gpu_slots =
+        gpu::validate_sections(&mut reader, &machine.virtio, expected_gpu_slots.is_some())?;
     if let Some(expected) = expected_gpu_slots {
         if gpu_slots != expected {
             return Err(SnapshotError::Mismatch {
@@ -597,6 +613,18 @@ mod tests {
         }
     }
 
+    fn fixture_host() -> HostKind {
+        HostKind::current()
+            .filter(|h| *h != HostKind::HvfMacos)
+            .unwrap_or(HostKind::KvmLinux)
+    }
+    fn fixture_native() -> bool {
+        matches!(
+            HostKind::current(),
+            Some(HostKind::KvmLinux | HostKind::WhpWindows)
+        )
+    }
+
     fn write_sample(path: &Path, mem: &GuestMemoryMmap, files: Vec<FileFingerprint>) -> SaveReport {
         let machine = machine_state();
         let cpus = [cpu_state(0, 0xffff_ffff_8100_0000)];
@@ -605,7 +633,7 @@ mod tests {
             mem,
             SaveRequest {
                 metadata: metadata(files),
-                host: HostKind::current().unwrap_or(HostKind::KvmLinux),
+                host: fixture_host(),
                 cpus: &cpus,
                 clock: Some(VmClockState {
                     clock_ns: 1_234_567,
@@ -628,7 +656,7 @@ mod tests {
         mem: &GuestMemoryMmap,
         shape: &MachineShape,
     ) -> Result<Restored> {
-        if HostKind::current().is_some() {
+        if fixture_native() {
             return restore(path, mem, shape);
         }
         let file = std::fs::File::open(path).map_err(SnapshotError::io("opening the snapshot"))?;
@@ -844,12 +872,7 @@ mod tests {
             .iter()
             .any(|s| s.kind == SectionKind::Cpu && s.instance == 0));
         assert!(info.sections.iter().any(|s| s.kind == SectionKind::Memory));
-        assert_eq!(
-            info.restorable_here,
-            HostKind::current().is_some(),
-            "{:?}",
-            info.refusal
-        );
+        assert_eq!(info.restorable_here, fixture_native(), "{:?}", info.refusal);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

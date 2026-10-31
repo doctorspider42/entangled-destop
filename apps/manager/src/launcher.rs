@@ -424,6 +424,7 @@ pub fn install_spec(
         cwd,
         log_path: vm_dir.join(format!("{}-install.log", machine.name)),
         control: machine.family == GuestFamily::OtherLinux,
+        restoring: false,
     })
 }
 
@@ -456,6 +457,7 @@ pub fn run_spec(
         cwd,
         log_path: vm_dir.join(format!("{}-run.log", vm.name)),
         control: true,
+        restoring: false,
     })
 }
 
@@ -495,6 +497,7 @@ pub fn resume_spec(
         // machine, "resumed" and "started" are the same event in its history.
         log_path: vm_dir.join(format!("{vm}-run.log")),
         control: true,
+        restoring: true,
     })
 }
 

@@ -202,7 +202,7 @@ fn lifecycle_buttons(
         }
         // One-way, and nothing to press: the machine is being written to a
         // file and stops when it has.
-        Status::Suspending => activity_button(ui, app, &vm.name, actions),
+        Status::Suspending | Status::Resuming => activity_button(ui, app, &vm.name, actions),
     }
 }
 
@@ -229,8 +229,7 @@ fn more_menu(
         ui.set_min_width(220.0);
         if status == Status::Running {
             let controllable = app.has_control(&vm.name);
-            // Restart and Suspend need the backend's own CPU state handling,
-            // which the native ARM64 backend does not have yet.
+            // Restart needs the backend's own CPU reset handling.
             let cpu_block = app.backend_of(&vm.name).cpu_lifecycle_block();
             let cpu_controllable = controllable && cpu_block.is_none();
             if ui
@@ -402,10 +401,11 @@ fn panel(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 
 /// What the machine is doing right now — or, at rest, what it last was.
 fn now_panel(ui: &mut egui::Ui, app: &ManagerApp, vm: &VmEntry, status: Status) {
-    let title = if matches!(status, Status::Running | Status::Stopping) {
-        "Right now"
-    } else {
-        "At rest"
+    let title = match status {
+        Status::Running | Status::Stopping => "Right now",
+        Status::Suspending => "Saving session",
+        Status::Resuming => "Waking up",
+        _ => "At rest",
     };
     panel(ui, title, |ui| {
         let width = ui.available_width();
@@ -432,7 +432,7 @@ fn now_panel(ui: &mut egui::Ui, app: &ManagerApp, vm: &VmEntry, status: Status) 
                 theme::ACCENT,
             );
             ui.add_space(8.0);
-        } else if status == Status::Suspending {
+        } else if matches!(status, Status::Suspending | Status::Resuming) {
             // No progress to report — the engine writes the memory in one pass
             // and says nothing until it is done — so the honest thing is the
             // time it has been going. A bar filling at a guessed rate would be
@@ -440,11 +440,21 @@ fn now_panel(ui: &mut egui::Ui, app: &ManagerApp, vm: &VmEntry, status: Status) 
             let elapsed = app
                 .supervisor
                 .active_task(&vm.name)
-                .and_then(|task| task.suspending_for())
+                .and_then(|task| {
+                    if status == Status::Suspending {
+                        task.suspending_for()
+                    } else {
+                        task.restoring_for()
+                    }
+                })
                 .unwrap_or_default();
             row_value(
                 ui,
-                "Writing memory to disk",
+                if status == Status::Suspending {
+                    "Saving your session"
+                } else {
+                    "Restoring your session"
+                },
                 Some(format!("{:.0} s", elapsed.as_secs_f32())),
             );
             ui.add_space(8.0);

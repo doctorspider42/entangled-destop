@@ -1772,3 +1772,152 @@ distribution's 0.9.x does not.
 The loader also exports `RENDER_SERVER_EXEC_PATH` itself, derived from the
 library it opened, because virglrenderer compiles that path in as an absolute
 one under its build prefix. Without it a downloaded artifact loses Venus quietly.
+
+## Apple Silicon checkpoint staging (2026-10-29)
+
+`GuestDevice::host_visible_types()` is a **guest-index** mask. A unified-memory
+GPU can expose native type 0 as device-local and append a host-visible guest
+alias at index 1. Private checkpoint staging intersects native Vulkan buffer
+requirements and `host_pointer_types`, so use `coherent_import_host_types()`:
+filter coherent importable guest types, then map each through `host_type`.
+Intersecting the guest mask directly refuses all staging on Apple M3 Pro.
+The real two-process checkpoint test covers native buffer/image contents with
+KosmicKrisp. Native shared-image export is unavailable on this driver; that
+separate acceptance must check `memory_export` before opening a scanout device.
+
+
+### Native GNOME GPU suspend acceptance (2026-10-29)
+
+Private image checkpointing accepts `ALIAS_BIT` as a capability flag. The
+existing native binding-span/granularity checks must still refuse actual
+live image/buffer overlaps before any GPU read. Mesa's software WSI used
+`MUTABLE_FORMAT | EXTENDED_USAGE | ALIAS` (0x508) on a private BGRA image;
+rejecting the flag itself prevented the native GNOME snapshot. Regression
+coverage combines unique flagged images with real overlapping flagged
+bindings, plus the real Vulkan two-process pixel-content fixture.
+[Vulkan flag semantics](https://docs.vulkan.org/refpages/latest/refpages/source/VkImageCreateFlagBits.html)
+distinguish creation capability from bindings that actually alias.
+
+A fresh Ubuntu 24.04.5 GNOME session on Apple M3 Pro passed two short windowed
+save/restore cycles with an active glmark2 process. Boot ID, compositor and
+workload PID/start time remained unchanged; old rendering advanced and a new
+GL/Vulkan probe worked after each restore. The opt-in guest witness is
+`guest/ubuntu-arm64/gpu-suspend-acceptance.sh`; unmount its staging share first.
+The first longer run exhausted the 64 MiB historical recipe journal. The journal
+now compacts superseded primary command-buffer recordings after each additional
+4 MiB and under shared-budget pressure. It also drops whole descriptor-write
+commands whose every destination was fully overwritten (exact range/type) or
+freed/reset with its pool. Keep all writes to descriptor-copy source ids across
+generations: historical copies read earlier values. Repeated resets of the same
+fences and resource-0 temporary semaphore imports retain their last effect;
+submissions/waits are excluded and the sync archive restores completed state.
+Keep creation/destruction
+and allocation/import generations ordered. Pin all secondary ids and their pool resets across
+recycled generations; old primary recordings can reference them. Do not compact
+untrusted archives before semantic replay. The core hard/shared budget remains
+64 MiB; irreducible object/secondary history must still refuse rather than truncate.
+Regressions cover more than 64 MiB of replaced recordings, pool and individual
+resets, free/reallocation, pool destruction, partial recordings, secondary
+references/recycled ids, small shared-budget pressure, overwritten/freed/reused
+descriptor sets, preservation of descriptor-copy source values, and complete
+synchronization-state roundtrips after repeated fence resets/temporary imports.
+
+
+Duration follow-up: five minutes before save, three more after restore, then a
+second save/restore passed with the same boot/compositor/glmark2 identity. Scene
+counts were 249 → 259 → 407 → 417; fresh GL/Vulkan work passed after both restores.
+The first two phases reclaimed >630 MiB without increasing the 64 MiB budget.
+Final checks: 2463 workspace tests (13 ignored), full-workspace Clippy and 143
+checkpoint tests with native Vulkan. Seven broader native-driver fixtures failed
+outside recipe retention; do not report that whole suite green. Evidence and
+controller-timeout recovery are in `artifacts/macos/acceptance/suspend-desktop/`.
+
+
+### Closed lifetime compaction and macOS native scopes (2026-10-29)
+
+A subsequent long-load audit added reachability pruning for closed object
+lifetimes. Surviving recordings/descriptor values keep their object generation's
+creation inputs and destruction position; live pipeline caches also retain
+historical pipeline builds which modified them. Batched pipeline outputs share
+one creation node. Opaque descriptor-template/private-data operations prevent
+lifetime pruning rather than guessing embedded handles. Secondary history remains conservative. Command/descriptor pools and pooled
+allocation batches participate in the lifetime graph: explicit frees, pool
+destruction and descriptor-pool reset retire the corresponding generations.
+Retaining one output of a batch retains creation and cleanup of its siblings;
+needed historical children keep their implicit pool cleanup at its original
+position. Empty descriptor resets need no replay.
+
+Recipe v3 carries an allocation high-water counter and an explicit ordinal per
+allocation record, so removing a retired allocation cannot renumber live page or
+shared-payload links or reuse a future ordinal. The reader also accepts v2,
+assigning its original dense ordinals before replay. Reject zero, unordered or
+out-of-range allocation ordinals and nonzero tags on other commands before
+creating native objects. Failed single allocations returning OUT_OF_HOST_MEMORY
+or OUT_OF_DEVICE_MEMORY consume an ordinal but create no recipe/object; other
+failed state changes still invalidate capture. Retain the high-water counter
+even when every allocation was retired.
+
+Core accounting stays at 64 MiB across contexts. Eight-byte ordinal tags have a
+separate derived bound: MAX_RECIPE_BYTES / (12 + RECORD_COST) * 8, including v2
+upgrade at an exactly full original core budget. Compaction must return the old
+Vec capacity, not only its elements. Live import metadata pressure retries
+compaction; decoding never does so before semantic replay.
+
+Mac Vulkan calls have thread-local autorelease guards, including generated
+operation dispatch. The guard is !Send/!Sync and must drain on its creating
+thread before an enclosing pool. FreeMemory drains native temporaries before
+unmapping imported pages. This prevents temporary Objective-C objects from
+waiting indefinitely on long-lived renderer/vCPU/restore threads; real sustained
+Metal memory behavior still requires a measured endurance run.
+
+The seven native-suite failures in the earlier duration report were investigated:
+UMA fixtures now test the guest's split device/host heap policy; optional Zink
+extensions are enabled only when advertised; transform-feedback execution skips
+when that extension is absent. The retired-buffer fixture now re-records its
+ONE_TIME_SUBMIT command buffer before submitting it again. Real supported
+conditional rendering, triangle-fan rendering and cross-context content tests
+continue to run. The resulting native suite passed 896 tests, including native autorelease,
+pooled-lifetime and allocation-generation/page-link regressions. The full workspace passed 2480
+tests (13 ignored), Clippy, formatting and cargo deny. Treat the subsequent long-load result
+separately from these unit/native fixtures.
+
+
+The subsequent final-compactor desktop run retained the same glmark2 session and
+passed fresh GPU work, but its process crossed the test's 8 GiB footprint guard
+soon after restore. The source powered off normally; the planned 30-minute load
+was not completed. Do not describe native memory growth as fixed by autorelease
+scopes. A bounded `display --example memory_soak` diagnostic uploads a 2048x1536
+plane repeatedly without a VM, accepts `stop` on stdin, and exits after its
+requested duration; compare it with a headless guest on an exclusively owned
+clone to separate host presentation from Venus execution.
+
+
+### Native command-pool cache release policy (2026-10-30)
+
+On macOS, HostVulkan::call adds COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT only
+for the native vkResetCommandPool invocation. The executor already validates
+that all children are nonpending and the operation puts every child in its
+initial state; releasing cached driver heaps needs no additional wait/reset.
+Restore the original command flags afterward on both native success and failure,
+while preserving its result, so guest commands and reconstruction recipes stay
+unchanged. Other hosts retain the requested cache policy; descriptor-pool resets
+must not gain command-pool flags. This uses the Vulkan API, never private Metal
+object layouts. It is a memory-retention policy under endurance validation,
+not evidence by itself that the earlier footprint finding is resolved.
+
+Portable tests exercise both policies, existing flags and failure returns.
+The native GPU regression resets/releases a pool, re-records/submits the same
+allocated command buffer 128 times, and checks all 4 MiB of coherent output.
+The full native suite passed 898 tests before that extra GPU regression, which
+also passed individually; workspace Clippy passed. The application/SDK install
+remains unchanged while task-owned engines exercise the new policy.
+
+The final hidden-window defect was in host presentation: uploads were staged
+before an occlusion early return, without a submit. Do not attribute that fix
+to autorelease or command-pool policy alone. With visibility/surface acquisition
+checked before uploads, the 30-minute windowed GPU load and two fresh-process
+restores passed, retaining boot/compositor/glmark2 identity and executing fresh
+GL/Vulkan work after each restore. Retained recipes compacted to 146336 bytes
+near the end of the load. The final 899-test virtio-gpu suite and 2488-test
+workspace passed; 13 workspace tests were ignored. Native packaged CLI/SMP
+suspend tests passed too. See ADR-0007 for exact engine stages and metrics.

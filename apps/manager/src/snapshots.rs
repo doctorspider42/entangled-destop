@@ -157,6 +157,9 @@ pub fn host_of(backend: Backend) -> Option<HostKind> {
     if backend.is_linux_kvm() {
         return Some(HostKind::KvmLinux);
     }
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return Some(HostKind::HvfMacos);
+    }
     cfg!(windows).then_some(HostKind::WhpWindows)
 }
 
@@ -407,14 +410,23 @@ mod tests {
             snapshot.host = host;
             let refusal = verdict(&row(Ok(snapshot)), Backend::Native, None);
             assert!(!refusal.resumable());
-            assert!(refusal
-                .blocked
-                .iter()
-                .any(|reason| reason.contains("cannot be resumed")));
+            assert!(refusal.blocked.iter().any(
+                |reason| reason.contains("cannot load") || reason.contains("cannot be resumed")
+            ));
         }
     }
 
     /// `inspect`'s own `restorable_here` answers for the manager's process.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn native_macos_can_resume_its_own_arm64_session() {
+        assert_eq!(host_of(Backend::Native), Some(HostKind::HvfMacos));
+        let mut snapshot = facts();
+        snapshot.host = HostKind::HvfMacos;
+        let verdict = verdict(&row(Ok(snapshot)), Backend::Native, None);
+        assert!(verdict.resumable(), "{:?}", verdict.blocked);
+    }
+
     /// The manager is not the process that restores anything — on Windows the
     /// machine may be set to run under WSL, where a Linux snapshot is right.
     #[test]

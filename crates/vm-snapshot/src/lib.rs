@@ -30,6 +30,7 @@
 //! | [`devices`] | virtio transports and the machine's own devices |
 //! | [`vm`] | the whole-VM save and restore, and [`vm::inspect`] for a GUI |
 
+pub mod arm64;
 pub mod codec;
 pub mod cpu;
 pub mod devices;

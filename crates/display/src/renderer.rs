@@ -167,6 +167,8 @@ pub(crate) struct Renderer {
     /// The window's quick-actions bar (`crate::toolbar`), drawn over the
     /// whole surface after the frame; armed only while it is visible.
     toolbar: CursorOverlay,
+    loading: CursorOverlay,
+    loading_scrim: CursorOverlay,
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     /// The shared presenter's texture this frame draws, and the bind group
@@ -284,6 +286,8 @@ impl Renderer {
         let image = ImagePipeline::new(&device, format, wgpu::FilterMode::Linear);
         let cursor = CursorOverlay::new(&device, format);
         let toolbar = CursorOverlay::new(&device, format);
+        let loading = CursorOverlay::new(&device, format);
+        let loading_scrim = CursorOverlay::new(&device, format);
 
         let texture = create_scanout_texture(&device, guest_w, guest_h);
         let bind_group = image.bind(
@@ -301,6 +305,8 @@ impl Renderer {
             image,
             cursor,
             toolbar,
+            loading,
+            loading_scrim,
             texture,
             bind_group,
             shared: None,
@@ -582,80 +588,82 @@ impl Renderer {
         true
     }
 
-    /// Presents the scanout into `viewport`, recovering from a lost or outdated
-    /// surface (backlog MVP-706).
-    pub(crate) fn render(&mut self, viewport: Viewport) -> Result<(), DisplayError> {
+    /// Acquire before preparing uploads: an unavailable surface must leave
+    /// dirty pixels in the CPU mirror, never queue transfers without a submit.
+    pub(crate) fn acquire_frame(&mut self) -> Result<Option<wgpu::SurfaceTexture>, DisplayError> {
         if !self.configured {
             self.stats.skipped += 1;
-            return Ok(());
+            return Ok(None);
         }
-        let shared = u64::from(self.shared.is_some());
-        match self.frame(viewport) {
-            Ok(()) => {
-                self.stats.frames += 1;
-                self.stats.shared_frames += shared;
-                Ok(())
-            }
+        let acquire = Instant::now();
+        let frame = match self.surface.get_current_texture() {
             Err(err @ (wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated)) => {
                 tracing::debug!(%err, "surface needs reconfiguring");
                 self.recover_surface();
-                match self.frame(viewport) {
-                    Ok(()) => {
-                        self.stats.frames += 1;
-                        self.stats.shared_frames += shared;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        tracing::warn!(%err, "surface still unusable after reconfiguring");
-                        self.stats.skipped += 1;
-                        Ok(())
-                    }
-                }
+                self.surface.get_current_texture()
             }
-            Err(wgpu::SurfaceError::Timeout) => {
-                tracing::debug!("surface acquisition timed out; dropping the frame");
+            result => result,
+        };
+        let us = micros(acquire.elapsed());
+        self.stats.acquire_us = self.stats.acquire_us.saturating_add(us);
+        self.stats.acquire_max_us = self.stats.acquire_max_us.max(us);
+        match frame {
+            Ok(frame) => Ok(Some(frame)),
+            Err(
+                err @ (wgpu::SurfaceError::Timeout
+                | wgpu::SurfaceError::Lost
+                | wgpu::SurfaceError::Outdated),
+            ) => {
+                tracing::debug!(%err, "surface unavailable; keeping dirty CPU pixels");
                 self.stats.skipped += 1;
-                Ok(())
+                Ok(None)
             }
-            // OutOfMemory and any future variant: fatal for this window.
             Err(err) => Err(DisplayError::Surface(err)),
         }
+    }
+
+    /// Uploads have an acquired frame to consume them in the same submit.
+    pub(crate) fn render(&mut self, viewport: Viewport, frame: wgpu::SurfaceTexture) {
+        let shared = u64::from(self.shared.is_some());
+        self.frame(viewport, frame);
+        self.stats.frames += 1;
+        self.stats.shared_frames += shared;
     }
 
     /// What the next frames draw over everything: the toolbar's picture, or
     /// nothing. Placed in surface pixels, so it ignores the letterbox.
     pub(crate) fn set_toolbar(&mut self, overlay: Option<&crate::toolbar::Overlay>) {
-        let Some(o) = overlay else {
-            self.toolbar
-                .place(&self.device, &self.queue, (0, 0, 0, &[]), [0.0; 4]);
-            return;
-        };
-        let (sw, sh) = (
-            f64::from(self.config.width.max(1)),
-            f64::from(self.config.height.max(1)),
-        );
-        let to_x = |px: f64| (px / sw * 2.0 - 1.0) as f32;
-        let to_y = |py: f64| (1.0 - py / sh * 2.0) as f32;
-        let rect = [
-            to_x(f64::from(o.x)),
-            to_y(f64::from(o.y)),
-            to_x(f64::from(o.x + o.width)),
-            to_y(f64::from(o.y + o.height)),
-        ];
-        self.toolbar.place(
+        place_overlay(
             &self.device,
             &self.queue,
-            (o.serial, o.width, o.height, &o.pixels),
-            rect,
+            &mut self.toolbar,
+            overlay,
+            (self.config.width, self.config.height),
         );
     }
 
-    fn frame(&mut self, viewport: Viewport) -> Result<(), wgpu::SurfaceError> {
-        let acquire = Instant::now();
-        let frame = self.surface.get_current_texture()?;
-        let us = micros(acquire.elapsed());
-        self.stats.acquire_us = self.stats.acquire_us.saturating_add(us);
-        self.stats.acquire_max_us = self.stats.acquire_max_us.max(us);
+    pub(crate) fn set_loading(&mut self, overlay: Option<&crate::toolbar::Overlay>) {
+        place_overlay(
+            &self.device,
+            &self.queue,
+            &mut self.loading,
+            overlay,
+            (self.config.width, self.config.height),
+        );
+        if overlay.is_some() {
+            self.loading_scrim.place(
+                &self.device,
+                &self.queue,
+                (1, 1, 1, &[8, 6, 4, 180]),
+                [-1.0, 1.0, 1.0, -1.0],
+            );
+        } else {
+            self.loading_scrim
+                .place(&self.device, &self.queue, (0, 0, 0, &[]), [0.0; 4]);
+        }
+    }
+
+    fn frame(&mut self, viewport: Viewport, frame: wgpu::SurfaceTexture) {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -714,6 +722,8 @@ impl Renderer {
             if max_w > 0 && max_h > 0 {
                 pass.set_viewport(0.0, 0.0, max_w as f32, max_h as f32, 0.0, 1.0);
                 pass.set_scissor_rect(0, 0, max_w, max_h);
+                self.loading_scrim.draw(&mut pass);
+                self.loading.draw(&mut pass);
                 self.toolbar.draw(&mut pass);
             }
         }
@@ -723,8 +733,34 @@ impl Renderer {
         let us = micros(present.elapsed());
         self.stats.present_us = self.stats.present_us.saturating_add(us);
         self.stats.present_max_us = self.stats.present_max_us.max(us);
-        Ok(())
     }
+}
+
+fn place_overlay(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: &mut CursorOverlay,
+    overlay: Option<&crate::toolbar::Overlay>,
+    surface: (u32, u32),
+) {
+    let Some(o) = overlay else {
+        target.place(device, queue, (0, 0, 0, &[]), [0.0; 4]);
+        return;
+    };
+    let (sw, sh) = (f64::from(surface.0.max(1)), f64::from(surface.1.max(1)));
+    let to_x = |px: f64| (px / sw * 2.0 - 1.0) as f32;
+    let to_y = |py: f64| (1.0 - py / sh * 2.0) as f32;
+    target.place(
+        device,
+        queue,
+        (o.serial, o.width, o.height, &o.pixels),
+        [
+            to_x(f64::from(o.x)),
+            to_y(f64::from(o.y)),
+            to_x(f64::from(o.x + o.width)),
+            to_y(f64::from(o.y + o.height)),
+        ],
+    );
 }
 
 fn micros(d: Duration) -> u64 {

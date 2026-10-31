@@ -144,6 +144,7 @@ fn fixture(buffer_offset: u64) -> (Arc<FakeVulkan>, VulkanContext<FakeVulkan>) {
     );
     let mut image = h::image_info();
     image.usage = 3;
+    image.flags = 0x508; // MUTABLE_FORMAT | EXTENDED_USAGE | ALIAS; binding overlap still decides safety.
     run(&mut context, h::create_image(h::DEVICE, h::IMAGE, image));
     run(
         &mut context,

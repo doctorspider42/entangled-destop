@@ -27,6 +27,9 @@
 
 use std::time::{Duration, Instant};
 
+#[path = "lifecycle.rs"]
+pub(crate) mod lifecycle;
+
 /// How close to the top edge, in logical pixels, the pointer must come.
 pub const REVEAL_EDGE: f64 = 3.0;
 /// How far below the bar (and its label), in logical pixels, the pointer may

@@ -37,6 +37,7 @@ pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x7d, 0x86, 0x95);
 /// The one accent: selection, focus, meters, links.
 pub const ACCENT: Color32 = Color32::from_rgb(0x8c, 0xc8, 0xe0);
 pub const ACCENT_DEEP: Color32 = Color32::from_rgb(0x5a, 0xa9, 0xcc);
+pub const RESUMING: Color32 = Color32::from_rgb(0xb8, 0xdc, 0xec);
 /// The primary button's fill; its label is [`BG_DEEP`].
 pub const PRIMARY: Color32 = Color32::from_rgb(0xdc, 0xe6, 0xef);
 

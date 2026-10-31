@@ -50,3 +50,17 @@ pub trait VcpuRegisters {
     fn register(&self, register: Register) -> Result<u64, HvError>;
     fn set_register(&mut self, register: Register, value: u64) -> Result<(), HvError>;
 }
+
+/// Complete non-nested ARM64 CPU state. Register identifiers are architectural
+/// encodings; Apple-specific calls remain inside the HVF implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpuState {
+    pub registers: [u64; 35],
+    pub simd: [[u8; 16]; 32],
+    pub system: Vec<(u16, u64)>,
+    pub icc: Vec<(u16, u64)>,
+    pub features: Vec<u64>,
+    pub timer_offset: u64,
+    pub timer_mask: bool,
+    pub serror: bool,
+}

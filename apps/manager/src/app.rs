@@ -800,6 +800,8 @@ impl ManagerApp {
             ScreenshotView::SnapshotDiscard => app.view = View::Machines,
             ScreenshotView::Main
             | ScreenshotView::Machine
+            | ScreenshotView::MachineSuspending
+            | ScreenshotView::MachineResuming
             | ScreenshotView::Editor
             | ScreenshotView::EditorBoot
             | ScreenshotView::EditorDisplay
@@ -863,6 +865,12 @@ impl ManagerApp {
                         .is_some_and(|t| t.stop_requested())
                     {
                         Status::Stopping
+                    } else if self
+                        .supervisor
+                        .active_task(name)
+                        .is_some_and(|task| task.restoring_for().is_some())
+                    {
+                        Status::Resuming
                     } else {
                         Status::Running
                     }
@@ -881,7 +889,11 @@ impl ManagerApp {
         if self.mock_mode {
             return matches!(
                 self.status_of(name),
-                Status::Running | Status::Stopping | Status::Installing | Status::Suspending
+                Status::Running
+                    | Status::Stopping
+                    | Status::Installing
+                    | Status::Suspending
+                    | Status::Resuming
             );
         }
         self.supervisor.is_busy(name)
@@ -1337,7 +1349,12 @@ impl ManagerApp {
             self.ask_discard_snapshot(&name);
             return;
         }
-        if self.screenshot_view == ScreenshotView::Machine {
+        if matches!(
+            self.screenshot_view,
+            ScreenshotView::Machine
+                | ScreenshotView::MachineSuspending
+                | ScreenshotView::MachineResuming
+        ) {
             // The running machine if there is one: it is the page with the
             // most on it.
             let Some(name) = self
@@ -1350,6 +1367,16 @@ impl ManagerApp {
                 return;
             };
             self.screenshot_surface_opened = true;
+            if self.mock_mode {
+                let progress = match self.screenshot_view {
+                    ScreenshotView::MachineSuspending => Some(Status::Suspending),
+                    ScreenshotView::MachineResuming => Some(Status::Resuming),
+                    _ => None,
+                };
+                if let Some(status) = progress {
+                    self.mock_statuses.insert(name.clone(), status);
+                }
+            }
             self.view = View::Machine(name);
             return;
         }
@@ -1646,6 +1673,12 @@ impl ManagerApp {
                     launcher::FIRMWARE_FIX
                 )
             })
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && chosen == Backend::Native
+        {
+            // ARM64 direct boot uses the verified Ubuntu kernel/initramfs
+            // named by its profile, never the x86 Debian bootstrap artifacts.
+            None
         } else {
             (!launcher::bootstrap_artifacts_present(&cwd)).then(|| {
                 format!(
@@ -1764,9 +1797,6 @@ impl ManagerApp {
     /// the engine's own reply line, read out of the log as it goes past, is
     /// what ends the wait.
     fn suspend(&mut self, name: &str) {
-        if self.reject_unsupported_cpu_control(name) {
-            return;
-        }
         let Some(task) = self.supervisor.active_task(name) else {
             self.toast(ToastLevel::Warn, format!("'{name}' is not running"));
             return;
@@ -3905,6 +3935,8 @@ pub enum Status {
     Installing,
     /// Writing itself to a snapshot file, on its way out (ADR-0006).
     Suspending,
+    /// Reconstructing the saved session; the engine has not signalled ready.
+    Resuming,
     /// Not running, and not a plain stopped machine either: there is a file
     /// holding everything it was in the middle of.
     Suspended,
@@ -3918,6 +3950,7 @@ impl Status {
             Status::Stopping => "Stopping",
             Status::Installing => "Installing",
             Status::Suspending => "Suspending",
+            Status::Resuming => "Resuming",
             Status::Suspended => "Suspended",
             Status::Stopped => "Stopped",
         }
@@ -3930,6 +3963,7 @@ impl Status {
             Status::Stopping => theme::TEXT_DIM,
             Status::Installing => theme::WARN,
             Status::Suspending => theme::ACCENT_DEEP,
+            Status::Resuming => theme::RESUMING,
             Status::Suspended => theme::ACCENT,
             Status::Stopped => theme::IDLE,
         }
@@ -3942,6 +3976,9 @@ impl Status {
             Status::Running => "The machine is running in its own window.",
             Status::Stopping => "Shutdown was asked for; the guest is closing down.",
             Status::Installing => "An installer is running inside it.",
+            Status::Resuming => {
+                "Restoring the saved session. Your apps and windows are coming back."
+            }
             Status::Suspending => {
                 "Writing the machine's memory to a file. It stops when that finishes; \
                  opening it again puts you back exactly here."
@@ -3969,6 +4006,8 @@ impl eframe::App for ManagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame += 1;
         theme::set_motion_enabled(self.settings.animations_enabled);
+        self.supervisor
+            .set_interface_motion(self.settings.animations_enabled);
         self.request_scan(false);
         self.collect_scan();
         self.open_screenshot_surface();
@@ -4251,6 +4290,7 @@ mod tests {
             Status::Stopping,
             Status::Installing,
             Status::Suspending,
+            Status::Resuming,
             Status::Suspended,
             Status::Stopped,
         ];

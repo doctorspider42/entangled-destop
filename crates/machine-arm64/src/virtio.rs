@@ -46,6 +46,79 @@ impl MmioBus {
         })
     }
 
+    fn locked(
+        &self,
+        slot: usize,
+    ) -> Result<std::sync::MutexGuard<'_, MmioTransport>, MachineError> {
+        self.transports
+            .get(slot)
+            .ok_or_else(|| MachineError::Invalid("absent virtio slot".into()))?
+            .lock()
+            .map_err(|_| MachineError::Invalid("poisoned virtio transport".into()))
+    }
+
+    pub fn prepare_snapshot(&self) -> Result<(), MachineError> {
+        for slot in 0..self.len() {
+            let mut transport = self.locked(slot)?;
+            transport
+                .prepare_snapshot()
+                .map_err(|e| MachineError::Invalid(e.to_string()))?;
+            if let Some(reason) = transport.snapshot_refusal() {
+                return Err(MachineError::Invalid(reason));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn save(&self) -> Result<Vec<virtio_core::TransportSaveState>, MachineError> {
+        (0..self.len())
+            .map(|slot| Ok(self.locked(slot)?.save()))
+            .collect()
+    }
+
+    pub fn load(&self, saved: &[virtio_core::TransportSaveState]) -> Result<(), MachineError> {
+        if saved.len() != self.len() {
+            return Err(MachineError::Invalid("virtio inventory differs".into()));
+        }
+        for (slot, state) in saved.iter().enumerate() {
+            self.locked(slot)?
+                .load(state)
+                .map_err(|e| MachineError::Invalid(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn gpu_checkpoint_slots(&self) -> Result<Vec<u32>, MachineError> {
+        let mut slots = Vec::new();
+        for slot in 0..self.len() {
+            let transport = self.locked(slot)?;
+            if transport.has_streamed_state() {
+                slots.push(slot as u32);
+            }
+        }
+        Ok(slots)
+    }
+
+    pub fn save_streamed_state(
+        &self,
+        slot: u32,
+        out: &mut dyn std::io::Write,
+    ) -> Result<(), MachineError> {
+        self.locked(slot as usize)?
+            .save_streamed_state(out)
+            .map_err(|e| MachineError::Invalid(e.to_string()))
+    }
+
+    pub fn load_streamed_state(
+        &self,
+        slot: u32,
+        input: &mut dyn virtio_core::StateReader,
+    ) -> Result<(), MachineError> {
+        self.locked(slot as usize)?
+            .load_streamed_state(input)
+            .map_err(|e| MachineError::Invalid(e.to_string()))
+    }
+
     pub fn len(&self) -> usize {
         self.transports.len()
     }

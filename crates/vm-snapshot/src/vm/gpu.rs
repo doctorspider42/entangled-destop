@@ -26,7 +26,7 @@ pub struct GpuArchives {
     slots: Vec<u32>,
 }
 impl GpuArchives {
-    pub(super) fn new(reader: SnapshotReader<File>, slots: Vec<u32>) -> Self {
+    pub(crate) fn new(reader: SnapshotReader<File>, slots: Vec<u32>) -> Self {
         Self { reader, slots }
     }
     pub fn slots(&self) -> &[u32] {
@@ -42,15 +42,14 @@ impl GpuArchives {
     }
 }
 
-fn validate_slots(slots: &[u32], machine: &MachineState) -> Result<()> {
+fn validate_slots(slots: &[u32], devices: &[machine_x86::state::SavedVirtioSlot]) -> Result<()> {
     if slots.len() > MAX_SLOTS || slots.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(SnapshotError::Restore(
             "GPU archive slots are oversized, duplicated or unsorted".into(),
         ));
     }
     for slot in slots {
-        if !machine
-            .virtio
+        if !devices
             .iter()
             .any(|device| device.slot == *slot && device.state.device_type == GPU_DEVICE_TYPE)
         {
@@ -83,15 +82,15 @@ impl Write for BoundedWriter<'_> {
     }
 }
 
-pub(super) fn save_sections(
+pub(crate) fn save_sections(
     writer: &mut SnapshotWriter<File>,
-    machine: &MachineState,
+    devices: &[machine_x86::state::SavedVirtioSlot],
     gpu: Option<&mut dyn GpuSave>,
 ) -> Result<()> {
     let Some(gpu) = gpu else {
         return Ok(());
     };
-    validate_slots(gpu.slots(), machine)?;
+    validate_slots(gpu.slots(), devices)?;
     let slots = gpu.slots().to_vec(); // <= 256 trusted/validated scalar slot ids
     for slot in slots {
         let mut section = writer.section(SectionKind::Gpu, VERSION, slot)?;
@@ -108,9 +107,9 @@ pub(super) fn save_sections(
     Ok(())
 }
 
-pub(super) fn validate_sections(
+pub(crate) fn validate_sections(
     reader: &mut SnapshotReader<File>,
-    machine: &MachineState,
+    devices: &[machine_x86::state::SavedVirtioSlot],
     allow_gpu: bool,
 ) -> Result<Vec<u32>> {
     let slots = reader.instances(SectionKind::Gpu);
@@ -119,7 +118,7 @@ pub(super) fn validate_sections(
             "this restore path cannot apply saved accelerated GPU state".into(),
         ));
     }
-    validate_slots(&slots, machine)?;
+    validate_slots(&slots, devices)?;
     for slot in &slots {
         reader.require_version(SectionKind::Gpu, *slot, VERSION)?;
         let section = reader

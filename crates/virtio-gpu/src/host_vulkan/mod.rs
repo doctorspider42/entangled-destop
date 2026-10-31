@@ -330,6 +330,9 @@ fn c_string(text: &Option<String>) -> Option<CString> {
     text.as_deref().and_then(|t| CString::new(t).ok())
 }
 
+mod command_pool_policy;
+mod macos_pool;
+
 impl HostVulkan for AshVulkan {
     type Instance = ash::Instance;
     type PhysicalDevice = vk::PhysicalDevice;
@@ -344,6 +347,7 @@ impl HostVulkan for AshVulkan {
     type SharedMemory = SharedMemoryHandle;
 
     fn instance_version(&self) -> Result<u32, VkResult> {
+        let _pool = macos_pool::Pool::new();
         // SAFETY: a global command with no arguments but the out value.
         match unsafe { self.entry.try_enumerate_instance_version() } {
             Ok(Some(version)) => Ok(version),
@@ -353,6 +357,7 @@ impl HostVulkan for AshVulkan {
     }
 
     fn create_instance(&self, request: &InstanceRequest) -> Result<ash::Instance, VkResult> {
+        let _pool = macos_pool::Pool::new();
         let app_name = c_string(&request.application_name);
         let engine_name = c_string(&request.engine_name);
         let mut app = vk::ApplicationInfo::default()
@@ -372,6 +377,7 @@ impl HostVulkan for AshVulkan {
     }
 
     fn destroy_instance(&self, instance: ash::Instance) {
+        let _pool = macos_pool::Pool::new();
         // SAFETY: the executor destroyed every child first; the value is
         // consumed, so it cannot be used again.
         unsafe { instance.destroy_instance(None) };
@@ -381,6 +387,7 @@ impl HostVulkan for AshVulkan {
         &self,
         instance: &ash::Instance,
     ) -> Result<Vec<vk::PhysicalDevice>, VkResult> {
+        let _pool = macos_pool::Pool::new();
         // SAFETY: `instance` is ours.
         unsafe { instance.enumerate_physical_devices() }.map_err(result_code)
     }
@@ -390,6 +397,7 @@ impl HostVulkan for AshVulkan {
         instance: &ash::Instance,
         device: vk::PhysicalDevice,
     ) -> HostDeviceInfo {
+        let _pool = macos_pool::Pool::new();
         let api = Self::device_api(instance, device);
         // SAFETY: `device` is ours; the call only writes its results.
         let extensions: Vec<VkExtensionProperties> =
@@ -458,6 +466,7 @@ impl HostVulkan for AshVulkan {
         &self,
         instance: &ash::Instance,
     ) -> Result<Vec<HostGroup<vk::PhysicalDevice>>, VkResult> {
+        let _pool = macos_pool::Pool::new();
         // SAFETY: `instance` is ours; the second call writes exactly the
         // `len` structures the first reported, into a local vector of them.
         let groups = unsafe {
@@ -491,6 +500,7 @@ impl HostVulkan for AshVulkan {
         format: VkFormat,
         out: &mut VkFormatProperties2,
     ) {
+        let _pool = macos_pool::Pool::new();
         let api = Self::device_api(instance, device);
         let wants3 = api >= API_1_3
             && out
@@ -530,6 +540,7 @@ impl HostVulkan for AshVulkan {
         info: &VkPhysicalDeviceImageFormatInfo2,
         out: &mut VkImageFormatProperties2,
     ) -> VkResult {
+        let _pool = macos_pool::Pool::new();
         let mut external = None;
         let mut list: Option<Vec<vk::Format>> = None;
         let mut stencil = None;
@@ -625,6 +636,7 @@ impl HostVulkan for AshVulkan {
         handle_type: u32,
         timeline: bool,
     ) -> crate::venus::protocol::VkExternalSemaphoreProperties {
+        let _pool = macos_pool::Pool::new();
         let mut kind = vk::SemaphoreTypeCreateInfo::default().semaphore_type(if timeline {
             vk::SemaphoreType::TIMELINE
         } else {
@@ -657,6 +669,7 @@ impl HostVulkan for AshVulkan {
         flags: u32,
         usage: u32,
     ) -> bool {
+        let _pool = macos_pool::Pool::new();
         let info = vk::PhysicalDeviceExternalBufferInfo::default()
             .flags(vk::BufferCreateFlags::from_raw(flags))
             .usage(vk::BufferUsageFlags::from_raw(usage))
@@ -680,6 +693,7 @@ impl HostVulkan for AshVulkan {
         flags: u32,
         usage: u32,
     ) -> bool {
+        let _pool = macos_pool::Pool::new();
         if !cfg!(windows) {
             // No NT handles to export: refused cleanly, never asked.
             return false;
@@ -707,6 +721,7 @@ impl HostVulkan for AshVulkan {
         device: vk::PhysicalDevice,
         request: &DeviceRequest<vk::PhysicalDevice>,
     ) -> Result<HostDevice, VkResult> {
+        let _pool = macos_pool::Pool::new();
         let queues: Vec<vk::DeviceQueueCreateInfo<'_>> = request
             .queues
             .iter()
@@ -817,6 +832,7 @@ impl HostVulkan for AshVulkan {
     }
 
     fn destroy_device(&self, device: HostDevice) {
+        let _pool = macos_pool::Pool::new();
         let probes = std::mem::take(
             &mut *device
                 .probes
@@ -843,6 +859,7 @@ impl HostVulkan for AshVulkan {
         queues: &[vk::Queue],
         timeout: std::time::Duration,
     ) -> Idle {
+        let _pool = macos_pool::Pool::new();
         let d = &device.device;
         let mut probes = device
             .probes
@@ -900,6 +917,7 @@ impl HostVulkan for AshVulkan {
     }
 
     fn device_queue(&self, device: &HostDevice, flags: u32, family: u32, index: u32) -> vk::Queue {
+        let _pool = macos_pool::Pool::new();
         let device = &device.device;
         if flags == 0 {
             // SAFETY: `(family, index)` is a queue the device was created
@@ -921,17 +939,20 @@ impl HostVulkan for AshVulkan {
         device: &HostDevice,
         info: &VkCommandPoolCreateInfo,
     ) -> Result<vk::CommandPool, VkResult> {
+        let _pool = macos_pool::Pool::new();
         let info = info.to_ash();
         // SAFETY: `device` is ours; flags and family were checked.
         unsafe { device.device.create_command_pool(&info, None) }.map_err(result_code)
     }
 
     fn destroy_command_pool(&self, device: &HostDevice, pool: vk::CommandPool) {
+        let _pool = macos_pool::Pool::new();
         // SAFETY: `pool` was created on `device` and is destroyed once.
         unsafe { device.device.destroy_command_pool(pool, None) };
     }
 
     fn image_accepts_host_memory(&self, device: &HostDevice, info: &VkImageCreateInfo) -> bool {
+        let _pool = macos_pool::Pool::new();
         let mut external =
             vk::PhysicalDeviceExternalImageFormatInfo::default().handle_type(HOST_ALLOCATION);
         let query = vk::PhysicalDeviceImageFormatInfo2::default()
@@ -964,6 +985,7 @@ impl HostVulkan for AshVulkan {
         info: &VkImageCreateInfo,
         memory: ResourceMemory,
     ) -> Result<vk::Image, VkResult> {
+        let _pool = macos_pool::Pool::new();
         with_image_create_info(info, memory, |create| {
             // SAFETY: `device` is ours; every field was range-checked and the
             // image checked against the host's own format limits; the create
@@ -974,6 +996,7 @@ impl HostVulkan for AshVulkan {
     }
 
     fn destroy_image(&self, device: &HostDevice, image: vk::Image) {
+        let _pool = macos_pool::Pool::new();
         // SAFETY: `image` was created on `device` and is destroyed once.
         unsafe { device.device.destroy_image(image, None) };
     }
@@ -985,6 +1008,7 @@ impl HostVulkan for AshVulkan {
         plane: Option<VkImageAspectFlagBits>,
         out: &mut VkMemoryRequirements2,
     ) {
+        let _pool = macos_pool::Pool::new();
         let mut plane_info = plane.map(|aspect| {
             vk::ImagePlaneMemoryRequirementsInfo::default().plane_aspect(
                 vk::ImageAspectFlags::from_raw(u32::try_from(aspect).unwrap_or(0)),
@@ -1010,6 +1034,7 @@ impl HostVulkan for AshVulkan {
         plane: Option<VkImageAspectFlagBits>,
         out: &mut VkMemoryRequirements2,
     ) {
+        let _pool = macos_pool::Pool::new();
         let aspect =
             vk::ImageAspectFlags::from_raw(plane.and_then(|p| u32::try_from(p).ok()).unwrap_or(0));
         let _ = with_image_create_info(info, memory, |create| {
@@ -1036,6 +1061,7 @@ impl HostVulkan for AshVulkan {
         image: vk::Image,
         subresource: &VkImageSubresource,
     ) -> VkSubresourceLayout {
+        let _pool = macos_pool::Pool::new();
         let sub = vk::ImageSubresource {
             aspect_mask: vk::ImageAspectFlags::from_raw(subresource.aspect_mask),
             mip_level: subresource.mip_level,
@@ -1058,6 +1084,7 @@ impl HostVulkan for AshVulkan {
         device: &HostDevice,
         binds: &[ImageBind<'_, vk::Image, HostMemory>],
     ) -> VkResult {
+        let _pool = macos_pool::Pool::new();
         let mut planes: Vec<Option<vk::BindImagePlaneMemoryInfo<'_>>> = binds
             .iter()
             .map(|b| {
@@ -1098,6 +1125,7 @@ impl HostVulkan for AshVulkan {
         image: vk::Image,
         info: &VkImageViewCreateInfo,
     ) -> Result<vk::ImageView, VkResult> {
+        let _pool = macos_pool::Pool::new();
         let mut usage = None;
         for link in &info.p_next {
             match link {
@@ -1141,11 +1169,13 @@ impl HostVulkan for AshVulkan {
     }
 
     fn destroy_image_view(&self, device: &HostDevice, view: vk::ImageView) {
+        let _pool = macos_pool::Pool::new();
         // SAFETY: `view` was created on `device` and is destroyed once.
         unsafe { device.device.destroy_image_view(view, None) };
     }
 
     fn host_pointer_types(&self, device: &HostDevice, pages: &RingPages) -> Result<u32, VkResult> {
+        let _pool = macos_pool::Pool::new();
         let Some(get) = device.host_pointer_properties else {
             return Err(VK_ERROR_OUT_OF_DEVICE_MEMORY);
         };
@@ -1174,6 +1204,7 @@ impl HostVulkan for AshVulkan {
         device: &HostDevice,
         request: &MemoryRequest<vk::Buffer, vk::Image, SharedMemoryHandle>,
     ) -> Result<HostMemory, VkResult> {
+        let _pool = macos_pool::Pool::new();
         let win32 = device.memory_win32_handle.is_some();
         if (request.export_handle || request.import_handle.is_some()) && !win32 {
             // A device that cannot export cannot import either (stage S1).
@@ -1241,6 +1272,7 @@ impl HostVulkan for AshVulkan {
     }
 
     fn free_memory(&self, device: &HostDevice, memory: HostMemory) {
+        let pool = macos_pool::Pool::new();
         if memory.pages.is_some() {
             // The pages go back to the allocator after this, so no GPU work
             // may still be writing them. Nothing is submitted in this stage
@@ -1253,6 +1285,7 @@ impl HostVulkan for AshVulkan {
         // SAFETY: `memory` was allocated on `device` and is freed once (the
         // value is consumed).
         unsafe { device.device.free_memory(memory.memory, None) };
+        drop(pool);
         // Only now may the imported pages go (if this was their last holder).
         drop(memory.pages);
     }
@@ -1262,6 +1295,7 @@ impl HostVulkan for AshVulkan {
         device: &HostDevice,
         memory: &HostMemory,
     ) -> Result<SharedMemoryHandle, VkResult> {
+        let _pool = macos_pool::Pool::new();
         let Some(get) = device.memory_win32_handle else {
             return Err(VK_ERROR_FEATURE_NOT_PRESENT);
         };
@@ -1290,6 +1324,7 @@ impl HostVulkan for AshVulkan {
         &self,
         shared: &SharedMemoryHandle,
     ) -> Option<crate::shared::ExternalHandle> {
+        let _pool = macos_pool::Pool::new();
         use std::os::windows::io::BorrowedHandle;
         // SAFETY: `shared.handle` is the NT handle `vkGetMemoryWin32HandleKHR`
         // returned to this process, owned by `shared` and open for as long as
@@ -1307,12 +1342,14 @@ impl HostVulkan for AshVulkan {
     }
 
     fn memory_commitment(&self, device: &HostDevice, memory: &HostMemory) -> u64 {
+        let _pool = macos_pool::Pool::new();
         // SAFETY: `memory` is of `device` and of a lazily allocated type (the
         // executor asks nothing else).
         unsafe { device.device.get_device_memory_commitment(memory.memory) }
     }
 
     fn buffer_accepts_host_memory(&self, device: &HostDevice, flags: u32, usage: u32) -> bool {
+        let _pool = macos_pool::Pool::new();
         let info = vk::PhysicalDeviceExternalBufferInfo::default()
             .flags(vk::BufferCreateFlags::from_raw(flags))
             .usage(vk::BufferUsageFlags::from_raw(usage))
@@ -1336,6 +1373,7 @@ impl HostVulkan for AshVulkan {
         info: &VkBufferCreateInfo,
         memory: ResourceMemory,
     ) -> Result<vk::Buffer, VkResult> {
+        let _pool = macos_pool::Pool::new();
         with_buffer_create_info(info, memory, |create| {
             // SAFETY: `device` is ours; every field was checked; the create
             // info and its chain are locals of the helper that outlive the
@@ -1345,6 +1383,7 @@ impl HostVulkan for AshVulkan {
     }
 
     fn destroy_buffer(&self, device: &HostDevice, buffer: vk::Buffer) {
+        let _pool = macos_pool::Pool::new();
         // SAFETY: `buffer` was created on `device` and is destroyed once.
         unsafe { device.device.destroy_buffer(buffer, None) };
     }
@@ -1355,6 +1394,7 @@ impl HostVulkan for AshVulkan {
         buffer: vk::Buffer,
         out: &mut VkMemoryRequirements2,
     ) {
+        let _pool = macos_pool::Pool::new();
         let info = vk::BufferMemoryRequirementsInfo2::default().buffer(buffer);
         with_requirements(out, |head| {
             // SAFETY: `buffer` was created on `device`; `info` and `head` are
@@ -1370,6 +1410,7 @@ impl HostVulkan for AshVulkan {
         memory: ResourceMemory,
         out: &mut VkMemoryRequirements2,
     ) {
+        let _pool = macos_pool::Pool::new();
         let _ = with_buffer_create_info(info, memory, |create| {
             let query = vk::DeviceBufferMemoryRequirements::default().create_info(create);
             with_requirements(out, |head| {
@@ -1391,6 +1432,7 @@ impl HostVulkan for AshVulkan {
         device: &HostDevice,
         binds: &[(vk::Buffer, &HostMemory, u64)],
     ) -> VkResult {
+        let _pool = macos_pool::Pool::new();
         let infos: Vec<vk::BindBufferMemoryInfo<'_>> = binds
             .iter()
             .map(|(buffer, memory, offset)| {
@@ -1411,6 +1453,7 @@ impl HostVulkan for AshVulkan {
     }
 
     fn buffer_device_address(&self, device: &HostDevice, buffer: vk::Buffer) -> u64 {
+        let _pool = macos_pool::Pool::new();
         let info = vk::BufferDeviceAddressInfo::default().buffer(buffer);
         // SAFETY: `buffer` is a bound buffer of `device` created with
         // `SHADER_DEVICE_ADDRESS` usage, on a device that enabled
@@ -1424,6 +1467,7 @@ impl HostVulkan for AshVulkan {
         buffer: vk::Buffer,
         info: &VkBufferViewCreateInfo,
     ) -> Result<vk::BufferView, VkResult> {
+        let _pool = macos_pool::Pool::new();
         let create = vk::BufferViewCreateInfo::default()
             .buffer(buffer)
             .format(vk::Format::from_raw(info.format))
@@ -1435,23 +1479,31 @@ impl HostVulkan for AshVulkan {
     }
 
     fn destroy_buffer_view(&self, device: &HostDevice, view: vk::BufferView) {
+        let _pool = macos_pool::Pool::new();
         // SAFETY: `view` was created on `device` and is destroyed once.
         unsafe { device.device.destroy_buffer_view(view, None) };
     }
 
     fn call(&self, device: &HostDevice, command: &mut Command<'_>) -> Result<(), CallError> {
-        // SAFETY: `call`'s contract, which the executor keeps: the command
-        // was translated by `executor::generated::translate` against this
-        // context's table (every handle a live object of `device` of the
-        // field's type, or null where Vulkan allows null there; every enum
-        // and flag word a core 1.3 value; every count its array's length),
-        // the executor refused it unless it is core in the device's version
-        // (`generated::min_api`), and the executor's context lock is held,
-        // which is the external synchronisation every object named needs.
-        unsafe { calls::call(&device.device, &device.ext, command) }
+        let _pool = macos_pool::Pool::new();
+        // Metal command allocators can retain large heaps behind a reset
+        // Vulkan pool. Ask for their release at the guest's already validated
+        // reset boundary; other hosts keep their existing cache policy.
+        command_pool_policy::invoke(command, cfg!(target_os = "macos"), |command| {
+            // SAFETY: `call`'s contract, which the executor keeps: the command
+            // was translated by `executor::generated::translate` against this
+            // context's table (every handle a live object of `device` of the
+            // field's type, or null where Vulkan allows null there; every enum
+            // and flag word a core 1.3 value; every count its array's length),
+            // the executor refused it unless it is core in the device's version
+            // (`generated::min_api`), and the executor's context lock is held,
+            // which is the external synchronisation every object named needs.
+            unsafe { calls::call(&device.device, &device.ext, command) }
+        })
     }
 
     fn destroy_object(&self, device: &HostDevice, kind: Kind, raw: u64) {
+        let _pool = macos_pool::Pool::new();
         let d = &device.device;
         // SAFETY: `raw` is a live handle of `kind` created on `device`
         // through `call`, which the executor has just taken out of its table,
@@ -1503,6 +1555,7 @@ impl HostVulkan for AshVulkan {
     }
 
     fn device_wait_idle(&self, device: &HostDevice) -> VkResult {
+        let _pool = macos_pool::Pool::new();
         // SAFETY: `device` is ours; the executor's context lock is the
         // external synchronisation for every queue of it.
         match unsafe { device.device.device_wait_idle() } {

@@ -22,6 +22,9 @@ use crate::GuestMem;
 
 pub use crate::hv::arm64::{Exit as Arm64Exit, Register};
 
+mod serror;
+mod snapshot;
+
 static VM_EXISTS: AtomicBool = AtomicBool::new(false);
 const PAGE_SIZE: usize = 16 * 1024;
 
@@ -86,6 +89,8 @@ pub enum HvfError {
     Register(u8),
     #[error("Hypervisor.framework returned a null vCPU exit pointer")]
     NullExit,
+    #[error("ARM64 CPU snapshots require the SError state APIs available on macOS 27 or newer")]
+    SnapshotUnsupported,
 }
 
 fn check(status: i32, operation: &'static str) -> Result<(), HvfError> {

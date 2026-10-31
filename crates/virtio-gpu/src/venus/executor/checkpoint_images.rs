@@ -24,8 +24,10 @@ const MAX_CELLS: u64 = 1 << 16;
 const ALL_COMMANDS: u32 = 0x1_0000;
 const TRANSFER: u32 = 0x1000;
 const MEMORY_READ_WRITE: u32 = 0x1_8000;
-// These flags change permissible views, not the base subresource copy geometry.
-const COPY_VIEW_FLAGS: u32 = 0x8 | 0x10 | 0x80 | 0x100;
+// View compatibility and alias capability do not change base copy geometry.
+// ALIAS_BIT permits aliasing; actual overlapping bindings are rejected below
+// using native requirement spans and bufferImageGranularity before any read.
+const COPY_IMAGE_FLAGS: u32 = 0x8 | 0x10 | 0x80 | 0x100 | 0x400;
 
 #[derive(Clone, Copy, Debug)]
 struct Block {
@@ -336,7 +338,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             if image.facts.image_type != 1
                 || image.facts.depth != 1
                 || image.facts.samples != 1
-                || image.facts.flags & !COPY_VIEW_FLAGS != 0
+                || image.facts.flags & !COPY_IMAGE_FLAGS != 0
                 || image.facts.usage & 3 != 3
             {
                 return Err(failed(format!(

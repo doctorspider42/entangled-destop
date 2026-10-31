@@ -596,7 +596,7 @@ impl<H: HostVulkan> VulkanContext<H> {
             if let (Some(journal), Some(recipe)) = (&mut self.recipes, recipe) {
                 journal.note(recipe, command);
                 if let Some(meta) = import_recipe {
-                    if let Err(error) = journal.note_import(meta) {
+                    if let Err(error) = journal.note_live_import(meta) {
                         journal.fail(error);
                     }
                 }
