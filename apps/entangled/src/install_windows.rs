@@ -275,7 +275,13 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
             refresh_hz: install::installed_refresh_hz_here(args),
             ..Default::default()
         },
-        sound: Default::default(),
+        // Sound through Windows' in-box HD Audio driver: virtio-win has no
+        // released virtio-snd driver.
+        sound: control_api::SoundSection {
+            enabled: true,
+            device: control_api::SoundDevice::Hda,
+            ..Default::default()
+        },
         gamepad: Default::default(),
         shares: Vec::new(),
         reclaim_memory: false,

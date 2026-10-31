@@ -198,6 +198,8 @@ pub enum SectionKind {
     Gpu,
     /// The boot framebuffer's registers and VRAM (ADR-0008).
     Display,
+    /// The HD Audio controller's registers and codec (ADR-0008).
+    Hda,
 }
 
 impl SectionKind {
@@ -218,6 +220,7 @@ impl SectionKind {
             SectionKind::HostIrqChip => 13,
             SectionKind::Gpu => 14,
             SectionKind::Display => 15,
+            SectionKind::Hda => 16,
         }
     }
 
@@ -238,6 +241,7 @@ impl SectionKind {
             13 => SectionKind::HostIrqChip,
             14 => SectionKind::Gpu,
             15 => SectionKind::Display,
+            16 => SectionKind::Hda,
             other => return Err(SnapshotError::UnknownSection { kind: other }),
         })
     }
@@ -259,6 +263,7 @@ impl SectionKind {
             SectionKind::HostIrqChip => "host-irqchip",
             SectionKind::Gpu => "gpu",
             SectionKind::Display => "display",
+            SectionKind::Hda => "hda",
         }
     }
 }

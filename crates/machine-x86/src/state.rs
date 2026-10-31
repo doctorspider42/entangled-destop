@@ -263,6 +263,8 @@ pub struct MachineState {
     pub virtio: Vec<SavedVirtioSlot>,
     /// Present only with a boot framebuffer, standalone or virtio-vga.
     pub framebuffer: Option<SavedFramebuffer>,
+    /// Present only with an HD Audio controller: its opaque saved state.
+    pub hda: Option<Vec<u8>>,
 }
 
 /// Checks that two optional halves of the machine agree about existing.

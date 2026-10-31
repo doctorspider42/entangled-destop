@@ -37,6 +37,29 @@ mod framebuffer_present;
 
 /// Puts the profile's `[[optical]]` drives on an AHCI controller (ADR-0008
 /// §4). Nothing for a profile without any.
+/// Puts the HD Audio controller on the bus when the profile asks for one
+/// (ADR-0008): a sound card Windows plays through with its in-box driver.
+fn attach_hda(
+    pci: &mut machine_x86::virtio_pci::VirtioPciBus,
+    cfg: &VmConfig,
+    mem: &Arc<virtio_core::GuestMem>,
+) -> Result<(), String> {
+    if !cfg.sound.enabled || cfg.sound.device != control_api::SoundDevice::Hda {
+        return Ok(());
+    }
+    let choice = match cfg.sound.backend {
+        control_api::SoundBackend::Auto => virtio_sound::SinkChoice::Auto,
+        control_api::SoundBackend::Null => virtio_sound::SinkChoice::Null,
+        control_api::SoundBackend::Alsa => virtio_sound::SinkChoice::Alsa,
+        control_api::SoundBackend::Wasapi => virtio_sound::SinkChoice::Wasapi,
+    };
+    let (sink, factory) = virtio_sound::open_sink(choice)
+        .map_err(|e| format!("[sound] backend = \"{}\": {e}", cfg.sound.backend))?;
+    tracing::info!(%sink, requested = %cfg.sound.backend, "attaching the HD Audio controller");
+    pci.attach_hda(Arc::clone(mem), factory)
+        .map_err(|e| e.to_string())
+}
+
 fn attach_optical(
     pci: &mut machine_x86::virtio_pci::VirtioPciBus,
     cfg: &VmConfig,
@@ -621,6 +644,9 @@ fn build_devices(
         let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
         gpu.set_refresh_hz(cfg.display.refresh_hz);
         gpu.set_frame_stats(cfg.display.frame_stats.clone());
+        if cfg.display.adapter == control_api::DisplayAdapter::VirtioVga {
+            gpu_scanout = Some(gpu.scanout_flag());
+        }
         devices.push(Box::new(gpu));
     } else if let GpuPlan::Venus(source) = plan {
         // The Venus executor (EPIC 20 stage 5a.3): the renderer that answers,
@@ -678,6 +704,9 @@ fn build_devices(
         }
         gpu.set_refresh_hz(cfg.display.refresh_hz);
         gpu.set_frame_stats(cfg.display.frame_stats.clone());
+        if cfg.display.adapter == control_api::DisplayAdapter::VirtioVga {
+            gpu_scanout = Some(gpu.scanout_flag());
+        }
         devices.push(Box::new(gpu));
     } else if plan == GpuPlan::Virgl {
         #[cfg(target_os = "linux")]
@@ -738,6 +767,9 @@ fn build_devices(
             gpu.set_fence_mode(fences);
             gpu.set_refresh_hz(cfg.display.refresh_hz);
             gpu.set_frame_stats(cfg.display.frame_stats.clone());
+            if cfg.display.adapter == control_api::DisplayAdapter::VirtioVga {
+                gpu_scanout = Some(gpu.scanout_flag());
+            }
             devices.push(Box::new(gpu));
         }
         #[cfg(not(target_os = "linux"))]
@@ -770,7 +802,9 @@ fn build_devices(
     // virtio-snd (GAME-2102), deliberately last: device order is guest-visible
     // naming, so a card added after the input devices never renames /dev/vda
     // nor shifts a PCI device number in a profile that already existed.
-    if cfg.sound.enabled {
+    // The HD Audio controller is not a virtio device: the machine attaches it
+    // after the bus is built (`attach_hda`).
+    if cfg.sound.enabled && cfg.sound.device == control_api::SoundDevice::Virtio {
         let choice = match cfg.sound.backend {
             control_api::SoundBackend::Auto => virtio_sound::SinkChoice::Auto,
             control_api::SoundBackend::Null => virtio_sound::SinkChoice::Null,
@@ -2566,6 +2600,7 @@ mod host {
                     )
                     .map_err(|e| e.to_string())?;
                     super::attach_optical(&mut pci, cfg, &mem)?;
+                    super::attach_hda(&mut pci, cfg, &mem)?;
                     let cmdline =
                         direct_linux_cmdline(&cfg.boot.cmdline, net_cmdline.as_deref(), "");
                     (MachineBus::with_virtio_pci(serial, pci), cmdline)
@@ -2908,6 +2943,7 @@ mod host {
                         pci.offload_kicks();
                     }
                     super::attach_optical(&mut pci, cfg, &mem)?;
+                    super::attach_hda(&mut pci, cfg, &mem)?;
                     let cmdline =
                         direct_linux_cmdline(&cfg.boot.cmdline, net_cmdline.as_deref(), "");
                     (MachineBus::with_virtio_pci(serial, pci), cmdline)

@@ -109,6 +109,8 @@ kernel and initramfs artifacts, and self-skips without them.
 | `crates/virtio-balloon` | free page reporting only: pages the guest reports free are discarded on the host (`reclaim_memory = true`) | — |
 | `crates/virtio-input` | keyboard + absolute pointer devices | EPIC 9 |
 | `crates/virtio-sound` | virtio-snd playback: control/event/TX queues, PCM lifecycle, host sinks behind `AudioSink` (null/recording everywhere, ALSA dlopen'd on Linux, WASAPI on Windows) | EPIC 21, GAME-2102 |
+| `crates/hda` | Intel HD Audio controller + one-output codec for Windows guests (in-box driver), playing into virtio-sound's `AudioSink` | ADR-0008 |
+| `crates/ahci` | AHCI controller with ATAPI drives (`[[optical]]`), so Windows PE sees the untouched ISO | ADR-0008 |
 | `crates/display` | winit window, wgpu renderer, host input capture | EPIC 7 |
 | `crates/debian-media` | Debian download, PGP+SHA-512 verification, cache, manifests | EPIC 6 |
 | `crates/disk-image` | Portable disk-image logic: MBR/GPT/ext4 inspection, create/resize, sparse-preserving relocate, profile-reference guard, `.nvram` sidecar convention | — |

@@ -363,6 +363,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         sound: SoundSection {
             enabled: true,
             backend: SoundBackend::Auto,
+            ..Default::default()
         },
         // …and neither is a desktop you cannot play on (GAME-2104). Same
         // bargain as the sound card: `auto` costs a virtio slot and nothing

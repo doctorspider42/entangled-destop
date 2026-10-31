@@ -48,6 +48,9 @@ pub const IRQCHIP_VERSION: u32 = 1;
 pub const RESET_VERSION: u32 = 1;
 /// Version of the boot-framebuffer section's encoding.
 pub const DISPLAY_VERSION: u32 = 1;
+/// Version of the HD Audio section's encoding (the device's own bytes; the
+/// device checks its own version inside them).
+pub const HDA_VERSION: u32 = 1;
 /// DISPI registers a framebuffer may carry (it has eleven).
 const MAX_DISPLAY_REGISTERS: usize = 64;
 
@@ -623,6 +626,9 @@ pub fn encode_machine(state: &MachineState) -> Vec<(crate::SectionKind, u32, u32
     if let Some(chip) = &state.irqchip {
         out.push((K::IrqChip, IRQCHIP_VERSION, 0, encode_irqchip(chip)));
     }
+    if let Some(hda) = &state.hda {
+        out.push((K::Hda, HDA_VERSION, 0, hda.clone()));
+    }
     if let Some(framebuffer) = &state.framebuffer {
         out.push((
             K::Display,
@@ -681,6 +687,7 @@ pub fn decode_machine<R: std::io::Read + std::io::Seek + std::fmt::Debug>(
     let framebuffer = optional(reader, K::Display, DISPLAY_VERSION)?
         .map(|bytes| decode_framebuffer(&bytes))
         .transpose()?;
+    let hda = optional(reader, K::Hda, HDA_VERSION)?;
 
     let mut virtio = Vec::new();
     for slot in reader.instances(K::Virtio) {
@@ -702,6 +709,7 @@ pub fn decode_machine<R: std::io::Read + std::io::Seek + std::fmt::Debug>(
         irqchip,
         virtio,
         framebuffer,
+        hda,
     })
 }
 
@@ -860,6 +868,7 @@ mod tests {
                 slot: 0,
                 state: sample_virtio(),
             }],
+            hda: Some(vec![1, 2, 3]),
             framebuffer: Some(SavedFramebuffer {
                 registers: vec![0xb0c5, 1920, 1080, 32, 0x41, 0, 1920, 2184, 0, 0, 256],
                 vram: (0..4096u32).map(|i| i as u8).collect(),

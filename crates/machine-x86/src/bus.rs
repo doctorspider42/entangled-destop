@@ -313,10 +313,12 @@ impl MachineBus {
         let mut virtio = self.virtio.save_state();
         let mut pci_root = None;
         let mut framebuffer = None;
+        let mut hda = None;
         if let Some(pci) = &self.pci {
             virtio = pci.save_state();
             pci_root = pci.save_config();
             framebuffer = pci.save_framebuffer();
+            hda = pci.save_hda();
         }
         crate::state::MachineState {
             serial: match self.serial.lock() {
@@ -349,6 +351,7 @@ impl MachineBus {
             irqchip: self.irqchip.as_ref().map(|chip| chip.save_state()),
             virtio,
             framebuffer,
+            hda,
         }
     }
 
@@ -410,6 +413,7 @@ impl MachineBus {
             (Some(pci), Some(config)) => {
                 pci.load_state(config, &state.virtio)?;
                 pci.load_framebuffer(state.framebuffer.as_ref())?;
+                pci.load_hda(state.hda.as_ref())?;
             }
             _ => {
                 crate::state::require_same_presence(

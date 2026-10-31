@@ -163,6 +163,9 @@ pub const VIRTIO_PCI_BAR_SIZE: u64 = 0x8000;
 pub struct RegsPlacement {
     pub bar: u8,
     pub offset: u64,
+    /// The register of the 64-bit pair that carries the shared-memory
+    /// regions, when the device has any.
+    pub shm_bar: u8,
 }
 
 impl RegsPlacement {
@@ -170,6 +173,7 @@ impl RegsPlacement {
     pub const PLAIN: Self = Self {
         bar: VIRTIO_PCI_BAR_INDEX,
         offset: 0,
+        shm_bar: VIRTIO_PCI_SHM_BAR_INDEX,
     };
 
     /// A virtio-gpu function that is also the machine's VGA display
@@ -184,10 +188,14 @@ impl RegsPlacement {
     /// in registers 0–1, `PciBusDxe`'s logical BAR 2 is register 3. So the
     /// register file goes there, one page in: the first page is the Bochs
     /// page (`machine_x86::framebuffer`), and the six regions end at `0x7000`,
-    /// inside the same [`VIRTIO_PCI_BAR_SIZE`].
+    /// inside the same [`VIRTIO_PCI_BAR_SIZE`]. Shared memory (the Venus
+    /// renderer's host-visible window) takes the pair at registers 4–5, the
+    /// one left — where QEMU's `virtio-vga-gl` puts it too, and so where the
+    /// Windows Venus driver was developed against.
     pub const VGA: Self = Self {
         bar: 3,
         offset: 0x1000,
+        shm_bar: 4,
     };
 
     /// Where queue `index`'s notification slot is, from the BAR's base.
@@ -317,7 +325,9 @@ pub fn capability_records() -> Vec<Vec<u8>> {
 /// [`capability_records`] for a register file placed elsewhere
 /// ([`RegsPlacement::VGA`]).
 pub fn capability_records_at(regs: RegsPlacement) -> Vec<Vec<u8>> {
-    let RegsPlacement { bar, offset: base } = regs;
+    let RegsPlacement {
+        bar, offset: base, ..
+    } = regs;
     vec![
         encode_cap(
             bar,
@@ -393,17 +403,15 @@ fn encode_cap64(cfg_type: u8, id: u8, bar: u8, offset: u64, length: u64) -> Vec<
 /// produces byte-identical configuration space to the one it produced before
 /// shared memory existed.
 pub fn shm_capability_records(placements: &[ShmPlacement]) -> Vec<Vec<u8>> {
+    shm_capability_records_in(placements, VIRTIO_PCI_SHM_BAR_INDEX)
+}
+
+/// [`shm_capability_records`] for regions in BAR `bar`
+/// ([`RegsPlacement::shm_bar`]).
+pub fn shm_capability_records_in(placements: &[ShmPlacement], bar: u8) -> Vec<Vec<u8>> {
     placements
         .iter()
-        .map(|p| {
-            encode_cap64(
-                VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
-                p.id,
-                VIRTIO_PCI_SHM_BAR_INDEX,
-                p.offset,
-                p.len,
-            )
-        })
+        .map(|p| encode_cap64(VIRTIO_PCI_CAP_SHARED_MEMORY_CFG, p.id, bar, p.offset, p.len))
         .collect()
 }
 

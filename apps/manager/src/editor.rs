@@ -373,6 +373,9 @@ enabled = true
         cfg.sound = SoundSection {
             enabled: self.sound,
             backend: self.sound_backend,
+            // The card is not on the form; it stays what the profile said
+            // (a Windows machine's HD Audio).
+            device: self.base.sound.device,
         };
         // Only the switch: `backend` stays whatever the profile said, because
         // the form does not offer it and silently rewriting a field nobody was

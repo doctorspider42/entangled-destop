@@ -593,6 +593,7 @@ mod tests {
             SectionKind::HostIrqChip => 13,
             SectionKind::Gpu => 14,
             SectionKind::Display => 15,
+            SectionKind::Hda => 16,
         }
     }
 

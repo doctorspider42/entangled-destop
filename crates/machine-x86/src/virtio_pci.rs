@@ -304,9 +304,21 @@ pub struct VirtioPciBus {
     /// The AHCI controller with the VM's optical drives (ADR-0008 §4), after
     /// the virtio functions and the framebuffer.
     ahci: Option<AhciSlot>,
+    /// The HD Audio controller (ADR-0008, sound for Windows guests), last.
+    hda: Option<HdaSlot>,
     /// The MSI sink the virtio functions use, kept for functions attached
     /// after construction (the AHCI controller).
     msi: Option<Arc<dyn MsiSink>>,
+}
+
+/// The HD Audio controller on the bus.
+pub struct HdaSlot {
+    /// PCI device number on bus 0.
+    pub device_number: u8,
+    /// The controller.
+    pub device: Arc<crate::hda_function::HdaFunction>,
+    /// The token [`PciRoot`] knows this function by.
+    owner: usize,
 }
 
 /// The AHCI controller on the bus.
@@ -394,6 +406,7 @@ impl VirtioPciBus {
             host_wake: None,
             framebuffer: None,
             ahci: None,
+            hda: None,
             msi: None,
         }
     }
@@ -495,6 +508,7 @@ impl VirtioPciBus {
             host_wake: None,
             framebuffer: None,
             ahci: None,
+            hda: None,
             msi: msi.clone(),
         };
         let mut apertures = shm
@@ -665,6 +679,7 @@ impl VirtioPciBus {
             host_wake: None,
             framebuffer: None,
             ahci: None,
+            hda: None,
             msi: msi.clone(),
         };
         let host_wake = HostWakeService::new(devices.len());
@@ -840,8 +855,7 @@ impl VirtioPciBus {
         drives: Vec<ahci::Atapi>,
         mem: Arc<GuestMem>,
     ) -> Result<(), VirtioPciAttachError> {
-        let standalone_framebuffer = self.framebuffer.as_ref().is_some_and(|fb| !fb.embedded);
-        let owner = self.slots.len() + usize::from(standalone_framebuffer);
+        let owner = self.next_owner();
         let bus_error = |source| VirtioPciAttachError::Bus {
             slot: owner,
             source,
@@ -881,6 +895,82 @@ impl VirtioPciBus {
         self.ahci.as_ref()
     }
 
+    /// The owner token (and aperture slot) the next non-virtio function
+    /// gets: one past everything attached so far.
+    fn next_owner(&self) -> usize {
+        let standalone_framebuffer = self.framebuffer.as_ref().is_some_and(|fb| !fb.embedded);
+        self.slots.len()
+            + usize::from(standalone_framebuffer)
+            + usize::from(self.ahci.is_some())
+            + usize::from(self.hda.is_some())
+    }
+
+    /// Puts an HD Audio controller on the bus, playing into sinks from
+    /// `factory` (ADR-0008). Its registers take the next 32-bit slot, its
+    /// interrupt is MSI through the sink the virtio functions use.
+    pub fn attach_hda(
+        &mut self,
+        mem: Arc<GuestMem>,
+        factory: virtio_sound::SinkFactory,
+    ) -> Result<(), VirtioPciAttachError> {
+        let owner = self.next_owner();
+        let bus_error = |source| VirtioPciAttachError::Bus {
+            slot: owner,
+            source,
+        };
+        if owner as u64 >= layout::PCI_MMIO_SLOTS {
+            return Err(bus_error(PciError::BusFull));
+        }
+        let base = u32::try_from(layout::pci_bar_slot(owner as u64))
+            .map_err(|_| bus_error(PciError::BusFull))?;
+        let device = crate::hda_function::HdaFunction::new(mem, self.msi.clone(), factory)
+            .map_err(|e| VirtioPciAttachError::Framebuffer {
+                reason: format!("cannot start the HD Audio output engine: {e}"),
+            })?;
+        let space = device.config_space(base).map_err(bus_error)?;
+        let device_number = self
+            .root
+            .lock()
+            .map_err(|_| bus_error(PciError::BusFull))?
+            .attach(space, owner)
+            .map_err(bus_error)?;
+        tracing::info!(
+            address = format_args!("00:{device_number:02x}.0"),
+            regs = format_args!("{base:#x}"),
+            msi = self.msi.is_some(),
+            "attached the HD Audio controller"
+        );
+        self.hda = Some(HdaSlot {
+            device_number,
+            device,
+            owner,
+        });
+        Ok(())
+    }
+
+    /// The HD Audio controller, when the VM has one.
+    pub fn hda(&self) -> Option<&HdaSlot> {
+        self.hda.as_ref()
+    }
+
+    /// The HD Audio controller's state, for a snapshot.
+    pub fn save_hda(&self) -> Option<Vec<u8>> {
+        self.hda.as_ref().map(|slot| slot.device.save())
+    }
+
+    /// Puts the HD Audio controller back.
+    pub fn load_hda(&self, saved: Option<&Vec<u8>>) -> Result<(), crate::state::StateError> {
+        crate::state::require_same_presence("HD Audio controller", saved, self.hda.is_some())?;
+        if let (Some(slot), Some(bytes)) = (&self.hda, saved) {
+            if !slot.device.load(bytes) {
+                return Err(crate::state::StateError::Poisoned(
+                    "the HD Audio controller (an unreadable saved state)",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Builds and attaches one function's host-neutral pieces: the MSI-X table
     /// size, the configuration space, the [`IntxLine`] gate, the transport and
     /// the config-space attachment to the root. Shared by both constructors so
@@ -901,19 +991,11 @@ impl VirtioPciBus {
         // Before anything else, because it decides whether the configuration
         // space grows a second BAR and a fifth virtio capability.
         let window = crate::shm::back_regions(slot, device.as_mut(), reborrow(&mut shm));
-        // A virtio-vga function's VRAM is BAR 0–1 and its registers BAR 3,
-        // which leaves no 64-bit pair for a shared-memory window: 3D and the
-        // VGA display are refused together by the config, and this is the
-        // backstop.
+        // A virtio-vga function's VRAM is BAR 0–1 and its registers BAR 3;
+        // a shared-memory window then takes BARs 4–5
+        // (`vpci::RegsPlacement::VGA`).
         let vram = match vga {
-            Some(config) if window.is_none() => {
-                Some((Self::back_vram(&config, reborrow(&mut shm))?, config))
-            }
-            Some(_) => {
-                return Err(VirtioPciAttachError::Framebuffer {
-                    reason: "a virtio-gpu with shared memory cannot also be the VGA display".into(),
-                })
-            }
+            Some(config) => Some((Self::back_vram(&config, reborrow(&mut shm))?, config)),
             None => None,
         };
         let shm = window;
@@ -1089,11 +1171,7 @@ impl VirtioPciBus {
         }
         if let Some(shm) = shm {
             config = config
-                .with_memory_bar64(
-                    vpci::VIRTIO_PCI_SHM_BAR_INDEX,
-                    shm.initial_base(),
-                    shm.bar_size(),
-                )
+                .with_memory_bar64(regs.shm_bar, shm.initial_base(), shm.bar_size())
                 .map_err(bus_error)?;
         }
         for record in vpci::capability_records_at(regs) {
@@ -1108,7 +1186,7 @@ impl VirtioPciBus {
         // `virtio_pci_cap64` pointing at a BAR nothing decodes is worse than no
         // capability at all, so it appears exactly when the window above does.
         if let Some(shm) = shm {
-            for record in vpci::shm_capability_records(shm.placements()) {
+            for record in vpci::shm_capability_records_in(shm.placements(), regs.shm_bar) {
                 config.add_capability(&record).map_err(bus_error)?;
             }
         }
@@ -1154,6 +1232,9 @@ impl VirtioPciBus {
             if let Some(kicks) = &slot.kicks {
                 kicks.set_quiesce(Arc::clone(&quiesce));
             }
+        }
+        if let Some(hda) = &self.hda {
+            hda.device.set_quiesce(Arc::clone(&quiesce));
         }
         if let Some(host_wake) = &self.host_wake {
             host_wake.set_quiesce(quiesce);
@@ -1207,6 +1288,9 @@ impl VirtioPciBus {
         }
         if let Some(ahci) = &self.ahci {
             ahci.device.reset();
+        }
+        if let Some(hda) = &self.hda {
+            hda.device.reset();
         }
     }
 
@@ -1724,7 +1808,7 @@ impl VirtioPciBus {
                 break;
             };
             let window = match self.root.lock() {
-                Ok(root) => root.bar_window_of(index, vpci::VIRTIO_PCI_SHM_BAR_INDEX),
+                Ok(root) => root.bar_window_of(index, slot.regs.shm_bar),
                 Err(_) => {
                     tracing::error!(
                         "PCI root lock is poisoned; not reconciling shared-memory windows"
@@ -1822,10 +1906,22 @@ impl VirtioPciBus {
         (owner == slot.owner && bar == ahci::ABAR_INDEX).then_some((slot.device.as_ref(), offset))
     }
 
+    /// The HD Audio controller's register offset for `addr`, if that is
+    /// where it lands.
+    fn locate_hda(&self, addr: u64) -> Option<(&crate::hda_function::HdaFunction, u64)> {
+        let slot = self.hda.as_ref()?;
+        let (owner, bar, offset) = self.root.lock().ok()?.locate_mmio(addr)?;
+        (owner == slot.owner && bar == hda::BAR_INDEX).then_some((slot.device.as_ref(), offset))
+    }
+
     /// Guest MMIO read inside some device's BAR window.
     pub fn mmio_read(&self, addr: u64, data: &mut [u8]) {
         if let Some((ahci, offset)) = self.locate_ahci(addr) {
             ahci.mmio_read(offset, data);
+            return;
+        }
+        if let Some((hda, offset)) = self.locate_hda(addr) {
+            hda.mmio_read(offset, data);
             return;
         }
         if let Some((fb, offset)) = self.locate_framebuffer(addr) {
@@ -1856,6 +1952,10 @@ impl VirtioPciBus {
         }
         if let Some((ahci, offset)) = self.locate_ahci(addr) {
             ahci.mmio_write(offset, data);
+            return;
+        }
+        if let Some((hda, offset)) = self.locate_hda(addr) {
+            hda.mmio_write(offset, data);
             return;
         }
         if let Some((fb, offset)) = self.locate_framebuffer(addr) {

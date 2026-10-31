@@ -1,0 +1,20 @@
+[package]
+name = "hda"
+description = "Intel High Definition Audio controller with one output codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tracing.workspace = true
+virtio-core.workspace = true
+virtio-sound.workspace = true
+vm-memory.workspace = true
+
+[dev-dependencies]
+vm-memory = { workspace = true, features = ["backend-mmap"] }
+
+[lints]
+workspace = true

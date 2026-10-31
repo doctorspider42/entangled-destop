@@ -972,6 +972,10 @@ pub struct SoundSection {
     /// false, and therefore not refused there: a profile may keep its chosen
     /// backend across an on/off toggle.
     pub backend: SoundBackend,
+    /// Which sound card the guest gets. Not written when it is the default:
+    /// an older engine denies unknown keys.
+    #[serde(skip_serializing_if = "SoundDevice::is_default")]
+    pub device: SoundDevice,
 }
 
 impl Default for SoundSection {
@@ -979,7 +983,36 @@ impl Default for SoundSection {
         Self {
             enabled: false,
             backend: SoundBackend::Auto,
+            device: SoundDevice::default(),
         }
+    }
+}
+
+/// The guest's sound card (ADR-0008).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SoundDevice {
+    /// virtio-snd: output and capture, what Linux guests use. The default.
+    #[default]
+    Virtio,
+    /// An Intel HD Audio controller with one output codec: what Windows
+    /// plays through with its in-box driver (virtio-win has no released
+    /// virtio-snd driver). Output only; PCI transport.
+    Hda,
+}
+
+impl SoundDevice {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl std::fmt::Display for SoundDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Virtio => "virtio",
+            Self::Hda => "hda",
+        })
     }
 }
 
@@ -1216,7 +1249,10 @@ impl VmConfig {
         }
         if self.display.adapter != DisplayAdapter::VirtioGpu {
             let adapter = self.display.adapter;
-            if self.display.virgl || self.display.venus {
+            // Venus beside virtio-vga is the Windows 3D path (ADR-0008): the
+            // guest's Venus WDDM driver binds the same VGA-class function.
+            let venus_on_vga = adapter == DisplayAdapter::VirtioVga && !self.display.virgl;
+            if (self.display.virgl || self.display.venus) && !venus_on_vga {
                 return err(format!(
                     "display.adapter = \"{adapter}\" has no 3D: virgl and venus are \
                      renderers for the plain virtio-gpu adapter. Drop them, or use that one"
@@ -1228,6 +1264,14 @@ impl VmConfig {
                      drives: it needs transport = \"pci\" and boot.mode = \"uefi\""
                 ));
             }
+        }
+        if self.sound.enabled
+            && self.sound.device == SoundDevice::Hda
+            && self.transport != VirtioTransport::Pci
+        {
+            return err("[sound] device = \"hda\" is a PCI controller: it needs \
+                 transport = \"pci\""
+                .into());
         }
         if self.display.virgl && self.display.venus {
             return err(

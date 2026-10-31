@@ -553,3 +553,46 @@ module parameter would: 0 on read, writes dropped, each MSR logged once.
 This is built, linted and unit-tested on Linux, but **no Windows guest has
 run on KVM yet**: this machine's WSL has no `/dev/kvm`. A real Linux host is
 the acceptance.
+
+### Amendment, 2026-10-31: sound through an HD Audio controller
+
+virtio-win 0.1.302 ships no virtio-snd driver (`viosnd` is not on the ISO),
+so §B's "virtio-snd through `viosnd`" is not available. Windows has had an
+in-box HD Audio stack since Vista, so the machine grows one: the `hda` crate,
+Intel ICH6's identity (`8086:2668`, class `0403`), registers in BAR 0, MSI
+(`machine_x86::msi_cap`, now shared with AHCI). The controller has the global
+registers, the CORB/RIRB rings and the immediate-command interface, one idle
+input descriptor and one output descriptor; the codec is the smallest graph
+`HDAudio.sys` builds an endpoint from — an audio function group, one stereo
+DAC, one fixed speaker pin. The output engine is a host thread that walks the
+buffer descriptor list a 10 ms period at a time under the pause gate,
+converts to S16LE and plays into virtio-sound's `AudioSink` (WASAPI, ALSA or
+null), which paces it; buffer completion sets `BCIS` and raises MSI, and the
+DMA position buffer follows. Guest-supplied lists, lengths and ring bases are
+bounded and read through `vm-memory`; an empty descriptor stops the stream
+with the descriptor error, a ring outside RAM sets the memory-error status.
+
+`[sound] device = "hda"` selects it (PCI only; written only when not the
+default) and `install windows` profiles have it on. Measured on the
+installed Windows 10: "Speakers — High Definition Audio Device" is the
+default endpoint with nothing installed, `SoundPlayer.PlaySync()` plays
+through WASAPI at 48 kHz stereo and returns, and a snapshot taken after it
+(the controller is an `hda` section) resumes and plays again.
+
+### Amendment, 2026-10-31: groundwork for 3D in Windows guests
+
+"3D in Windows guests" was out of scope; it is now the next step, because a
+guest driver exists that targets exactly the renderer this project already
+has. Research (2026-10-31) found the experimental Yttrium `viogpu3d` — a
+Venus-based WDDM 2 kernel driver with a Mesa user-mode driver giving D3D9/10/11
+over Gallium, Vulkan through the Venus ICD and OpenGL through Zink — whose
+host requirements are a **VGA-subclass** virtio-gpu, blob resources, the
+Venus capset and a host-visible shared-memory window: the Venus executor and
+`virtio-vga` together. The host half is in: `[display] venus = true` is now
+accepted beside `adapter = "virtio-vga"` (virgl still is not), and the
+shared-memory window moves to the 64-bit pair at BARs 4–5 on that function
+(`RegsPlacement::shm_bar`), where QEMU's `virtio-vga-gl` puts it. The guest
+half needs the test-signed driver and the LunarG Vulkan runtime downloaded
+into the guest, test-signing on, and is not done yet. GPU-PV through WHP is
+not possible (WHP has no GPU-partition API), and the older virgl-based
+`viogpu3d` is abandoned upstream.
