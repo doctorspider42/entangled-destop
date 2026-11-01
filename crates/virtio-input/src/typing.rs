@@ -335,6 +335,16 @@ pub fn parse_chord(chord: &str) -> Option<Vec<u16>> {
             "enter" => Some(28),
             "escape" => Some(1),
             "tab" => Some(15),
+            "space" => Some(57),
+            "backspace" => Some(14),
+            "delete" => Some(111),
+            "up" => Some(103),
+            "down" => Some(108),
+            "left" => Some(105),
+            "right" => Some(106),
+            "home" => Some(102),
+            "end" => Some(107),
+            "f8" => Some(66),
             letter if letter.chars().count() == 1 => letter
                 .chars()
                 .next()
@@ -352,6 +362,7 @@ mod tests {
     fn chords_parse_from_words() {
         assert_eq!(parse_chord("super r"), Some(vec![125, 19]));
         assert_eq!(parse_chord("ctrl alt t"), Some(vec![29, 56, 20]));
+        assert_eq!(parse_chord("down"), Some(vec![108]));
         assert_eq!(parse_chord(""), None);
         assert_eq!(parse_chord("hyper r"), None);
         assert_eq!(parse_chord("a b c d e f g h i"), None);
