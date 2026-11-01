@@ -76,8 +76,10 @@ use super::UserNetConfig;
 use crate::frame::{ETH_HEADER_LEN, MAX_FRAME_LEN};
 
 /// Concurrent guest TCP connections. Each costs two socket buffers and, briefly,
-/// one connect thread.
-pub const MAX_FLOWS: usize = 64;
+/// one connect thread. 64 was enough for Linux guests; a Windows desktop with a
+/// browser open (telemetry, the store, the news feed) sat at that limit and
+/// dropped every new connection (ADR-0008).
+pub const MAX_FLOWS: usize = 256;
 
 /// Per-direction socket buffer for one flow, and so the most one flow has in
 /// flight: the guest's ACKs reach smoltcp one pump tick after the segments

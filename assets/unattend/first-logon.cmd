@@ -33,4 +33,27 @@ if exist "%disc%\entangled\entangled-agent.exe" (
   copy /y "%disc%\entangled\entangled-agent.exe" "%dir%\" >nul
   powershell -NoProfile -Command "$a = New-ScheduledTaskAction -Execute '%dir%\entangled-agent.exe'; $t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest; $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName 'Entangled agent' -Action $a -Trigger $t -Principal $p -Settings $s -Force" >nul
 )
+rem 3D (ADR-0008), when the installer was given the viogpu3d package: its
+rem test certificate, test-signing (the driver is test-signed), the Vulkan
+rem runtime, the driver, and MSI for the function - the INF turns MSI off,
+rem and this machine has no _PRT for the line-based fallback; gpu3d-msi.ps1
+rem says why it runs at every startup. The installer's
+rem final shutdown is the reboot all of it needs.
+if exist "%disc%\entangled\gpu3d\VirtIOTestCert.cer" call :gpu3d
 endlocal
+exit /b 0
+
+:gpu3d
+set "g=%disc%\entangled\gpu3d"
+certutil -addstore -f Root "%g%\VirtIOTestCert.cer" >nul
+certutil -addstore -f TrustedPublisher "%g%\VirtIOTestCert.cer" >nul
+bcdedit /set testsigning on >nul
+"%g%\VulkanRT-Installer.exe" /S
+pnputil /add-driver "%g%\Win10\amd64\viogpu3d.inf" /install >nul
+copy /y "%disc%\entangled\gpu3d-msi.ps1" "%dir%\" >nul
+schtasks /create /tn "Entangled 3D interrupts" /sc onstart /ru SYSTEM /rl HIGHEST /tr "powershell -NoProfile -ExecutionPolicy Bypass -File \"%dir%\gpu3d-msi.ps1\"" /f >nul
+rem And at logon: on the first boot after the install the function's new
+rem instance is only enumerated after the startup run.
+schtasks /create /tn "Entangled 3D interrupts at logon" /sc onlogon /ru SYSTEM /rl HIGHEST /tr "powershell -NoProfile -ExecutionPolicy Bypass -File \"%dir%\gpu3d-msi.ps1\"" /f >nul
+powershell -NoProfile -ExecutionPolicy Bypass -File "%dir%\gpu3d-msi.ps1"
+exit /b 0

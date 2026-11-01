@@ -837,6 +837,7 @@ mod tests {
             drivers: None,
             edition: None,
             product_key: None,
+            gpu3d: None,
         }
     }
 

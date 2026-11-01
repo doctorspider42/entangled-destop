@@ -617,8 +617,8 @@ took:
 - **Interrupts.** The INF sets `MSISupported = 0`, and our DSDT has no `_PRT`,
   so the line-based fallback has nowhere to go. The PoC guest forces MSI in
   its registry (`Interrupt Management\MessageSignaledInterruptProperties`,
-  `MSISupported = 1`). **Open:** a `_PRT` for the root bus, or shipping that
-  override with the driver install, before this is more than a PoC.
+  `MSISupported = 1`); `install windows --gpu3d` sets it with the driver.
+  A `_PRT` would need level-triggered INTx, which this machine does not have.
 - **Vulkan 1.0 queries.** The Windows ICD asks
   `vkGetPhysicalDevice{Features,QueueFamilyProperties,MemoryProperties,
   FormatProperties,ImageFormatProperties}` without the `2` suffix; the
@@ -647,6 +647,27 @@ the Mesa UMD, with no Venus refusal in the log. Not yet tried: OpenGL
 applications and a game. A guest that was
 force-stopped twice boots into WinRE, which has no virtio-input driver and so
 takes no keyboard; a hard `reset` gets it back to Windows.
+
+**`install windows --gpu3d DIR`** makes it one step. DIR is the viogpu3d
+package as Yttrium ships it plus the LunarG `VulkanRT-*.exe`; the answer disc
+carries it under `entangled/gpu3d/` (symbols left out), and `first-logon.cmd`
+installs the certificate, turns test-signing on, runs the Vulkan runtime's
+silent install, adds the driver with `pnputil` and sets `MSISupported = 1`
+on the function; the profile gets `venus = true`, and the installer's final
+power-off is the reboot all of it needs. MSI is a per-instance setting and the
+function's instance changes with its slot (the installer's offline machine
+has no network card, so every later device moves up one), so
+`gpu3d-msi.ps1` runs as SYSTEM at every startup and logon, sets it on every
+instance and restarts the one it changed. Validated on a fresh install: the
+desktop composites on the GPU and Edge runs the WebGL Aquarium (500 fish,
+46 fps). WebGL needs `msedge --use-angle=vulkan`: through ANGLE's default
+D3D11 backend the alpha D3D10 UMD clears but draws no geometry, with no Venus
+refusal in the log — a guest-driver gap, not ours. Nothing is downloaded for the user:
+the driver is a third party's test-signed alpha, and taking it is their call.
+
+**The user-mode NAT now allows 256 TCP flows, not 64.** A Windows desktop with
+a browser open sat at 64 for hours (telemetry, the store, the news feed) and
+every new connection was refused.
 
 ### Amendment, 2026-10-31: the shared clipboard
 

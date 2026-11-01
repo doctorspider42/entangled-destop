@@ -439,6 +439,13 @@ pub struct InstallArgs {
     /// Without one the system installs unactivated, which Windows allows.
     #[arg(long)]
     pub product_key: Option<String>,
+    /// Windows only, experimental: 3D through Venus on the host GPU. A
+    /// directory holding the Yttrium viogpu3d package (`VirtIOTestCert.cer`,
+    /// `Win10md64iogpu3d.inf` and its files) and the LunarG Vulkan
+    /// runtime installer (`VulkanRT-*.exe`). The driver is test-signed, so the
+    /// guest runs in test-signing mode.
+    #[arg(long, value_name = "DIR")]
+    pub gpu3d: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {

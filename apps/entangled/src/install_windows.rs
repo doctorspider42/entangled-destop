@@ -36,6 +36,8 @@ use crate::{install, InstallArgs};
 const TEMPLATE: &str = include_str!("../../../assets/unattend/windows.xml");
 /// The first-logon setup script, run from the answer disc (see the template).
 const FIRST_LOGON: &str = include_str!("../../../assets/unattend/first-logon.cmd");
+/// The startup task that keeps the 3D function on MSI (see the script).
+const GPU3D_MSI: &str = include_str!("../../../assets/unattend/gpu3d-msi.ps1");
 
 /// The WIM header's magic.
 const WIM_MAGIC: &[u8; 8] = b"MSWIM\0\0\0";
@@ -246,6 +248,7 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
             .map(product_key)
             .transpose()?
             .as_deref(),
+        args.gpu3d.as_deref(),
     )?;
     let firmware = crate::firmware::resolve(args.firmware.as_deref()).map_err(|e| e.to_string())?;
     tracing::info!(
@@ -277,6 +280,8 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
             // One adapter for the firmware, Setup and the installed system:
             // `BasicDisplay` draws into its VRAM until `viogpudo` binds it.
             adapter: DisplayAdapter::VirtioVga,
+            // viogpu3d (first-logon.cmd) drives Venus beside the VGA function.
+            venus: args.gpu3d.is_some(),
             refresh_hz: install::installed_refresh_hz_here(args),
             ..Default::default()
         },
@@ -354,6 +359,7 @@ fn answer_disc(
     computer_name: &str,
     timezone: &str,
     product_key: Option<&str>,
+    gpu3d: Option<&Path>,
 ) -> Result<(Vec<u8>, WimImage), String> {
     let mut windows = optical::open(windows_iso).map_err(|e| e.to_string())?;
     let images =
@@ -382,6 +388,14 @@ fn answer_disc(
              installs without the shared clipboard"
         ),
     }
+    if let Some(dir) = gpu3d {
+        disc.add_file("entangled/gpu3d-msi.ps1", crlf(GPU3D_MSI))
+            .map_err(|e| e.to_string())?;
+        for (path, data) in gpu3d_files(dir)? {
+            disc.add_file(&format!("entangled/gpu3d/{path}"), data)
+                .map_err(|e| e.to_string())?;
+        }
+    }
     let mut virtio = optical::open(drivers_iso).map_err(|e| e.to_string())?;
     for (path, data) in driver_files(virtio.as_mut(), image.is_windows_11())
         .map_err(|e| format!("{}: {e}", drivers_iso.display()))?
@@ -390,6 +404,65 @@ fn answer_disc(
             .map_err(|e| e.to_string())?;
     }
     Ok((disc.build(), image))
+}
+
+/// The 3D package's files, as the answer disc carries them under
+/// `entangled/gpu3d/`: the test certificate, the Vulkan runtime installer
+/// (renamed `VulkanRT-Installer.exe`) and everything under `Win10/amd64`
+/// except debug symbols.
+fn gpu3d_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|e| format!("--gpu3d: cannot read {}: {e}", path.display()))
+    };
+    let cert = dir.join("VirtIOTestCert.cer");
+    let drivers = dir.join("Win10").join("amd64");
+    if !cert.is_file() || !drivers.join("viogpu3d.inf").is_file() {
+        return Err(format!(
+            "--gpu3d: {} is not the viogpu3d package: it needs VirtIOTestCert.cer and \
+             Win10\\amd64\\viogpu3d.inf",
+            dir.display()
+        ));
+    }
+    let runtime = std::fs::read_dir(dir)
+        .map_err(|e| format!("--gpu3d: cannot list {}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    let name = name.to_ascii_lowercase();
+                    name.starts_with("vulkanrt") && name.ends_with(".exe")
+                })
+        })
+        .ok_or_else(|| {
+            format!(
+                "--gpu3d: no Vulkan runtime installer (VulkanRT-*.exe from LunarG) in {}",
+                dir.display()
+            )
+        })?;
+    let mut files = vec![
+        ("VirtIOTestCert.cer".to_owned(), read(&cert)?),
+        ("VulkanRT-Installer.exe".to_owned(), read(&runtime)?),
+    ];
+    let mut pending = vec![(drivers, "Win10/amd64".to_owned())];
+    while let Some((at, prefix)) = pending.pop() {
+        let entries = std::fs::read_dir(&at)
+            .map_err(|e| format!("--gpu3d: cannot list {}: {e}", at.display()))?;
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+                continue;
+            };
+            if path.is_dir() {
+                pending.push((path, format!("{prefix}/{name}")));
+            } else if !name.to_ascii_lowercase().ends_with(".pdb") {
+                files.push((format!("{prefix}/{name}"), read(&path)?));
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// Where a guest agent build may be named explicitly.
@@ -906,6 +979,44 @@ mod tests {
         assert_eq!(key.step(&format!("{prompt}\n{prompt}")), None);
     }
 
+    /// The 3D package goes on the disc as first-logon.cmd expects it: the
+    /// certificate, the runtime under one name, the driver tree without
+    /// symbols; a directory that is not the package is refused by name.
+    #[test]
+    fn the_gpu3d_package_is_carried_without_symbols_and_checked() {
+        let dir = std::env::temp_dir().join(format!("entangled-gpu3d-{}", std::process::id()));
+        let amd64 = dir.join("Win10").join("amd64");
+        std::fs::create_dir_all(amd64.join("x64")).unwrap();
+        for (path, bytes) in [
+            (amd64.join("viogpu3d.inf"), &b"inf"[..]),
+            (amd64.join("viogpu3d.pdb"), b"pdb"),
+            (amd64.join("x64").join("opengl32_x64.dll"), b"dll"),
+        ] {
+            std::fs::write(path, bytes).unwrap();
+        }
+        let refused = gpu3d_files(&dir).unwrap_err();
+        assert!(refused.contains("VirtIOTestCert.cer"), "{refused}");
+        std::fs::write(dir.join("VirtIOTestCert.cer"), b"cer").unwrap();
+        let refused = gpu3d_files(&dir).unwrap_err();
+        assert!(refused.contains("VulkanRT"), "{refused}");
+        std::fs::write(dir.join("VulkanRT-1.4.363.0-Installer.exe"), b"exe").unwrap();
+        let names: Vec<String> = gpu3d_files(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "VirtIOTestCert.cer",
+                "VulkanRT-Installer.exe",
+                "Win10/amd64/viogpu3d.inf",
+                "Win10/amd64/x64/opengl32_x64.dll",
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// An answer disc built from two synthetic ISOs: the edition is read out
     /// of the WIM header, the drivers of the right version are copied.
     #[test]
@@ -942,7 +1053,7 @@ mod tests {
         std::fs::write(&virtio_iso, virtio.build()).unwrap();
 
         let (disc, image) =
-            answer_disc(&windows_iso, &virtio_iso, None, "WIN10", "UTC", None).unwrap();
+            answer_disc(&windows_iso, &virtio_iso, None, "WIN10", "UTC", None, None).unwrap();
         assert_eq!(image.index, 6);
         let mut answers = optical::iso9660::IsoImage::new(std::io::Cursor::new(disc)).unwrap();
         let root = answers.root().clone();
@@ -975,7 +1086,8 @@ mod tests {
         let mut empty = IsoBuilder::new("EMPTY");
         empty.add_file("README", b"x".to_vec()).unwrap();
         std::fs::write(&virtio_iso, empty.build()).unwrap();
-        let error = answer_disc(&windows_iso, &virtio_iso, None, "W", "UTC", None).unwrap_err();
+        let error =
+            answer_disc(&windows_iso, &virtio_iso, None, "W", "UTC", None, None).unwrap_err();
         assert!(error.contains("viostor/w10/amd64"), "{error}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
