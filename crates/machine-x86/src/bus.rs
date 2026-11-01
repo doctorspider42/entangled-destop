@@ -82,6 +82,10 @@ pub struct MachineBus {
     /// line ([`Self::with_rtc_interrupt`]). Shared by every clone of the bus
     /// and joined when the last one goes.
     rtc_timer: Option<Arc<crate::rtc::RtcTimer>>,
+    /// The 8042 keyboard controller (ADR-0008 §5), once the machine has wired
+    /// its interrupt ([`Self::with_keyboard`]). `None` leaves `0x60`/`0x64` as
+    /// they were: reads float, and only the reset pulse is decoded.
+    keyboard: Option<Arc<Mutex<crate::i8042::I8042>>>,
 }
 
 #[cfg(test)]
@@ -100,6 +104,7 @@ impl MachineBus {
             pflash: None,
             reset: Arc::new(ResetControl::new()),
             rtc_timer: None,
+            keyboard: None,
         }
     }
 
@@ -141,6 +146,19 @@ impl MachineBus {
     /// Wires the RTC to `line` (IRQ 8) and starts the thread that drives it
     /// (ADR-0008 §3). Nothing without a firmware platform: a direct-Linux
     /// machine has no RTC.
+    /// Puts the 8042 keyboard controller on `0x60`/`0x64`, raising `line`
+    /// (IRQ 1).
+    pub fn with_keyboard(mut self, line: Arc<dyn virtio_core::interrupt::IrqLine>) -> Self {
+        self.keyboard = Some(Arc::new(Mutex::new(crate::i8042::I8042::new(line))));
+        self
+    }
+
+    /// The keyboard controller, for the host's keys while the guest drives no
+    /// virtio keyboard.
+    pub fn keyboard(&self) -> Option<Arc<Mutex<crate::i8042::I8042>>> {
+        self.keyboard.clone()
+    }
+
     pub fn with_rtc_interrupt(mut self, line: Arc<dyn virtio_core::interrupt::IrqLine>) -> Self {
         let Some(platform) = self.platform.clone() else {
             return self;
@@ -352,6 +370,10 @@ impl MachineBus {
             virtio,
             framebuffer,
             hda,
+            keyboard: self
+                .keyboard
+                .as_ref()
+                .and_then(|keyboard| keyboard.lock().ok().map(|k| k.save())),
         }
     }
 
@@ -408,6 +430,21 @@ impl MachineBus {
         }
         self.acpi_pm.load_state(&state.acpi_pm);
         self.reset.load_state(&state.reset);
+        match (&self.keyboard, &state.keyboard) {
+            (Some(keyboard), Some(saved)) => keyboard
+                .lock()
+                .map_err(|_| crate::state::StateError::Poisoned("the keyboard controller"))?
+                .load(saved)
+                .map_err(|_| crate::state::StateError::BadValue {
+                    what: "the keyboard controller's state",
+                    value: saved.len() as u64,
+                })?,
+            _ => crate::state::require_same_presence(
+                "keyboard controller",
+                state.keyboard.as_ref(),
+                self.keyboard.is_some(),
+            )?,
+        }
 
         match (&self.pci, &state.pci_root) {
             (Some(pci), Some(config)) => {
@@ -473,6 +510,12 @@ impl MachineBus {
                 ),
             }
         }
+        if let Some(keyboard) = &self.keyboard {
+            match keyboard.lock() {
+                Ok(mut keyboard) => keyboard.reset(),
+                Err(_) => tracing::error!("keyboard lock is poisoned; the 8042 is not reset"),
+            }
+        }
         self.acpi_pm.reset();
         self.reset.clear();
     }
@@ -480,6 +523,21 @@ impl MachineBus {
 
 impl ExitHandler for MachineBus {
     fn io_out(&mut self, port: u16, data: &[u8]) {
+        if let Some(keyboard) = &self.keyboard {
+            if crate::i8042::I8042::contains(port) {
+                let pulse = match keyboard.lock() {
+                    Ok(mut keyboard) => data.iter().any(|&b| keyboard.io_write(port, b)),
+                    Err(_) => false,
+                };
+                if pulse {
+                    self.reset.io_write(
+                        crate::reset::PORT_KBD_COMMAND,
+                        &[crate::reset::KBD_PULSE_RESET],
+                    );
+                }
+                return;
+            }
+        }
         if SerialConsole::contains(port) {
             if let Ok(mut serial) = self.serial.lock() {
                 for &byte in data {
@@ -529,6 +587,16 @@ impl ExitHandler for MachineBus {
     }
 
     fn io_in(&mut self, port: u16, data: &mut [u8]) {
+        if let Some(keyboard) = &self.keyboard {
+            if crate::i8042::I8042::contains(port) {
+                if let Ok(mut keyboard) = keyboard.lock() {
+                    for byte in data.iter_mut() {
+                        *byte = keyboard.io_read(port);
+                    }
+                    return;
+                }
+            }
+        }
         if SerialConsole::contains(port) {
             if let Ok(mut serial) = self.serial.lock() {
                 for byte in data.iter_mut() {

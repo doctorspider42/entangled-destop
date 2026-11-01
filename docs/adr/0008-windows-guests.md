@@ -146,6 +146,13 @@ the `acpi/mod.rs` comment says is missing today. The FADT's `8042` flag and a
 `PNP0303` device in the DSDT are part of the same change. This step is second
 priority; the acceptance in phase A does not depend on it.
 
+**Done (2026-11-02):** `machine_x86::i8042` — controller and keyboard on
+`0x60`/`0x64`, IRQ 1, scancode set 1, `PNP0303` (`PS2K`) in the DSDT, the
+FADT `8042` bit, controller command `0xfe` through `crate::reset`, a
+`keyboard` snapshot section. The host sends its keys there only while the
+guest drives no virtio keyboard, so nothing is typed twice. Verified in
+WinRE, which used to take no keyboard at all.
+
 ### 6. What every new device owes
 
 The Bochs display and the 8042 are new devices. Each owes a `reset()`, a
@@ -646,7 +653,7 @@ decode, WebGL and WebGL2 hardware accelerated through ANGLE's D3D11 backend on
 the Mesa UMD, with no Venus refusal in the log. Not yet tried: OpenGL
 applications and a game. A guest that was
 force-stopped twice boots into WinRE, which has no virtio-input driver and so
-takes no keyboard; a hard `reset` gets it back to Windows.
+took no keyboard; the 8042 (§5) now answers there.
 
 **`install windows --gpu3d DIR`** makes it one step. DIR is the viogpu3d
 package as Yttrium ships it plus the LunarG `VulkanRT-*.exe`; the answer disc
@@ -696,7 +703,9 @@ from a logon task at run level highest for the installed user rather than
 from `Run`. Measured on a fresh install: the agent connects ~13 s after a
 reboot, host → guest and guest → host both carry "Zażółć gęślą jaźń" intact.
 
-**Open: a rare reset failure with the console attached.** Three times in
+**Not reproduced since (2026-11-02): 33 resets of a `guest_agent` VM at
+random points of the boot, none failed.** It stays recorded in case it
+returns. Originally: **a rare reset failure with the console attached.** Three times in
 roughly fifteen resets of a VM with `guest_agent`, all while Windows was
 bringing `vioserial` up for the first time, the firmware faulted ~40 µs after
 the machine reset, and every reset after it faulted the same way (the reset

@@ -367,9 +367,13 @@ const FADT_RESET_REG_SUP: u32 = 1 << 10;
 ///   bit there would save the ~1.4 s `rtc_cmos` probe timeout; that needs the
 ///   FADT to know the boot mode, which is a follow-up (see the acpi-machine
 ///   skill).
-/// * `LEGACY_DEVICES` (bit 0) and `8042` (bit 1) — no ISA bus behind the
-///   IOAPIC's ISA IRQs beyond the UART, and no PS/2 controller.
+/// * `LEGACY_DEVICES` (bit 0) — no ISA bus behind the IOAPIC's ISA IRQs
+///   beyond the UART and the keyboard controller.
+///
+/// `8042` (bit 1) is set: the keyboard controller (`crate::i8042`) is there.
 const IAPC_VGA_NOT_PRESENT: u16 = 1 << 2;
+/// FADT `IAPC_BOOT_ARCH` bit 1: an 8042 is present.
+const IAPC_8042: u16 = 1 << 1;
 
 /// The Fixed ACPI Description Table: where the ACPI PM register block is, and
 /// where the DSDT and FACS are.
@@ -401,7 +405,7 @@ fn fadt(facs_addr: u64, dsdt_addr: u64) -> Vec<u8> {
     put(96, &0x0fffu16.to_le_bytes()); // P_LVL2_LAT
     put(98, &0x0fffu16.to_le_bytes()); // P_LVL3_LAT
     put(108, &[crate::rtc::REG_CENTURY]); // CENTURY
-    put(109, &IAPC_VGA_NOT_PRESENT.to_le_bytes());
+    put(109, &(IAPC_VGA_NOT_PRESENT | IAPC_8042).to_le_bytes());
     put(
         112,
         &(FADT_WBINVD
@@ -564,6 +568,19 @@ fn dsdt(vcpu_count: u32, mmio64_base: u64) -> Vec<u8> {
         ]),
     ));
     sb.extend_from_slice(&aml::device("PCI0", &pci0));
+
+    // The 8042 keyboard controller (`crate::i8042`, ADR-0008 §5): Windows
+    // enumerates a PS/2 keyboard only through this device.
+    let mut ps2 = aml::name("_HID", &aml::eisa_id("PNP0303"));
+    ps2.extend_from_slice(&aml::name(
+        "_CRS",
+        &aml::resource_template(&[
+            aml::io_port(crate::i8042::PORT_DATA, 1),
+            aml::io_port(crate::i8042::PORT_COMMAND, 1),
+            aml::irq_no_flags(crate::i8042::KEYBOARD_IRQ as u8),
+        ]),
+    ));
+    sb.extend_from_slice(&aml::device("PS2K", &ps2));
 
     for cpu in 0..vcpu_count {
         let mut processor = aml::name("_HID", &aml::string("ACPI0007"));

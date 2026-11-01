@@ -228,6 +228,8 @@ pub enum SectionKind {
     Display,
     /// The HD Audio controller's registers and codec (ADR-0008).
     Hda,
+    /// The 8042 keyboard controller (ADR-0008 §5).
+    Keyboard,
 }
 
 impl SectionKind {
@@ -249,6 +251,7 @@ impl SectionKind {
             SectionKind::Gpu => 14,
             SectionKind::Display => 15,
             SectionKind::Hda => 16,
+            SectionKind::Keyboard => 17,
         }
     }
 
@@ -270,6 +273,7 @@ impl SectionKind {
             14 => SectionKind::Gpu,
             15 => SectionKind::Display,
             16 => SectionKind::Hda,
+            17 => SectionKind::Keyboard,
             other => return Err(SnapshotError::UnknownSection { kind: other }),
         })
     }
@@ -292,6 +296,7 @@ impl SectionKind {
             SectionKind::Gpu => "gpu",
             SectionKind::Display => "display",
             SectionKind::Hda => "hda",
+            SectionKind::Keyboard => "keyboard",
         }
     }
 }

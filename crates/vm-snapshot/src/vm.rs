@@ -610,6 +610,7 @@ mod tests {
             SectionKind::Gpu => 14,
             SectionKind::Display => 15,
             SectionKind::Hda => 16,
+            SectionKind::Keyboard => 17,
         }
     }
 

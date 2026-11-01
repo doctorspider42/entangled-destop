@@ -1066,9 +1066,34 @@ pub const CONTROL_PREFIX: &str = control_api::control::PREFIX;
 /// second, each delivery under a pause-gate pass like the input pump's — a
 /// paused VM's event ring is not written (ADR-0005), and what waits keeps
 /// waiting until it resumes.
+/// The host's keys: to the virtio keyboard once the guest drives it, else to
+/// the 8042 (ADR-0008 §5) — Windows' recovery environment, and anything else
+/// that runs before `vioinput`. Never both, so nothing is typed twice.
+fn deliver_keys(
+    keyboard: &virtio_input::InputHandle,
+    ps2: Option<&Arc<Mutex<machine_x86::i8042::I8042>>>,
+    events: &[virtio_input::InputEvent],
+) -> Result<(), String> {
+    match ps2 {
+        Some(ps2) if !keyboard.is_active() => {
+            if let Ok(mut ps2) = ps2.lock() {
+                for event in events
+                    .iter()
+                    .filter(|e| e.event_type == virtio_input::ev::KEY)
+                {
+                    ps2.key(event.code, event.value != 0);
+                }
+            }
+            Ok(())
+        }
+        _ => keyboard.push(events).map(drop).map_err(|e| e.to_string()),
+    }
+}
+
 fn spawn_typist(
     typist: virtio_input::Typist,
     keyboard: virtio_input::InputHandle,
+    ps2: Option<Arc<Mutex<machine_x86::i8042::I8042>>>,
     quiesce: Arc<virtio_core::Quiesce>,
 ) {
     let spawned = std::thread::Builder::new()
@@ -1083,7 +1108,7 @@ fn spawn_typist(
                     continue;
                 };
                 let events = typist.take(4);
-                if let Err(error) = keyboard.push(&events) {
+                if let Err(error) = deliver_keys(&keyboard, ps2.as_ref(), &events) {
                     tracing::warn!(%error, "typed keys could not be delivered");
                 }
                 drop(pass);
@@ -1724,7 +1749,12 @@ pub fn run_with(
         Arc::clone(&vm_state),
         Some(display_handle.clone()),
     );
-    spawn_typist(typist.clone(), keyboard_sink.clone(), Arc::clone(&quiesce));
+    spawn_typist(
+        typist.clone(),
+        keyboard_sink.clone(),
+        bus.keyboard(),
+        Arc::clone(&quiesce),
+    );
     if control_stdin {
         spawn_control_channel(
             bus.clone(),
@@ -1776,6 +1806,7 @@ pub fn run_with(
             let control_queue = host.control_queue();
             let pump_requests = Arc::clone(&requests);
             let pump_quiesce = Arc::clone(&quiesce);
+            let pump_ps2 = bus.keyboard();
             let pump_snapshot = snapshot.clone();
             let pump = std::thread::spawn(move || {
                 while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
@@ -1809,7 +1840,7 @@ pub fn run_with(
                         keyboard.extend(split.keyboard);
                         pointer.extend(split.pointer);
                     }
-                    if let Err(e) = keyboard_sink.push(&keyboard) {
+                    if let Err(e) = deliver_keys(&keyboard_sink, pump_ps2.as_ref(), &keyboard) {
                         tracing::warn!(error = %e, "keyboard event delivery failed");
                     }
                     if !pointer.is_empty() {
@@ -2668,6 +2699,17 @@ mod host {
                     bus
                 }
             };
+        // The 8042 keyboard on IRQ 1 (ADR-0008 §5).
+        let bus = match machine_x86::irqfd::IrqFdLine::new(
+            &vm.fd_shared(),
+            machine_x86::i8042::KEYBOARD_IRQ,
+        ) {
+            Ok(line) => bus.with_keyboard(Arc::new(line)),
+            Err(error) => {
+                tracing::warn!(%error, "no keyboard irqfd; no PS/2 keyboard");
+                bus
+            }
+        };
 
         // Boot mode dispatch (EPIC 18 / ADR-0003). Everything above this point —
         // memory, IRQ chip, serial, the whole virtio window — is identical for both
@@ -2987,7 +3029,8 @@ mod host {
             Some(flash) => bus.with_pflash(Arc::clone(flash)),
             None => bus,
         }
-        .with_irqchip(Arc::clone(&irqchip));
+        .with_irqchip(Arc::clone(&irqchip))
+        .with_keyboard(irqchip.keyboard_line());
 
         let mem_size = machine.memory_mib << 20;
         let plan = match cfg.boot.mode {

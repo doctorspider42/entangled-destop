@@ -143,6 +143,15 @@ impl UserspaceIrqChip {
         }
     }
 
+    /// The 8042 keyboard's interrupt: IOAPIC pin
+    /// [`crate::i8042::KEYBOARD_IRQ`].
+    pub fn keyboard_line(&self) -> Arc<dyn IrqLine> {
+        match self.ioapic.line(crate::i8042::KEYBOARD_IRQ as u8) {
+            Ok(line) => line,
+            Err(_) => unreachable!("the keyboard's pin is within the IOAPIC's pin count"),
+        }
+    }
+
     /// The RTC's interrupt: IOAPIC pin [`crate::layout::RTC_GSI`].
     pub fn rtc_line(&self) -> Arc<dyn IrqLine> {
         match u8::try_from(crate::layout::RTC_GSI)

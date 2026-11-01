@@ -255,6 +255,13 @@ pub fn io_port(base: u16, len: u8) -> Vec<u8> {
     out
 }
 
+/// `IRQNoFlags () {irq}` — 3 bytes: one ISA interrupt, edge, active high.
+pub fn irq_no_flags(irq: u8) -> Vec<u8> {
+    let mask = 1u16 << (irq & 0x0f);
+    let [lo, hi] = mask.to_le_bytes();
+    vec![0x22, lo, hi]
+}
+
 /// `DWordMemory (…, base, base+len-1, 0, len)` — 26 bytes, non-cacheable and
 /// read/write, which is what an MMIO aperture is.
 pub fn dword_memory(base: u32, len: u32) -> Vec<u8> {

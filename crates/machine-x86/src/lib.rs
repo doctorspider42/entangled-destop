@@ -9,6 +9,7 @@ pub mod ahci_function;
 pub mod boot;
 pub mod bus;
 pub mod hda_function;
+pub mod i8042;
 pub mod msi_cap;
 
 /// The boot framebuffer (ADR-0008 §1): a PCI display with a linear

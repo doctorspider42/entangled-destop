@@ -265,6 +265,8 @@ pub struct MachineState {
     pub framebuffer: Option<SavedFramebuffer>,
     /// Present only with an HD Audio controller: its opaque saved state.
     pub hda: Option<Vec<u8>>,
+    /// Present only with the 8042 keyboard controller: its saved state.
+    pub keyboard: Option<Vec<u8>>,
 }
 
 /// Checks that two optional halves of the machine agree about existing.
