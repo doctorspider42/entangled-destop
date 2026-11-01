@@ -657,8 +657,10 @@ on the function; the profile gets `venus = true`, and the installer's final
 power-off is the reboot all of it needs. MSI is a per-instance setting and the
 function's instance changes with its slot (the installer's offline machine
 has no network card, so every later device moves up one), so
-`gpu3d-msi.ps1` runs as SYSTEM at every startup and logon, sets it on every
-instance and restarts the one it changed. Validated on a fresh install: the
+`gpu3d-msi.ps1` runs as SYSTEM at every startup and logon and sets it on every
+instance. Windows assigns interrupts once per boot (`pnputil /restart-device`
+left the function at code 12 with MSI already set), so a change restarts the
+machine: the first boot after the install restarts once, by itself. Validated on a fresh install: the
 desktop composites on the GPU and Edge runs the WebGL Aquarium (500 fish,
 46 fps). WebGL needs `msedge --use-angle=vulkan`: through ANGLE's default
 D3D11 backend the alpha D3D10 UMD clears but draws no geometry, with no Venus
