@@ -17,7 +17,6 @@
 #include "entangled_gpu_public.h"
 
 #define VENUS_CAPSET_ID 4
-#define ENTANGLED_CTX_ID 1
 
 struct entangled_shmem {
    struct vn_renderer_shmem base;
@@ -38,6 +37,9 @@ struct entangled {
    HANDLE dev;
    uint32_t next_res;
    SRWLOCK lock;
+   /* Ours alone: every process (and every instance in it) has a context of
+    * its own on the host, so two Vulkan programs can run at once. */
+   uint32_t ctx_id;
 };
 
 struct venus_capset {
@@ -48,6 +50,17 @@ struct venus_capset {
    uint32_t supports_blob_id_0;
    uint32_t vk_extension_mask1[32];
 };
+
+/* ENTANGLED_GPU_TRACE=1: every submit and every wait that does not return
+ * at once, on stderr - for finding what a stalled program waits for. */
+static bool
+trace_on(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("ENTANGLED_GPU_TRACE") != NULL;
+   return on;
+}
 
 static bool
 ioctl(struct entangled *gpu, DWORD code, void *in, DWORD in_size, void *out,
@@ -69,7 +82,7 @@ entangled_destroy(struct vn_renderer *renderer,
                   const VkAllocationCallbacks *alloc)
 {
    struct entangled *gpu = (struct entangled *)renderer;
-   ENTANGLED_GPU_CTX ctx = {ENTANGLED_CTX_ID};
+   ENTANGLED_GPU_CTX ctx = {gpu->ctx_id};
    ENTANGLED_GPU_RESPONSE resp;
    ioctl(gpu, IOCTL_ENTANGLED_GPU_CTX_DESTROY, &ctx, sizeof(ctx), &resp,
          sizeof(resp));
@@ -90,7 +103,7 @@ entangled_submit(struct vn_renderer *renderer,
    if (!req)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    memset(req, 0, sizeof(*req));
-   req->CtxId = ENTANGLED_CTX_ID;
+   req->CtxId = gpu->ctx_id;
    req->Size = (unsigned long)batch->cs_size;
    req->RingIdx = batch->ring_idx;
    req->Flags = batch->sync_count ? ENTANGLED_GPU_SUBMIT_FENCE : 0;
@@ -103,6 +116,14 @@ entangled_submit(struct vn_renderer *renderer,
                          &resp, sizeof(resp));
    ReleaseSRWLockExclusive(&gpu->lock);
    free(req);
+   if (trace_on()) {
+      fprintf(stderr, "entangled: submit tid %lu ring %u size %zu syncs %u ->%s 0x%x\n",
+              GetCurrentThreadId(), batch->ring_idx, batch->cs_size,
+              batch->sync_count, ok ? "" : " failed", resp.Type);
+      for (uint32_t i = 0; i < batch->sync_count; i++)
+         fprintf(stderr, "entangled:   sync %p = %llu\n", (void *)batch->syncs[i],
+                 (unsigned long long)batch->sync_values[i]);
+   }
    if (!ok || resp.Type != 0x1100)
       return VK_ERROR_DEVICE_LOST;
 
@@ -120,6 +141,7 @@ entangled_wait(struct vn_renderer *renderer,
 {
    (void)renderer;
    const int64_t deadline = os_time_get_absolute_timeout(wait->timeout);
+   bool traced = false;
    for (;;) {
       uint32_t reached = 0;
       for (uint32_t i = 0; i < wait->sync_count; i++) {
@@ -132,6 +154,18 @@ entangled_wait(struct vn_renderer *renderer,
          return VK_SUCCESS;
       if (os_time_timeout(0, deadline, os_time_get_nano()))
          return VK_TIMEOUT;
+      if (trace_on() && !traced) {
+         traced = true;
+         fprintf(stderr, "entangled: wait tid %lu any %d timeout %llu\n",
+                 GetCurrentThreadId(), wait->wait_any,
+                 (unsigned long long)wait->timeout);
+         for (uint32_t i = 0; i < wait->sync_count; i++)
+            fprintf(stderr, "entangled:   sync %p at %llu for %llu\n",
+                    (void *)wait->syncs[i],
+                    (unsigned long long)((const struct entangled_sync *)
+                                            wait->syncs[i])->value,
+                    (unsigned long long)wait->sync_values[i]);
+      }
       Sleep(1);
    }
 }
@@ -144,7 +178,7 @@ entangled_shmem_create(struct vn_renderer *renderer, size_t size)
    if (!shmem)
       return NULL;
    size = align64(size, 4096);
-   ENTANGLED_GPU_BLOB_IN in = {ENTANGLED_CTX_ID, next_res(gpu), size, 0};
+   ENTANGLED_GPU_BLOB_IN in = {gpu->ctx_id, next_res(gpu), size, 0};
    ENTANGLED_GPU_BLOB_OUT out = {0};
    AcquireSRWLockExclusive(&gpu->lock);
    const bool ok = ioctl(gpu, IOCTL_ENTANGLED_GPU_BLOB_CREATE, &in, sizeof(in),
@@ -164,7 +198,7 @@ entangled_shmem_create(struct vn_renderer *renderer, size_t size)
 static void
 entangled_release(struct entangled *gpu, uint32_t res_id)
 {
-   ENTANGLED_GPU_BLOB_REF ref = {ENTANGLED_CTX_ID, res_id};
+   ENTANGLED_GPU_BLOB_REF ref = {gpu->ctx_id, res_id};
    ENTANGLED_GPU_RESPONSE resp;
    AcquireSRWLockExclusive(&gpu->lock);
    ioctl(gpu, IOCTL_ENTANGLED_GPU_BLOB_DESTROY, &ref, sizeof(ref), &resp,
@@ -202,7 +236,7 @@ entangled_bo_create_from_device_memory(
    struct entangled_bo *bo = calloc(1, sizeof(*bo));
    if (!bo)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   ENTANGLED_GPU_BLOB_IN in = {ENTANGLED_CTX_ID, next_res(gpu),
+   ENTANGLED_GPU_BLOB_IN in = {gpu->ctx_id, next_res(gpu),
                                align64(size, 4096), mem_id};
    ENTANGLED_GPU_BLOB_OUT out = {0};
    AcquireSRWLockExclusive(&gpu->lock);
@@ -365,6 +399,9 @@ vn_renderer_create_entangled(struct vn_instance *instance,
    InitializeSRWLock(&gpu->lock);
    gpu->alloc = alloc;
    gpu->next_res = 0x10000;
+   static volatile LONG instances;
+   gpu->ctx_id = (GetCurrentProcessId() & 0xffffff) << 8 |
+                 ((uint32_t)InterlockedIncrement(&instances) & 0xff);
    gpu->dev = CreateFileW(ENTANGLED_GPU_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE,
                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                           OPEN_EXISTING, 0, NULL);
@@ -375,7 +412,7 @@ vn_renderer_create_entangled(struct vn_instance *instance,
 
    ENTANGLED_GPU_CAPSET_IN cin = {VENUS_CAPSET_ID, 0};
    ENTANGLED_GPU_CAPSET_OUT *cout = calloc(1, sizeof(*cout));
-   ENTANGLED_GPU_CTX_CREATE create = {ENTANGLED_CTX_ID, VENUS_CAPSET_ID};
+   ENTANGLED_GPU_CTX_CREATE create = {gpu->ctx_id, VENUS_CAPSET_ID};
    ENTANGLED_GPU_RESPONSE created = {0};
    if (!cout ||
        !ioctl(gpu, IOCTL_ENTANGLED_GPU_CAPSET, &cin, sizeof(cin), cout,

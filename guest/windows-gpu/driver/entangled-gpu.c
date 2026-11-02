@@ -81,6 +81,7 @@
 #define VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE 0x0202
 #define VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB 0x010c
 #define VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB 0x0208
+#define VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB 0x0209
 #define VIRTIO_GPU_RESP_OK_NODATA 0x1100
 #define VIRTIO_GPU_RESP_OK_MAP_INFO 0x1106
 #define VIRTIO_GPU_BLOB_MEM_HOST3D 2
@@ -168,9 +169,12 @@ typedef struct {
 
 typedef struct {
     PHYSICAL_ADDRESS Base; /* from the BAR register */
-    ULONG Length;
+    ULONGLONG Length;
     PUCHAR Va;             /* mapped, or NULL */
 } BAR;
+
+/* Blobs in the shared-memory BAR at once, all processes together. */
+#define MAX_RANGES 4096
 
 typedef struct {
     BAR Bars[6];
@@ -192,27 +196,38 @@ typedef struct {
     UINT64 DeviceFeatures;
     UINT64 DriverFeatures;
     BOOLEAN Ready;
-    /* Where the next blob goes in the shared-memory BAR: a bump allocator,
-     * never reused in this slice. */
-    UINT64 ShmNext;
+    /* The blobs placed in the shared-memory BAR, every handle's, sorted by
+     * offset: a new blob takes the first gap that fits. */
+    struct {
+        UINT64 Offset;
+        UINT64 Size;
+    } Ranges[MAX_RANGES];
+    ULONG RangeCount;
     /* One command in flight: the IOCTL queue and the caller-context blob
      * path both take it. */
     WDFWAITLOCK Lock;
 } DEVICE_CONTEXT;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetCtx)
 
-#define MAX_MAPS 16
-/* The blobs a handle mapped into its process, unmapped at cleanup (a user
- * mapping outliving its process is a bugcheck). */
+/* Zink alone keeps dozens of host-visible allocations. */
+#define MAX_MAPS 1024
+/* The blobs a handle mapped into its process, unmapped and released at
+ * cleanup (a user mapping outliving its process is a bugcheck, and a blob
+ * left on the host keeps its BAR range). */
 typedef struct {
     struct {
         PMDL Mdl;
+        ULONG CtxId;
         ULONG ResourceId;
         PVOID User;
         PVOID Kernel;
         SIZE_T Size;
+        UINT64 Offset;
     } Maps[MAX_MAPS];
     ULONG Count;
+    /* The Venus context this handle created, destroyed at cleanup so a
+     * process that dies leaves nothing behind on the host; 0 for none. */
+    ULONG CtxId;
 } FILE_CONTEXT;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FILE_CONTEXT, GetFileCtx)
 
@@ -329,23 +344,37 @@ NTSTATUS EgEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST T
         }
     }
 
-    /* Map every memory BAR up to 1 MiB: the register BAR. The 4 GiB
-     * shared-memory BAR is mapped per blob later, never whole. */
+    /* Every memory BAR's length, and a mapping of each up to 1 MiB: the
+     * register BAR. The 4 GiB shared-memory BAR (a large-memory resource)
+     * is mapped per blob later, never whole. */
     for (i = 0; i < WdfCmResourceListGetCount(Translated); i++) {
         PCM_PARTIAL_RESOURCE_DESCRIPTOR raw = WdfCmResourceListGetDescriptor(Raw, i);
         PCM_PARTIAL_RESOURCE_DESCRIPTOR tr = WdfCmResourceListGetDescriptor(Translated, i);
         ULONG b;
-        if (raw->Type != CmResourceTypeMemory || tr->Type != CmResourceTypeMemory) {
+        ULONGLONG length;
+        if (raw->Type != CmResourceTypeMemory && raw->Type != CmResourceTypeMemoryLarge) {
             continue;
         }
-        if (tr->u.Memory.Length == 0 || tr->u.Memory.Length > 0x100000) {
+        length = tr->u.Memory.Length;
+        if (tr->Type == CmResourceTypeMemoryLarge) {
+            if (tr->Flags & CM_RESOURCE_MEMORY_LARGE_40) {
+                length = (ULONGLONG)tr->u.Memory40.Length40 << 8;
+            } else if (tr->Flags & CM_RESOURCE_MEMORY_LARGE_48) {
+                length = (ULONGLONG)tr->u.Memory48.Length48 << 16;
+            } else if (tr->Flags & CM_RESOURCE_MEMORY_LARGE_64) {
+                length = (ULONGLONG)tr->u.Memory64.Length64 << 32;
+            }
+        }
+        if (length == 0) {
             continue;
         }
         for (b = 0; b < 6; b++) {
             if (ctx->Bars[b].Base.QuadPart == raw->u.Memory.Start.QuadPart) {
-                ctx->Bars[b].Length = tr->u.Memory.Length;
-                ctx->Bars[b].Va = MmMapIoSpaceEx(tr->u.Memory.Start, tr->u.Memory.Length,
-                                                 PAGE_READWRITE | PAGE_NOCACHE);
+                ctx->Bars[b].Length = length;
+                if (length <= 0x100000) {
+                    ctx->Bars[b].Va = MmMapIoSpaceEx(tr->u.Memory.Start, (SIZE_T)length,
+                                                     PAGE_READWRITE | PAGE_NOCACHE);
+                }
             }
         }
     }
@@ -598,6 +627,66 @@ static NTSTATUS Submit3d(DEVICE_CONTEXT *ctx, const ENTANGLED_GPU_SUBMIT *in, si
     return HeaderCommand(ctx, sizeof(*req) + in->Size, type);
 }
 
+/* A range of the shared-memory BAR for a blob: the first gap that fits.
+ * With the lock held. */
+static BOOLEAN ShmAlloc(DEVICE_CONTEXT *ctx, UINT64 size, UINT64 *offset)
+{
+    UINT64 at = 0;
+    ULONG i;
+    if (ctx->RangeCount >= MAX_RANGES) {
+        return FALSE;
+    }
+    for (i = 0; i <= ctx->RangeCount; i++) {
+        UINT64 end = i < ctx->RangeCount ? ctx->Ranges[i].Offset : ctx->Bars[SHM_BAR].Length;
+        if (end >= at && end - at >= size) {
+            RtlMoveMemory(&ctx->Ranges[i + 1], &ctx->Ranges[i],
+                          (ctx->RangeCount - i) * sizeof(ctx->Ranges[0]));
+            ctx->Ranges[i].Offset = at;
+            ctx->Ranges[i].Size = size;
+            ctx->RangeCount++;
+            *offset = at;
+            return TRUE;
+        }
+        if (i < ctx->RangeCount) {
+            at = ctx->Ranges[i].Offset + ctx->Ranges[i].Size;
+        }
+    }
+    return FALSE;
+}
+
+static VOID ShmFree(DEVICE_CONTEXT *ctx, UINT64 offset)
+{
+    ULONG i;
+    for (i = 0; i < ctx->RangeCount; i++) {
+        if (ctx->Ranges[i].Offset == offset) {
+            RtlMoveMemory(&ctx->Ranges[i], &ctx->Ranges[i + 1],
+                          (ctx->RangeCount - i - 1) * sizeof(ctx->Ranges[0]));
+            ctx->RangeCount--;
+            return;
+        }
+    }
+}
+
+/* Release a blob on the host: unmap it from the BAR (when it was mapped),
+ * then drop it. With the lock held. */
+static NTSTATUS HostRelease(DEVICE_CONTEXT *ctx, ULONG ctxId, ULONG resourceId, BOOLEAN mapped,
+                            ULONG *type)
+{
+    GPU_CTX_RESOURCE *req = (GPU_CTX_RESOURCE *)ctx->Cmd;
+    if (mapped) {
+        RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+        req->Hdr.Type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
+        req->Hdr.CtxId = ctxId;
+        req->ResourceId = resourceId;
+        (void)HeaderCommand(ctx, sizeof(*req), type);
+    }
+    RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+    req->Hdr.Type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    req->Hdr.CtxId = ctxId;
+    req->ResourceId = resourceId;
+    return HeaderCommand(ctx, sizeof(*req), type);
+}
+
 /* Create, attach and map one blob, and map its pages into the calling
  * process. Runs in the caller's context, with the lock held. */
 static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
@@ -618,7 +707,9 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         file->Count >= MAX_MAPS || ctx->Bars[SHM_BAR].Base.QuadPart == 0) {
         return STATUS_INVALID_PARAMETER;
     }
-    offset = ctx->ShmNext;
+    if (!ShmAlloc(ctx, in->Size, &offset)) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     {
         GPU_CREATE_BLOB *req = (GPU_CREATE_BLOB *)ctx->Cmd;
@@ -632,6 +723,7 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         req->Size = in->Size;
         status = HeaderCommand(ctx, sizeof(*req), &type);
         if (!NT_SUCCESS(status) || type != VIRTIO_GPU_RESP_OK_NODATA) {
+            ShmFree(ctx, offset);
             out->Response = type;
             return status;
         }
@@ -644,6 +736,9 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         req->ResourceId = in->ResourceId;
         status = HeaderCommand(ctx, sizeof(*req), &type);
         if (!NT_SUCCESS(status) || type != VIRTIO_GPU_RESP_OK_NODATA) {
+            ULONG ignored = 0;
+            (void)HostRelease(ctx, in->CtxId, in->ResourceId, FALSE, &ignored);
+            ShmFree(ctx, offset);
             out->Response = type;
             return status;
         }
@@ -657,26 +752,29 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         req->ResourceId = in->ResourceId;
         req->Offset = offset;
         status = Command(ctx, sizeof(*req), sizeof(*resp));
-        if (!NT_SUCCESS(status)) {
+        if (!NT_SUCCESS(status) || resp->Hdr.Type != VIRTIO_GPU_RESP_OK_MAP_INFO) {
+            ULONG ignored = 0;
+            if (NT_SUCCESS(status)) {
+                out->Response = resp->Hdr.Type;
+            }
+            (void)HostRelease(ctx, in->CtxId, in->ResourceId, FALSE, &ignored);
+            ShmFree(ctx, offset);
             return status;
-        }
-        if (resp->Hdr.Type != VIRTIO_GPU_RESP_OK_MAP_INFO) {
-            out->Response = resp->Hdr.Type;
-            return STATUS_SUCCESS;
         }
         out->MapInfo = resp->MapInfo;
     }
-    ctx->ShmNext = offset + in->Size;
 
     /* Host memory behind a BAR: cached, as the host maps it. */
     pa.QuadPart = ctx->Bars[SHM_BAR].Base.QuadPart + (LONGLONG)offset;
     kernel = MmMapIoSpaceEx(pa, (SIZE_T)in->Size, PAGE_READWRITE);
-    if (kernel == NULL) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    mdl = IoAllocateMdl(kernel, (ULONG)in->Size, FALSE, FALSE, NULL);
+    mdl = kernel != NULL ? IoAllocateMdl(kernel, (ULONG)in->Size, FALSE, FALSE, NULL) : NULL;
     if (mdl == NULL) {
-        MmUnmapIoSpace(kernel, (SIZE_T)in->Size);
+        ULONG ignored = 0;
+        if (kernel != NULL) {
+            MmUnmapIoSpace(kernel, (SIZE_T)in->Size);
+        }
+        (void)HostRelease(ctx, in->CtxId, in->ResourceId, TRUE, &ignored);
+        ShmFree(ctx, offset);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     MmBuildMdlForNonPagedPool(mdl);
@@ -687,11 +785,16 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         user = NULL;
     }
     if (user == NULL) {
+        ULONG ignored = 0;
         IoFreeMdl(mdl);
         MmUnmapIoSpace(kernel, (SIZE_T)in->Size);
+        (void)HostRelease(ctx, in->CtxId, in->ResourceId, TRUE, &ignored);
+        ShmFree(ctx, offset);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     file->Maps[file->Count].Mdl = mdl;
+    file->Maps[file->Count].CtxId = in->CtxId;
+    file->Maps[file->Count].Offset = offset;
     file->Maps[file->Count].ResourceId = in->ResourceId;
     file->Maps[file->Count].User = user;
     file->Maps[file->Count].Kernel = kernel;
@@ -706,22 +809,20 @@ static NTSTATUS BlobDestroy(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
                             const ENTANGLED_GPU_BLOB_REF *in, ULONG *type)
 {
     ULONG i;
-    GPU_CTX_RESOURCE *req = (GPU_CTX_RESOURCE *)ctx->Cmd;
+    BOOLEAN mapped = FALSE;
     for (i = 0; i < file->Count; i++) {
         if (file->Maps[i].ResourceId == in->ResourceId) {
             MmUnmapLockedPages(file->Maps[i].User, file->Maps[i].Mdl);
             IoFreeMdl(file->Maps[i].Mdl);
             MmUnmapIoSpace(file->Maps[i].Kernel, file->Maps[i].Size);
+            ShmFree(ctx, file->Maps[i].Offset);
             file->Maps[i] = file->Maps[file->Count - 1];
             file->Count--;
+            mapped = TRUE;
             break;
         }
     }
-    RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
-    req->Hdr.Type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
-    req->Hdr.CtxId = in->CtxId;
-    req->ResourceId = in->ResourceId;
-    return HeaderCommand(ctx, sizeof(*req), type);
+    return HostRelease(ctx, in->CtxId, in->ResourceId, mapped, type);
 }
 
 VOID EgEvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
@@ -779,13 +880,24 @@ VOID EgEvtFileCleanup(WDFFILEOBJECT FileObject)
 {
     FILE_CONTEXT *file = GetFileCtx(FileObject);
     ULONG i;
-    /* In the closing process's context, so its user mappings can go. */
+    DEVICE_CONTEXT *ctx = GetCtx(WdfFileObjectGetDevice(FileObject));
+    ULONG type = 0;
+    /* In the closing process's context, so its user mappings can go; the
+     * blobs go on the host too, and with them their BAR ranges. */
+    WdfWaitLockAcquire(ctx->Lock, NULL);
     for (i = 0; i < file->Count; i++) {
         MmUnmapLockedPages(file->Maps[i].User, file->Maps[i].Mdl);
         IoFreeMdl(file->Maps[i].Mdl);
         MmUnmapIoSpace(file->Maps[i].Kernel, file->Maps[i].Size);
+        ShmFree(ctx, file->Maps[i].Offset);
+        (void)HostRelease(ctx, file->Maps[i].CtxId, file->Maps[i].ResourceId, TRUE, &type);
     }
     file->Count = 0;
+    if (file->CtxId != 0) {
+        (void)CtxDestroy(ctx, file->CtxId, &type);
+        file->CtxId = 0;
+    }
+    WdfWaitLockRelease(ctx->Lock);
 }
 
 VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLength,
@@ -868,11 +980,19 @@ VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLengt
             break;
         }
         if (IoControlCode == IOCTL_ENTANGLED_GPU_CTX_CREATE) {
-            status = inLength >= sizeof(ENTANGLED_GPU_CTX_CREATE)
+            FILE_CONTEXT *file = GetFileCtx(WdfRequestGetFileObject(Request));
+            status = inLength >= sizeof(ENTANGLED_GPU_CTX_CREATE) && file->CtxId == 0
                          ? CtxCreate(ctx, (ENTANGLED_GPU_CTX_CREATE *)in, &out->Type)
                          : STATUS_INVALID_PARAMETER;
+            if (NT_SUCCESS(status) && out->Type == VIRTIO_GPU_RESP_OK_NODATA) {
+                file->CtxId = ((ENTANGLED_GPU_CTX_CREATE *)in)->CtxId;
+            }
         } else if (IoControlCode == IOCTL_ENTANGLED_GPU_CTX_DESTROY) {
+            FILE_CONTEXT *file = GetFileCtx(WdfRequestGetFileObject(Request));
             status = CtxDestroy(ctx, ((ENTANGLED_GPU_CTX *)in)->CtxId, &out->Type);
+            if (file->CtxId == ((ENTANGLED_GPU_CTX *)in)->CtxId) {
+                file->CtxId = 0;
+            }
         } else {
             status = inLength >= sizeof(ENTANGLED_GPU_SUBMIT)
                          ? Submit3d(ctx, (ENTANGLED_GPU_SUBMIT *)in, inLength, &out->Type)
