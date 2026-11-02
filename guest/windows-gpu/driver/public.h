@@ -69,3 +69,22 @@ typedef struct _ENTANGLED_GPU_SUBMIT {
     unsigned long Size;
     /* followed by Size bytes of command stream */
 } ENTANGLED_GPU_SUBMIT;
+
+/* A host-memory blob of a context, mapped into the calling process: in
+ * ENTANGLED_GPU_BLOB_IN, out ENTANGLED_GPU_BLOB_OUT. Created HOST3D and
+ * mappable, attached to the context, mapped into the shared-memory BAR and
+ * from there into the process; unmapped when the handle is closed. */
+#define IOCTL_ENTANGLED_GPU_BLOB_CREATE \
+    CTL_CODE(ENTANGLED_GPU_TYPE, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _ENTANGLED_GPU_BLOB_IN {
+    unsigned long CtxId;
+    unsigned long ResourceId;
+    unsigned long long Size; /* a multiple of 4 KiB */
+} ENTANGLED_GPU_BLOB_IN;
+
+typedef struct _ENTANGLED_GPU_BLOB_OUT {
+    unsigned long long Address; /* in the calling process */
+    unsigned long Response;     /* the first non-OK answer, or 0x1100 */
+    unsigned long MapInfo;
+} ENTANGLED_GPU_BLOB_OUT;

@@ -80,7 +80,7 @@ Venus renderer this stack talks to.
 | Phase | Deliverable | Done when |
 |---|---|---|
 | A0 | the render-only virtio-gpu function on the host (class `0x0380`, Venus only) — **done 2026-11-02**: `[display] render_node = true`; the PCI bus grew to ten slots (pins 3 and 15) to fit it beside a Windows machine's nine functions | a Windows guest enumerates it beside virtio-vga, whose 3D desktop is unaffected (verified); a Linux guest's Venus on it is not yet tried |
-| A | `entangled-gpu.sys` (KMDF, virtio-win's BSD `VirtioLib` for the transport) with context + blob + `SUBMIT_3D` + fence IOCTLs; a test tool | the tool creates a Venus context and round-trips `vkEnumerateInstanceVersion` through the host executor |
+| A — **done 2026-11-02** | `entangled-gpu.sys` (KMDF, a virtio transport of our own) with context + blob + `SUBMIT_3D` + fence IOCTLs; a test tool | the tool creates a Venus context and round-trips `vkEnumerateInstanceVersion` through the host executor |
 | B | Mesa Venus Windows winsys + registry ICD | `vk-smoke` passes 9/9 on our stack with Yttrium uninstalled |
 | C | Software WSI for `VK_KHR_win32_surface` | `vkcube` spins in a window |
 | D | DXVK + Zink in the install (`install windows --gpu3d` with no third-party package) | WebGL Aquarium through ANGLE's D3D11 backend, an OpenGL demo and a D3D11 game run |
@@ -104,8 +104,15 @@ driver store. Second slice: `IOCTL_ENTANGLED_GPU_CTX_CREATE`/`_DESTROY`
 and `_SUBMIT_3D` (up to 1 KiB inline). In the guest a Venus context is
 created (the host logs `venus context created ... name="entangled-gpu"`), an
 empty stream is accepted, an unknown opcode refused (0x1205) and the context
-destroyed. Next in phase A: blob resources mapped into the process, a ring,
-and a `vkEnumerateInstanceVersion` answered through it.
+destroyed. Third slice, **phase A done**: `IOCTL_ENTANGLED_GPU_BLOB_CREATE`
+creates a HOST3D mappable blob, attaches it to the context, maps it into the
+shared-memory BAR (a bump allocator over BAR 2) and from there into the
+calling process — handled in the caller's context, the mapping undone in
+`EvtFileCleanup`. `gpu-test venus` builds a ring in one blob and a reply
+stream in another, writes `vkSetReplyCommandStreamMESA` +
+`vkEnumerateInstanceVersion` into the ring, rings `vkNotifyRingMESA`, and
+reads `result 0, apiVersion 1.3.341` — the host RTX 2070's Vulkan, through
+our driver and our executor, Yttrium nowhere in the path.
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.

@@ -69,6 +69,16 @@
 #define VIRTIO_GPU_CMD_CTX_DESTROY 0x0201
 #define VIRTIO_GPU_CMD_SUBMIT_3D 0x0207
 #define VIRTIO_GPU_RESP_OK_CAPSET_INFO 0x1102
+#define VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE 0x0202
+#define VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB 0x010c
+#define VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB 0x0208
+#define VIRTIO_GPU_RESP_OK_NODATA 0x1100
+#define VIRTIO_GPU_RESP_OK_MAP_INFO 0x1106
+#define VIRTIO_GPU_BLOB_MEM_HOST3D 2
+#define VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE 1
+/* The render-only function's shared-memory BAR (virtio_core's PLAIN
+ * placement puts it at BARs 2-3). */
+#define SHM_BAR 2
 /* ctx_create.context_init: the capset id in the low byte (CONTEXT_INIT). */
 #define VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK 0xff
 
@@ -116,6 +126,35 @@ typedef struct {
     UINT32 Padding;
     /* followed by Size bytes */
 } GPU_SUBMIT_3D;
+
+typedef struct {
+    GPU_CTRL_HDR Hdr;
+    UINT32 ResourceId;
+    UINT32 BlobMem;
+    UINT32 BlobFlags;
+    UINT32 NrEntries;
+    UINT64 BlobId;
+    UINT64 Size;
+} GPU_CREATE_BLOB;
+
+typedef struct {
+    GPU_CTRL_HDR Hdr;
+    UINT32 ResourceId;
+    UINT32 Padding;
+} GPU_CTX_RESOURCE;
+
+typedef struct {
+    GPU_CTRL_HDR Hdr;
+    UINT32 ResourceId;
+    UINT32 Padding;
+    UINT64 Offset;
+} GPU_MAP_BLOB;
+
+typedef struct {
+    GPU_CTRL_HDR Hdr;
+    UINT32 MapInfo;
+    UINT32 Padding;
+} GPU_RESP_MAP_INFO;
 #pragma pack(pop)
 
 typedef struct {
@@ -143,8 +182,31 @@ typedef struct {
     UINT64 DeviceFeatures;
     UINT64 DriverFeatures;
     BOOLEAN Ready;
+    /* Where the next blob goes in the shared-memory BAR: a bump allocator,
+     * never reused in this slice. */
+    UINT64 ShmNext;
+    /* One command in flight: the IOCTL queue and the caller-context blob
+     * path both take it. */
+    WDFWAITLOCK Lock;
 } DEVICE_CONTEXT;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetCtx)
+
+#define MAX_MAPS 16
+/* The blobs a handle mapped into its process, unmapped at cleanup (a user
+ * mapping outliving its process is a bugcheck). */
+typedef struct {
+    struct {
+        PMDL Mdl;
+        PVOID User;
+        PVOID Kernel;
+        SIZE_T Size;
+    } Maps[MAX_MAPS];
+    ULONG Count;
+} FILE_CONTEXT;
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FILE_CONTEXT, GetFileCtx)
+
+EVT_WDF_FILE_CLEANUP EgEvtFileCleanup;
+EVT_WDF_IO_IN_CALLER_CONTEXT EgEvtIoInCallerContext;
 
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD EgEvtDeviceAdd;
@@ -186,9 +248,24 @@ NTSTATUS EgEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     pnp.EvtDevicePrepareHardware = EgEvtPrepareHardware;
     pnp.EvtDeviceReleaseHardware = EgEvtReleaseHardware;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnp);
+    {
+        WDF_FILEOBJECT_CONFIG files;
+        WDF_OBJECT_ATTRIBUTES fileAttributes;
+        WDF_FILEOBJECT_CONFIG_INIT(&files, WDF_NO_EVENT_CALLBACK, WDF_NO_EVENT_CALLBACK,
+                                   EgEvtFileCleanup);
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&fileAttributes, FILE_CONTEXT);
+        WdfDeviceInitSetFileObjectConfig(DeviceInit, &files, &fileAttributes);
+    }
+    /* Blob mappings go into the caller's address space, so that IOCTL is
+     * handled in the caller's context. */
+    WdfDeviceInitSetIoInCallerContextCallback(DeviceInit, EgEvtIoInCallerContext);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, DEVICE_CONTEXT);
     status = WdfDeviceCreate(&DeviceInit, &attributes, &device);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &GetCtx(device)->Lock);
     if (!NT_SUCCESS(status)) {
         return status;
     }
@@ -494,6 +571,152 @@ static NTSTATUS Submit3d(DEVICE_CONTEXT *ctx, const ENTANGLED_GPU_SUBMIT *in, si
     return HeaderCommand(ctx, sizeof(*req) + in->Size, type);
 }
 
+/* Create, attach and map one blob, and map its pages into the calling
+ * process. Runs in the caller's context, with the lock held. */
+static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
+                           const ENTANGLED_GPU_BLOB_IN *in, ENTANGLED_GPU_BLOB_OUT *out)
+{
+    UINT64 offset;
+    ULONG type = 0;
+    NTSTATUS status;
+    PHYSICAL_ADDRESS pa;
+    PVOID kernel;
+    PMDL mdl;
+    PVOID user = NULL;
+
+    out->Address = 0;
+    out->MapInfo = 0;
+    out->Response = VIRTIO_GPU_RESP_OK_NODATA;
+    if (in->Size == 0 || (in->Size & (PAGE_SIZE - 1)) != 0 || in->Size > 0x10000000 ||
+        file->Count >= MAX_MAPS || ctx->Bars[SHM_BAR].Base.QuadPart == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    offset = ctx->ShmNext;
+
+    {
+        GPU_CREATE_BLOB *req = (GPU_CREATE_BLOB *)ctx->Cmd;
+        RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+        req->Hdr.Type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+        req->Hdr.CtxId = in->CtxId;
+        req->ResourceId = in->ResourceId;
+        req->BlobMem = VIRTIO_GPU_BLOB_MEM_HOST3D;
+        req->BlobFlags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+        req->Size = in->Size;
+        status = HeaderCommand(ctx, sizeof(*req), &type);
+        if (!NT_SUCCESS(status) || type != VIRTIO_GPU_RESP_OK_NODATA) {
+            out->Response = type;
+            return status;
+        }
+    }
+    {
+        GPU_CTX_RESOURCE *req = (GPU_CTX_RESOURCE *)ctx->Cmd;
+        RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+        req->Hdr.Type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+        req->Hdr.CtxId = in->CtxId;
+        req->ResourceId = in->ResourceId;
+        status = HeaderCommand(ctx, sizeof(*req), &type);
+        if (!NT_SUCCESS(status) || type != VIRTIO_GPU_RESP_OK_NODATA) {
+            out->Response = type;
+            return status;
+        }
+    }
+    {
+        GPU_MAP_BLOB *req = (GPU_MAP_BLOB *)ctx->Cmd;
+        GPU_RESP_MAP_INFO *resp = (GPU_RESP_MAP_INFO *)(ctx->Cmd + CMD_HALF);
+        RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+        req->Hdr.Type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+        req->Hdr.CtxId = in->CtxId;
+        req->ResourceId = in->ResourceId;
+        req->Offset = offset;
+        status = Command(ctx, sizeof(*req), sizeof(*resp));
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+        if (resp->Hdr.Type != VIRTIO_GPU_RESP_OK_MAP_INFO) {
+            out->Response = resp->Hdr.Type;
+            return STATUS_SUCCESS;
+        }
+        out->MapInfo = resp->MapInfo;
+    }
+    ctx->ShmNext = offset + in->Size;
+
+    /* Host memory behind a BAR: cached, as the host maps it. */
+    pa.QuadPart = ctx->Bars[SHM_BAR].Base.QuadPart + (LONGLONG)offset;
+    kernel = MmMapIoSpaceEx(pa, (SIZE_T)in->Size, PAGE_READWRITE);
+    if (kernel == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    mdl = IoAllocateMdl(kernel, (ULONG)in->Size, FALSE, FALSE, NULL);
+    if (mdl == NULL) {
+        MmUnmapIoSpace(kernel, (SIZE_T)in->Size);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    MmBuildMdlForNonPagedPool(mdl);
+    __try {
+        user = MmMapLockedPagesSpecifyCache(mdl, UserMode, MmCached, NULL, FALSE,
+                                            NormalPagePriority | MdlMappingNoExecute);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        user = NULL;
+    }
+    if (user == NULL) {
+        IoFreeMdl(mdl);
+        MmUnmapIoSpace(kernel, (SIZE_T)in->Size);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    file->Maps[file->Count].Mdl = mdl;
+    file->Maps[file->Count].User = user;
+    file->Maps[file->Count].Kernel = kernel;
+    file->Maps[file->Count].Size = (SIZE_T)in->Size;
+    file->Count++;
+    out->Address = (ULONG_PTR)user;
+    return STATUS_SUCCESS;
+}
+
+VOID EgEvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
+{
+    WDF_REQUEST_PARAMETERS params;
+    DEVICE_CONTEXT *ctx = GetCtx(Device);
+    ENTANGLED_GPU_BLOB_IN *in = NULL;
+    ENTANGLED_GPU_BLOB_OUT *out = NULL;
+    NTSTATUS status;
+
+    WDF_REQUEST_PARAMETERS_INIT(&params);
+    WdfRequestGetParameters(Request, &params);
+    if (params.Type != WdfRequestTypeDeviceControl ||
+        params.Parameters.DeviceIoControl.IoControlCode != IOCTL_ENTANGLED_GPU_BLOB_CREATE) {
+        status = WdfDeviceEnqueueRequest(Device, Request);
+        if (!NT_SUCCESS(status)) {
+            WdfRequestComplete(Request, status);
+        }
+        return;
+    }
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in), (PVOID *)&in, NULL);
+    if (NT_SUCCESS(status)) {
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, NULL);
+    }
+    if (NT_SUCCESS(status)) {
+        ENTANGLED_GPU_BLOB_IN copy = *in;
+        WdfWaitLockAcquire(ctx->Lock, NULL);
+        status = BlobCreate(ctx, GetFileCtx(WdfRequestGetFileObject(Request)), &copy, out);
+        WdfWaitLockRelease(ctx->Lock);
+    }
+    WdfRequestCompleteWithInformation(Request, status,
+                                      NT_SUCCESS(status) ? sizeof(*out) : 0);
+}
+
+VOID EgEvtFileCleanup(WDFFILEOBJECT FileObject)
+{
+    FILE_CONTEXT *file = GetFileCtx(FileObject);
+    ULONG i;
+    /* In the closing process's context, so its user mappings can go. */
+    for (i = 0; i < file->Count; i++) {
+        MmUnmapLockedPages(file->Maps[i].User, file->Maps[i].Mdl);
+        IoFreeMdl(file->Maps[i].Mdl);
+        MmUnmapIoSpace(file->Maps[i].Kernel, file->Maps[i].Size);
+    }
+    file->Count = 0;
+}
+
 VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLength,
                           size_t InputLength, ULONG IoControlCode)
 {
@@ -503,6 +726,7 @@ VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLengt
     UNREFERENCED_PARAMETER(OutputLength);
     UNREFERENCED_PARAMETER(InputLength);
 
+    WdfWaitLockAcquire(ctx->Lock, NULL);
     switch (IoControlCode) {
     case IOCTL_ENTANGLED_GPU_INFO: {
         ENTANGLED_GPU_INFO *out = NULL;
@@ -565,5 +789,6 @@ VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLengt
     default:
         break;
     }
+    WdfWaitLockRelease(ctx->Lock);
     WdfRequestCompleteWithInformation(Request, status, written);
 }
