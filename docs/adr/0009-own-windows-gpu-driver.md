@@ -42,8 +42,16 @@ Vulkan app ──────────────┘   (our Windows winsys) 
 desktop (DWM) ──► viogpudo (display-only, as today) ──► virtio-vga scanout
 ```
 
-1. **`entangled-gpu.sys`, a KMDF driver, not a WDDM one.** It owns the
-   virtio-gpu function's 3D half: contexts (`CTX_CREATE/DESTROY`), blob
+0. **A second virtio-gpu function, render-only.** One PCI function has one
+   driver, and the virtio-vga function stays `viogpudo`'s (the display). The
+   host therefore adds a second virtio-gpu device with no scanout, Venus
+   capset and shared-memory BAR only, as PCI class `0x0380` (display, other)
+   with its own subsystem ID, so Windows matches our INF to it and never
+   offers it to a display driver. The executor serves it exactly as it
+   serves the virtio-vga function's contexts today; the host change is a
+   `[display] render_node = true` switch and a second `attach`.
+1. **`entangled-gpu.sys`, a KMDF driver, not a WDDM one,** bound to that
+   function. It owns the virtio-gpu 3D half: contexts (`CTX_CREATE/DESTROY`), blob
    resources (`RESOURCE_CREATE_BLOB`, `MAP/UNMAP` into the process through
    the shared-memory BAR), `SUBMIT_3D` with fences, and ring setup — exposed
    to user mode through a small IOCTL interface, the Windows twin of Linux's
@@ -69,14 +77,16 @@ Venus renderer this stack talks to.
 
 | Phase | Deliverable | Done when |
 |---|---|---|
-| A | `entangled-gpu.sys` with context + blob + `SUBMIT_3D` + fence IOCTLs; a test tool | the tool creates a Venus context and round-trips `vkEnumerateInstanceVersion` through the host executor |
+| A0 | the render-only virtio-gpu function on the host (class `0x0380`, Venus only) | a Linux guest's Venus runs on it beside virtio-vga |
+| A | `entangled-gpu.sys` (KMDF, virtio-win's BSD `VirtioLib` for the transport) with context + blob + `SUBMIT_3D` + fence IOCTLs; a test tool | the tool creates a Venus context and round-trips `vkEnumerateInstanceVersion` through the host executor |
 | B | Mesa Venus Windows winsys + registry ICD | `vk-smoke` passes 9/9 on our stack with Yttrium uninstalled |
 | C | Software WSI for `VK_KHR_win32_surface` | `vkcube` spins in a window |
 | D | DXVK + Zink in the install (`install windows --gpu3d` with no third-party package) | WebGL Aquarium through ANGLE's D3D11 backend, an OpenGL demo and a D3D11 game run |
 | E | Zero-copy present (the guest image shared with the display path instead of copied) | presenting costs no CPU copy per frame |
 | F | Signing | Microsoft attestation signing (EV certificate + Partner Center account), so test-signing mode is not needed |
 
-Phases A–D are the replacement; E is performance; F is distribution.
+Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
+build A; E is performance; F is distribution.
 
 ## Consequences
 
