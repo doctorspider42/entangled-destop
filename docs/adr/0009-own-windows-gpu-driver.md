@@ -254,7 +254,9 @@ or a chained one, the latter only on a device that *enabled* maintenance5 (the
 first cut asked the physical device's advertised list; a test caught it).
 **Verified:** DXVK 3.1.1's `d3d11-test` passes at 532 fps. With maintenance5
 served, Zink builds unpatched again (`0002-zink-without-maintenance5.patch` is
-gone) and `gl-test` passes at ~51 fps. **Phase D is done.** Left:
+gone) and `gl-test` passes at ~51 fps, and the WebGL Aquarium
+(webglsamples.org, 1024×1024 canvas) swims at ~44 fps in Edge. **Phase D is
+done.** Left:
 async/interrupt submits, zero-copy present (E) and signing (F).
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
