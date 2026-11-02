@@ -3878,6 +3878,118 @@ fn ch_VkRenderingInfo(
     Ok(next)
 }
 
+fn c_VkBindDescriptorSetsInfo(
+    a: &mut Arena,
+    v: &VkBindDescriptorSetsInfo,
+) -> Result<vk::BindDescriptorSetsInfoKHR<'static>, CallError> {
+    if let Some(x) = &v.p_descriptor_sets {
+        same(
+            x.len(),
+            u64::from(v.descriptor_set_count),
+            "VkBindDescriptorSetsInfo.pDescriptorSets",
+        )?;
+    }
+    if let Some(x) = &v.p_dynamic_offsets {
+        same(
+            x.len(),
+            u64::from(v.dynamic_offset_count),
+            "VkBindDescriptorSetsInfo.pDynamicOffsets",
+        )?;
+    }
+    let next = ch_VkBindDescriptorSetsInfo(a, &v.p_next)?;
+    Ok(vk::BindDescriptorSetsInfoKHR {
+        p_next: next as _,
+        stage_flags: vk::ShaderStageFlags::from_raw(v.stage_flags),
+        layout: vk::PipelineLayout::from_raw(v.layout.0),
+        first_set: v.first_set,
+        descriptor_set_count: v.descriptor_set_count,
+        p_descriptor_sets: match &v.p_descriptor_sets {
+            Some(xs) => {
+                let c: Vec<_> = xs
+                    .iter()
+                    .map(|x| vk::DescriptorSet::from_raw(x.0))
+                    .collect();
+                a.slice(c).cast_const()
+            }
+            None => core::ptr::null(),
+        },
+        dynamic_offset_count: v.dynamic_offset_count,
+        p_dynamic_offsets: match &v.p_dynamic_offsets {
+            Some(xs) => {
+                let c: Vec<_> = xs.iter().map(|x| *x).collect();
+                a.slice(c).cast_const()
+            }
+            None => core::ptr::null(),
+        },
+        ..Default::default()
+    })
+}
+
+fn ch_VkBindDescriptorSetsInfo(
+    a: &mut Arena,
+    links: &[VkBindDescriptorSetsInfoNext],
+) -> Result<*mut c_void, CallError> {
+    let mut next: *mut c_void = core::ptr::null_mut();
+    for link in links.iter().rev() {
+        next = match link {
+            VkBindDescriptorSetsInfoNext::VkPipelineLayoutCreateInfo(x) => {
+                let mut c = c_VkPipelineLayoutCreateInfo(a, x)?;
+                c.p_next = next as _;
+                a.one(c).cast()
+            }
+            other => {
+                return Err(CallError::Link {
+                    parent: "VkBindDescriptorSetsInfo",
+                    stype: ChainLink::structure_type(other),
+                })
+            }
+        };
+    }
+    Ok(next)
+}
+
+fn c_VkPushConstantsInfo(
+    a: &mut Arena,
+    v: &VkPushConstantsInfo<'_>,
+) -> Result<vk::PushConstantsInfoKHR<'static>, CallError> {
+    if let Some(x) = &v.p_values {
+        same(x.len(), u64::from(v.size), "VkPushConstantsInfo.pValues")?;
+    }
+    let next = ch_VkPushConstantsInfo(a, &v.p_next)?;
+    Ok(vk::PushConstantsInfoKHR {
+        p_next: next as _,
+        layout: vk::PipelineLayout::from_raw(v.layout.0),
+        stage_flags: vk::ShaderStageFlags::from_raw(v.stage_flags),
+        offset: v.offset,
+        size: v.size,
+        p_values: v.p_values.map_or(core::ptr::null(), |b| b.as_ptr()) as _,
+        ..Default::default()
+    })
+}
+
+fn ch_VkPushConstantsInfo(
+    a: &mut Arena,
+    links: &[VkPushConstantsInfoNext],
+) -> Result<*mut c_void, CallError> {
+    let mut next: *mut c_void = core::ptr::null_mut();
+    for link in links.iter().rev() {
+        next = match link {
+            VkPushConstantsInfoNext::VkPipelineLayoutCreateInfo(x) => {
+                let mut c = c_VkPipelineLayoutCreateInfo(a, x)?;
+                c.p_next = next as _;
+                a.one(c).cast()
+            }
+            other => {
+                return Err(CallError::Link {
+                    parent: "VkPushConstantsInfo",
+                    stype: ChainLink::structure_type(other),
+                })
+            }
+        };
+    }
+    Ok(next)
+}
+
 fn b_VkExtent2D(src: &vk::Extent2D, dst: &mut VkExtent2D) {
     dst.width = src.width;
     dst.height = src.height;
@@ -3912,6 +4024,8 @@ pub struct ExtTables {
     pub khr_line_rasterization: Option<ash::khr::line_rasterization::Device>,
     /// `VK_KHR_maintenance5`, when the device enabled it.
     pub khr_maintenance5: Option<ash::khr::maintenance5::Device>,
+    /// `VK_KHR_maintenance6`, when the device enabled it.
+    pub khr_maintenance6: Option<ash::khr::maintenance6::Device>,
 }
 
 impl ExtTables {
@@ -3934,6 +4048,8 @@ impl ExtTables {
                 .then(|| ash::khr::line_rasterization::Device::new(instance, device)),
             khr_maintenance5: enabled("VK_KHR_maintenance5")
                 .then(|| ash::khr::maintenance5::Device::new(instance, device)),
+            khr_maintenance6: enabled("VK_KHR_maintenance6")
+                .then(|| ash::khr::maintenance6::Device::new(instance, device)),
         }
     }
 }
@@ -7902,6 +8018,58 @@ unsafe fn call_CmdEndRendering(
     Ok(())
 }
 
+unsafe fn call_CmdBindDescriptorSets2(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut CmdBindDescriptorSets2Args,
+) -> Result<(), CallError> {
+    let f = ext
+        .khr_maintenance6
+        .as_ref()
+        .map(|t| t.fp().cmd_bind_descriptor_sets2_khr)
+        .ok_or(CallError::NoCall("vkCmdBindDescriptorSets2"))?;
+    let p0 = vk::CommandBuffer::from_raw(args.command_buffer.0);
+    let p1 = match &args.p_bind_descriptor_sets_info {
+        Some(x) => {
+            let c = c_VkBindDescriptorSetsInfo(a, x)?;
+            a.one(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe { (f)(p0, p1) };
+    Ok(())
+}
+
+unsafe fn call_CmdPushConstants2(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut CmdPushConstants2Args<'_>,
+) -> Result<(), CallError> {
+    let f = ext
+        .khr_maintenance6
+        .as_ref()
+        .map(|t| t.fp().cmd_push_constants2_khr)
+        .ok_or(CallError::NoCall("vkCmdPushConstants2"))?;
+    let p0 = vk::CommandBuffer::from_raw(args.command_buffer.0);
+    let p1 = match &args.p_push_constants_info {
+        Some(x) => {
+            let c = c_VkPushConstantsInfo(a, x)?;
+            a.one(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe { (f)(p0, p1) };
+    Ok(())
+}
+
 /// Call the host driver for `command`, whose inputs [the executor translated]
 /// (`crate::venus::executor::generated::translate`), and write its outputs back.
 ///
@@ -8266,6 +8434,12 @@ pub unsafe fn call(
                 call_CmdBeginRendering(device, ext, &mut arena, args)
             }
             Command::CmdEndRendering(args) => call_CmdEndRendering(device, ext, &mut arena, args),
+            Command::CmdBindDescriptorSets2(args) => {
+                call_CmdBindDescriptorSets2(device, ext, &mut arena, args)
+            }
+            Command::CmdPushConstants2(args) => {
+                call_CmdPushConstants2(device, ext, &mut arena, args)
+            }
             other => Err(CallError::NoCall(other.name())),
         }
     }

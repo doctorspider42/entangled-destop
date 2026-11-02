@@ -537,6 +537,7 @@ pub const ADMITTED_EXTENSIONS: &[&str] = &[
     "VK_KHR_line_rasterization",
     "VK_KHR_load_store_op_none",
     "VK_KHR_maintenance5",
+    "VK_KHR_maintenance6",
     "VK_KHR_robustness2",
     "VK_KHR_vertex_attribute_divisor",
 ];
@@ -2560,11 +2561,12 @@ mod tests {
         );
         assert!(numbers.contains(&527), "VK_KHR_load_store_op_none");
         assert!(numbers.contains(&471), "VK_KHR_maintenance5");
-        assert_eq!(numbers.len(), 77);
+        assert!(numbers.contains(&546), "VK_KHR_maintenance6");
+        assert_eq!(numbers.len(), 78);
         let mask = admitted_extension_mask();
         assert!(mask.is_enumerated());
         let set: u32 = mask.words().iter().map(|w| w.count_ones()).sum();
-        assert_eq!(set, 78, "77 extensions and the sentinel");
+        assert_eq!(set, 79, "78 extensions and the sentinel");
         for name in ADMITTED_EXTENSIONS {
             let number = info::extension(name).expect("known").number;
             assert!(mask.is_enabled(number), "{name}'s bit is in the capset");

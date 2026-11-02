@@ -1415,3 +1415,65 @@ fn a_feature_structure_of_an_extension_not_enabled_never_reaches_the_driver() {
     };
     assert_eq!(d.ret, VK_ERROR_FEATURE_NOT_PRESENT);
 }
+
+#[test]
+fn a_chained_shader_module_needs_maintenance5_and_a_null_module() {
+    // DXVK passes every shader in the stage's chain, the module left null.
+    let pipeline = |module: u64, chained: bool| {
+        let Command::CreateGraphicsPipelines(mut p) =
+            create_triangle_pipeline(DEVICE, PIPELINE, SHADER, PIPELINE_LAYOUT, RENDER_PASS, 64)
+        else {
+            panic!()
+        };
+        for stage in p.p_create_infos.as_mut().unwrap()[0]
+            .p_stages
+            .as_mut()
+            .unwrap()
+        {
+            stage.module = VkShaderModule(module);
+            if chained {
+                stage.p_next.push(
+                    VkPipelineShaderStageCreateInfoNext::VkShaderModuleCreateInfo(
+                        VkShaderModuleCreateInfo {
+                            flags: 0,
+                            code_size: 32,
+                            p_code: Some(vec![0x0723_0203; 8]),
+                        },
+                    ),
+                );
+            }
+        }
+        Command::CreateGraphicsPipelines(p)
+    };
+    let objects = |h: &mut Harness<FakeVulkan>| {
+        h.send(&create_shader_module(DEVICE, SHADER, &[0x0723_0203; 8]))
+            .unwrap();
+        h.send(&create_pipeline_layout(DEVICE, PIPELINE_LAYOUT, &[]))
+            .unwrap();
+        h.send(&create_render_pass(DEVICE, RENDER_PASS, RGBA8))
+            .unwrap();
+    };
+    let mut with: Vec<&'static str> = ZINK_EXTENSIONS.to_vec();
+    with.push("VK_KHR_maintenance5");
+    let (mut h, host) = zink_with(&with);
+    objects(&mut h);
+    h.send(&pipeline(0, true))
+        .expect("a chained module, the module null");
+    assert!(!h.fatal());
+    assert_eq!(host.called("vkCreateGraphicsPipelines"), 1);
+    for (module, chained, what) in [
+        (SHADER, true, "a module named and chained"),
+        (0, false, "no module at all"),
+    ] {
+        let (mut h, _) = zink_with(&with);
+        objects(&mut h);
+        fatal_on(&mut h, &pipeline(module, chained), what);
+    }
+    let (mut h, _) = zink();
+    objects(&mut h);
+    fatal_on(
+        &mut h,
+        &pipeline(0, true),
+        "a chained module on a device without VK_KHR_maintenance5",
+    );
+}

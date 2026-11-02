@@ -159,6 +159,7 @@ vkDeviceWaitIdle
 # fixed-size state a driver keeps on the host (viewports, push constants).
 vkCmdBindPipeline               # the pipeline's own bind point
 vkCmdBindDescriptorSets         # sets inside the layout, one offset per dynamic descriptor
+vkCmdBindDescriptorSets2        # the same, maintenance6
 vkCmdBeginRenderPass            # framebuffer and pass agree, a clear value per cleared attachment
 vkCmdBeginRenderPass2
 vkCmdBeginRendering             # colour attachments, view mask, layers, area (5b.3)
@@ -171,6 +172,7 @@ vkCmdSetScissor
 vkCmdSetViewportWithCount
 vkCmdSetScissorWithCount
 vkCmdPushConstants              # inside maxPushConstantsSize
+vkCmdPushConstants2             # the same, and the layout must exist (maintenance6)
 vkCmdFillBuffer                 # the range inside the buffer
 vkCmdUpdateBuffer
 vkCmdCopyBuffer
@@ -267,6 +269,7 @@ vkCmdSetPrimitiveRestartEnable
 vkCmdEndConditionalRenderingEXT
 
 [refused]
+vkCmdPushDescriptorSet2                 # maintenance6; VK_KHR_push_descriptor is not advertised
 vkGetImageSubresourceLayout2            # maintenance5; the 1.0 query carries the stage S1 layout lies
 vkGetDeviceImageSubresourceLayout       # maintenance5; asks the driver about an image that does not exist
 # Sparse resources: every sparse feature is reported false (policy::mask_features).

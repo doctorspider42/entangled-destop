@@ -96,7 +96,8 @@ SCOPE_EXTENSIONS = sorted(ADMITTED_EXTENSIONS - PROTOCOL_EXTENSIONS)
 # (A null vertex buffer is legal with robustness2's nullDescriptor, which a
 # guest may enable since stage 5c; the executor checks that by hand.)
 REQUIRED_HANDLES = {
-    ('VkPipelineShaderStageCreateInfo', 'module'),
+    # VkPipelineShaderStageCreateInfo.module may be null with maintenance5 (its
+    # module chained); device_objects.rs `check_stages` holds that rule.
     ('VkComputePipelineCreateInfo', 'layout'),
     ('VkGraphicsPipelineCreateInfo', 'layout'),
     ('VkWriteDescriptorSet', 'dstSet'),

@@ -217,6 +217,7 @@ pub fn zink_gpu(name: &str) -> FakeDevice {
         "VK_EXT_vertex_attribute_divisor",
         "VK_KHR_line_rasterization",
         "VK_KHR_vertex_attribute_divisor",
+        "VK_KHR_maintenance5",
         "VK_KHR_external_memory_win32",
     ]);
     for name in names {

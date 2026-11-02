@@ -241,8 +241,18 @@ and `gpu-test venus` passes.
 automatic restart (`owngpu-bind.ps1` rebinding the moved function), then
 get.webgl.org's cube spins in Edge opened from a plain link, and with the
 installed DLLs `d3d11-test` passes at 533 fps and `gl-test` at 51.5 fps — no
-Yttrium, no environment variable, nothing set by hand. Left: DXVK 3
-(`VK_KHR_maintenance6`), dropping `0002-zink-without-maintenance5.patch` now
+Yttrium, no environment variable, nothing set by hand.
+
+**DXVK 3 (2026-11-02):** `VK_KHR_maintenance6` is admitted:
+`vkCmdBindDescriptorSets2` and `vkCmdPushConstants2` bounded like their 1.0
+forms (the layout must exist — a null one, `dynamicPipelineLayout`, is not
+served), `vkCmdPushDescriptorSet2` refused (no `VK_KHR_push_descriptor`).
+DXVK 3.1.1 then chained every shader into its stage with the module null,
+which the generated translation refused: `VkPipelineShaderStageCreateInfo.module`
+may now be null, and `check_stages` holds the rule — exactly one of a module
+or a chained one, the latter only on a device that *enabled* maintenance5 (the
+first cut asked the physical device's advertised list; a test caught it).
+**Verified:** DXVK 3.1.1's `d3d11-test` passes at 532 fps. Left: dropping `0002-zink-without-maintenance5.patch` now
 that the executor serves maintenance5, async/interrupt submits, zero-copy
 present (E) and signing (F).
 

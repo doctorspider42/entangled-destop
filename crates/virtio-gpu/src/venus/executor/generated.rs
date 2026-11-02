@@ -671,7 +671,7 @@ fn t_VkPipelineShaderStageCreateInfo(
     v.module.0 = r.handle(
         Kind::ShaderModule,
         v.module.0,
-        false,
+        true,
         "VkPipelineShaderStageCreateInfo.module",
     )?;
     if let Some(x) = v.p_specialization_info.as_mut() {
@@ -4069,6 +4069,101 @@ fn t_VkRenderingInfo(r: &mut dyn Resolve, v: &mut VkRenderingInfo) -> Result<(),
     Ok(())
 }
 
+fn t_VkBindDescriptorSetsInfo(
+    r: &mut dyn Resolve,
+    v: &mut VkBindDescriptorSetsInfo,
+) -> Result<(), ExecError> {
+    for link in v.p_next.iter_mut() {
+        match link {
+            VkBindDescriptorSetsInfoNext::VkPipelineLayoutCreateInfo(x) => {
+                t_VkPipelineLayoutCreateInfo(r, x)?
+            }
+            other => {
+                return Err(r.link("VkBindDescriptorSetsInfo", ChainLink::structure_type(other)))
+            }
+        }
+    }
+    if !(v.stage_flags & !0x7fffffff_u32 == 0) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkBindDescriptorSetsInfo.stageFlags", v.stage_flags
+        )));
+    }
+    v.layout.0 = r.handle(
+        Kind::PipelineLayout,
+        v.layout.0,
+        true,
+        "VkBindDescriptorSetsInfo.layout",
+    )?;
+    if let Some(x) = &v.p_descriptor_sets {
+        chk_len(
+            r,
+            "VkBindDescriptorSetsInfo.pDescriptorSets",
+            x.len(),
+            u64::from(v.descriptor_set_count),
+        )?;
+    }
+    if v.p_descriptor_sets.is_none() && u64::from(v.descriptor_set_count) != 0 {
+        return Err(r.invalid(format!(
+            "{} is null with a nonzero count",
+            "VkBindDescriptorSetsInfo.pDescriptorSets"
+        )));
+    }
+    for h in v.p_descriptor_sets.iter_mut().flatten() {
+        h.0 = r.handle(
+            Kind::DescriptorSet,
+            h.0,
+            false,
+            "VkBindDescriptorSetsInfo.pDescriptorSets",
+        )?;
+    }
+    if let Some(x) = &v.p_dynamic_offsets {
+        chk_len(
+            r,
+            "VkBindDescriptorSetsInfo.pDynamicOffsets",
+            x.len(),
+            u64::from(v.dynamic_offset_count),
+        )?;
+    }
+    Ok(())
+}
+
+fn t_VkPushConstantsInfo(
+    r: &mut dyn Resolve,
+    v: &mut VkPushConstantsInfo<'_>,
+) -> Result<(), ExecError> {
+    for link in v.p_next.iter_mut() {
+        match link {
+            VkPushConstantsInfoNext::VkPipelineLayoutCreateInfo(x) => {
+                t_VkPipelineLayoutCreateInfo(r, x)?
+            }
+            other => return Err(r.link("VkPushConstantsInfo", ChainLink::structure_type(other))),
+        }
+    }
+    v.layout.0 = r.handle(
+        Kind::PipelineLayout,
+        v.layout.0,
+        true,
+        "VkPushConstantsInfo.layout",
+    )?;
+    if !(v.stage_flags & !0x7fffffff_u32 == 0) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkPushConstantsInfo.stageFlags", v.stage_flags
+        )));
+    }
+    if let Some(x) = &v.p_values {
+        chk_len(r, "VkPushConstantsInfo.pValues", x.len(), u64::from(v.size))?;
+    }
+    if v.p_values.is_none() && u64::from(v.size) != 0 {
+        return Err(r.invalid(format!(
+            "{} is null with a nonzero count",
+            "VkPushConstantsInfo.pValues"
+        )));
+    }
+    Ok(())
+}
+
 fn t_QueueSubmit(r: &mut dyn Resolve, a: &mut QueueSubmitArgs) -> Result<(), ExecError> {
     a.queue.0 = r.handle(Kind::Queue, a.queue.0, false, "vkQueueSubmit.queue")?;
     if let Some(x) = &a.p_submits {
@@ -7396,6 +7491,38 @@ fn t_CmdEndRendering(r: &mut dyn Resolve, a: &mut CmdEndRenderingArgs) -> Result
     Ok(())
 }
 
+fn t_CmdBindDescriptorSets2(
+    r: &mut dyn Resolve,
+    a: &mut CmdBindDescriptorSets2Args,
+) -> Result<(), ExecError> {
+    a.command_buffer.0 = r.handle(
+        Kind::CommandBuffer,
+        a.command_buffer.0,
+        false,
+        "vkCmdBindDescriptorSets2.commandBuffer",
+    )?;
+    if let Some(x) = a.p_bind_descriptor_sets_info.as_mut() {
+        t_VkBindDescriptorSetsInfo(r, x)?;
+    }
+    Ok(())
+}
+
+fn t_CmdPushConstants2(
+    r: &mut dyn Resolve,
+    a: &mut CmdPushConstants2Args<'_>,
+) -> Result<(), ExecError> {
+    a.command_buffer.0 = r.handle(
+        Kind::CommandBuffer,
+        a.command_buffer.0,
+        false,
+        "vkCmdPushConstants2.commandBuffer",
+    )?;
+    if let Some(x) = a.p_push_constants_info.as_mut() {
+        t_VkPushConstantsInfo(r, x)?;
+    }
+    Ok(())
+}
+
 /// Translate every input of `command`: ids to host handles, every value checked.
 ///
 /// # Errors
@@ -7561,6 +7688,8 @@ pub fn translate(r: &mut dyn Resolve, command: &mut Command<'_>) -> Result<(), E
         Command::CmdWriteTimestamp2(a) => t_CmdWriteTimestamp2(r, a),
         Command::CmdBeginRendering(a) => t_CmdBeginRendering(r, a),
         Command::CmdEndRendering(a) => t_CmdEndRendering(r, a),
+        Command::CmdBindDescriptorSets2(a) => t_CmdBindDescriptorSets2(r, a),
+        Command::CmdPushConstants2(a) => t_CmdPushConstants2(r, a),
         other => Err(ExecError::NotImplemented {
             command: other.name(),
         }),
@@ -7835,6 +7964,9 @@ pub fn dispatchable(command: &Command<'_>) -> Option<(Kind, u64)> {
         Command::CmdEndRendering(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::GetImageSubresourceLayout2(a) => Some((Kind::Device, a.device.0)),
         Command::GetDeviceImageSubresourceLayout(a) => Some((Kind::Device, a.device.0)),
+        Command::CmdBindDescriptorSets2(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
+        Command::CmdPushConstants2(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
+        Command::CmdPushDescriptorSet2(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         _ => None,
     }
 }
@@ -8481,6 +8613,8 @@ pub const TRANSLATED: &[&str] = &[
     "vkCmdWriteTimestamp2",
     "vkCmdBeginRendering",
     "vkCmdEndRendering",
+    "vkCmdBindDescriptorSets2",
+    "vkCmdPushConstants2",
 ];
 
 /// Commands served by translation and the host call alone.
@@ -8553,6 +8687,9 @@ pub fn extensions_of(command: &Command<'_>) -> &'static [&'static str] {
         Command::CmdBindIndexBuffer2(_) => &["VK_KHR_maintenance5"],
         Command::GetImageSubresourceLayout2(_) => &["VK_KHR_maintenance5"],
         Command::GetDeviceImageSubresourceLayout(_) => &["VK_KHR_maintenance5"],
+        Command::CmdBindDescriptorSets2(_) => &["VK_KHR_maintenance6"],
+        Command::CmdPushConstants2(_) => &["VK_KHR_maintenance6"],
+        Command::CmdPushDescriptorSet2(_) => &["VK_KHR_maintenance6"],
         _ => &[],
     }
 }

@@ -920,49 +920,30 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::CmdBindDescriptorSets(args) => {
                 const NAME: &str = "vkCmdBindDescriptorSets";
                 let device = self.cmd_device(NAME, args.command_buffer.0)?;
-                let sets = match self
-                    .objects
-                    .raw(Kind::PipelineLayout, device, args.layout.0)
-                    .map_err(id_error(NAME))?
-                    .facts
-                {
-                    Facts::PipelineLayout { sets } => sets,
-                    _ => 0,
+                self.check_bind_sets(
+                    NAME,
+                    device,
+                    args.layout.0,
+                    (args.first_set, args.descriptor_set_count),
+                    args.p_descriptor_sets.as_deref(),
+                    args.dynamic_offset_count,
+                )?;
+                self.pass_through(command)
+            }
+            Command::CmdBindDescriptorSets2(args) => {
+                const NAME: &str = "vkCmdBindDescriptorSets2";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                let Some(info) = &args.p_bind_descriptor_sets_info else {
+                    return Err(invalid(NAME, "pBindDescriptorSetsInfo is null"));
                 };
-                if ranges_overflow(
-                    u64::from(args.first_set),
-                    u64::from(args.descriptor_set_count),
-                    u64::from(sets),
-                ) {
-                    return Err(invalid(
-                        NAME,
-                        format!(
-                            "sets {}+{} of a layout of {sets}",
-                            args.first_set, args.descriptor_set_count
-                        ),
-                    ));
-                }
-                // The driver reads one dynamic offset per dynamic descriptor
-                // of the sets bound: exactly that many must be there.
-                let mut dynamic = 0u32;
-                for set in args.p_descriptor_sets.iter().flatten() {
-                    let object = self
-                        .objects
-                        .raw(Kind::DescriptorSet, device, set.0)
-                        .map_err(id_error(NAME))?;
-                    if let Facts::DescriptorSet { layout, .. } = &object.facts {
-                        dynamic = dynamic.saturating_add(layout.dynamic);
-                    }
-                }
-                if args.dynamic_offset_count != dynamic {
-                    return Err(invalid(
-                        NAME,
-                        format!(
-                            "{} dynamic offsets for sets with {dynamic} dynamic descriptors",
-                            args.dynamic_offset_count
-                        ),
-                    ));
-                }
+                self.check_bind_sets(
+                    NAME,
+                    device,
+                    info.layout.0,
+                    (info.first_set, info.descriptor_set_count),
+                    info.p_descriptor_sets.as_deref(),
+                    info.dynamic_offset_count,
+                )?;
                 self.pass_through(command)
             }
             Command::CmdBeginRenderPass(args) => {
@@ -1067,24 +1048,22 @@ impl<H: HostVulkan> VulkanContext<H> {
             Command::CmdPushConstants(args) => {
                 const NAME: &str = "vkCmdPushConstants";
                 let device = self.cmd_device(NAME, args.command_buffer.0)?;
-                let limit = self.limits(NAME, device)?.max_push_constants_size;
-                if args.size == 0
-                    || args.offset % 4 != 0
-                    || args.size % 4 != 0
-                    || ranges_overflow(
-                        u64::from(args.offset),
-                        u64::from(args.size),
-                        u64::from(limit),
-                    )
-                {
-                    return Err(invalid(
-                        NAME,
-                        format!(
-                            "{} bytes at {} are not a 4-aligned range inside maxPushConstantsSize {limit}",
-                            args.size, args.offset
-                        ),
-                    ));
-                }
+                self.check_push_constants(NAME, device, args.offset, args.size)?;
+                self.pass_through(command)
+            }
+            Command::CmdPushConstants2(args) => {
+                const NAME: &str = "vkCmdPushConstants2";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                let Some(info) = &args.p_push_constants_info else {
+                    return Err(invalid(NAME, "pPushConstantsInfo is null"));
+                };
+                // The layout must exist: a null one (dynamicPipelineLayout,
+                // maintenance6's chained VkPipelineLayoutCreateInfo) is not
+                // served.
+                self.objects
+                    .raw(Kind::PipelineLayout, device, info.layout.0)
+                    .map_err(id_error(NAME))?;
+                self.check_push_constants(NAME, device, info.offset, info.size)?;
                 self.pass_through(command)
             }
             Command::CmdFillBuffer(args) => {
@@ -2274,13 +2253,87 @@ impl<H: HostVulkan> VulkanContext<H> {
             .size)
     }
 
+    /// `vkCmdBindDescriptorSets` and its maintenance6 form: the sets inside
+    /// the layout, and one dynamic offset per dynamic descriptor of them.
+    fn check_bind_sets(
+        &self,
+        command: &'static str,
+        device: u64,
+        layout: u64,
+        (first, count): (u32, u32),
+        sets_bound: Option<&[crate::venus::protocol::VkDescriptorSet]>,
+        dynamic_offset_count: u32,
+    ) -> Result<(), ExecError> {
+        let sets = match self
+            .objects
+            .raw(Kind::PipelineLayout, device, layout)
+            .map_err(id_error(command))?
+            .facts
+        {
+            Facts::PipelineLayout { sets } => sets,
+            _ => 0,
+        };
+        if ranges_overflow(u64::from(first), u64::from(count), u64::from(sets)) {
+            return Err(invalid(
+                command,
+                format!("sets {}+{} of a layout of {sets}", first, count),
+            ));
+        }
+        // The driver reads one dynamic offset per dynamic descriptor
+        // of the sets bound: exactly that many must be there.
+        let mut dynamic = 0u32;
+        for set in sets_bound.unwrap_or_default() {
+            let object = self
+                .objects
+                .raw(Kind::DescriptorSet, device, set.0)
+                .map_err(id_error(command))?;
+            if let Facts::DescriptorSet { layout, .. } = &object.facts {
+                dynamic = dynamic.saturating_add(layout.dynamic);
+            }
+        }
+        if dynamic_offset_count != dynamic {
+            return Err(invalid(
+                command,
+                format!(
+                    "{} dynamic offsets for sets with {dynamic} dynamic descriptors",
+                    dynamic_offset_count
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `vkCmdPushConstants` and its maintenance6 form: a nonempty 4-aligned
+    /// range inside `maxPushConstantsSize`.
+    fn check_push_constants(
+        &self,
+        command: &'static str,
+        device: u64,
+        offset: u32,
+        size: u32,
+    ) -> Result<(), ExecError> {
+        let limit = self.limits(command, device)?.max_push_constants_size;
+        if size == 0
+            || offset % 4 != 0
+            || size % 4 != 0
+            || ranges_overflow(u64::from(offset), u64::from(size), u64::from(limit))
+        {
+            return Err(invalid(
+                command,
+                format!(
+                    "{size} bytes at {offset} are not a 4-aligned range inside maxPushConstantsSize {limit}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether the guest enabled extension `name` on `device`.
     fn enabled(&self, command: &'static str, device: u64, name: &str) -> Result<bool, ExecError> {
-        let (_, guest) = self
-            .objects
-            .device_and_guest(device)
-            .map_err(id_error(command))?;
-        Ok(super::policy::has_extension(&guest.extensions, name))
+        // The extensions the guest enabled on it, not those its physical
+        // device advertises.
+        let device = self.objects.device(device).map_err(id_error(command))?;
+        Ok(device.extensions.iter().any(|e| e == name))
     }
 
     /// A shader stage may carry its module in its chain only on a device
@@ -2295,6 +2348,18 @@ impl<H: HostVulkan> VulkanContext<H> {
     ) -> Result<(), ExecError> {
         use crate::venus::protocol::VkPipelineShaderStageCreateInfoNext as N;
         for stage in stages {
+            let chained = stage
+                .p_next
+                .iter()
+                .any(|l| matches!(l, N::VkShaderModuleCreateInfo(_)));
+            // Exactly one of the two: a module, or (maintenance5) its code
+            // chained with the module left null.
+            if chained == (stage.module.0 != 0) {
+                return Err(invalid(
+                    command,
+                    "a shader stage names a module and chains one, or does neither",
+                ));
+            }
             for link in stage.p_next.iter() {
                 let N::VkShaderModuleCreateInfo(module) = link else {
                     continue;

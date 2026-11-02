@@ -570,7 +570,7 @@ fn own_gpu_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 
 /// The optional folders of our own package and the DLLs each must hold:
 /// `opengl` from `guest/windows-gpu/mesa/build-zink.cmd`, `dxvk` from a DXVK
-/// 2.3 release's `x64` (DXVK 3 needs `VK_KHR_maintenance6`, ADR-0009).
+/// release's `x64` (2.3 and 3.1 verified, ADR-0009).
 const OPTIONAL_GPU_FOLDERS: &[(&str, &[&str])] = &[
     ("opengl", &["opengl32.dll", "libgallium_wgl.dll"]),
     (
