@@ -34,6 +34,9 @@ set "UINC=/I"%WDK%\Include\%V%\um" /I"%WDK%\Include\%V%\shared" /I"%WDK%\Include
 set "ULIB=/LIBPATH:"%WDK%\Lib\%V%\um\x64" /LIBPATH:"%WDK%\Lib\%V%\ucrt\x64" /LIBPATH:"%MSVC%\lib\x64""
 "%BIN%\cl.exe" /nologo /W4 /WX /O2 /MT %UINC% /Fo"%OUT%\gpu-test.obj" /Fe"%OUT%\gpu-test.exe" "%SRC%gpu-test.c" /link %ULIB%
 if errorlevel 1 exit /b 1
+rem The presentation test (phase C), against Mesa's Vulkan headers.
+"%BIN%\cl.exe" /nologo /W3 /O2 /MT %UINC% /I"F:\entangled-targets\mesa\include" /Fo"%OUT%\vk-present.obj" /Fe"%OUT%\vk-present.exe" "%SRC%vk-present.c" /link %ULIB% user32.lib
+if errorlevel 1 exit /b 1
 copy /y "%SRC%entangled-gpu.inf" "%OUT%\" >nul
 rem A new DriverVer every build: with the same one, Windows keeps the copy
 rem already in its driver store and the new binary never runs.

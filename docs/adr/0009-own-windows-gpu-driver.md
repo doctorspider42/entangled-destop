@@ -147,9 +147,15 @@ host logs `venus context created ctx_id=1 name="entangled-gpu"` and our ring —
 with Yttrium nowhere in the path. (The loader ignores `VK_ICD_FILENAMES` in
 an elevated process, which first made Yttrium's ICD answer instead.) It is
 slow where the host round-trips: an empty submit costs ~10 ms and 1000 fenced
-submits 7 s, because every submit is synchronous and the driver polls; an
-interrupt-driven, asynchronous submit path is the next work, then the
-win32 surface (phase C).
+submits 7 s, because every submit is synchronous and the driver polls; the
+driver now spins ~2 ms before sleeping (a 1 ms sleep lasts a whole timer
+tick), which removed most of it. **Phase C (2026-11-02):** Venus listed no
+`VK_KHR_win32_surface`; advertised under `VK_USE_PLATFORM_WIN32_KHR`, Mesa's
+own win32 WSI (a CPU blit of the finished image) works on our stack:
+`vk-present` (`guest/windows-gpu/driver`) opens a window, makes a swapchain
+(624×441, 2 images) and presents 300 frames in 0.55 s on our ICD, the host
+logging the `entangled-gpu` context. Next: DXVK and Zink over this ICD
+(phase D), and installing the stack from `install windows`.
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.
