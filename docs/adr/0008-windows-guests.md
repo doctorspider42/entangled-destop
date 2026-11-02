@@ -705,8 +705,10 @@ host call happens in the translation. Served: INIT, LOOKUP, FORGET,
 BATCH_FORGET, GETATTR, SETATTR, OPEN(DIR), READ, WRITE, READDIR, RELEASE(DIR),
 FLUSH, ACCESS, FSYNC(DIR), STATFS, MKDIR, CREATE, UNLINK, RMDIR, RENAME(2);
 anything else is `-ENOSYS`. Unit-tested (lookup, read, write, listing, `..` at
-the root staying there). **Not yet tried in a guest:** the Windows side needs
-WinFsp installed in the guest, a download not yet made.
+the root staying there). `install windows` puts virtio-win's `viofs` driver on
+the answer disc with the others, so the device has its driver from the first
+boot. **Not yet tried in a guest:** the mount needs WinFsp installed in the
+guest, a download not yet made.
 
 ### Amendment, 2026-10-31: the shared clipboard
 

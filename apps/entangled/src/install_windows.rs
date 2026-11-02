@@ -69,6 +69,9 @@ const DRIVERS: &[(&str, bool)] = &[
     ("Balloon", false),
     ("vioserial", false),
     ("viorng", false),
+    // virtio-fs shared folders (`[[share]] virtiofs = true`): the driver is
+    // ready, and WinFsp plus virtio-win's virtiofs service make the mount.
+    ("viofs", false),
 ];
 
 /// Smallest disk Windows installs onto (Microsoft says 32 GB for 10 and 64
