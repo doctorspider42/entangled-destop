@@ -114,6 +114,15 @@ stream in another, writes `vkSetReplyCommandStreamMESA` +
 reads `result 0, apiVersion 1.3.341` — the host RTX 2070's Vulkan, through
 our driver and our executor, Yttrium nowhere in the path.
 
+**Phase B, first look (2026-11-02):** Mesa 26.2.6 configures for
+`-Dplatforms=windows -Dvulkan-drivers=virtio` with meson and MSVC (the Windows
+WSI is already in its Venus driver; only the renderer backend is missing —
+ours would sit beside `vn_renderer_virtgpu.c` and `vn_renderer_vtest.c`). It
+does not compile with MSVC, though: C11 atomics need `/experimental:c11atomics`,
+and past that the driver is GNU C — arithmetic on `void *`, variable-length
+arrays, `gettid`. The build needs `clang-cl` (LLVM for Windows), which this
+machine does not have yet.
+
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.
 
