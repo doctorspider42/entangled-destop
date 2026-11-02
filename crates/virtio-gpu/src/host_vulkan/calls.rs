@@ -1022,6 +1022,16 @@ fn c_VkPipelineDynamicStateCreateInfo(
     })
 }
 
+fn c_VkPipelineCreateFlags2CreateInfo(
+    a: &mut Arena,
+    v: &VkPipelineCreateFlags2CreateInfo,
+) -> Result<vk::PipelineCreateFlags2CreateInfoKHR<'static>, CallError> {
+    Ok(vk::PipelineCreateFlags2CreateInfoKHR {
+        flags: vk::PipelineCreateFlags2KHR::from_raw(v.flags),
+        ..Default::default()
+    })
+}
+
 fn c_VkPipelineCreationFeedback(
     a: &mut Arena,
     v: &VkPipelineCreationFeedback,
@@ -1199,6 +1209,11 @@ fn ch_VkGraphicsPipelineCreateInfo(
     let mut next: *mut c_void = core::ptr::null_mut();
     for link in links.iter().rev() {
         next = match link {
+            VkGraphicsPipelineCreateInfoNext::VkPipelineCreateFlags2CreateInfo(x) => {
+                let mut c = c_VkPipelineCreateFlags2CreateInfo(a, x)?;
+                c.p_next = next as _;
+                a.one(c).cast()
+            }
             VkGraphicsPipelineCreateInfoNext::VkPipelineCreationFeedbackCreateInfo(x) => {
                 let mut c = c_VkPipelineCreationFeedbackCreateInfo(a, x)?;
                 c.p_next = next as _;
@@ -1243,6 +1258,11 @@ fn ch_VkComputePipelineCreateInfo(
     let mut next: *mut c_void = core::ptr::null_mut();
     for link in links.iter().rev() {
         next = match link {
+            VkComputePipelineCreateInfoNext::VkPipelineCreateFlags2CreateInfo(x) => {
+                let mut c = c_VkPipelineCreateFlags2CreateInfo(a, x)?;
+                c.p_next = next as _;
+                a.one(c).cast()
+            }
             VkComputePipelineCreateInfoNext::VkPipelineCreationFeedbackCreateInfo(x) => {
                 let mut c = c_VkPipelineCreationFeedbackCreateInfo(a, x)?;
                 c.p_next = next as _;
@@ -2280,6 +2300,33 @@ fn ch_VkRenderPassCreateInfo(
         };
     }
     Ok(next)
+}
+
+fn c_VkRenderingAreaInfo(
+    a: &mut Arena,
+    v: &VkRenderingAreaInfo,
+) -> Result<vk::RenderingAreaInfoKHR<'static>, CallError> {
+    if let Some(x) = &v.p_color_attachment_formats {
+        same(
+            x.len(),
+            u64::from(v.color_attachment_count),
+            "VkRenderingAreaInfo.pColorAttachmentFormats",
+        )?;
+    }
+    Ok(vk::RenderingAreaInfoKHR {
+        view_mask: v.view_mask,
+        color_attachment_count: v.color_attachment_count,
+        p_color_attachment_formats: match &v.p_color_attachment_formats {
+            Some(xs) => {
+                let c: Vec<_> = xs.iter().map(|x| vk::Format::from_raw(*x)).collect();
+                a.slice(c).cast_const()
+            }
+            None => core::ptr::null(),
+        },
+        depth_attachment_format: vk::Format::from_raw(v.depth_attachment_format),
+        stencil_attachment_format: vk::Format::from_raw(v.stencil_attachment_format),
+        ..Default::default()
+    })
 }
 
 fn c_VkCommandBufferAllocateInfo(
@@ -3863,6 +3910,8 @@ pub struct ExtTables {
     pub ext_transform_feedback: Option<ash::ext::transform_feedback::Device>,
     /// `VK_KHR_line_rasterization`, when the device enabled it.
     pub khr_line_rasterization: Option<ash::khr::line_rasterization::Device>,
+    /// `VK_KHR_maintenance5`, when the device enabled it.
+    pub khr_maintenance5: Option<ash::khr::maintenance5::Device>,
 }
 
 impl ExtTables {
@@ -3883,6 +3932,8 @@ impl ExtTables {
                 .then(|| ash::ext::transform_feedback::Device::new(instance, device)),
             khr_line_rasterization: enabled("VK_KHR_line_rasterization")
                 .then(|| ash::khr::line_rasterization::Device::new(instance, device)),
+            khr_maintenance5: enabled("VK_KHR_maintenance5")
+                .then(|| ash::khr::maintenance5::Device::new(instance, device)),
         }
     }
 }
@@ -4973,6 +5024,35 @@ unsafe fn call_GetRenderAreaGranularity(
     unsafe {
         (device.fp_v1_0().get_render_area_granularity)(device.handle(), p1, &mut o_p_granularity)
     };
+    if let Some(d) = args.p_granularity.as_mut() {
+        b_VkExtent2D(&o_p_granularity, d);
+    }
+    Ok(())
+}
+
+unsafe fn call_GetRenderingAreaGranularity(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut GetRenderingAreaGranularityArgs,
+) -> Result<(), CallError> {
+    let f = ext
+        .khr_maintenance5
+        .as_ref()
+        .map(|t| t.fp().get_rendering_area_granularity_khr)
+        .ok_or(CallError::NoCall("vkGetRenderingAreaGranularity"))?;
+    let mut o_p_granularity = vk::Extent2D::default();
+    let p1 = match &args.p_rendering_area_info {
+        Some(x) => {
+            let c = c_VkRenderingAreaInfo(a, x)?;
+            a.one(c).cast_const()
+        }
+        None => core::ptr::null(),
+    };
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe { (f)(device.handle(), p1, &mut o_p_granularity) };
     if let Some(d) = args.p_granularity.as_mut() {
         b_VkExtent2D(&o_p_granularity, d);
     }
@@ -7180,6 +7260,27 @@ unsafe fn call_CmdSetScissorWithCount(
     Ok(())
 }
 
+unsafe fn call_CmdBindIndexBuffer2(
+    device: &ash::Device,
+    ext: &ExtTables,
+    a: &mut Arena,
+    args: &mut CmdBindIndexBuffer2Args,
+) -> Result<(), CallError> {
+    let f = ext
+        .khr_maintenance5
+        .as_ref()
+        .map(|t| t.fp().cmd_bind_index_buffer2_khr)
+        .ok_or(CallError::NoCall("vkCmdBindIndexBuffer2"))?;
+    let p0 = vk::CommandBuffer::from_raw(args.command_buffer.0);
+    let p1 = vk::Buffer::from_raw(args.buffer.0);
+    let p4 = vk::IndexType::from_raw(args.index_type);
+    // SAFETY: the contract of `call`, which this is one arm of; every pointer
+    // argument points into `a` or a local of this function, both of which
+    // outlive the call.
+    unsafe { (f)(p0, p1, args.offset, args.size, p4) };
+    Ok(())
+}
+
 unsafe fn call_CmdBindVertexBuffers2(
     device: &ash::Device,
     ext: &ExtTables,
@@ -7919,6 +8020,9 @@ pub unsafe fn call(
             Command::GetRenderAreaGranularity(args) => {
                 call_GetRenderAreaGranularity(device, ext, &mut arena, args)
             }
+            Command::GetRenderingAreaGranularity(args) => {
+                call_GetRenderingAreaGranularity(device, ext, &mut arena, args)
+            }
             Command::ResetCommandPool(args) => call_ResetCommandPool(device, ext, &mut arena, args),
             Command::AllocateCommandBuffers(args) => {
                 call_AllocateCommandBuffers(device, ext, &mut arena, args)
@@ -8098,6 +8202,9 @@ pub unsafe fn call(
             }
             Command::CmdSetScissorWithCount(args) => {
                 call_CmdSetScissorWithCount(device, ext, &mut arena, args)
+            }
+            Command::CmdBindIndexBuffer2(args) => {
+                call_CmdBindIndexBuffer2(device, ext, &mut arena, args)
             }
             Command::CmdBindVertexBuffers2(args) => {
                 call_CmdBindVertexBuffers2(device, ext, &mut arena, args)

@@ -206,12 +206,18 @@ submits in 156 ms.
 (NVIDIA GeForce RTX 2070)" through our ICD and skips it for two required
 extensions. `VK_KHR_load_store_op_none` (enum values only) is now admitted by
 the executor — its capset bit comes from the admitted list, since it brings no
-structure. `VK_KHR_maintenance5` is the one left, the same extension Zink
-wanted: DXVK will not run without it, so the executor must serve it (its
-feature/property structures, `PipelineCreateFlags2`/`BufferUsageFlags2`,
-`vkCmdBindIndexBuffer2`, the subresource-layout and rendering-area queries,
-a shader module chained into a stage, and its new formats). Next: that, then
-Zink and DXVK in the `--gpu3d` package.
+structure. `VK_KHR_maintenance5` is now admitted too: its feature and property
+structures and flags-2 values through the generated translation,
+`vkCmdBindIndexBuffer2` bounded like `vkCmdBindIndexBuffer` (and its size),
+`vkGetRenderingAreaGranularity` passed through, a shader module chained into a
+pipeline stage accepted on a device that enabled it (bounded like
+`vkCreateShaderModule`), and the two subresource-layout queries refused (the
+1.0 query carries the stage S1 layout lies). DXVK 3.1.1 then asks for
+`VK_KHR_maintenance6`; **DXVK 2.3.1 runs. Verified 2026-11-02:** `d3d11-test`
+gets "Virtio-GPU Venus (NVIDIA GeForce RTX 2070)", feature level 11_0, a FIFO
+swap chain, and passes — 300 frames in 0.67 s (451 fps), the read-back right.
+Next: Zink and DXVK in the `--gpu3d` package, maintenance6 for DXVK 3, and
+dropping `0002-zink-without-maintenance5.patch`.
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.

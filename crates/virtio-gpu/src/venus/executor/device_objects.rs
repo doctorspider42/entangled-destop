@@ -434,8 +434,11 @@ impl<H: HostVulkan> VulkanContext<H> {
             }
             Command::CreateGraphicsPipelines(args) => {
                 const NAME: &str = "vkCreateGraphicsPipelines";
+                let maintenance5 =
+                    self.enabled(NAME, args.device.0, super::policy::MAINTENANCE_5)?;
                 self.check_stages(
                     NAME,
+                    maintenance5,
                     args.p_create_infos
                         .iter()
                         .flatten()
@@ -452,8 +455,12 @@ impl<H: HostVulkan> VulkanContext<H> {
                 self.create(command, Kind::Pipeline, facts, 0)
             }
             Command::CreateComputePipelines(args) => {
+                const NAME: &str = "vkCreateComputePipelines";
+                let maintenance5 =
+                    self.enabled(NAME, args.device.0, super::policy::MAINTENANCE_5)?;
                 self.check_stages(
-                    "vkCreateComputePipelines",
+                    NAME,
+                    maintenance5,
                     args.p_create_infos.iter().flatten().map(|i| &i.stage),
                 )?;
                 let facts = Facts::Pipeline {
@@ -980,6 +987,18 @@ impl<H: HostVulkan> VulkanContext<H> {
                 let size = self.buffer_size(NAME, device, args.buffer.0)?;
                 if args.offset >= size {
                     return Err(invalid(NAME, "offset is outside the buffer"));
+                }
+                self.pass_through(command)
+            }
+            Command::CmdBindIndexBuffer2(args) => {
+                const NAME: &str = "vkCmdBindIndexBuffer2";
+                let device = self.cmd_device(NAME, args.command_buffer.0)?;
+                // VK_NULL_HANDLE is not allowed here without maintenance6.
+                let size = self.buffer_size(NAME, device, args.buffer.0)?;
+                if args.offset >= size
+                    || (args.size != WHOLE_SIZE && ranges_overflow(args.offset, args.size, size))
+                {
+                    return Err(invalid(NAME, "the range is outside the buffer"));
                 }
                 self.pass_through(command)
             }
@@ -2255,25 +2274,46 @@ impl<H: HostVulkan> VulkanContext<H> {
             .size)
     }
 
-    /// No shader stage may carry its module in its chain (maintenance5, not
-    /// enabled on any host device here); the module itself must be named,
-    /// which translation checks.
+    /// Whether the guest enabled extension `name` on `device`.
+    fn enabled(&self, command: &'static str, device: u64, name: &str) -> Result<bool, ExecError> {
+        let (_, guest) = self
+            .objects
+            .device_and_guest(device)
+            .map_err(id_error(command))?;
+        Ok(super::policy::has_extension(&guest.extensions, name))
+    }
+
+    /// A shader stage may carry its module in its chain only on a device
+    /// that enabled `VK_KHR_maintenance5`, and that module is bounded like
+    /// one `vkCreateShaderModule` makes (DXVK passes every shader that way);
+    /// without it the stage must name a module, which translation checks.
     fn check_stages<'s>(
         &self,
         command: &'static str,
+        maintenance5: bool,
         stages: impl Iterator<Item = &'s crate::venus::protocol::VkPipelineShaderStageCreateInfo<'s>>,
     ) -> Result<(), ExecError> {
         use crate::venus::protocol::VkPipelineShaderStageCreateInfoNext as N;
         for stage in stages {
-            if stage
-                .p_next
-                .iter()
-                .any(|l| matches!(l, N::VkShaderModuleCreateInfo(_)))
-            {
-                return Err(invalid(
-                    command,
-                    "a shader stage chains its module (VK_KHR_maintenance5), which no device here enables",
-                ));
+            for link in stage.p_next.iter() {
+                let N::VkShaderModuleCreateInfo(module) = link else {
+                    continue;
+                };
+                if !maintenance5 {
+                    return Err(invalid(
+                        command,
+                        "a shader stage chains its module without VK_KHR_maintenance5",
+                    ));
+                }
+                let size = module.code_size;
+                if size == 0 || size % 4 != 0 || size > MAX_SHADER_BYTES {
+                    return Err(invalid(
+                        command,
+                        format!(
+                            "a chained module's codeSize {size} is not a nonzero multiple of 4 below {MAX_SHADER_BYTES}"
+                        ),
+                    ));
+                }
             }
             // The driver reads every map entry's bytes out of pData: each
             // must be inside it (the wire already made pData dataSize long).

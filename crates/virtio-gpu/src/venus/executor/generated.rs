@@ -697,7 +697,7 @@ fn t_VkVertexInputAttributeDescription(
     r: &mut dyn Resolve,
     v: &mut VkVertexInputAttributeDescription,
 ) -> Result<(), ExecError> {
-    if !(e_VkFormat(v.format)) {
+    if !(e_VkFormat(v.format) || x_VkFormat(&*r, v.format)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkVertexInputAttributeDescription.format", v.format
@@ -1194,6 +1194,19 @@ fn t_VkPipelineDynamicStateCreateInfo(
     Ok(())
 }
 
+fn t_VkPipelineCreateFlags2CreateInfo(
+    r: &mut dyn Resolve,
+    v: &mut VkPipelineCreateFlags2CreateInfo,
+) -> Result<(), ExecError> {
+    if !(v.flags & !0x4800031f_u64 == 0) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "VkPipelineCreateFlags2CreateInfo.flags", v.flags
+        )));
+    }
+    Ok(())
+}
+
 fn t_VkPipelineCreationFeedback(
     r: &mut dyn Resolve,
     v: &mut VkPipelineCreationFeedback,
@@ -1257,6 +1270,15 @@ fn t_VkGraphicsPipelineCreateInfo(
 ) -> Result<(), ExecError> {
     for link in v.p_next.iter_mut() {
         match link {
+            VkGraphicsPipelineCreateInfoNext::VkPipelineCreateFlags2CreateInfo(x) => {
+                if !(r.enabled("VK_KHR_maintenance5")) {
+                    return Err(r.link(
+                        "VkGraphicsPipelineCreateInfo",
+                        VkPipelineCreateFlags2CreateInfo::STRUCTURE_TYPE,
+                    ));
+                }
+                t_VkPipelineCreateFlags2CreateInfo(r, x)?
+            }
             VkGraphicsPipelineCreateInfoNext::VkPipelineCreationFeedbackCreateInfo(x) => {
                 t_VkPipelineCreationFeedbackCreateInfo(r, x)?
             }
@@ -1336,6 +1358,15 @@ fn t_VkComputePipelineCreateInfo(
 ) -> Result<(), ExecError> {
     for link in v.p_next.iter_mut() {
         match link {
+            VkComputePipelineCreateInfoNext::VkPipelineCreateFlags2CreateInfo(x) => {
+                if !(r.enabled("VK_KHR_maintenance5")) {
+                    return Err(r.link(
+                        "VkComputePipelineCreateInfo",
+                        VkPipelineCreateFlags2CreateInfo::STRUCTURE_TYPE,
+                    ));
+                }
+                t_VkPipelineCreateFlags2CreateInfo(r, x)?
+            }
             VkComputePipelineCreateInfoNext::VkPipelineCreationFeedbackCreateInfo(x) => {
                 t_VkPipelineCreationFeedbackCreateInfo(r, x)?
             }
@@ -1458,7 +1489,7 @@ fn t_VkSamplerCustomBorderColorCreateInfoEXT(
     r: &mut dyn Resolve,
     v: &mut VkSamplerCustomBorderColorCreateInfoEXT,
 ) -> Result<(), ExecError> {
-    if !(e_VkFormat(v.format)) {
+    if !(e_VkFormat(v.format) || x_VkFormat(&*r, v.format)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkSamplerCustomBorderColorCreateInfoEXT.format", v.format
@@ -1982,7 +2013,7 @@ fn t_VkFramebufferAttachmentImageInfo(
         )));
     }
     for x in v.p_view_formats.iter().flatten() {
-        if !(e_VkFormat(*x)) {
+        if !(e_VkFormat(*x) || x_VkFormat(&*r, *x)) {
             return Err(r.invalid(format!(
                 "{} = {:#x} is not a Vulkan 1.3 value",
                 "VkFramebufferAttachmentImageInfo.pViewFormats", *x
@@ -2071,7 +2102,7 @@ fn t_VkAttachmentDescription(
             "VkAttachmentDescription.flags", v.flags
         )));
     }
-    if !(e_VkFormat(v.format)) {
+    if !(e_VkFormat(v.format) || x_VkFormat(&*r, v.format)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkAttachmentDescription.format", v.format
@@ -2414,6 +2445,21 @@ fn t_VkRenderPassCreateInfo(
     Ok(())
 }
 
+fn t_VkRenderingAreaInfo(
+    r: &mut dyn Resolve,
+    v: &mut VkRenderingAreaInfo,
+) -> Result<(), ExecError> {
+    if let Some(x) = &v.p_color_attachment_formats {
+        chk_len(
+            r,
+            "VkRenderingAreaInfo.pColorAttachmentFormats",
+            x.len(),
+            u64::from(v.color_attachment_count),
+        )?;
+    }
+    Ok(())
+}
+
 fn t_VkCommandBufferAllocateInfo(
     r: &mut dyn Resolve,
     v: &mut VkCommandBufferAllocateInfo,
@@ -2465,21 +2511,21 @@ fn t_VkCommandBufferInheritanceRenderingInfo(
         )));
     }
     for x in v.p_color_attachment_formats.iter().flatten() {
-        if !(e_VkFormat(*x)) {
+        if !(e_VkFormat(*x) || x_VkFormat(&*r, *x)) {
             return Err(r.invalid(format!(
                 "{} = {:#x} is not a Vulkan 1.3 value",
                 "VkCommandBufferInheritanceRenderingInfo.pColorAttachmentFormats", *x
             )));
         }
     }
-    if !(e_VkFormat(v.depth_attachment_format)) {
+    if !(e_VkFormat(v.depth_attachment_format) || x_VkFormat(&*r, v.depth_attachment_format)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkCommandBufferInheritanceRenderingInfo.depthAttachmentFormat",
             v.depth_attachment_format
         )));
     }
-    if !(e_VkFormat(v.stencil_attachment_format)) {
+    if !(e_VkFormat(v.stencil_attachment_format) || x_VkFormat(&*r, v.stencil_attachment_format)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkCommandBufferInheritanceRenderingInfo.stencilAttachmentFormat",
@@ -2883,7 +2929,7 @@ fn t_VkSamplerYcbcrConversionCreateInfo(
     r: &mut dyn Resolve,
     v: &mut VkSamplerYcbcrConversionCreateInfo,
 ) -> Result<(), ExecError> {
-    if !(e_VkFormat(v.format)) {
+    if !(e_VkFormat(v.format) || x_VkFormat(&*r, v.format)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkSamplerYcbcrConversionCreateInfo.format", v.format
@@ -2962,7 +3008,7 @@ fn t_VkAttachmentDescription2(
             "VkAttachmentDescription2.flags", v.flags
         )));
     }
-    if !(e_VkFormat(v.format)) {
+    if !(e_VkFormat(v.format) || x_VkFormat(&*r, v.format)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkAttachmentDescription2.format", v.format
@@ -4759,6 +4805,22 @@ fn t_GetRenderAreaGranularity(
         false,
         "vkGetRenderAreaGranularity.renderPass",
     )?;
+    Ok(())
+}
+
+fn t_GetRenderingAreaGranularity(
+    r: &mut dyn Resolve,
+    a: &mut GetRenderingAreaGranularityArgs,
+) -> Result<(), ExecError> {
+    a.device.0 = r.handle(
+        Kind::Device,
+        a.device.0,
+        false,
+        "vkGetRenderingAreaGranularity.device",
+    )?;
+    if let Some(x) = a.p_rendering_area_info.as_mut() {
+        t_VkRenderingAreaInfo(r, x)?;
+    }
     Ok(())
 }
 
@@ -6781,6 +6843,31 @@ fn t_CmdSetScissorWithCount(
     Ok(())
 }
 
+fn t_CmdBindIndexBuffer2(
+    r: &mut dyn Resolve,
+    a: &mut CmdBindIndexBuffer2Args,
+) -> Result<(), ExecError> {
+    a.command_buffer.0 = r.handle(
+        Kind::CommandBuffer,
+        a.command_buffer.0,
+        false,
+        "vkCmdBindIndexBuffer2.commandBuffer",
+    )?;
+    a.buffer.0 = r.handle(
+        Kind::Buffer,
+        a.buffer.0,
+        true,
+        "vkCmdBindIndexBuffer2.buffer",
+    )?;
+    if !(e_VkIndexType(a.index_type)) {
+        return Err(r.invalid(format!(
+            "{} = {:#x} is not a Vulkan 1.3 value",
+            "vkCmdBindIndexBuffer2.indexType", a.index_type
+        )));
+    }
+    Ok(())
+}
+
 fn t_CmdBindVertexBuffers2(
     r: &mut dyn Resolve,
     a: &mut CmdBindVertexBuffers2Args,
@@ -7360,6 +7447,7 @@ pub fn translate(r: &mut dyn Resolve, command: &mut Command<'_>) -> Result<(), E
         Command::CreateRenderPass(a) => t_CreateRenderPass(r, a),
         Command::DestroyRenderPass(a) => t_DestroyRenderPass(r, a),
         Command::GetRenderAreaGranularity(a) => t_GetRenderAreaGranularity(r, a),
+        Command::GetRenderingAreaGranularity(a) => t_GetRenderingAreaGranularity(r, a),
         Command::ResetCommandPool(a) => t_ResetCommandPool(r, a),
         Command::AllocateCommandBuffers(a) => t_AllocateCommandBuffers(r, a),
         Command::FreeCommandBuffers(a) => t_FreeCommandBuffers(r, a),
@@ -7444,6 +7532,7 @@ pub fn translate(r: &mut dyn Resolve, command: &mut Command<'_>) -> Result<(), E
         Command::CmdSetPrimitiveTopology(a) => t_CmdSetPrimitiveTopology(r, a),
         Command::CmdSetViewportWithCount(a) => t_CmdSetViewportWithCount(r, a),
         Command::CmdSetScissorWithCount(a) => t_CmdSetScissorWithCount(r, a),
+        Command::CmdBindIndexBuffer2(a) => t_CmdBindIndexBuffer2(r, a),
         Command::CmdBindVertexBuffers2(a) => t_CmdBindVertexBuffers2(r, a),
         Command::CmdSetDepthTestEnable(a) => t_CmdSetDepthTestEnable(r, a),
         Command::CmdSetDepthWriteEnable(a) => t_CmdSetDepthWriteEnable(r, a),
@@ -7578,6 +7667,7 @@ pub fn dispatchable(command: &Command<'_>) -> Option<(Kind, u64)> {
         Command::CreateRenderPass(a) => Some((Kind::Device, a.device.0)),
         Command::DestroyRenderPass(a) => Some((Kind::Device, a.device.0)),
         Command::GetRenderAreaGranularity(a) => Some((Kind::Device, a.device.0)),
+        Command::GetRenderingAreaGranularity(a) => Some((Kind::Device, a.device.0)),
         Command::CreateCommandPool(a) => Some((Kind::Device, a.device.0)),
         Command::DestroyCommandPool(a) => Some((Kind::Device, a.device.0)),
         Command::ResetCommandPool(a) => Some((Kind::Device, a.device.0)),
@@ -7712,6 +7802,7 @@ pub fn dispatchable(command: &Command<'_>) -> Option<(Kind, u64)> {
         Command::CmdSetPrimitiveTopology(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::CmdSetViewportWithCount(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::CmdSetScissorWithCount(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
+        Command::CmdBindIndexBuffer2(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::CmdBindVertexBuffers2(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::CmdSetDepthTestEnable(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::CmdSetDepthWriteEnable(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
@@ -7742,6 +7833,8 @@ pub fn dispatchable(command: &Command<'_>) -> Option<(Kind, u64)> {
         Command::CmdWriteTimestamp2(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::CmdBeginRendering(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
         Command::CmdEndRendering(a) => Some((Kind::CommandBuffer, a.command_buffer.0)),
+        Command::GetImageSubresourceLayout2(a) => Some((Kind::Device, a.device.0)),
+        Command::GetDeviceImageSubresourceLayout(a) => Some((Kind::Device, a.device.0)),
         _ => None,
     }
 }
@@ -7975,6 +8068,7 @@ pub fn is_pass_through(command: &Command<'_>) -> bool {
         Command::GetFenceStatus(_)
             | Command::MergePipelineCaches(_)
             | Command::GetRenderAreaGranularity(_)
+            | Command::GetRenderingAreaGranularity(_)
             | Command::EndCommandBuffer(_)
             | Command::CmdSetLineWidth(_)
             | Command::CmdSetDepthBias(_)
@@ -8275,6 +8369,7 @@ pub const TRANSLATED: &[&str] = &[
     "vkCreateRenderPass",
     "vkDestroyRenderPass",
     "vkGetRenderAreaGranularity",
+    "vkGetRenderingAreaGranularity",
     "vkResetCommandPool",
     "vkAllocateCommandBuffers",
     "vkFreeCommandBuffers",
@@ -8357,6 +8452,7 @@ pub const TRANSLATED: &[&str] = &[
     "vkCmdSetPrimitiveTopology",
     "vkCmdSetViewportWithCount",
     "vkCmdSetScissorWithCount",
+    "vkCmdBindIndexBuffer2",
     "vkCmdBindVertexBuffers2",
     "vkCmdSetDepthTestEnable",
     "vkCmdSetDepthWriteEnable",
@@ -8392,6 +8488,7 @@ pub const PASS_THROUGH: &[&str] = &[
     "vkGetFenceStatus",
     "vkMergePipelineCaches",
     "vkGetRenderAreaGranularity",
+    "vkGetRenderingAreaGranularity",
     "vkEndCommandBuffer",
     "vkCmdSetLineWidth",
     "vkCmdSetDepthBias",
@@ -8441,6 +8538,7 @@ pub const PASS_THROUGH: &[&str] = &[
 #[must_use]
 pub fn extensions_of(command: &Command<'_>) -> &'static [&'static str] {
     match command {
+        Command::GetRenderingAreaGranularity(_) => &["VK_KHR_maintenance5"],
         Command::CmdBeginConditionalRenderingEXT(_) => &["VK_EXT_conditional_rendering"],
         Command::CmdEndConditionalRenderingEXT(_) => &["VK_EXT_conditional_rendering"],
         Command::CmdBindTransformFeedbackBuffersEXT(_) => &["VK_EXT_transform_feedback"],
@@ -8452,6 +8550,9 @@ pub fn extensions_of(command: &Command<'_>) -> &'static [&'static str] {
         Command::CmdSetLineStipple(_) => {
             &["VK_EXT_line_rasterization", "VK_KHR_line_rasterization"]
         }
+        Command::CmdBindIndexBuffer2(_) => &["VK_KHR_maintenance5"],
+        Command::GetImageSubresourceLayout2(_) => &["VK_KHR_maintenance5"],
+        Command::GetDeviceImageSubresourceLayout(_) => &["VK_KHR_maintenance5"],
         _ => &[],
     }
 }
@@ -8465,6 +8566,11 @@ fn x_VkAttachmentLoadOp(r: &dyn Resolve, v: i32) -> bool {
 fn x_VkDynamicState(r: &dyn Resolve, v: i32) -> bool {
     (r.enabled("VK_EXT_line_rasterization") || r.enabled("VK_KHR_line_rasterization"))
         && matches!(v, 1000259000)
+}
+
+/// Whether `v` is a `VkFormat` value an admitted extension the device enabled adds.
+fn x_VkFormat(r: &dyn Resolve, v: i32) -> bool {
+    r.enabled("VK_KHR_maintenance5") && matches!(v, 1000470000..=1000470001)
 }
 
 /// Whether `v` is a `VkQueryType` value an admitted extension the device enabled adds.

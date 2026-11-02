@@ -536,6 +536,7 @@ pub const ADMITTED_EXTENSIONS: &[&str] = &[
     "VK_EXT_vertex_attribute_divisor",
     "VK_KHR_line_rasterization",
     "VK_KHR_load_store_op_none",
+    "VK_KHR_maintenance5",
     "VK_KHR_robustness2",
     "VK_KHR_vertex_attribute_divisor",
 ];
@@ -1585,6 +1586,8 @@ pub const BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER: u32 = 0x1000;
 pub const TRANSFORM_FEEDBACK: &str = "VK_EXT_transform_feedback";
 /// `VK_EXT_conditional_rendering`.
 pub const CONDITIONAL_RENDERING: &str = "VK_EXT_conditional_rendering";
+/// `VK_KHR_maintenance5`.
+pub const MAINTENANCE_5: &str = "VK_KHR_maintenance5";
 
 /// The `VK_BUFFER_USAGE_*` bits the admitted extensions add, on a device for
 /// which `enabled` names the extensions the guest enabled (stage 5c): a
@@ -2118,7 +2121,6 @@ mod tests {
             EXTERNAL_MEMORY_HOST,
             "VK_KHR_device_group",
             "VK_EXT_4444_formats",
-            "VK_KHR_maintenance5",
             "VK_KHR_push_descriptor",
             "VK_EXT_calibrated_timestamps",
             "VK_KHR_external_memory_win32",
@@ -2527,7 +2529,6 @@ mod tests {
             (126, "VK_EXT_external_memory_dma_buf"),
             (75, "VK_KHR_external_memory_fd"),
             (378, "VK_EXT_extended_dynamic_state2"),
-            (471, "VK_KHR_maintenance5"),
             (1, "VK_KHR_swapchain"),
             (158 + 1000, "no such extension"),
         ] {
@@ -2558,11 +2559,12 @@ mod tests {
             "VK_EXT_queue_family_foreign chains nothing"
         );
         assert!(numbers.contains(&527), "VK_KHR_load_store_op_none");
-        assert_eq!(numbers.len(), 75);
+        assert!(numbers.contains(&471), "VK_KHR_maintenance5");
+        assert_eq!(numbers.len(), 77);
         let mask = admitted_extension_mask();
         assert!(mask.is_enumerated());
         let set: u32 = mask.words().iter().map(|w| w.count_ones()).sum();
-        assert_eq!(set, 76, "75 extensions and the sentinel");
+        assert_eq!(set, 78, "77 extensions and the sentinel");
         for name in ADMITTED_EXTENSIONS {
             let number = info::extension(name).expect("known").number;
             assert!(mask.is_enabled(number), "{name}'s bit is in the capset");
