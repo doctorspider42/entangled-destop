@@ -232,9 +232,19 @@ ids are one namespace for the whole device and every process counted from
 **Verified 2026-11-02:** get.webgl.org's cube spins in Edge opened from a
 plain link (the sandbox on, no environment variable), and beside it
 `vk-smoke` passes 9/9 (1000 submits in 198 ms), `gl-test` 300 frames at 63 fps
-and `gpu-test venus` passes. Next: Zink and DXVK in the `--gpu3d` package, a
-fresh install of all of it, maintenance6 for DXVK 3, and dropping
-`0002-zink-without-maintenance5.patch`.
+and `gpu-test venus` passes.
+
+**The whole stack from `install windows` (2026-11-02):** the package may carry
+`opengl/` (Zink) and `dxvk/` (DXVK 2.3's x64 DLLs), installed under
+`Program Files\Entangled` for programs to take from beside themselves.
+**Verified on a fresh Windows 10 install**, the profile as written: one
+automatic restart (`owngpu-bind.ps1` rebinding the moved function), then
+get.webgl.org's cube spins in Edge opened from a plain link, and with the
+installed DLLs `d3d11-test` passes at 533 fps and `gl-test` at 51.5 fps — no
+Yttrium, no environment variable, nothing set by hand. Left: DXVK 3
+(`VK_KHR_maintenance6`), dropping `0002-zink-without-maintenance5.patch` now
+that the executor serves maintenance5, async/interrupt submits, zero-copy
+present (E) and signing (F).
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.
