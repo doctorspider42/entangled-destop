@@ -41,6 +41,7 @@ mod op {
     pub const CREATE: u32 = 35;
     pub const DESTROY: u32 = 38;
     pub const BATCH_FORGET: u32 = 42;
+    pub const READDIRPLUS: u32 = 44;
     pub const RENAME2: u32 = 45;
 }
 
@@ -150,7 +151,8 @@ impl FuseServer {
             op::OPEN | op::OPENDIR => self.open(nodeid, le32(body, 0), opcode == op::OPENDIR),
             op::READ => self.read(body),
             op::WRITE => self.write(body),
-            op::READDIR => self.readdir(body),
+            op::READDIR => self.readdir(body, None),
+            op::READDIRPLUS => self.readdir(body, Some(nodeid)),
             op::RELEASE | op::RELEASEDIR => {
                 if let Some(fid) = self.handles.remove(&le64(body, 0)) {
                     self.clunk(fid);
@@ -352,7 +354,14 @@ impl FuseServer {
         Ok(o)
     }
 
-    fn readdir(&mut self, body: &[u8]) -> Result<Vec<u8>, u32> {
+    /// READDIR, or READDIRPLUS when `plus` names the directory's node: each
+    /// entry then carries a looked-up `fuse_entry_out` before it (zeroed for
+    /// `.` and `..`, and for a name that will not resolve).
+    fn readdir(&mut self, body: &[u8], plus: Option<u64>) -> Result<Vec<u8>, u32> {
+        let dir_fid = match plus {
+            Some(node) => Some(self.node_fid(node)?),
+            None => None,
+        };
         let fid = self.handle_fid(le64(body, 0))?;
         let size = le32(body, 16).min(MAX_WRITE) as usize;
         let mut m = self.msg(wire_t::TREADDIR);
@@ -373,8 +382,23 @@ impl FuseServer {
                 break;
             };
             let entry = (24 + len).next_multiple_of(8);
-            if o.len() + entry > size {
+            let lookup = if dir_fid.is_some() { 128 } else { 0 };
+            if o.len() + lookup + entry > size {
                 break;
+            }
+            if let Some(dfid) = dir_fid {
+                let looked = if name == b"." || name == b".." {
+                    None
+                } else {
+                    match self.walk(dfid, &[name]) {
+                        Ok(fid) => self.entry_out(fid).ok(),
+                        Err(_) => None,
+                    }
+                };
+                match looked {
+                    Some(e) => o.extend_from_slice(&e),
+                    None => o.resize(o.len() + 128, 0),
+                }
             }
             put64(&mut o, ino);
             put64(&mut o, off);
@@ -694,6 +718,15 @@ mod tests {
         let listing = fs.handle(&request(op::READDIR, ROOT_NODE, &list)).unwrap();
         let names = String::from_utf8_lossy(&listing[OUT_HEADER..]).into_owned();
         assert!(names.contains("hello.txt"), "{names:?}");
+        let plus = fs
+            .handle(&request(op::READDIRPLUS, ROOT_NODE, &list))
+            .unwrap();
+        assert_eq!(error(&plus), 0);
+        let names = String::from_utf8_lossy(&plus[OUT_HEADER..]).into_owned();
+        assert!(
+            names.contains("hello.txt"),
+            "READDIRPLUS lists too: {names:?}"
+        );
 
         assert!(fs
             .handle(&request(op::FORGET, node, &[1, 0, 0, 0, 0, 0, 0, 0]))

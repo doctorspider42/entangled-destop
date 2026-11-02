@@ -707,8 +707,14 @@ FLUSH, ACCESS, FSYNC(DIR), STATFS, MKDIR, CREATE, UNLINK, RMDIR, RENAME(2);
 anything else is `-ENOSYS`. Unit-tested (lookup, read, write, listing, `..` at
 the root staying there). `install windows` puts virtio-win's `viofs` driver on
 the answer disc with the others, so the device has its driver from the first
-boot. **Not yet tried in a guest:** the mount needs WinFsp installed in the
-guest, a download not yet made.
+boot. **Verified in a Windows 10 guest** with WinFsp 2.1 and virtio-win's
+`virtiofs.exe` as a service: the share mounts as `Z:`, and listing, reading,
+writing, `mkdir` and rename all reach the host folder. The first try listed
+nothing — `virtiofs.exe` lists with READDIRPLUS, now served (each entry
+looked up and counted like a LOOKUP). Windows creates `System Volume
+Information` in the share on mount. WinFsp itself is GPLv3 with a FLOSS
+exception, a guest-side component the user installs; nothing of it is in host
+code. Not yet: installing WinFsp and the service from `install windows`.
 
 ### Amendment, 2026-10-31: the shared clipboard
 
