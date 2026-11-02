@@ -139,7 +139,17 @@ at creation, shmem and device-memory blobs through `BLOB_CREATE`/`_DESTROY`,
 that signals asks the driver for a fenced answer (`ENTANGLED_GPU_SUBMIT_FENCE`,
 the host answering once the ring's fence retires), so a returned submit is a
 finished one. The driver grew the IOCTLs for it and a 64 KiB command area.
-`vulkan_virtio.dll` links; not yet run in a guest.
+Mesa's Venus needed `vs_module_defs : vulkan_api_def` to export its ICD
+entry points on Windows (without it the linker drops the whole driver).
+**Verified 2026-11-02:** in a Windows 10 guest with the render-only function,
+`vk-smoke` run with `VK_ICD_FILENAMES` naming only our ICD passes 9/9 — the
+host logs `venus context created ctx_id=1 name="entangled-gpu"` and our ring —
+with Yttrium nowhere in the path. (The loader ignores `VK_ICD_FILENAMES` in
+an elevated process, which first made Yttrium's ICD answer instead.) It is
+slow where the host round-trips: an empty submit costs ~10 ms and 1000 fenced
+submits 7 s, because every submit is synchronous and the driver polls; an
+interrupt-driven, asynchronous submit path is the next work, then the
+win32 surface (phase C).
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.
