@@ -2949,6 +2949,16 @@ fn wizard_step(
                     ) {
                         actions.push(Action::PickPath(PickTarget::WizardDrivers));
                     }
+                    if ui::path_row(
+                        ui,
+                        "3D (OPTIONAL)",
+                        "Experimental: Vulkan, OpenGL and WebGL on this computer's GPU. A                          folder holding the viogpu3d driver package and LunarG's Vulkan                          runtime installer (VulkanRT-*.exe). The driver is test-signed, so                          Windows runs in test mode. Leave empty for 2D.",
+                        &mut state.machine.gpu3d_path,
+                        "no 3D",
+                        true,
+                    ) {
+                        actions.push(Action::PickPath(PickTarget::WizardGpu3d));
+                    }
                     ui.label(ui::dim(
                         "Installs on its own and powers off when it is done. No product key is entered.",
                     ));

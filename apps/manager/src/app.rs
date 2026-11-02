@@ -753,6 +753,7 @@ impl ManagerApp {
                     state.machine.memory_mib = state.machine.memory_mib.max(4096);
                     state.machine.iso_path = r"C:\Images\Win10_22H2_English_x64.iso".into();
                     state.machine.drivers_path = r"C:\Images\virtio-win.iso".into();
+                    state.machine.gpu3d_path = r"C:\Images\gpu3d".into();
                 }
             }
             ScreenshotView::WizardMore => {
@@ -962,6 +963,7 @@ impl ManagerApp {
                 family: launcher::GuestFamily::default_for_host(),
                 iso_path: String::new(),
                 drivers_path: String::new(),
+                gpu3d_path: String::new(),
                 variant: self.settings.default_variant.clone(),
                 automated: true,
                 headless: self.settings.headless_install,
@@ -3205,6 +3207,7 @@ impl ManagerApp {
             (Modal::Wizard(state), PickTarget::WizardDrivers) => {
                 Some(&mut state.machine.drivers_path)
             }
+            (Modal::Wizard(state), PickTarget::WizardGpu3d) => Some(&mut state.machine.gpu3d_path),
             (Modal::Wizard(state), PickTarget::WizardDisk) => Some(&mut state.machine.disk_path),
             (Modal::MoveDisk(state), PickTarget::MoveDestination) => Some(&mut state.dest),
             (Modal::EditVm(state), target) => match target {

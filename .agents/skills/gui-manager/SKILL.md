@@ -137,7 +137,10 @@ ISO (`drivers_path`, `PickTarget::WizardDrivers`), which become `install
 windows --iso … --drivers …`. Never `--auto`: Windows is always unattended and
 the engine refuses the flag. Choosing the card raises the disk to 64 GiB and
 memory to 4 GiB, the engine's own Windows minimums for comfort. Pre-flight is
-the UEFI firmware, as for Ubuntu. Its screenshot surface is `wizard-windows`.
+the UEFI firmware, as for Ubuntu. Its screenshot surface is `wizard-windows`. An optional third path row, **3D (OPTIONAL)**, takes the folder with the
+experimental viogpu3d package and LunarG's Vulkan runtime installer and passes it as
+`install windows --gpu3d` (`NewMachine::gpu3d_path`, picked with
+`PickTarget::WizardGpu3d`); empty installs 2D, and the launcher test asserts both.
 
 The four-stage wizard collects system/media, name/resources, storage and a
 review before it launches anything. It supports Debian's verified variants and

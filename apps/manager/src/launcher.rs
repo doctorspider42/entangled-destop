@@ -292,6 +292,9 @@ pub struct NewMachine {
     pub iso_path: String,
     /// The virtio-win driver ISO; Windows only, and required there.
     pub drivers_path: String,
+    /// The folder holding the experimental 3D package (viogpu3d plus the
+    /// Vulkan runtime installer); Windows only, optional: empty installs 2D.
+    pub gpu3d_path: String,
     pub variant: String,
     pub automated: bool,
     pub headless: bool,
@@ -394,6 +397,10 @@ pub fn install_spec(
         }
         args.push("--drivers".to_string());
         args.push(runner.path_arg(Path::new(machine.drivers_path.trim()))?);
+        if !machine.gpu3d_path.trim().is_empty() {
+            args.push("--gpu3d".to_string());
+            args.push(runner.path_arg(Path::new(machine.gpu3d_path.trim()))?);
+        }
     }
     // Windows is always unattended, from its own answer file, and refuses
     // `--auto`.
@@ -751,6 +758,7 @@ mod tests {
             family: GuestFamily::Debian,
             iso_path: String::new(),
             drivers_path: String::new(),
+            gpu3d_path: String::new(),
             variant: "text-netboot".into(),
             automated: true,
             headless: false,
@@ -855,6 +863,13 @@ mod tests {
             assert!(line.contains(needle), "missing {needle} in {line}");
         }
         assert!(!line.contains("--auto"), "{line}");
+        assert!(
+            !line.contains("--gpu3d"),
+            "2D unless a 3D package is chosen: {line}"
+        );
+        m.gpu3d_path = "/drivers/gpu3d".into();
+        let line = spec(&m).expect("spec").command_line();
+        assert!(line.contains("--gpu3d /drivers/gpu3d"), "{line}");
     }
 
     #[test]
