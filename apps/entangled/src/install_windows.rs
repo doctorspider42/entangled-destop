@@ -545,9 +545,39 @@ fn own_gpu_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
         }
         files.push((name.to_owned(), read(&path)?));
     }
+    // Optional: Mesa's OpenGL over Vulkan (Zink) and DXVK's Direct3D 9-11,
+    // each a folder of DLLs an application takes from beside itself.
+    for (folder, wanted) in OPTIONAL_GPU_FOLDERS {
+        let at = dir.join(folder);
+        if !at.is_dir() {
+            continue;
+        }
+        for name in *wanted {
+            let path = at.join(name);
+            if !path.is_file() {
+                return Err(format!(
+                    "--gpu3d: {} has no {name}; it holds {}",
+                    at.display(),
+                    wanted.join(", ")
+                ));
+            }
+            files.push((format!("{folder}/{name}"), read(&path)?));
+        }
+    }
     files.sort();
     Ok(files)
 }
+
+/// The optional folders of our own package and the DLLs each must hold:
+/// `opengl` from `guest/windows-gpu/mesa/build-zink.cmd`, `dxvk` from a DXVK
+/// 2.3 release's `x64` (DXVK 3 needs `VK_KHR_maintenance6`, ADR-0009).
+const OPTIONAL_GPU_FOLDERS: &[(&str, &[&str])] = &[
+    ("opengl", &["opengl32.dll", "libgallium_wgl.dll"]),
+    (
+        "dxvk",
+        &["d3d9.dll", "d3d10core.dll", "d3d11.dll", "dxgi.dll"],
+    ),
+];
 
 /// WinFsp's installer for the answer disc: an `.msi` of a sane size.
 fn winfsp_installer(msi: &Path) -> Result<Vec<u8>, String> {
@@ -1146,6 +1176,13 @@ mod tests {
         ] {
             std::fs::write(dir.join(name), name).unwrap();
         }
+        std::fs::create_dir_all(dir.join("dxvk")).unwrap();
+        std::fs::write(dir.join("dxvk").join("d3d11.dll"), b"dll").unwrap();
+        let refused = own_gpu_files(&dir).unwrap_err();
+        assert!(refused.contains("d3d9.dll"), "{refused}");
+        for name in ["d3d9.dll", "d3d10core.dll", "dxgi.dll"] {
+            std::fs::write(dir.join("dxvk").join(name), b"dll").unwrap();
+        }
         let names: Vec<String> = own_gpu_files(&dir)
             .unwrap()
             .into_iter()
@@ -1155,6 +1192,10 @@ mod tests {
             names,
             [
                 "VulkanRT-Installer.exe",
+                "dxvk/d3d10core.dll",
+                "dxvk/d3d11.dll",
+                "dxvk/d3d9.dll",
+                "dxvk/dxgi.dll",
                 "entangled-gpu.cat",
                 "entangled-gpu.cer",
                 "entangled-gpu.inf",
