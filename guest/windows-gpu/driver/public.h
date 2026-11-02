@@ -35,3 +35,37 @@ typedef struct _ENTANGLED_GPU_CAPSET_INFO_OUT {
     unsigned long MaxVersion;
     unsigned long MaxSize;
 } ENTANGLED_GPU_CAPSET_INFO_OUT;
+
+/* Every command below answers with the host's virtio-gpu response type
+ * (0x1100 = OK_NODATA; 0x12xx = an error). */
+typedef struct _ENTANGLED_GPU_RESPONSE {
+    unsigned long Type;
+} ENTANGLED_GPU_RESPONSE;
+
+/* in: ENTANGLED_GPU_CTX_CREATE, out: ENTANGLED_GPU_RESPONSE */
+#define IOCTL_ENTANGLED_GPU_CTX_CREATE \
+    CTL_CODE(ENTANGLED_GPU_TYPE, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* in: ENTANGLED_GPU_CTX, out: ENTANGLED_GPU_RESPONSE */
+#define IOCTL_ENTANGLED_GPU_CTX_DESTROY \
+    CTL_CODE(ENTANGLED_GPU_TYPE, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* in: ENTANGLED_GPU_SUBMIT followed by Size bytes, out: ENTANGLED_GPU_RESPONSE */
+#define IOCTL_ENTANGLED_GPU_SUBMIT_3D \
+    CTL_CODE(ENTANGLED_GPU_TYPE, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+/* The most one SUBMIT_3D carries through this slice's command page. */
+#define ENTANGLED_GPU_MAX_SUBMIT 1024
+
+typedef struct _ENTANGLED_GPU_CTX_CREATE {
+    unsigned long CtxId;
+    unsigned long CapsetId; /* 4 = Venus */
+} ENTANGLED_GPU_CTX_CREATE;
+
+typedef struct _ENTANGLED_GPU_CTX {
+    unsigned long CtxId;
+} ENTANGLED_GPU_CTX;
+
+typedef struct _ENTANGLED_GPU_SUBMIT {
+    unsigned long CtxId;
+    unsigned long Size;
+    /* followed by Size bytes of command stream */
+} ENTANGLED_GPU_SUBMIT;

@@ -65,7 +65,12 @@
 #define CMD_HALF 2048
 
 #define VIRTIO_GPU_CMD_GET_CAPSET_INFO 0x0108
+#define VIRTIO_GPU_CMD_CTX_CREATE 0x0200
+#define VIRTIO_GPU_CMD_CTX_DESTROY 0x0201
+#define VIRTIO_GPU_CMD_SUBMIT_3D 0x0207
 #define VIRTIO_GPU_RESP_OK_CAPSET_INFO 0x1102
+/* ctx_create.context_init: the capset id in the low byte (CONTEXT_INIT). */
+#define VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK 0xff
 
 #pragma pack(push, 1)
 typedef struct {
@@ -97,6 +102,20 @@ typedef struct {
     UINT32 CapsetMaxSize;
     UINT32 Padding;
 } GPU_RESP_CAPSET_INFO;
+
+typedef struct {
+    GPU_CTRL_HDR Hdr;
+    UINT32 NameLen;
+    UINT32 ContextInit;
+    char DebugName[64];
+} GPU_CTX_CREATE;
+
+typedef struct {
+    GPU_CTRL_HDR Hdr;
+    UINT32 Size;
+    UINT32 Padding;
+    /* followed by Size bytes */
+} GPU_SUBMIT_3D;
 #pragma pack(pop)
 
 typedef struct {
@@ -428,6 +447,53 @@ static NTSTATUS CapsetInfo(DEVICE_CONTEXT *ctx, ULONG index, ENTANGLED_GPU_CAPSE
     return STATUS_SUCCESS;
 }
 
+/* A command whose answer is only a header: the response type comes back. */
+static NTSTATUS HeaderCommand(DEVICE_CONTEXT *ctx, ULONG request, ULONG *type)
+{
+    NTSTATUS status = Command(ctx, request, sizeof(GPU_CTRL_HDR));
+    if (NT_SUCCESS(status)) {
+        *type = ((GPU_CTRL_HDR *)(ctx->Cmd + CMD_HALF))->Type;
+    }
+    return status;
+}
+
+static NTSTATUS CtxCreate(DEVICE_CONTEXT *ctx, const ENTANGLED_GPU_CTX_CREATE *in, ULONG *type)
+{
+    GPU_CTX_CREATE *req = (GPU_CTX_CREATE *)ctx->Cmd;
+    static const char name[] = "entangled-gpu";
+    RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+    req->Hdr.Type = VIRTIO_GPU_CMD_CTX_CREATE;
+    req->Hdr.CtxId = in->CtxId;
+    req->NameLen = sizeof(name) - 1;
+    RtlCopyMemory(req->DebugName, name, sizeof(name) - 1);
+    req->ContextInit = in->CapsetId & VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK;
+    return HeaderCommand(ctx, sizeof(*req), type);
+}
+
+static NTSTATUS CtxDestroy(DEVICE_CONTEXT *ctx, ULONG ctxId, ULONG *type)
+{
+    GPU_CTRL_HDR *req = (GPU_CTRL_HDR *)ctx->Cmd;
+    RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+    req->Type = VIRTIO_GPU_CMD_CTX_DESTROY;
+    req->CtxId = ctxId;
+    return HeaderCommand(ctx, sizeof(*req), type);
+}
+
+static NTSTATUS Submit3d(DEVICE_CONTEXT *ctx, const ENTANGLED_GPU_SUBMIT *in, size_t inLength,
+                         ULONG *type)
+{
+    GPU_SUBMIT_3D *req = (GPU_SUBMIT_3D *)ctx->Cmd;
+    if (in->Size > ENTANGLED_GPU_MAX_SUBMIT || inLength < sizeof(*in) + in->Size) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+    req->Hdr.Type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    req->Hdr.CtxId = in->CtxId;
+    req->Size = in->Size;
+    RtlCopyMemory(req + 1, in + 1, in->Size);
+    return HeaderCommand(ctx, sizeof(*req) + in->Size, type);
+}
+
 VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLength,
                           size_t InputLength, ULONG IoControlCode)
 {
@@ -463,6 +529,36 @@ VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLengt
             if (NT_SUCCESS(status)) {
                 written = sizeof(*out);
             }
+        }
+        break;
+    }
+    case IOCTL_ENTANGLED_GPU_CTX_CREATE:
+    case IOCTL_ENTANGLED_GPU_CTX_DESTROY:
+    case IOCTL_ENTANGLED_GPU_SUBMIT_3D: {
+        PVOID in = NULL;
+        size_t inLength = 0;
+        ENTANGLED_GPU_RESPONSE *out = NULL;
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(ENTANGLED_GPU_CTX), &in,
+                                               &inLength);
+        if (NT_SUCCESS(status)) {
+            status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, NULL);
+        }
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+        if (IoControlCode == IOCTL_ENTANGLED_GPU_CTX_CREATE) {
+            status = inLength >= sizeof(ENTANGLED_GPU_CTX_CREATE)
+                         ? CtxCreate(ctx, (ENTANGLED_GPU_CTX_CREATE *)in, &out->Type)
+                         : STATUS_INVALID_PARAMETER;
+        } else if (IoControlCode == IOCTL_ENTANGLED_GPU_CTX_DESTROY) {
+            status = CtxDestroy(ctx, ((ENTANGLED_GPU_CTX *)in)->CtxId, &out->Type);
+        } else {
+            status = inLength >= sizeof(ENTANGLED_GPU_SUBMIT)
+                         ? Submit3d(ctx, (ENTANGLED_GPU_SUBMIT *)in, inLength, &out->Type)
+                         : STATUS_INVALID_PARAMETER;
+        }
+        if (NT_SUCCESS(status)) {
+            written = sizeof(*out);
         }
         break;
     }

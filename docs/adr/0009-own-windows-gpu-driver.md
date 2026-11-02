@@ -100,8 +100,12 @@ story as viogpu3d); a Microsoft-signed `viogpudo` outranks our test-signed
 package even with the more specific hardware ID, so `gpu-test install`
 forces it with `UpdateDriverForPlugAndPlayDevices`; and every build needs a
 new `DriverVer` (`stampinf`), or Windows keeps the old binary from its
-driver store. Next in phase A: context create/destroy, blob resources mapped
-into the process, `SUBMIT_3D` and fences.
+driver store. Second slice: `IOCTL_ENTANGLED_GPU_CTX_CREATE`/`_DESTROY`
+and `_SUBMIT_3D` (up to 1 KiB inline). In the guest a Venus context is
+created (the host logs `venus context created ... name="entangled-gpu"`), an
+empty stream is accepted, an unknown opcode refused (0x1205) and the context
+destroyed. Next in phase A: blob resources mapped into the process, a ring,
+and a `vkEnumerateInstanceVersion` answered through it.
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.

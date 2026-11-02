@@ -63,7 +63,42 @@ int wmain(int argc, wchar_t **argv)
                out.MaxSize);
         venus |= out.Id == 4;
     }
-    printf(venus ? "GPU-TEST PASS\n" : "GPU-TEST FAIL no Venus capset\n");
+    if (!venus) {
+        printf("GPU-TEST FAIL no Venus capset\n");
+        return 1;
+    }
+    /* A Venus context: created, an empty stream accepted, an unknown
+     * opcode refused (a stream with no length field cannot step over it),
+     * destroyed. */
+    {
+        ENTANGLED_GPU_CTX_CREATE create = {7, 4};
+        ENTANGLED_GPU_CTX ctx = {7};
+        struct {
+            ENTANGLED_GPU_SUBMIT head;
+            unsigned long words[2];
+        } garbage = {{7, 8}, {4242, 0}};
+        ENTANGLED_GPU_SUBMIT empty = {7, 0};
+        ENTANGLED_GPU_RESPONSE created, accepted, refused, destroyed;
+        if (!DeviceIoControl(dev, IOCTL_ENTANGLED_GPU_CTX_CREATE, &create, sizeof(create),
+                             &created, sizeof(created), &got, NULL) ||
+            !DeviceIoControl(dev, IOCTL_ENTANGLED_GPU_SUBMIT_3D, &empty, sizeof(empty),
+                             &accepted, sizeof(accepted), &got, NULL) ||
+            !DeviceIoControl(dev, IOCTL_ENTANGLED_GPU_SUBMIT_3D, &garbage, sizeof(garbage),
+                             &refused, sizeof(refused), &got, NULL) ||
+            !DeviceIoControl(dev, IOCTL_ENTANGLED_GPU_CTX_DESTROY, &ctx, sizeof(ctx),
+                             &destroyed, sizeof(destroyed), &got, NULL)) {
+            printf("GPU-TEST FAIL context: error %lu\n", GetLastError());
+            return 1;
+        }
+        printf("context create %#lx, empty submit %#lx, unknown opcode %#lx, destroy %#lx\n",
+               created.Type, accepted.Type, refused.Type, destroyed.Type);
+        if (created.Type != 0x1100 || accepted.Type != 0x1100 || refused.Type == 0x1100 ||
+            destroyed.Type != 0x1100) {
+            printf("GPU-TEST FAIL context answers\n");
+            return 1;
+        }
+    }
+    printf("GPU-TEST PASS\n");
     CloseHandle(dev);
-    return venus ? 0 : 1;
+    return 0;
 }
