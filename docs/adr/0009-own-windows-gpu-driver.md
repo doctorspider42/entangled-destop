@@ -87,6 +87,22 @@ Venus renderer this stack talks to.
 | E | Zero-copy present (the guest image shared with the display path instead of copied) | presenting costs no CPU copy per frame |
 | F | Signing | Microsoft attestation signing (EV certificate + Partner Center account), so test-signing mode is not needed |
 
+**Phase A, first slice (2026-11-02):** `guest/windows-gpu/driver` —
+`entangled-gpu.sys` (KMDF 1.15, plain C, built by `build.cmd` with `cl`/`link`
+against the WDK because this machine's build tools have no WDK MSBuild
+toolset; test-signed by `sign.ps1`) brings the render-only function up over
+its own virtio 1.x transport (capabilities, one-bit-at-a-time status, one
+polled split virtqueue) and answers `IOCTL_ENTANGLED_GPU_INFO` and
+`_CAPSET_INFO`. `gpu-test.exe` in the guest prints `GPU-TEST PASS`: features
+`0x100000019` accepted, one capset, Venus (id 4, 160 bytes). Learned on the
+way: the INF needs `MSISupported = 1` (code 12 otherwise, the same `_PRT`
+story as viogpu3d); a Microsoft-signed `viogpudo` outranks our test-signed
+package even with the more specific hardware ID, so `gpu-test install`
+forces it with `UpdateDriverForPlugAndPlayDevices`; and every build needs a
+new `DriverVer` (`stampinf`), or Windows keeps the old binary from its
+driver store. Next in phase A: context create/destroy, blob resources mapped
+into the process, `SUBMIT_3D` and fences.
+
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.
 

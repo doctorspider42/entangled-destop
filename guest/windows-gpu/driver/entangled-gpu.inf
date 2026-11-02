@@ -1,0 +1,65 @@
+; entangled-gpu: the render-only virtio-gpu function (ADR-0009). Not a
+; display driver: class System, so no display stack ever binds it.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Entangled%
+CatalogFile = entangled-gpu.cat
+DriverVer   = 11/02/2026,0.1.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%Entangled% = Entangled, NTamd64
+
+; SUBSYS_00401AF4 is more specific than viogpudo's DEV_1050 match, so this
+; INF outranks it on the render-only function and only there.
+[Entangled.NTamd64]
+%DeviceDesc% = EntangledGpu, PCI\VEN_1AF4&DEV_1050&SUBSYS_00401AF4&REV_01
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+entangled-gpu.sys = 1
+
+[EntangledGpu.NT]
+CopyFiles = EntangledGpu.CopyFiles
+
+[EntangledGpu.CopyFiles]
+entangled-gpu.sys
+
+; MSI: the driver polls and takes no interrupt, but without this the PnP
+; manager asks for a line interrupt, which this machine cannot route (no
+; _PRT), and the function fails with code 12.
+[EntangledGpu.NT.HW]
+AddReg = EntangledGpu.MsiReg
+
+[EntangledGpu.MsiReg]
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 1
+
+[EntangledGpu.NT.Services]
+AddService = EntangledGpu, 0x00000002, EntangledGpu.Service
+
+[EntangledGpu.Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\entangled-gpu.sys
+
+[EntangledGpu.NT.Wdf]
+KmdfService = EntangledGpu, EntangledGpu.KmdfService
+
+[EntangledGpu.KmdfService]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+Entangled   = "Entangled Desktop"
+DeviceDesc  = "Entangled render-only GPU (Venus)"
+ServiceDesc = "Entangled render-only GPU"
+DiskName    = "Entangled GPU driver"
