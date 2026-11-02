@@ -675,7 +675,10 @@ was ours — a D3D11 process binds *imported* shared memory to an image created
 without a handle type, which the executor refused, killing the context; that
 bind is now accepted as the exportable one is — but with it fixed and no Venus
 refusal left in the log the canvas is still empty: the rest is the guest
-driver's. Nothing is downloaded for the user:
+driver's. Nor can the guest be told to prefer Vulkan once and for all:
+`edge://flags/#use-angle` on Edge 156 offers only Default, D3D11 and D3D11
+WARP, so `--use-angle=vulkan` on the command line is the only switch; a D3D11
+path that draws is ADR-0009's (DXVK over our own ICD). Nothing is downloaded for the user:
 the driver is a third party's test-signed alpha, and taking it is their call.
 
 **The user-mode NAT now allows 256 TCP flows, not 64.** A Windows desktop with
