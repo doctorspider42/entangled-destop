@@ -516,6 +516,11 @@ pub const PROTOCOL_EXTENSIONS: &[&str] =
 ///   rasterisation class is not a pipeline change there, `zink_draw.cpp:
 ///   676-733`), so every single-quad fan Cogl draws — a GNOME window — came
 ///   out as its first triangle (ADR-0004, "the scanout tear").
+/// * `VK_KHR_load_store_op_none` — enum values only:
+///   `VK_ATTACHMENT_LOAD_OP_NONE_KHR` (and the store op, core in 1.3) in an
+///   attachment description or a rendering attachment, once enabled. DXVK 3
+///   requires it (`khrLoadStoreOpNone`) and lists no adapter without it
+///   (ADR-0009 phase D).
 pub const ADMITTED_EXTENSIONS: &[&str] = &[
     "VK_EXT_command_serialization",
     "VK_MESA_venus_protocol",
@@ -530,6 +535,7 @@ pub const ADMITTED_EXTENSIONS: &[&str] = &[
     "VK_EXT_transform_feedback",
     "VK_EXT_vertex_attribute_divisor",
     "VK_KHR_line_rasterization",
+    "VK_KHR_load_store_op_none",
     "VK_KHR_robustness2",
     "VK_KHR_vertex_attribute_divisor",
 ];
@@ -1061,6 +1067,9 @@ pub fn admits_link(stype: i32) -> bool {
 #[must_use]
 pub fn admitted_extension_numbers() -> Vec<u32> {
     let mut names: Vec<&str> = PROTOCOL_EXTENSIONS.to_vec();
+    // An admitted extension may bring no structure at all, only enum values
+    // (`VK_KHR_load_store_op_none`); its bit is still owed.
+    names.extend(ADMITTED_EXTENSIONS.iter().copied());
     for s in info::STRUCTURES {
         if admits_link(s.stype) {
             names.extend(s.extensions.iter().copied());
@@ -2524,15 +2533,17 @@ mod tests {
         ] {
             assert!(!numbers.contains(&number), "{name} ({number})");
         }
-        // Every bit is an extension one of whose structures is admitted —
-        // or one of the two protocol extensions — so the mask and the chain
-        // policy are one rule.
+        // Every bit is an extension one of whose structures is admitted, an
+        // admitted extension (some bring only enum values), or one of the
+        // two protocol extensions — so the mask and the chain policy are one
+        // rule.
         for number in &numbers {
             let ext = info::EXTENSIONS
                 .iter()
                 .find(|e| e.number == *number)
                 .expect("a known extension");
             let admitted = PROTOCOL_EXTENSIONS.contains(&ext.name)
+                || ADMITTED_EXTENSIONS.contains(&ext.name)
                 || info::STRUCTURES
                     .iter()
                     .any(|s| admits_link(s.stype) && s.extensions.contains(&ext.name));
@@ -2546,11 +2557,12 @@ mod tests {
             !numbers.contains(&127),
             "VK_EXT_queue_family_foreign chains nothing"
         );
-        assert_eq!(numbers.len(), 74);
+        assert!(numbers.contains(&527), "VK_KHR_load_store_op_none");
+        assert_eq!(numbers.len(), 75);
         let mask = admitted_extension_mask();
         assert!(mask.is_enumerated());
         let set: u32 = mask.words().iter().map(|w| w.count_ones()).sum();
-        assert_eq!(set, 75, "74 extensions and the sentinel");
+        assert_eq!(set, 76, "75 extensions and the sentinel");
         for name in ADMITTED_EXTENSIONS {
             let number = info::extension(name).expect("known").number;
             assert!(mask.is_enabled(number), "{name}'s bit is in the capset");

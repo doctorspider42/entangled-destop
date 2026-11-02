@@ -2083,7 +2083,7 @@ fn t_VkAttachmentDescription(
             "VkAttachmentDescription.samples", v.samples
         )));
     }
-    if !(e_VkAttachmentLoadOp(v.load_op)) {
+    if !(e_VkAttachmentLoadOp(v.load_op) || x_VkAttachmentLoadOp(&*r, v.load_op)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkAttachmentDescription.loadOp", v.load_op
@@ -2095,7 +2095,7 @@ fn t_VkAttachmentDescription(
             "VkAttachmentDescription.storeOp", v.store_op
         )));
     }
-    if !(e_VkAttachmentLoadOp(v.stencil_load_op)) {
+    if !(e_VkAttachmentLoadOp(v.stencil_load_op) || x_VkAttachmentLoadOp(&*r, v.stencil_load_op)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkAttachmentDescription.stencilLoadOp", v.stencil_load_op
@@ -2974,7 +2974,7 @@ fn t_VkAttachmentDescription2(
             "VkAttachmentDescription2.samples", v.samples
         )));
     }
-    if !(e_VkAttachmentLoadOp(v.load_op)) {
+    if !(e_VkAttachmentLoadOp(v.load_op) || x_VkAttachmentLoadOp(&*r, v.load_op)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkAttachmentDescription2.loadOp", v.load_op
@@ -2986,7 +2986,7 @@ fn t_VkAttachmentDescription2(
             "VkAttachmentDescription2.storeOp", v.store_op
         )));
     }
-    if !(e_VkAttachmentLoadOp(v.stencil_load_op)) {
+    if !(e_VkAttachmentLoadOp(v.stencil_load_op) || x_VkAttachmentLoadOp(&*r, v.stencil_load_op)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkAttachmentDescription2.stencilLoadOp", v.stencil_load_op
@@ -3966,7 +3966,7 @@ fn t_VkRenderingAttachmentInfo(
             "VkRenderingAttachmentInfo.resolveImageLayout", v.resolve_image_layout
         )));
     }
-    if !(e_VkAttachmentLoadOp(v.load_op)) {
+    if !(e_VkAttachmentLoadOp(v.load_op) || x_VkAttachmentLoadOp(&*r, v.load_op)) {
         return Err(r.invalid(format!(
             "{} = {:#x} is not a Vulkan 1.3 value",
             "VkRenderingAttachmentInfo.loadOp", v.load_op
@@ -8454,6 +8454,11 @@ pub fn extensions_of(command: &Command<'_>) -> &'static [&'static str] {
         }
         _ => &[],
     }
+}
+
+/// Whether `v` is a `VkAttachmentLoadOp` value an admitted extension the device enabled adds.
+fn x_VkAttachmentLoadOp(r: &dyn Resolve, v: i32) -> bool {
+    r.enabled("VK_KHR_load_store_op_none") && matches!(v, 1000400000)
 }
 
 /// Whether `v` is a `VkDynamicState` value an admitted extension the device enabled adds.

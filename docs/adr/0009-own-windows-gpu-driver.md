@@ -199,9 +199,19 @@ take the first free gap of the shared-memory BAR and give it back
 reused anything, with 16 mappings per handle where Zink keeps dozens. The
 BAR's length is read from its large-memory resource descriptor. With these,
 a killed program frees everything and `vk-smoke` passes 9/9 with 1000
-submits in 156 ms. Next: Zink in the `--gpu3d` package (opengl32.dll beside
-an application, or as the system's OpenGL), then DXVK (D3D9–11) over the same
-ICD.
+submits in 156 ms.
+
+**Phase D, Direct3D (2026-11-02):** DXVK 3.1.1 (zlib, the release's x64
+`d3d11.dll`/`dxgi.dll` beside `d3d11-test.exe`) finds "Virtio-GPU Venus
+(NVIDIA GeForce RTX 2070)" through our ICD and skips it for two required
+extensions. `VK_KHR_load_store_op_none` (enum values only) is now admitted by
+the executor — its capset bit comes from the admitted list, since it brings no
+structure. `VK_KHR_maintenance5` is the one left, the same extension Zink
+wanted: DXVK will not run without it, so the executor must serve it (its
+feature/property structures, `PipelineCreateFlags2`/`BufferUsageFlags2`,
+`vkCmdBindIndexBuffer2`, the subresource-layout and rendering-area queries,
+a shader module chained into a stage, and its new formats). Next: that, then
+Zink and DXVK in the `--gpu3d` package.
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.
