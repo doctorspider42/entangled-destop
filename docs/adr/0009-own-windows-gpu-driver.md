@@ -81,8 +81,8 @@ Venus renderer this stack talks to.
 |---|---|---|
 | A0 | the render-only virtio-gpu function on the host (class `0x0380`, Venus only) — **done 2026-11-02**: `[display] render_node = true`; the PCI bus grew to ten slots (pins 3 and 15) to fit it beside a Windows machine's nine functions | a Windows guest enumerates it beside virtio-vga, whose 3D desktop is unaffected (verified); a Linux guest's Venus on it is not yet tried |
 | A — **done 2026-11-02** | `entangled-gpu.sys` (KMDF, a virtio transport of our own) with context + blob + `SUBMIT_3D` + fence IOCTLs; a test tool | the tool creates a Venus context and round-trips `vkEnumerateInstanceVersion` through the host executor |
-| B | Mesa Venus Windows winsys + registry ICD | `vk-smoke` passes 9/9 on our stack with Yttrium uninstalled |
-| C | Software WSI for `VK_KHR_win32_surface` | `vkcube` spins in a window |
+| B — **done 2026-11-02** | Mesa Venus Windows winsys + registry ICD | `vk-smoke` passes 9/9 on our stack with Yttrium uninstalled |
+| C — **done 2026-11-02** | Software WSI for `VK_KHR_win32_surface` | `vkcube` spins in a window |
 | D | DXVK + Zink in the install (`install windows --gpu3d` with no third-party package) | WebGL Aquarium through ANGLE's D3D11 backend, an OpenGL demo and a D3D11 game run |
 | E | Zero-copy present (the guest image shared with the display path instead of copied) | presenting costs no CPU copy per frame |
 | F | Signing | Microsoft attestation signing (EV certificate + Partner Center account), so test-signing mode is not needed |
@@ -154,8 +154,35 @@ tick), which removed most of it. **Phase C (2026-11-02):** Venus listed no
 own win32 WSI (a CPU blit of the finished image) works on our stack:
 `vk-present` (`guest/windows-gpu/driver`) opens a window, makes a swapchain
 (624×441, 2 images) and presents 300 frames in 0.55 s on our ICD, the host
-logging the `entangled-gpu` context. Next: DXVK and Zink over this ICD
-(phase D), and installing the stack from `install windows`.
+logging the `entangled-gpu` context.
+
+**Installed by `install windows` (2026-11-02):** `--gpu3d DIR` now takes
+either package; a folder with `entangled-gpu.inf` is ours (the driver, its
+`*.cer`, `gpu-test.exe`, `vulkan_virtio.dll` and the LunarG `VulkanRT-*.exe`),
+the profile gets `render_node = true`, and `first-logon.cmd`'s `:owngpu`
+trusts the certificate, turns test-signing on, installs the runtime and the
+driver, and registers the ICD under `HKLM\SOFTWARE\Khronos\Vulkan\Drivers`
+(so elevated programs find it too). Verified on a fresh Windows 10 install:
+`vk-smoke` finds "Virtio-GPU Venus (NVIDIA GeForce RTX 2070)" through the
+registry, no environment variable, Yttrium nowhere. One trap, the same one
+viogpu3d's MSI fell into: the render-only function's device instance follows
+its PCI slot, which moves between the installer's machine (answer discs, no
+network card) and the installed one, and on the new instance Windows picks
+the Microsoft-signed viogpudo. `owngpu-bind.ps1` (a SYSTEM task at startup and
+logon) rebinds ours whenever that happens and restarts once — a device
+swapped live refuses `CreateFile` with access denied until the restart.
+
+**Phase D, OpenGL (2026-11-02):** `guest/windows-gpu/mesa/build-zink.cmd`
+builds Mesa's gallium WGL frontend with Zink only (`opengl32.dll` +
+`libgallium_wgl.dll`, zlib static; `win_flex`/`win_bison` at build time).
+Mesa 26.2's Zink requires `VK_KHR_maintenance5`, which the executor
+deliberately does not advertise (`policy.rs`), so
+`0002-zink-without-maintenance5.patch` makes it optional (two uses: buffer-view
+usage flags, and dropping an unread PointSize). With it `gl-test` (beside the
+DLLs, `GALLIUM_DRIVER=zink`) gets a context whose renderer is "zink Vulkan 1.3
+(NVIDIA GeForce RTX 2070 (MESA_VENUS))" and draws its triangle — then stops
+after the first few frames: not yet found, the guest stays responsive. Next:
+that stall, then DXVK (D3D9–11) over the same ICD.
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.

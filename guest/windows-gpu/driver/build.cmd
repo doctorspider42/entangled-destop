@@ -37,6 +37,9 @@ if errorlevel 1 exit /b 1
 rem The presentation test (phase C), against Mesa's Vulkan headers.
 "%BIN%\cl.exe" /nologo /W3 /O2 /MT %UINC% /I"F:\entangled-targets\mesa\include" /Fo"%OUT%\vk-present.obj" /Fe"%OUT%\vk-present.exe" "%SRC%vk-present.c" /link %ULIB% user32.lib
 if errorlevel 1 exit /b 1
+rem The OpenGL test (phase D), for Mesa's opengl32.dll with Zink.
+"%BIN%\cl.exe" /nologo /W3 /O2 /MT %UINC% /Fo"%OUT%\gl-test.obj" /Fe"%OUT%\gl-test.exe" "%SRC%gl-test.c" /link %ULIB% user32.lib gdi32.lib opengl32.lib
+if errorlevel 1 exit /b 1
 copy /y "%SRC%entangled-gpu.inf" "%OUT%\" >nul
 rem A new DriverVer every build: with the same one, Windows keeps the copy
 rem already in its driver store and the new binary never runs.

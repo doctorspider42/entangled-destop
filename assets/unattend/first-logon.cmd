@@ -40,6 +40,13 @@ rem and this machine has no _PRT for the line-based fallback; gpu3d-msi.ps1
 rem says why it runs at every startup. The installer's
 rem final shutdown is the reboot all of it needs.
 if exist "%disc%\entangled\gpu3d\VirtIOTestCert.cer" call :gpu3d
+rem Or 3D through our own stack (ADR-0009): the certificate and test-signing
+rem again, the Vulkan runtime, entangled-gpu.sys on the render-only function -
+rem gpu-test.exe installs it over the Microsoft-signed display driver, which
+rem outranks a test-signed one - and Mesa's Venus ICD, registered machine-wide
+rem so elevated programs find it too (the loader ignores VK_ICD_FILENAMES
+rem there). Its INF turns MSI on by itself.
+if exist "%disc%\entangled\owngpu\entangled-gpu.inf" call :owngpu
 rem Shared folders over virtio-fs, when the installer was given WinFsp: WinFsp,
 rem then virtio-win's virtiofs service, which mounts the share as a drive.
 if exist "%disc%\entangled\winfsp.msi" call :virtiofs
@@ -65,6 +72,29 @@ rem And at logon: on the first boot after the install the function's new
 rem instance is only enumerated after the startup run.
 schtasks /create /tn "Entangled 3D interrupts at logon" /sc onlogon /ru SYSTEM /rl HIGHEST /tr "powershell -NoProfile -ExecutionPolicy Bypass -File \"%dir%\gpu3d-msi.ps1\" -Reboot" /f >nul
 powershell -NoProfile -ExecutionPolicy Bypass -File "%dir%\gpu3d-msi.ps1"
+call :edge
+exit /b 0
+
+:owngpu
+set "g=%disc%\entangled\owngpu"
+certutil -addstore -f Root "%g%\entangled-gpu.cer" >nul
+certutil -addstore -f TrustedPublisher "%g%\entangled-gpu.cer" >nul
+bcdedit /set testsigning on >nul
+"%g%\VulkanRT-Installer.exe" /S
+mkdir "%dir%\owngpu" 2>nul
+copy /y "%g%\entangled-gpu.*" "%dir%\owngpu\" >nul
+copy /y "%g%\gpu-test.exe" "%dir%\" >nul
+copy /y "%disc%\entangled\owngpu-bind.ps1" "%dir%\" >nul
+rem owngpu-bind.ps1 says why it runs at every startup and logon.
+schtasks /create /tn "Entangled 3D driver" /sc onstart /ru SYSTEM /rl HIGHEST /tr "powershell -NoProfile -ExecutionPolicy Bypass -File \"%dir%\owngpu-bind.ps1\" -Reboot" /f >nul
+schtasks /create /tn "Entangled 3D driver at logon" /sc onlogon /ru SYSTEM /rl HIGHEST /tr "powershell -NoProfile -ExecutionPolicy Bypass -File \"%dir%\owngpu-bind.ps1\" -Reboot" /f >nul
+powershell -NoProfile -ExecutionPolicy Bypass -File "%dir%\owngpu-bind.ps1"
+copy /y "%g%\vulkan_virtio.dll" "%dir%\" >nul
+powershell -NoProfile -Command "$j = Join-Path '%dir%' 'entangled_icd.json'; @{file_format_version='1.0.0'; ICD=@{library_path=(Join-Path '%dir%' 'vulkan_virtio.dll'); api_version='1.3.0'}} | ConvertTo-Json | Set-Content -Encoding ASCII $j; $k = 'HKLM:\SOFTWARE\Khronos\Vulkan\Drivers'; New-Item -Force $k | Out-Null; New-ItemProperty -Force -Path $k -Name $j -PropertyType DWord -Value 0 | Out-Null"
+call :edge
+exit /b 0
+
+:edge
 rem WebGL through ANGLE's Vulkan backend: gpu3d-edge.ps1 says why and where.
 copy /y "%disc%\entangled\gpu3d-edge.ps1" "%dir%\" >nul
 schtasks /create /tn "Entangled 3D browser" /sc onlogon /ru SYSTEM /rl HIGHEST /tr "powershell -NoProfile -ExecutionPolicy Bypass -File \"%dir%\gpu3d-edge.ps1\"" /f >nul

@@ -40,6 +40,9 @@ const FIRST_LOGON: &str = include_str!("../../../assets/unattend/first-logon.cmd
 const GPU3D_MSI: &str = include_str!("../../../assets/unattend/gpu3d-msi.ps1");
 /// The logon task that puts Edge's WebGL on Vulkan (see the script).
 const GPU3D_EDGE: &str = include_str!("../../../assets/unattend/gpu3d-edge.ps1");
+/// Keeps our own render-only driver bound to every instance of its function
+/// (ADR-0009).
+const OWNGPU_BIND: &str = include_str!("../../../assets/unattend/owngpu-bind.ps1");
 
 /// The WIM header's magic.
 const WIM_MAGIC: &[u8; 8] = b"MSWIM\0\0\0";
@@ -288,8 +291,10 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
             // One adapter for the firmware, Setup and the installed system:
             // `BasicDisplay` draws into its VRAM until `viogpudo` binds it.
             adapter: DisplayAdapter::VirtioVga,
-            // viogpu3d (first-logon.cmd) drives Venus beside the VGA function.
+            // Either package drives Venus beside the VGA function; our own
+            // (ADR-0009) needs its render-only function for that.
             venus: args.gpu3d.is_some(),
+            render_node: args.gpu3d.as_deref().is_some_and(is_own_gpu_package),
             refresh_hz: install::installed_refresh_hz_here(args),
             ..Default::default()
         },
@@ -411,8 +416,15 @@ fn answer_disc(
             .map_err(|e| e.to_string())?;
         disc.add_file("entangled/gpu3d-edge.ps1", crlf(GPU3D_EDGE))
             .map_err(|e| e.to_string())?;
-        for (path, data) in gpu3d_files(dir)? {
-            disc.add_file(&format!("entangled/gpu3d/{path}"), data)
+        let (at, files) = if is_own_gpu_package(dir) {
+            disc.add_file("entangled/owngpu-bind.ps1", crlf(OWNGPU_BIND))
+                .map_err(|e| e.to_string())?;
+            ("owngpu", own_gpu_files(dir)?)
+        } else {
+            ("gpu3d", gpu3d_files(dir)?)
+        };
+        for (path, data) in files {
+            disc.add_file(&format!("entangled/{at}/{path}"), data)
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -447,24 +459,15 @@ fn gpu3d_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
             dir.display()
         ));
     }
-    let runtime = std::fs::read_dir(dir)
-        .map_err(|e| format!("--gpu3d: cannot list {}: {e}", dir.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    let name = name.to_ascii_lowercase();
-                    name.starts_with("vulkanrt") && name.ends_with(".exe")
-                })
-        })
-        .ok_or_else(|| {
-            format!(
-                "--gpu3d: no Vulkan runtime installer (VulkanRT-*.exe from LunarG) in {}",
-                dir.display()
-            )
-        })?;
+    let runtime = find_file(dir, |name| {
+        name.starts_with("vulkanrt") && name.ends_with(".exe")
+    })?
+    .ok_or_else(|| {
+        format!(
+            "--gpu3d: no Vulkan runtime installer (VulkanRT-*.exe from LunarG) in {}",
+            dir.display()
+        )
+    })?;
     let mut files = vec![
         ("VirtIOTestCert.cer".to_owned(), read(&cert)?),
         ("VulkanRT-Installer.exe".to_owned(), read(&runtime)?),
@@ -484,6 +487,63 @@ fn gpu3d_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
                 files.push((format!("{prefix}/{name}"), read(&path)?));
             }
         }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Whether `--gpu3d` names Entangled's own package (ADR-0009) rather than
+/// Yttrium's.
+fn is_own_gpu_package(dir: &Path) -> bool {
+    dir.join("entangled-gpu.inf").is_file()
+}
+
+/// The first file in `dir` whose lower-cased name `wanted` accepts.
+fn find_file(dir: &Path, wanted: impl Fn(&str) -> bool) -> Result<Option<PathBuf>, String> {
+    Ok(std::fs::read_dir(dir)
+        .map_err(|e| format!("--gpu3d: cannot list {}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| wanted(&name.to_ascii_lowercase()))
+        }))
+}
+
+/// Our own package's files (ADR-0009), as the answer disc carries them under
+/// `entangled/owngpu/`: the kernel driver, its test certificate (renamed
+/// `entangled-gpu.cer`), the tool that installs it over the Microsoft-signed
+/// display driver, Mesa's Venus ICD and the Vulkan runtime installer.
+fn own_gpu_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|e| format!("--gpu3d: cannot read {}: {e}", path.display()))
+    };
+    let missing = |what: &str| format!("--gpu3d: {} has no {what}", dir.display());
+    let cert = find_file(dir, |name| name.ends_with(".cer"))?
+        .ok_or_else(|| missing("test certificate (*.cer)"))?;
+    let runtime = find_file(dir, |name| {
+        name.starts_with("vulkanrt") && name.ends_with(".exe")
+    })?
+    .ok_or_else(|| missing("Vulkan runtime installer (VulkanRT-*.exe from LunarG)"))?;
+    let mut files = vec![
+        ("entangled-gpu.cer".to_owned(), read(&cert)?),
+        ("VulkanRT-Installer.exe".to_owned(), read(&runtime)?),
+    ];
+    for name in [
+        "entangled-gpu.inf",
+        "entangled-gpu.sys",
+        "entangled-gpu.cat",
+        "gpu-test.exe",
+        "vulkan_virtio.dll",
+    ] {
+        let path = dir.join(name);
+        if !path.is_file() {
+            return Err(missing(name));
+        }
+        files.push((name.to_owned(), read(&path)?));
     }
     files.sort();
     Ok(files)
@@ -1059,6 +1119,48 @@ mod tests {
                 "VulkanRT-Installer.exe",
                 "Win10/amd64/viogpu3d.inf",
                 "Win10/amd64/x64/opengl32_x64.dll",
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn our_own_gpu_package_is_recognised_and_checked() {
+        let dir = std::env::temp_dir().join(format!("entangled-owngpu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!is_own_gpu_package(&dir));
+        std::fs::write(dir.join("entangled-gpu.inf"), b"inf").unwrap();
+        assert!(is_own_gpu_package(&dir));
+        let refused = own_gpu_files(&dir).unwrap_err();
+        assert!(refused.contains("certificate"), "{refused}");
+        std::fs::write(dir.join("entangled-gpu-test.cer"), b"cer").unwrap();
+        std::fs::write(dir.join("VulkanRT-1.4.363.0-Installer.exe"), b"exe").unwrap();
+        let refused = own_gpu_files(&dir).unwrap_err();
+        assert!(refused.contains("entangled-gpu.sys"), "{refused}");
+        for name in [
+            "entangled-gpu.sys",
+            "entangled-gpu.cat",
+            "gpu-test.exe",
+            "vulkan_virtio.dll",
+            "vk-smoke.exe",
+        ] {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+        let names: Vec<String> = own_gpu_files(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "VulkanRT-Installer.exe",
+                "entangled-gpu.cat",
+                "entangled-gpu.cer",
+                "entangled-gpu.inf",
+                "entangled-gpu.sys",
+                "gpu-test.exe",
+                "vulkan_virtio.dll",
             ]
         );
         std::fs::remove_dir_all(&dir).unwrap();
