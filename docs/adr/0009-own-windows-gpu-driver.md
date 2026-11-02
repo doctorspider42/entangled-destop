@@ -125,8 +125,14 @@ installed through scoop since 2026-11-02). With it, Mesa's own `util` stops
 first: under `clang-cl` it takes the MSVC atomics path and calls
 `_interlockedexchange64`, which clang does not declare there. Mesa on Windows
 with this driver is a port of its own — what mesa!24223 (the Windows Venus
-work Yttrium builds on) carries — and is phase B's first real task: start
-from that merge request's patches rather than from upstream alone.
+work Yttrium builds on) carries — and is phase B's first real task. It turned out small:
+`guest/windows-gpu/mesa/0001-venus-builds-with-clang-cl.patch` (Clang takes the
+GCC atomics path; `pid_t`, `windows.h` and `sync_file` stubs for Windows; vtn
+linked) and `build.cmd` build the whole Venus driver with clang-cl, and the
+link stops at exactly one symbol — `vn_renderer_create_vtest`, the renderer
+backend, which on Windows is ours to write over `entangled-gpu.sys`'s IOCTLs.
+That backend (capset data, contexts, blobs created and mapped, `SUBMIT_3D`
+with ring-index fences, waits) is the rest of phase B.
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.

@@ -1,0 +1,58 @@
+diff --git a/src/util/u_atomic.h b/src/util/u_atomic.h
+index 9f79113..730c41c 100644
+--- a/src/util/u_atomic.h
++++ b/src/util/u_atomic.h
+@@ -22,9 +22,9 @@
+  */
+ #if defined(__sun)
+ #define PIPE_ATOMIC_OS_SOLARIS
+-#elif defined(_MSC_VER)
++#elif defined(_MSC_VER) && !defined(__clang__)
+ #define PIPE_ATOMIC_MSVC_INTRINSIC
+-#elif defined(__GNUC__)
++#elif defined(__GNUC__) || defined(__clang__)
+ #define PIPE_ATOMIC_GCC_INTRINSIC
+ #else
+ #error "Unsupported platform"
+diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
+index fda382d..79f5643 100644
+--- a/src/virtio/vulkan/meson.build
++++ b/src/virtio/vulkan/meson.build
+@@ -124,6 +124,9 @@ vn_libs = []
+ 
+ if not with_platform_windows
+   libvn_files += files('vn_renderer_vtest.c')
++else
++  # The lite runtime's pipeline code calls into vtn on Windows too.
++  vn_deps += idep_vtn
+ endif
+ 
+ if system_has_kms_drm
+diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
+index 86235f6..cb97805 100644
+--- a/src/virtio/vulkan/vn_common.h
++++ b/src/virtio/vulkan/vn_common.h
+@@ -32,6 +32,23 @@
+ #include "util/perf/cpu_trace.h"
+ #include "util/simple_mtx.h"
+ #include "util/u_atomic.h"
++
++#if DETECT_OS_WINDOWS
++#include <windows.h>
++typedef int pid_t;
++/* No sync_file on Windows: nothing hands this driver a sync fd there. */
++static inline int sync_wait(int fd, int timeout)
++{
++   (void)fd;
++   (void)timeout;
++   return -1;
++}
++static inline bool sync_valid_fd(int fd)
++{
++   (void)fd;
++   return false;
++}
++#endif
+ #include "util/u_math.h"
+ #include "util/u_memset.h"
+ #include "util/u_thread.h"
