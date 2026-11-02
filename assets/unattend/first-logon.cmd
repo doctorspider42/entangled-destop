@@ -56,4 +56,8 @@ rem And at logon: on the first boot after the install the function's new
 rem instance is only enumerated after the startup run.
 schtasks /create /tn "Entangled 3D interrupts at logon" /sc onlogon /ru SYSTEM /rl HIGHEST /tr "powershell -NoProfile -ExecutionPolicy Bypass -File \"%dir%\gpu3d-msi.ps1\" -Reboot" /f >nul
 powershell -NoProfile -ExecutionPolicy Bypass -File "%dir%\gpu3d-msi.ps1"
+rem WebGL through ANGLE's Vulkan backend: gpu3d-edge.ps1 says why and where.
+copy /y "%disc%\entangled\gpu3d-edge.ps1" "%dir%\" >nul
+schtasks /create /tn "Entangled 3D browser" /sc onlogon /ru SYSTEM /rl HIGHEST /tr "powershell -NoProfile -ExecutionPolicy Bypass -File \"%dir%\gpu3d-edge.ps1\"" /f >nul
+powershell -NoProfile -ExecutionPolicy Bypass -File "%dir%\gpu3d-edge.ps1"
 exit /b 0

@@ -38,6 +38,8 @@ const TEMPLATE: &str = include_str!("../../../assets/unattend/windows.xml");
 const FIRST_LOGON: &str = include_str!("../../../assets/unattend/first-logon.cmd");
 /// The startup task that keeps the 3D function on MSI (see the script).
 const GPU3D_MSI: &str = include_str!("../../../assets/unattend/gpu3d-msi.ps1");
+/// The logon task that puts Edge's WebGL on Vulkan (see the script).
+const GPU3D_EDGE: &str = include_str!("../../../assets/unattend/gpu3d-edge.ps1");
 
 /// The WIM header's magic.
 const WIM_MAGIC: &[u8; 8] = b"MSWIM\0\0\0";
@@ -390,6 +392,8 @@ fn answer_disc(
     }
     if let Some(dir) = gpu3d {
         disc.add_file("entangled/gpu3d-msi.ps1", crlf(GPU3D_MSI))
+            .map_err(|e| e.to_string())?;
+        disc.add_file("entangled/gpu3d-edge.ps1", crlf(GPU3D_EDGE))
             .map_err(|e| e.to_string())?;
         for (path, data) in gpu3d_files(dir)? {
             disc.add_file(&format!("entangled/gpu3d/{path}"), data)

@@ -677,8 +677,13 @@ bind is now accepted as the exportable one is — but with it fixed and no Venus
 refusal left in the log the canvas is still empty: the rest is the guest
 driver's. Nor can the guest be told to prefer Vulkan once and for all:
 `edge://flags/#use-angle` on Edge 156 offers only Default, D3D11 and D3D11
-WARP, so `--use-angle=vulkan` on the command line is the only switch; a D3D11
-path that draws is ADR-0009's (DXVK over our own ICD). Nothing is downloaded for the user:
+WARP, so `--use-angle=vulkan` on the command line is the only switch — and
+`install windows --gpu3d` now puts it there: `gpu3d-edge.ps1`, a logon task as
+SYSTEM, adds it to every Edge shortcut (public and per-user desktop, Start,
+taskbar pins) and to the `MSEdgeHTM`/`MSEdgePDF` open commands, again at every
+logon because Edge's updates rewrite them. Verified on a fresh install: Edge
+started from its desktop shortcut runs the WebGL Aquarium with no switch
+typed. A D3D11 path that draws is ADR-0009's (DXVK over our own ICD). Nothing is downloaded for the user:
 the driver is a third party's test-signed alpha, and taking it is their call.
 
 **The user-mode NAT now allows 256 TCP flows, not 64.** A Windows desktop with
