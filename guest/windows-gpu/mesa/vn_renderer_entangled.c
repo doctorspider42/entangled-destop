@@ -184,6 +184,9 @@ entangled_shmem_create(struct vn_renderer *renderer, size_t size)
    const bool ok = ioctl(gpu, IOCTL_ENTANGLED_GPU_BLOB_CREATE, &in, sizeof(in),
                          &out, sizeof(out));
    ReleaseSRWLockExclusive(&gpu->lock);
+   if (trace_on())
+      fprintf(stderr, "entangled: shmem %u size %zu ->%s\n", in.ResourceId,
+              size, ok && out.Address ? "" : " failed");
    if (!ok || !out.Address) {
       free(shmem);
       return NULL;
@@ -204,6 +207,8 @@ entangled_release(struct entangled *gpu, uint32_t res_id)
    ioctl(gpu, IOCTL_ENTANGLED_GPU_BLOB_DESTROY, &ref, sizeof(ref), &resp,
          sizeof(resp));
    ReleaseSRWLockExclusive(&gpu->lock);
+   if (trace_on())
+      fprintf(stderr, "entangled: release %u\n", res_id);
 }
 
 static void
@@ -244,6 +249,10 @@ entangled_bo_create_from_device_memory(
                          &out, sizeof(out));
    ReleaseSRWLockExclusive(&gpu->lock);
    const bool mappable = flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+   if (trace_on())
+      fprintf(stderr, "entangled: bo %u size %llu flags 0x%x ->%s 0x%x\n",
+              in.ResourceId, (unsigned long long)in.Size, flags,
+              ok && (!mappable || out.Address) ? "" : " failed", out.Response);
    if (!ok || (mappable && !out.Address)) {
       free(bo);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -396,6 +405,11 @@ vn_renderer_create_entangled(struct vn_instance *instance,
                                      VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
    if (!gpu)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   /* Venus's asynchronous present (a thread of its own, vn_wsi.c) stalls on
+    * this backend after a few to a few dozen frames - Zink's every
+    * SwapBuffers goes through it - with no sync waited on and the host
+    * idle. Presenting on the caller's thread draws every frame. */
+   vn_env.perf |= VN_PERF_NO_ASYNC_PRESENT;
    InitializeSRWLock(&gpu->lock);
    gpu->alloc = alloc;
    gpu->next_res = 0x10000;

@@ -180,13 +180,15 @@ deliberately does not advertise (`policy.rs`), so
 `0002-zink-without-maintenance5.patch` makes it optional (two uses: buffer-view
 usage flags, and dropping an unread PointSize). With it `gl-test` (beside the
 DLLs, `GALLIUM_DRIVER=zink`) gets a context whose renderer is "zink Vulkan 1.3
-(NVIDIA GeForce RTX 2070 (MESA_VENUS))" and draws its triangle — then stops
-after some frames (2 to ~90 across runs): not yet found, the guest stays
-responsive, the host is idle and our winsys is not waiting on a sync
-(`ENTANGLED_GPU_TRACE=1` prints every submit and every wait that blocks); while
-it is stuck a second Vulkan program gets `VK_ERROR_OUT_OF_HOST_MEMORY`, which
-points at an allocation budget being exhausted. Killing it frees everything
-and `vk-smoke` then passes 9/9, 1000 submits in 156 ms.
+(NVIDIA GeForce RTX 2070 (MESA_VENUS))", OpenGL 4.6 compatibility profile.
+It first stalled after 2 to ~90 frames, the host idle and no sync waited on
+(`ENTANGLED_GPU_TRACE=1` prints every submit, blob and blocking wait; blobs
+did not leak). The stall is Venus's asynchronous present (its own thread,
+`vn_wsi.c`): `VN_PERF=no_async_present` alone cures it, so our backend now
+sets it. **Verified 2026-11-02:** `gl-test` passes, 300 frames at ~51 fps,
+twice in a row, and `vk-present` 300 frames at 1177 fps, no environment
+variable. Still open: a second Vulkan program started while Zink runs got
+`VK_ERROR_OUT_OF_HOST_MEMORY` (seen with the stalled build; not retried).
 
 Driver fixes found on the way: every process now has a Venus context of its
 own (the winsys derives the id from its PID; it was a fixed 1, so a second
@@ -195,8 +197,11 @@ included — destroys its context and releases its blobs on the host. Blobs
 take the first free gap of the shared-memory BAR and give it back
 (`RESOURCE_UNMAP_BLOB`, then unref); it was a bump allocator that never
 reused anything, with 16 mappings per handle where Zink keeps dozens. The
-BAR's length is read from its large-memory resource descriptor. Next: the
-Zink stall, then DXVK (D3D9–11) over the same ICD.
+BAR's length is read from its large-memory resource descriptor. With these,
+a killed program frees everything and `vk-smoke` passes 9/9 with 1000
+submits in 156 ms. Next: Zink in the `--gpu3d` package (opengl32.dll beside
+an application, or as the system's OpenGL), then DXVK (D3D9–11) over the same
+ICD.
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.
