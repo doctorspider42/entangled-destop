@@ -235,6 +235,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             virgl_isolation: control_api::VirglIsolation::default(),
             venus: false,
             venus_checkpoints: false,
+            render_node: false,
             refresh_hz: control_api::DEFAULT_REFRESH_HZ,
             frame_stats: None,
             host_visible_mib: None,

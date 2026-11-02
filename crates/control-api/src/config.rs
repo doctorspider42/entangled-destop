@@ -732,6 +732,13 @@ pub struct DisplaySection {
     /// Ignored for other renderers. Unsupported GPU states still refuse safely.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub venus_checkpoints: bool,
+    /// A second virtio-gpu function, render-only (ADR-0009 phase A0): Venus
+    /// and its shared-memory BAR, no scanout shown anywhere, PCI class
+    /// `0x0380` and subsystem `0x40`, so a guest driver of its own can own it
+    /// while the first function stays the display's. Needs `venus = true`.
+    /// Not written when off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub render_node: bool,
     /// The refresh rate the virtual monitor's EDID advertises, in Hz
     /// (GAME-2105).
     ///
@@ -854,6 +861,7 @@ impl Default for DisplaySection {
             virgl_isolation: VirglIsolation::default(),
             venus: false,
             venus_checkpoints: false,
+            render_node: false,
             refresh_hz: DEFAULT_REFRESH_HZ,
             frame_stats: None,
             host_visible_mib: None,
@@ -1299,6 +1307,12 @@ impl VmConfig {
                 ));
             }
         }
+        if self.display.render_node && !self.display.venus {
+            return err(
+                "display.render_node = true adds a second, render-only Venus function, but                  this machine has no Venus renderer; set venus = true or drop render_node"
+                    .into(),
+            );
+        }
         if self.display.gpu_boost == Some(true) && !self.display.venus {
             return err(
                 "display.gpu_boost = true asks the host GPU driver for its clocks while the \
@@ -1712,6 +1726,26 @@ scale = 1.0
         );
         let typo = format!("{BACKLOG_EXAMPLE}venus = true\ngpu_boost = \"max\"\n");
         assert!(VmConfig::from_toml(&typo).is_err(), "a boolean, not a word");
+    }
+
+    /// `[display] render_node` (ADR-0009 phase A0): only beside Venus, and
+    /// never written while off.
+    #[test]
+    fn render_node_needs_venus_and_is_not_written_when_off() {
+        let lonely = format!(
+            "{BACKLOG_EXAMPLE}render_node = true
+"
+        );
+        let error = VmConfig::from_toml(&lonely).expect_err("no Venus to render with");
+        assert!(error.to_string().contains("render_node"), "{error}");
+        let with = format!(
+            "{BACKLOG_EXAMPLE}venus = true
+render_node = true
+"
+        );
+        assert!(VmConfig::from_toml(&with).unwrap().display.render_node);
+        let off = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
+        assert!(!toml::to_string(&off).unwrap().contains("render_node"));
     }
 
     /// `[display] venus`: off unless asked for, never written while off (an

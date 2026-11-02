@@ -47,7 +47,9 @@ desktop (DWM) ──► viogpudo (display-only, as today) ──► virtio-vga s
    host therefore adds a second virtio-gpu device with no scanout, Venus
    capset and shared-memory BAR only, as PCI class `0x0380` (display, other)
    with its own subsystem ID, so Windows matches our INF to it and never
-   offers it to a display driver. The executor serves it exactly as it
+   offers it to a display driver. (Measured: `viogpudo`'s INF matches any
+   `DEV_1050` and takes the function until a driver with a more specific
+   hardware ID, `SUBSYS_00401AF4`, outranks it — ours must name it.) The executor serves it exactly as it
    serves the virtio-vga function's contexts today; the host change is a
    `[display] render_node = true` switch and a second `attach`.
 1. **`entangled-gpu.sys`, a KMDF driver, not a WDDM one,** bound to that
@@ -77,7 +79,7 @@ Venus renderer this stack talks to.
 
 | Phase | Deliverable | Done when |
 |---|---|---|
-| A0 | the render-only virtio-gpu function on the host (class `0x0380`, Venus only) | a Linux guest's Venus runs on it beside virtio-vga |
+| A0 | the render-only virtio-gpu function on the host (class `0x0380`, Venus only) — **done 2026-11-02**: `[display] render_node = true`; the PCI bus grew to ten slots (pins 3 and 15) to fit it beside a Windows machine's nine functions | a Windows guest enumerates it beside virtio-vga, whose 3D desktop is unaffected (verified); a Linux guest's Venus on it is not yet tried |
 | A | `entangled-gpu.sys` (KMDF, virtio-win's BSD `VirtioLib` for the transport) with context + blob + `SUBMIT_3D` + fence IOCTLs; a test tool | the tool creates a Venus context and round-trips `vkEnumerateInstanceVersion` through the host executor |
 | B | Mesa Venus Windows winsys + registry ICD | `vk-smoke` passes 9/9 on our stack with Yttrium uninstalled |
 | C | Software WSI for `VK_KHR_win32_surface` | `vkcube` spins in a window |

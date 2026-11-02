@@ -271,9 +271,9 @@ pub const PCI_MMIO_SLOT_SIZE: u64 = 0x8000;
 
 /// How many PCI devices the initial assignment covers. Matches
 /// `crate::pci::MAX_PCI_DEVICES`.
-pub const PCI_MMIO_SLOTS: u64 = 8;
+pub const PCI_MMIO_SLOTS: u64 = 10;
 
-/// One past the end of the *initial* BAR assignment — 8 slots, 256 KiB.
+/// One past the end of the *initial* BAR assignment — 10 slots, 320 KiB.
 ///
 /// Not the same thing as [`PCI_MMIO_END`]: this is where the host's own slots
 /// stop, and it is what `pci_bar_slot` is bounded by.
@@ -528,13 +528,16 @@ pub const VIRTIO_MMIO_FIRST_IRQ: u32 = VIRTIO_IRQS[0];
 /// inherited pin 8, and let both input devices bind: the fault followed the pin,
 /// not the device.
 ///
-/// 6 (floppy), 7 (LPT), 12 (PS/2 aux) and 14 (IDE) are safe here because this
-/// machine emulates none of those controllers, and the FADT's `IAPC_BOOT_ARCH`
-/// already tells the guest so (`LEGACY_DEVICES` and `8042` both clear). 4 is the
-/// UART, 0/1/2 are the timer, keyboard and cascade.
+/// 6 (floppy), 7 (LPT), 12 (PS/2 aux), 14 and 15 (IDE) and 3 (COM2) are safe
+/// here because this machine emulates none of those devices: the 8042
+/// (`crate::i8042`) has a keyboard and no mouse, so it never raises 12, and
+/// the DSDT declares no PS/2 mouse. 4 is the UART, 0/1/2 are the timer,
+/// keyboard and cascade.
 ///
-/// Eight entries, matching `virtio::MAX_VIRTIO_SLOTS` and [`PCI_MMIO_SLOTS`].
-pub const VIRTIO_IRQS: [u32; PCI_MMIO_SLOTS as usize] = [5, 6, 7, 9, 10, 11, 12, 14];
+/// The first eight are the virtio-mmio slots' (`virtio::MAX_VIRTIO_SLOTS`);
+/// 3 and 15 were added for the PCI bus, whose Windows machines carry more
+/// functions (ADR-0009's render-only GPU among them).
+pub const VIRTIO_IRQS: [u32; PCI_MMIO_SLOTS as usize] = [5, 6, 7, 9, 10, 11, 12, 14, 3, 15];
 
 /// The IOAPIC pin for virtio slot `n`, or `None` when there is no such slot.
 pub const fn virtio_irq(n: usize) -> Option<u32> {

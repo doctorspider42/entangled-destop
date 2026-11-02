@@ -267,6 +267,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             // host Vulkan device to install onto a disk.
             venus: false,
             venus_checkpoints: false,
+            render_node: false,
             refresh_hz: control_api::DEFAULT_REFRESH_HZ,
             frame_stats: None,
             host_visible_mib: None,

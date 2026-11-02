@@ -689,7 +689,8 @@ fn build_devices(
         // `[display] gpu_memory_mib`: the device-local memory every context
         // together may allocate per heap; absent, three quarters of each
         // (ADR-0004, the resource-exhaustion amendment).
-        let sinks = virtio_gpu::ExecutorFactory::new(Arc::new(host))
+        let host = Arc::new(host);
+        let sinks = virtio_gpu::ExecutorFactory::new(Arc::clone(&host))
             .with_gpu_memory(cfg.display.gpu_memory_mib.map(|mib| u64::from(mib) << 20));
         let renderer = virtio_gpu::VenusRenderer::new(sinks)
             .with_host_visible_bytes(venus_host_visible_bytes(&cfg.display));
@@ -712,6 +713,19 @@ fn build_devices(
             gpu_scanout = Some(gpu.scanout_flag());
         }
         devices.push(Box::new(gpu));
+        // ADR-0009 phase A0: a second, render-only function. Its own
+        // executor over the same host Vulkan, and a display nothing shows.
+        if cfg.display.render_node {
+            let sinks = virtio_gpu::ExecutorFactory::new(Arc::clone(&host))
+                .with_gpu_memory(cfg.display.gpu_memory_mib.map(|mib| u64::from(mib) << 20));
+            let renderer = virtio_gpu::VenusRenderer::new(sinks)
+                .with_host_visible_bytes(venus_host_visible_bytes(&cfg.display));
+            let detached = display::DisplayHandle::detached(cfg.display.width, cfg.display.height)
+                .map_err(|e| format!("cannot make the render-only function's display: {e}"))?;
+            let render = virtio_gpu::GpuDevice::with_renderer(detached, Box::new(renderer));
+            tracing::info!("attaching a render-only Venus function (ADR-0009 phase A0)");
+            devices.push(Box::new(render));
+        }
     } else if plan == GpuPlan::Virgl {
         #[cfg(target_os = "linux")]
         {
