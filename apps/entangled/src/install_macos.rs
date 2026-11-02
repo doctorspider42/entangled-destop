@@ -135,6 +135,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
                 tag: "entangled".into(),
                 path: stage.clone(),
                 read_only: true,
+                virtiofs: false,
             });
             installer.boot.cmdline.push_str(&format!(
                 " init=/bin/sh -- -c \"mkdir -p /run/entangled; modprobe 9pnet_virtio; mount -t 9p -o trans=virtio,version=9p2000.L,ro entangled /run/entangled; /bin/sh /run/entangled/provision-desktop.sh {} {} {} {} {}; /sbin/poweroff -f\"",

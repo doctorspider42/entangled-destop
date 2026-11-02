@@ -24,6 +24,9 @@ pub enum DeviceType {
     Gpu = 16,
     Input = 18,
     Sound = 25,
+    /// virtio-fs: a shared host directory over FUSE (the Windows guest's
+    /// shared folders, through virtio-win's `viofs` and WinFsp).
+    Fs = 26,
 }
 
 impl DeviceType {

@@ -690,6 +690,24 @@ the driver is a third party's test-signed alpha, and taking it is their call.
 a browser open sat at 64 for hours (telemetry, the store, the news feed) and
 every new connection was refused.
 
+### Amendment, 2026-11-02: shared folders over virtio-fs (host side)
+
+Windows has no 9P client; it mounts virtio-fs, through virtio-win's `viofs`
+driver and `virtiofs.exe` on top of WinFsp. `[[share]] virtiofs = true`
+attaches the share as a virtio-fs device (type 26: a hiprio and one request
+queue, a 36-byte tag in the config space) instead of virtio-9p.
+`virtio_9p::FsDevice` serves FUSE by **translating it to 9P2000.L** for the
+file server the crate already has (`fuse.rs`): a FUSE node is a walked fid, an
+open file a cloned fid after `Tlopen`, a reply the 9P answer re-encoded — so
+every rule that keeps a guest inside its share (single-component names, no
+symlink followed, bounded tables, read-only) stays in one tested place, and no
+host call happens in the translation. Served: INIT, LOOKUP, FORGET,
+BATCH_FORGET, GETATTR, SETATTR, OPEN(DIR), READ, WRITE, READDIR, RELEASE(DIR),
+FLUSH, ACCESS, FSYNC(DIR), STATFS, MKDIR, CREATE, UNLINK, RMDIR, RENAME(2);
+anything else is `-ENOSYS`. Unit-tested (lookup, read, write, listing, `..` at
+the root staying there). **Not yet tried in a guest:** the Windows side needs
+WinFsp installed in the guest, a download not yet made.
+
 ### Amendment, 2026-10-31: the shared clipboard
 
 Text, both ways, through a guest agent of our own. `guest_agent = true` puts

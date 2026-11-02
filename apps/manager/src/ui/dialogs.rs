@@ -1845,6 +1845,7 @@ fn edit_storage(ui: &mut egui::Ui, form: &mut crate::editor::EditForm, actions: 
                 path,
                 tag,
                 read_only: false,
+                virtiofs: false,
             });
             form.add_share.clear();
         }

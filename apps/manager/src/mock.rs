@@ -38,6 +38,7 @@ pub fn scan() -> Scan {
                 path: root.join("projects"),
                 tag: "projects".into(),
                 read_only: false,
+                virtiofs: false,
             }],
             forwards: ["2222:22", "0.0.0.0:8080:80"]
                 .iter()

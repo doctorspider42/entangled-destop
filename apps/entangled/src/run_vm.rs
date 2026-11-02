@@ -895,14 +895,18 @@ fn build_devices(
                 share.tag
             )
         })?;
-        let device = virtio_9p::NinePDevice::new(&share.tag, server)?;
         tracing::info!(
             path = %share.path.display(),
             tag = %share.tag,
             read_only = share.read_only,
-            "attaching virtio-9p shared folder"
+            protocol = if share.virtiofs { "virtio-fs" } else { "virtio-9p" },
+            "attaching a shared folder"
         );
-        devices.push(Box::new(device));
+        if share.virtiofs {
+            devices.push(Box::new(virtio_9p::FsDevice::new(&share.tag, server)?));
+        } else {
+            devices.push(Box::new(virtio_9p::NinePDevice::new(&share.tag, server)?));
+        }
     }
 
     // The balloon, for free page reporting only — and only when asked: it

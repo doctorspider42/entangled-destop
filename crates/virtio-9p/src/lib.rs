@@ -13,8 +13,11 @@
 //! mode bits).
 
 pub mod device;
+pub mod fs_device;
+pub mod fuse;
 pub mod server;
 pub mod wire;
 
 pub use device::{valid_tag, NinePDevice, MAX_TAG_LEN};
+pub use fs_device::FsDevice;
 pub use server::Server;

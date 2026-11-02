@@ -206,7 +206,7 @@ fn gather(mem: &GuestMem, readable: &[Segment]) -> Result<Vec<u8>, u32> {
 
 /// Writes `reply` over the device-writable half in order; returns the bytes
 /// written (short only if a buffer turned out not to be guest memory).
-fn scatter(mem: &GuestMem, writable: &[Segment], reply: &[u8]) -> u32 {
+pub(crate) fn scatter(mem: &GuestMem, writable: &[Segment], reply: &[u8]) -> u32 {
     let mut done = 0usize;
     for seg in writable {
         if done == reply.len() {

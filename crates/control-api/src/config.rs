@@ -184,6 +184,10 @@ pub struct ShareSection {
     /// The guest may read but never change anything.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub read_only: bool,
+    /// Served as virtio-fs (FUSE) instead of virtio-9p: what a Windows guest
+    /// mounts, through virtio-win's `viofs` and WinFsp. Not written when off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub virtiofs: bool,
 }
 
 /// Shared folders one machine may have.
@@ -2528,6 +2532,7 @@ path = "/home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-desktop-amd64.iso"
                 path: PathBuf::from("/srv/x"),
                 tag: format!("s{}", cfg.shares.len()),
                 read_only: false,
+                virtiofs: false,
             });
         }
         let error =
