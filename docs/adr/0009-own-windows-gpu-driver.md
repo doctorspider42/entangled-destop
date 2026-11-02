@@ -120,8 +120,13 @@ WSI is already in its Venus driver; only the renderer backend is missing —
 ours would sit beside `vn_renderer_virtgpu.c` and `vn_renderer_vtest.c`). It
 does not compile with MSVC, though: C11 atomics need `/experimental:c11atomics`,
 and past that the driver is GNU C — arithmetic on `void *`, variable-length
-arrays, `gettid`. The build needs `clang-cl` (LLVM for Windows), which this
-machine does not have yet.
+arrays, `gettid`. The build needs `clang-cl` (LLVM for Windows; LLVM 23.1.4 is
+installed through scoop since 2026-11-02). With it, Mesa's own `util` stops
+first: under `clang-cl` it takes the MSVC atomics path and calls
+`_interlockedexchange64`, which clang does not declare there. Mesa on Windows
+with this driver is a port of its own — what mesa!24223 (the Windows Venus
+work Yttrium builds on) carries — and is phase B's first real task: start
+from that merge request's patches rather than from upstream alone.
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.
