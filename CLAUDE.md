@@ -29,6 +29,9 @@ state a resumed guest would notice missing),
 what Windows guests need beyond what Linux tolerates — GOP framebuffer,
 Hyper-V enlightenments, ACPI/MSR gaps, the virtio-win unattended install —
 read before adding a guest-family switch or a legacy platform device).
+[docs/adr/0009-own-windows-gpu-driver.md](docs/adr/0009-own-windows-gpu-driver.md)
+(proposed: replacing the third-party viogpu3d with our own KMDF driver, a Mesa
+Venus winsys for Windows, and DXVK/Zink on top).
 
 ## Build and test
 
