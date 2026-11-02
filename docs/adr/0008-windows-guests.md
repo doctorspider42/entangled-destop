@@ -670,8 +670,12 @@ left the function at code 12 with MSI already set), so a change restarts the
 machine: the first boot after the install restarts once, by itself. Validated on a fresh install: the
 desktop composites on the GPU and Edge runs the WebGL Aquarium (500 fish,
 46 fps). WebGL needs `msedge --use-angle=vulkan`: through ANGLE's default
-D3D11 backend the alpha D3D10 UMD clears but draws no geometry, with no Venus
-refusal in the log — a guest-driver gap, not ours. Nothing is downloaded for the user:
+D3D11 backend the alpha D3D10 UMD clears but draws no geometry. One cause
+was ours — a D3D11 process binds *imported* shared memory to an image created
+without a handle type, which the executor refused, killing the context; that
+bind is now accepted as the exportable one is — but with it fixed and no Venus
+refusal left in the log the canvas is still empty: the rest is the guest
+driver's. Nothing is downloaded for the user:
 the driver is a third party's test-signed alpha, and taking it is their call.
 
 **The user-mode NAT now allows 256 TCP flows, not 64.** A Windows desktop with

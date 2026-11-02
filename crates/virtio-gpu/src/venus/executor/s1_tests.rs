@@ -662,7 +662,7 @@ fn another_context_imports_the_handle_blob_and_it_outlives_the_exporter() {
     assert!(h.memory_blob(2, 92, IMPORTED_MEM, blob).is_err());
     h.renderer.destroy_blob(EXPORTED_RES);
     assert_eq!(host.live_shared_handles(), 0);
-    // Imported memory binds only to a handle resource.
+    // An import dedicated to one image binds to nothing else.
     let Command::CreateBuffer(_) = h
         .call(&create_buffer(DEVICE, 0x920, buffer_info(4096, 0x3)))
         .unwrap()
@@ -672,7 +672,7 @@ fn another_context_imports_the_handle_blob_and_it_outlives_the_exporter() {
     fatal_on(
         &mut h,
         &bind_buffers(DEVICE, &[(0x920, IMPORTED_MEM, 0)]),
-        "imported device-local memory bound to a plain buffer",
+        "a dedicated import bound to another resource",
     );
 }
 

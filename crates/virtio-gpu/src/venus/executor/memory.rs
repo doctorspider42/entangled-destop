@@ -1670,18 +1670,14 @@ impl<H: HostVulkan> VulkanContext<H> {
                 ),
             ));
         }
-        // Stage S1: imported device-local memory binds only to a resource
-        // created for its handle type (`VUID-vkBindBufferMemory-memory-02985`).
-        // Exportable memory binds to anything: the Windows Venus driver
-        // (ADR-0008) allocates its device-local memory exportable and creates
-        // most resources without an external handle type, and an export is
-        // only ever imported into a resource that was created for it.
-        if memory.handle == MemoryHandle::Imported && !buffer.handle {
-            return Err(invalid(
-                command,
-                "imported device-local memory bound to a buffer not created for DMA_BUF",
-            ));
-        }
+        // Stage S1: shared device-local memory, exported or imported, binds
+        // to a resource created without an external handle type too
+        // (`VUID-vkBindBufferMemory-memory-02727`/`-02985` are the host
+        // driver's to enforce). The Windows Venus driver (ADR-0008) creates
+        // most resources without one, including the ones a D3D11 process
+        // shares with the compositor; refusing them left every WebGL canvas
+        // through ANGLE's D3D11 backend empty. The size and alignment checks
+        // above still hold the bind inside the allocation.
         match memory.dedicated {
             None => {}
             Some(DedicatedTo::Buffer(b)) if b == bind.buffer.0 && bind.memory_offset == 0 => {}
@@ -2170,13 +2166,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                 ),
             ));
         }
-        // Stage S1, as for a buffer (`VUID-vkBindImageMemory-memory-02989`).
-        if memory.handle == MemoryHandle::Imported && !image.handle {
-            return Err(invalid(
-                command,
-                "imported device-local memory bound to an image not created for DMA_BUF",
-            ));
-        }
+        // Stage S1: shared memory binds to any image, as for a buffer.
         match memory.dedicated {
             None => {}
             Some(DedicatedTo::Image(i)) if i == bind.image.0 && bind.memory_offset == 0 => {}
