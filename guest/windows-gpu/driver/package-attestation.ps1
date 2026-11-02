@@ -62,6 +62,8 @@ $ddf = Join-Path $Out 'entangled-gpu.ddf'
     '.Set CabinetNameTemplate=entangled-gpu.cab'
     ".Set DiskDirectoryTemplate=$Out"
     '.Set DestinationDir=entangled-gpu'
+    ".Set InfFileName=$(Join-Path $Out 'setup.inf')"
+    ".Set RptFileName=$(Join-Path $Out 'setup.rpt')"
     (Join-Path $stage 'entangled-gpu.inf')
     (Join-Path $stage 'entangled-gpu.sys')
     (Join-Path $stage 'entangled-gpu.pdb')
