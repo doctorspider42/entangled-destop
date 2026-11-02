@@ -72,8 +72,8 @@ static unsigned long submit(HANDLE dev, unsigned long ctxId, const STREAM *s)
 /* `gpu-test venus`: a Venus ring in a blob of our own, and the host's
  * answer to vkEnumerateInstanceVersion read back through a reply stream. */
 #define CTX 9
-#define RING_RES 20
-#define REPLY_RES 21
+#define RING_RES 0 /* the driver assigns resource ids */
+#define REPLY_RES 0
 #define RING_SIZE 0x11000ULL
 #define RING_BUFFER_OFFSET 0x100
 #define RING_BUFFER_SIZE 0x10000
@@ -114,7 +114,7 @@ static int venus_round_trip(HANDLE dev)
     put32(&s, 1000384000);           /* VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA */
     put64(&s, 0);                    /* pNext */
     put32(&s, 0);                    /* flags */
-    put32(&s, RING_RES);
+    put32(&s, ring.ResourceId);
     put64(&s, 0); put64(&s, RING_SIZE);
     put64(&s, 1000000);              /* idleTimeout, ns */
     put64(&s, 0); put64(&s, 4); put64(&s, 8); /* head, tail, status */
@@ -129,7 +129,7 @@ static int venus_round_trip(HANDLE dev)
     /* Into the ring: the reply stream, then the call. */
     s.n = 0;
     put32(&s, 178); put32(&s, 0);    /* vkSetReplyCommandStreamMESA */
-    put64(&s, 1); put32(&s, REPLY_RES); put64(&s, 0); put64(&s, 0x1000);
+    put64(&s, 1); put32(&s, reply.ResourceId); put64(&s, 0); put64(&s, 0x1000);
     put32(&s, 137); put32(&s, 1);    /* vkEnumerateInstanceVersion, reply */
     put64(&s, 1);                    /* pApiVersion */
     r = (volatile unsigned char *)(ULONG_PTR)ring.Address;

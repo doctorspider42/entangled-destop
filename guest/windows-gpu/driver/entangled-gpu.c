@@ -203,6 +203,8 @@ typedef struct {
         UINT64 Size;
     } Ranges[MAX_RANGES];
     ULONG RangeCount;
+    /* The next blob resource id (ENTANGLED_GPU_BLOB_OUT::ResourceId). */
+    ULONG NextResource;
     /* One command in flight: the IOCTL queue and the caller-context blob
      * path both take it. */
     WDFWAITLOCK Lock;
@@ -693,6 +695,7 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
                            const ENTANGLED_GPU_BLOB_IN *in, ENTANGLED_GPU_BLOB_OUT *out)
 {
     UINT64 offset;
+    ULONG res;
     ULONG type = 0;
     NTSTATUS status;
     PHYSICAL_ADDRESS pa;
@@ -702,6 +705,7 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
 
     out->Address = 0;
     out->MapInfo = 0;
+    out->ResourceId = 0;
     out->Response = VIRTIO_GPU_RESP_OK_NODATA;
     if (in->Size == 0 || (in->Size & (PAGE_SIZE - 1)) != 0 || in->Size > 0x10000000 ||
         file->Count >= MAX_MAPS || ctx->Bars[SHM_BAR].Base.QuadPart == 0) {
@@ -710,13 +714,18 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
     if (!ShmAlloc(ctx, in->Size, &offset)) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    /* Ours, never 0 and clear of the display function's low ids. */
+    if (ctx->NextResource < 0x10000) {
+        ctx->NextResource = 0x10000;
+    }
+    res = ctx->NextResource++;
 
     {
         GPU_CREATE_BLOB *req = (GPU_CREATE_BLOB *)ctx->Cmd;
         RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
         req->Hdr.Type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
         req->Hdr.CtxId = in->CtxId;
-        req->ResourceId = in->ResourceId;
+        req->ResourceId = res;
         req->BlobMem = VIRTIO_GPU_BLOB_MEM_HOST3D;
         req->BlobFlags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
         req->BlobId = in->BlobId;
@@ -733,11 +742,11 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
         req->Hdr.Type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
         req->Hdr.CtxId = in->CtxId;
-        req->ResourceId = in->ResourceId;
+        req->ResourceId = res;
         status = HeaderCommand(ctx, sizeof(*req), &type);
         if (!NT_SUCCESS(status) || type != VIRTIO_GPU_RESP_OK_NODATA) {
             ULONG ignored = 0;
-            (void)HostRelease(ctx, in->CtxId, in->ResourceId, FALSE, &ignored);
+            (void)HostRelease(ctx, in->CtxId, res, FALSE, &ignored);
             ShmFree(ctx, offset);
             out->Response = type;
             return status;
@@ -749,7 +758,7 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
         req->Hdr.Type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
         req->Hdr.CtxId = in->CtxId;
-        req->ResourceId = in->ResourceId;
+        req->ResourceId = res;
         req->Offset = offset;
         status = Command(ctx, sizeof(*req), sizeof(*resp));
         if (!NT_SUCCESS(status) || resp->Hdr.Type != VIRTIO_GPU_RESP_OK_MAP_INFO) {
@@ -757,7 +766,7 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
             if (NT_SUCCESS(status)) {
                 out->Response = resp->Hdr.Type;
             }
-            (void)HostRelease(ctx, in->CtxId, in->ResourceId, FALSE, &ignored);
+            (void)HostRelease(ctx, in->CtxId, res, FALSE, &ignored);
             ShmFree(ctx, offset);
             return status;
         }
@@ -773,7 +782,7 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         if (kernel != NULL) {
             MmUnmapIoSpace(kernel, (SIZE_T)in->Size);
         }
-        (void)HostRelease(ctx, in->CtxId, in->ResourceId, TRUE, &ignored);
+        (void)HostRelease(ctx, in->CtxId, res, TRUE, &ignored);
         ShmFree(ctx, offset);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -788,19 +797,20 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         ULONG ignored = 0;
         IoFreeMdl(mdl);
         MmUnmapIoSpace(kernel, (SIZE_T)in->Size);
-        (void)HostRelease(ctx, in->CtxId, in->ResourceId, TRUE, &ignored);
+        (void)HostRelease(ctx, in->CtxId, res, TRUE, &ignored);
         ShmFree(ctx, offset);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     file->Maps[file->Count].Mdl = mdl;
     file->Maps[file->Count].CtxId = in->CtxId;
     file->Maps[file->Count].Offset = offset;
-    file->Maps[file->Count].ResourceId = in->ResourceId;
+    file->Maps[file->Count].ResourceId = res;
     file->Maps[file->Count].User = user;
     file->Maps[file->Count].Kernel = kernel;
     file->Maps[file->Count].Size = (SIZE_T)in->Size;
     file->Count++;
     out->Address = (ULONG_PTR)user;
+    out->ResourceId = res;
     return STATUS_SUCCESS;
 }
 

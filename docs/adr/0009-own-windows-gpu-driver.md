@@ -216,8 +216,25 @@ pipeline stage accepted on a device that enabled it (bounded like
 `VK_KHR_maintenance6`; **DXVK 2.3.1 runs. Verified 2026-11-02:** `d3d11-test`
 gets "Virtio-GPU Venus (NVIDIA GeForce RTX 2070)", feature level 11_0, a FIFO
 swap chain, and passes — 300 frames in 0.67 s (451 fps), the read-back right.
-Next: Zink and DXVK in the `--gpu3d` package, maintenance6 for DXVK 3, and
-dropping `0002-zink-without-maintenance5.patch`.
+
+**WebGL in Edge, and many programs at once (2026-11-02):** Edge's GPU process
+brings ANGLE up on our ICD ("ANGLE (VirtIO, Vulkan 1.3.0 (Virtio-GPU Venus
+(NVIDIA GeForce RTX 2070)))") but Chromium's GPU blocklist turns WebGL off,
+because the only Direct3D adapter Windows lists is the Microsoft Basic Render
+Driver: `gpu3d-edge.ps1` adds `--ignore-gpu-blocklist` beside
+`--use-angle=vulkan` when our stack is installed. Then the GPU process lost its
+context on `VK_ERROR_OUT_OF_HOST_MEMORY`: Venus's feedback pool grows 4 KiB —
+one blob — at a time and under ANGLE never stops (over a thousand blobs, past
+the per-handle limit); our backend now turns event, semaphore and query
+feedback off. And a second Vulkan program failed at its first blob: resource
+ids are one namespace for the whole device and every process counted from
+0x10000, so the driver now assigns them (`ENTANGLED_GPU_BLOB_OUT::ResourceId`).
+**Verified 2026-11-02:** get.webgl.org's cube spins in Edge opened from a
+plain link (the sandbox on, no environment variable), and beside it
+`vk-smoke` passes 9/9 (1000 submits in 198 ms), `gl-test` 300 frames at 63 fps
+and `gpu-test venus` passes. Next: Zink and DXVK in the `--gpu3d` package, a
+fresh install of all of it, maintenance6 for DXVK 3, and dropping
+`0002-zink-without-maintenance5.patch`.
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.

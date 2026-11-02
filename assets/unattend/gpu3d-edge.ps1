@@ -6,6 +6,13 @@
 # shortcuts every user sees and the command that opens a link. Edge's updates
 # rewrite both now and then, which is why this runs at every logon.
 $switch = '--use-angle=vulkan'
+# With Entangled's own stack (ADR-0009) the only Direct3D adapter Windows
+# lists is the Microsoft Basic Render Driver, which Chromium's GPU blocklist
+# treats as software and turns WebGL off for, although ANGLE runs on the
+# Vulkan device; the blocklist is ignored there.
+if (Test-Path (Join-Path $PSScriptRoot 'vulkan_virtio.dll')) {
+    $switch = '--use-angle=vulkan --ignore-gpu-blocklist'
+}
 
 $shell = New-Object -ComObject WScript.Shell
 $links = @(

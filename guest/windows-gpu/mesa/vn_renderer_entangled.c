@@ -35,7 +35,6 @@ struct entangled {
    struct vn_renderer base;
    const VkAllocationCallbacks *alloc;
    HANDLE dev;
-   uint32_t next_res;
    SRWLOCK lock;
    /* Ours alone: every process (and every instance in it) has a context of
     * its own on the host, so two Vulkan programs can run at once. */
@@ -57,8 +56,15 @@ static bool
 trace_on(void)
 {
    static int on = -1;
-   if (on < 0)
-      on = getenv("ENTANGLED_GPU_TRACE") != NULL;
+   if (on < 0) {
+      const char *to = getenv("ENTANGLED_GPU_TRACE");
+      on = to != NULL;
+      /* A path rather than "1": stderr - this trace and Mesa's own log
+       * (VN_DEBUG=result) - goes to that file, for a process that has no
+       * console, such as a browser's GPU process. */
+      if (to && (strchr(to, '\\') || strchr(to, '/')))
+         freopen(to, "a", stderr);
+   }
    return on;
 }
 
@@ -69,12 +75,6 @@ ioctl(struct entangled *gpu, DWORD code, void *in, DWORD in_size, void *out,
    DWORD got = 0;
    return DeviceIoControl(gpu->dev, code, in, in_size, out, out_size, &got,
                           NULL);
-}
-
-static uint32_t
-next_res(struct entangled *gpu)
-{
-   return (uint32_t)InterlockedIncrement((volatile LONG *)&gpu->next_res);
 }
 
 static void
@@ -178,21 +178,21 @@ entangled_shmem_create(struct vn_renderer *renderer, size_t size)
    if (!shmem)
       return NULL;
    size = align64(size, 4096);
-   ENTANGLED_GPU_BLOB_IN in = {gpu->ctx_id, next_res(gpu), size, 0};
+   ENTANGLED_GPU_BLOB_IN in = {gpu->ctx_id, 0, size, 0};
    ENTANGLED_GPU_BLOB_OUT out = {0};
    AcquireSRWLockExclusive(&gpu->lock);
    const bool ok = ioctl(gpu, IOCTL_ENTANGLED_GPU_BLOB_CREATE, &in, sizeof(in),
                          &out, sizeof(out));
    ReleaseSRWLockExclusive(&gpu->lock);
    if (trace_on())
-      fprintf(stderr, "entangled: shmem %u size %zu ->%s\n", in.ResourceId,
+      fprintf(stderr, "entangled: shmem %u size %zu ->%s\n", out.ResourceId,
               size, ok && out.Address ? "" : " failed");
    if (!ok || !out.Address) {
       free(shmem);
       return NULL;
    }
    shmem->base.refcount = VN_REFCOUNT_INIT(1);
-   shmem->base.res_id = in.ResourceId;
+   shmem->base.res_id = out.ResourceId;
    shmem->base.mmap_size = size;
    shmem->base.mmap_ptr = (void *)(uintptr_t)out.Address;
    return &shmem->base;
@@ -241,7 +241,7 @@ entangled_bo_create_from_device_memory(
    struct entangled_bo *bo = calloc(1, sizeof(*bo));
    if (!bo)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   ENTANGLED_GPU_BLOB_IN in = {gpu->ctx_id, next_res(gpu),
+   ENTANGLED_GPU_BLOB_IN in = {gpu->ctx_id, 0,
                                align64(size, 4096), mem_id};
    ENTANGLED_GPU_BLOB_OUT out = {0};
    AcquireSRWLockExclusive(&gpu->lock);
@@ -251,14 +251,14 @@ entangled_bo_create_from_device_memory(
    const bool mappable = flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
    if (trace_on())
       fprintf(stderr, "entangled: bo %u size %llu flags 0x%x ->%s 0x%x\n",
-              in.ResourceId, (unsigned long long)in.Size, flags,
+              out.ResourceId, (unsigned long long)in.Size, flags,
               ok && (!mappable || out.Address) ? "" : " failed", out.Response);
    if (!ok || (mappable && !out.Address)) {
       free(bo);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
    bo->base.refcount = VN_REFCOUNT_INIT(1);
-   bo->base.res_id = in.ResourceId;
+   bo->base.res_id = out.ResourceId;
    bo->base.mmap_size = in.Size;
    bo->base.mmap_ptr = (void *)(uintptr_t)out.Address;
    *out_bo = &bo->base;
@@ -410,9 +410,17 @@ vn_renderer_create_entangled(struct vn_instance *instance,
     * SwapBuffers goes through it - with no sync waited on and the host
     * idle. Presenting on the caller's thread draws every frame. */
    vn_env.perf |= VN_PERF_NO_ASYNC_PRESENT;
+   /* The feedback pool grows 4 KiB at a time, one blob each, and under
+    * ANGLE (a browser's WebGL) it never stops growing: past a thousand
+    * blobs the next allocation fails and the GPU process loses its context.
+    * Without feedback, fences, semaphores and queries are answered by the
+    * host instead. */
+   vn_env.perf |= VN_PERF_NO_EVENT_FEEDBACK | VN_PERF_NO_SEMAPHORE_FEEDBACK |
+                  VN_PERF_NO_QUERY_FEEDBACK;
+   if (trace_on())
+      fprintf(stderr, "entangled: renderer for process %lu\n", GetCurrentProcessId());
    InitializeSRWLock(&gpu->lock);
    gpu->alloc = alloc;
-   gpu->next_res = 0x10000;
    static volatile LONG instances;
    gpu->ctx_id = (GetCurrentProcessId() & 0xffffff) << 8 |
                  ((uint32_t)InterlockedIncrement(&instances) & 0xff);

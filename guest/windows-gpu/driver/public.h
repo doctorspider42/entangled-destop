@@ -118,4 +118,8 @@ typedef struct _ENTANGLED_GPU_BLOB_OUT {
     unsigned long long Address; /* in the calling process */
     unsigned long Response;     /* the first non-OK answer, or 0x1100 */
     unsigned long MapInfo;
+    /* The blob's resource id, which the driver assigns: resource ids are one
+     * namespace for the whole device, every process's blobs together, so
+     * BLOB_IN's ResourceId is ignored. */
+    unsigned long ResourceId;
 } ENTANGLED_GPU_BLOB_OUT;
