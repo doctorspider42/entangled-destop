@@ -83,7 +83,7 @@ Venus renderer this stack talks to.
 | A — **done 2026-11-02** | `entangled-gpu.sys` (KMDF, a virtio transport of our own) with context + blob + `SUBMIT_3D` + fence IOCTLs; a test tool | the tool creates a Venus context and round-trips `vkEnumerateInstanceVersion` through the host executor |
 | B — **done 2026-11-02** | Mesa Venus Windows winsys + registry ICD | `vk-smoke` passes 9/9 on our stack with Yttrium uninstalled |
 | C — **done 2026-11-02** | Software WSI for `VK_KHR_win32_surface` | `vkcube` spins in a window |
-| D | DXVK + Zink in the install (`install windows --gpu3d` with no third-party package) | WebGL Aquarium through ANGLE's D3D11 backend, an OpenGL demo and a D3D11 game run |
+| D — **done 2026-11-02** | DXVK + Zink in the install (`install windows --gpu3d` with no third-party package) | WebGL Aquarium through ANGLE's D3D11 backend, an OpenGL demo and a D3D11 game run |
 | E | Zero-copy present (the guest image shared with the display path instead of copied) | presenting costs no CPU copy per frame |
 | F | Signing | Microsoft attestation signing (EV certificate + Partner Center account), so test-signing mode is not needed |
 
@@ -177,7 +177,7 @@ builds Mesa's gallium WGL frontend with Zink only (`opengl32.dll` +
 `libgallium_wgl.dll`, zlib static; `win_flex`/`win_bison` at build time).
 Mesa 26.2's Zink requires `VK_KHR_maintenance5`, which the executor
 deliberately does not advertise (`policy.rs`), so
-`0002-zink-without-maintenance5.patch` makes it optional (two uses: buffer-view
+`0002-zink-without-maintenance5.patch` (since removed: the executor now serves the extension) made it optional (two uses: buffer-view
 usage flags, and dropping an unread PointSize). With it `gl-test` (beside the
 DLLs, `GALLIUM_DRIVER=zink`) gets a context whose renderer is "zink Vulkan 1.3
 (NVIDIA GeForce RTX 2070 (MESA_VENUS))", OpenGL 4.6 compatibility profile.
@@ -252,9 +252,10 @@ which the generated translation refused: `VkPipelineShaderStageCreateInfo.module
 may now be null, and `check_stages` holds the rule — exactly one of a module
 or a chained one, the latter only on a device that *enabled* maintenance5 (the
 first cut asked the physical device's advertised list; a test caught it).
-**Verified:** DXVK 3.1.1's `d3d11-test` passes at 532 fps. Left: dropping `0002-zink-without-maintenance5.patch` now
-that the executor serves maintenance5, async/interrupt submits, zero-copy
-present (E) and signing (F).
+**Verified:** DXVK 3.1.1's `d3d11-test` passes at 532 fps. With maintenance5
+served, Zink builds unpatched again (`0002-zink-without-maintenance5.patch` is
+gone) and `gl-test` passes at ~51 fps. **Phase D is done.** Left:
+async/interrupt submits, zero-copy present (E) and signing (F).
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.
