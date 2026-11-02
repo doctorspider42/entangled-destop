@@ -977,6 +977,7 @@ mod tests {
             edition: None,
             product_key: None,
             gpu3d: None,
+            winfsp: None,
         };
 
         // A disk path in this host's spelling, with a space in it — the shape

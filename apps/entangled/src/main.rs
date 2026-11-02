@@ -446,6 +446,12 @@ pub struct InstallArgs {
     /// guest runs in test-signing mode.
     #[arg(long, value_name = "DIR")]
     pub gpu3d: Option<PathBuf>,
+    /// Windows only: WinFsp's installer (`winfsp-*.msi`, from winfsp.dev),
+    /// for shared folders over virtio-fs (`[[share]] virtiofs = true`). With
+    /// it the guest installs WinFsp and virtio-win's virtiofs service at the
+    /// first logon, and a share mounts as a drive.
+    #[arg(long, value_name = "MSI")]
+    pub winfsp: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {

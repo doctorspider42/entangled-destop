@@ -839,6 +839,7 @@ mod tests {
             edition: None,
             product_key: None,
             gpu3d: None,
+            winfsp: None,
         }
     }
 

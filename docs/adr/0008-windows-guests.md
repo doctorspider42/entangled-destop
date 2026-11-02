@@ -714,7 +714,12 @@ nothing — `virtiofs.exe` lists with READDIRPLUS, now served (each entry
 looked up and counted like a LOOKUP). Windows creates `System Volume
 Information` in the share on mount. WinFsp itself is GPLv3 with a FLOSS
 exception, a guest-side component the user installs; nothing of it is in host
-code. Not yet: installing WinFsp and the service from `install windows`.
+code. `install windows --winfsp <msi>` makes it one step: the answer disc
+carries WinFsp's installer, and `first-logon.cmd` installs it and registers
+virtio-win's `virtiofs.exe` (already on the disc with `viofs`) as an automatic
+service. Verified on a fresh install: with a `virtiofs = true` share added to
+the profile, `Z:` is there at the first logon. Like `--gpu3d`, nothing is
+downloaded for the user.
 
 ### Amendment, 2026-10-31: the shared clipboard
 

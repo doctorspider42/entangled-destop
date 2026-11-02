@@ -253,7 +253,10 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
             .map(product_key)
             .transpose()?
             .as_deref(),
-        args.gpu3d.as_deref(),
+        Extras {
+            gpu3d: args.gpu3d.as_deref(),
+            winfsp: args.winfsp.as_deref(),
+        },
     )?;
     let firmware = crate::firmware::resolve(args.firmware.as_deref()).map_err(|e| e.to_string())?;
     tracing::info!(
@@ -356,6 +359,15 @@ fn write_profile(path: &Path, cfg: &VmConfig) -> Result<(), String> {
         .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
+/// What the answer disc carries beyond Windows itself, all optional.
+#[derive(Default, Clone, Copy)]
+struct Extras<'a> {
+    /// The viogpu3d package folder (`--gpu3d`).
+    gpu3d: Option<&'a Path>,
+    /// WinFsp's installer (`--winfsp`).
+    winfsp: Option<&'a Path>,
+}
+
 /// The answer disc's bytes and the image it installs.
 fn answer_disc(
     windows_iso: &Path,
@@ -364,8 +376,9 @@ fn answer_disc(
     computer_name: &str,
     timezone: &str,
     product_key: Option<&str>,
-    gpu3d: Option<&Path>,
+    extras: Extras<'_>,
 ) -> Result<(Vec<u8>, WimImage), String> {
+    let Extras { gpu3d, winfsp } = extras;
     let mut windows = optical::open(windows_iso).map_err(|e| e.to_string())?;
     let images =
         wim_images(windows.as_mut()).map_err(|e| format!("{}: {e}", windows_iso.display()))?;
@@ -402,6 +415,10 @@ fn answer_disc(
             disc.add_file(&format!("entangled/gpu3d/{path}"), data)
                 .map_err(|e| e.to_string())?;
         }
+    }
+    if let Some(msi) = winfsp {
+        disc.add_file("entangled/winfsp.msi", winfsp_installer(msi)?)
+            .map_err(|e| e.to_string())?;
     }
     let mut virtio = optical::open(drivers_iso).map_err(|e| e.to_string())?;
     for (path, data) in driver_files(virtio.as_mut(), image.is_windows_11())
@@ -470,6 +487,29 @@ fn gpu3d_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     }
     files.sort();
     Ok(files)
+}
+
+/// WinFsp's installer for the answer disc: an `.msi` of a sane size.
+fn winfsp_installer(msi: &Path) -> Result<Vec<u8>, String> {
+    let is_msi = msi
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("msi"));
+    if !is_msi {
+        return Err(format!(
+            "--winfsp: {} is not an .msi (WinFsp's installer, winfsp-*.msi)",
+            msi.display()
+        ));
+    }
+    let data =
+        std::fs::read(msi).map_err(|e| format!("--winfsp: cannot read {}: {e}", msi.display()))?;
+    if data.len() as u64 > MAX_DRIVER_FILE {
+        return Err(format!(
+            "--winfsp: {} is too large for an installer",
+            msi.display()
+        ));
+    }
+    Ok(data)
 }
 
 /// Where a guest agent build may be named explicitly.
@@ -1059,8 +1099,16 @@ mod tests {
         let virtio_iso = dir.join("virtio.iso");
         std::fs::write(&virtio_iso, virtio.build()).unwrap();
 
-        let (disc, image) =
-            answer_disc(&windows_iso, &virtio_iso, None, "WIN10", "UTC", None, None).unwrap();
+        let (disc, image) = answer_disc(
+            &windows_iso,
+            &virtio_iso,
+            None,
+            "WIN10",
+            "UTC",
+            None,
+            Extras::default(),
+        )
+        .unwrap();
         assert_eq!(image.index, 6);
         let mut answers = optical::iso9660::IsoImage::new(std::io::Cursor::new(disc)).unwrap();
         let root = answers.root().clone();
@@ -1093,8 +1141,16 @@ mod tests {
         let mut empty = IsoBuilder::new("EMPTY");
         empty.add_file("README", b"x".to_vec()).unwrap();
         std::fs::write(&virtio_iso, empty.build()).unwrap();
-        let error =
-            answer_disc(&windows_iso, &virtio_iso, None, "W", "UTC", None, None).unwrap_err();
+        let error = answer_disc(
+            &windows_iso,
+            &virtio_iso,
+            None,
+            "W",
+            "UTC",
+            None,
+            Extras::default(),
+        )
+        .unwrap_err();
         assert!(error.contains("viostor/w10/amd64"), "{error}");
         std::fs::remove_dir_all(&dir).unwrap();
     }

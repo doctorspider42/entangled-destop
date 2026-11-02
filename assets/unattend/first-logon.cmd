@@ -40,7 +40,16 @@ rem and this machine has no _PRT for the line-based fallback; gpu3d-msi.ps1
 rem says why it runs at every startup. The installer's
 rem final shutdown is the reboot all of it needs.
 if exist "%disc%\entangled\gpu3d\VirtIOTestCert.cer" call :gpu3d
+rem Shared folders over virtio-fs, when the installer was given WinFsp: WinFsp,
+rem then virtio-win's virtiofs service, which mounts the share as a drive.
+if exist "%disc%\entangled\winfsp.msi" call :virtiofs
 endlocal
+exit /b 0
+
+:virtiofs
+msiexec /i "%disc%\entangled\winfsp.msi" /qn /norestart
+copy /y "%disc%\$WinPEDriver$\viofs\virtiofs.exe" "%dir%\" >nul
+sc create VirtioFsSvc binPath= "\"%dir%\virtiofs.exe\"" start= auto depend= WinFsp.Launcher DisplayName= "Virtio FS Service" >nul
 exit /b 0
 
 :gpu3d
