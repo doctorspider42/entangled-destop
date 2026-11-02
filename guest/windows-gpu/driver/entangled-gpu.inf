@@ -11,11 +11,11 @@ DriverVer   = 11/02/2026,0.1.0.0
 PnpLockdown = 1
 
 [Manufacturer]
-%Entangled% = Entangled, NTamd64
+%Entangled% = Entangled, NTamd64.10.0...16299
 
 ; SUBSYS_00401AF4 is more specific than viogpudo's DEV_1050 match, so this
 ; INF outranks it on the render-only function and only there.
-[Entangled.NTamd64]
+[Entangled.NTamd64.10.0...16299]
 %DeviceDesc% = EntangledGpu, PCI\VEN_1AF4&DEV_1050&SUBSYS_00401AF4&REV_01
 
 [DestinationDirs]

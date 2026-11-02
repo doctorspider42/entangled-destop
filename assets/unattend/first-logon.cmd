@@ -77,9 +77,13 @@ exit /b 0
 
 :owngpu
 set "g=%disc%\entangled\owngpu"
-certutil -addstore -f Root "%g%\entangled-gpu.cer" >nul
-certutil -addstore -f TrustedPublisher "%g%\entangled-gpu.cer" >nul
-bcdedit /set testsigning on >nul
+rem A test-signed driver brings its certificate and needs test-signing mode;
+rem a Microsoft-signed one (attestation, ADR-0009 phase F) brings neither.
+if exist "%g%\entangled-gpu.cer" (
+  certutil -addstore -f Root "%g%\entangled-gpu.cer" >nul
+  certutil -addstore -f TrustedPublisher "%g%\entangled-gpu.cer" >nul
+  bcdedit /set testsigning on >nul
+)
 "%g%\VulkanRT-Installer.exe" /S
 mkdir "%dir%\owngpu" 2>nul
 copy /y "%g%\entangled-gpu.*" "%dir%\owngpu\" >nul

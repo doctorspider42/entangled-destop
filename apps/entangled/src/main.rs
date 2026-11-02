@@ -441,11 +441,13 @@ pub struct InstallArgs {
     pub product_key: Option<String>,
     /// Windows only, experimental: 3D through Venus on the host GPU. A
     /// directory holding either Entangled's own package (`entangled-gpu.inf`,
-    /// `.sys`, `.cat`, its test certificate `*.cer`, `gpu-test.exe` and Mesa's
-    /// `vulkan_virtio.dll`, ADR-0009) or the Yttrium viogpu3d package
-    /// (`VirtIOTestCert.cer`, `Win10/amd64/viogpu3d.inf` and its files), and
-    /// in both cases the LunarG Vulkan runtime installer (`VulkanRT-*.exe`).
-    /// The drivers are test-signed, so the guest runs in test-signing mode.
+    /// `.sys`, `.cat`, `gpu-test.exe` and Mesa's `vulkan_virtio.dll`,
+    /// optionally `opengl/` and `dxvk/`, ADR-0009) or the Yttrium viogpu3d
+    /// package (`VirtIOTestCert.cer`, `Win10/amd64/viogpu3d.inf` and its
+    /// files), and in both cases the LunarG Vulkan runtime installer
+    /// (`VulkanRT-*.exe`). A test-signed driver comes with its `*.cer` and
+    /// the guest runs in test-signing mode; a Microsoft-signed one needs
+    /// neither.
     #[arg(long, value_name = "DIR")]
     pub gpu3d: Option<PathBuf>,
     /// Windows only: WinFsp's installer (`winfsp-*.msi`, from winfsp.dev),

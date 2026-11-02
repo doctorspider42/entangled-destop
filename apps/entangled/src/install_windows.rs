@@ -514,24 +514,25 @@ fn find_file(dir: &Path, wanted: impl Fn(&str) -> bool) -> Result<Option<PathBuf
 }
 
 /// Our own package's files (ADR-0009), as the answer disc carries them under
-/// `entangled/owngpu/`: the kernel driver, its test certificate (renamed
-/// `entangled-gpu.cer`), the tool that installs it over the Microsoft-signed
+/// `entangled/owngpu/`: the kernel driver, a test-signed build's certificate
+/// (renamed `entangled-gpu.cer`, absent for a Microsoft-signed one), the tool that installs it over the Microsoft-signed
 /// display driver, Mesa's Venus ICD and the Vulkan runtime installer.
 fn own_gpu_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let read = |path: &Path| {
         std::fs::read(path).map_err(|e| format!("--gpu3d: cannot read {}: {e}", path.display()))
     };
     let missing = |what: &str| format!("--gpu3d: {} has no {what}", dir.display());
-    let cert = find_file(dir, |name| name.ends_with(".cer"))?
-        .ok_or_else(|| missing("test certificate (*.cer)"))?;
     let runtime = find_file(dir, |name| {
         name.starts_with("vulkanrt") && name.ends_with(".exe")
     })?
     .ok_or_else(|| missing("Vulkan runtime installer (VulkanRT-*.exe from LunarG)"))?;
-    let mut files = vec![
-        ("entangled-gpu.cer".to_owned(), read(&cert)?),
-        ("VulkanRT-Installer.exe".to_owned(), read(&runtime)?),
-    ];
+    let mut files = vec![("VulkanRT-Installer.exe".to_owned(), read(&runtime)?)];
+    // A test-signed build comes with its certificate, and the guest runs in
+    // test-signing mode; one Microsoft signed (attestation, ADR-0009 phase F)
+    // comes without, and installs as any driver does.
+    if let Some(cert) = find_file(dir, |name| name.ends_with(".cer"))? {
+        files.push(("entangled-gpu.cer".to_owned(), read(&cert)?));
+    }
     for name in [
         "entangled-gpu.inf",
         "entangled-gpu.sys",
@@ -1162,8 +1163,7 @@ mod tests {
         std::fs::write(dir.join("entangled-gpu.inf"), b"inf").unwrap();
         assert!(is_own_gpu_package(&dir));
         let refused = own_gpu_files(&dir).unwrap_err();
-        assert!(refused.contains("certificate"), "{refused}");
-        std::fs::write(dir.join("entangled-gpu-test.cer"), b"cer").unwrap();
+        assert!(refused.contains("VulkanRT"), "{refused}");
         std::fs::write(dir.join("VulkanRT-1.4.363.0-Installer.exe"), b"exe").unwrap();
         let refused = own_gpu_files(&dir).unwrap_err();
         assert!(refused.contains("entangled-gpu.sys"), "{refused}");
@@ -1183,6 +1183,14 @@ mod tests {
         for name in ["d3d9.dll", "d3d10core.dll", "dxgi.dll"] {
             std::fs::write(dir.join("dxvk").join(name), b"dll").unwrap();
         }
+        // A Microsoft-signed package: no certificate, nothing test-signed.
+        let signed: Vec<String> = own_gpu_files(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(!signed.iter().any(|n| n.ends_with(".cer")), "{signed:?}");
+        std::fs::write(dir.join("entangled-gpu-test.cer"), b"cer").unwrap();
         let names: Vec<String> = own_gpu_files(&dir)
             .unwrap()
             .into_iter()

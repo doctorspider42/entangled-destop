@@ -296,6 +296,30 @@ memory exportable, a canonical image recorded on the handle blob, and the
 window importing it as it does for a Linux guest's GPU desktop (the shared
 lease, ADR-0004) — the plane's `present_shared` is the hook for it.
 
+**Phase F, signing (2026-11-03): everything but the publisher's step.**
+Attestation signing needs two things only the publisher can have: an EV
+code-signing certificate and a Partner Center hardware account. The rest is
+done:
+
+- The INF passes `infverif /w` (Windows driver) and `infverif /h` (the
+  Hardware Dev Center's signing rules); `/w` first refused `DIRID 13` without a
+  `TargetOSVersion` decoration, so the models section is now
+  `NTamd64.10.0...16299`.
+- `guest/windows-gpu/driver/package-attestation.ps1 <out> [-Version]
+  [-Thumbprint]` builds the driver fresh, checks the INF both ways, makes the
+  submission CAB (`entangled-gpu/` with the INF, the `.sys` and its symbols)
+  and, given the EV certificate's thumbprint, signs it (`signtool /fd sha256
+  /tr`). Verified with our test certificate standing in for the EV one: the
+  CAB comes out signed and timestamped.
+- `install windows --gpu3d` takes a Microsoft-signed package as it is: with no
+  `*.cer` in the folder the guest gets neither a certificate nor test-signing
+  mode (`first-logon.cmd`), and the driver installs as any signed one does.
+
+What is left is the publisher's: buy the EV certificate, open the Partner
+Center account, run the script with `-Thumbprint`, upload the CAB as an
+attestation submission for Windows 10 x64 and later, and put the returned
+`entangled-gpu.inf/.sys/.cat` into the `--gpu3d` folder without the `.cer`.
+
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.
 
