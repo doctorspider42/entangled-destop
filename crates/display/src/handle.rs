@@ -724,7 +724,10 @@ mod tests {
         // The window's program went without hiding it: the device says the
         // scanout lost its resource, and the plane goes.
         sink.scanout_disabled();
-        assert_eq!(handle.snapshot().expect("snapshot").pixels()[(4 * 8 + 3) * 4], 0);
+        assert_eq!(
+            handle.snapshot().expect("snapshot").pixels()[(4 * 8 + 3) * 4],
+            0
+        );
         // And the desktop handle itself is not affected by any of it.
         assert_eq!(DisplayHandle::resolution(&handle), (8, 8));
     }
