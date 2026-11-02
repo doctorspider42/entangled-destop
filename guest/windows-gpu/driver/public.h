@@ -52,8 +52,8 @@ typedef struct _ENTANGLED_GPU_RESPONSE {
 #define IOCTL_ENTANGLED_GPU_SUBMIT_3D \
     CTL_CODE(ENTANGLED_GPU_TYPE, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-/* The most one SUBMIT_3D carries through this slice's command page. */
-#define ENTANGLED_GPU_MAX_SUBMIT 1024
+/* The most one SUBMIT_3D carries. */
+#define ENTANGLED_GPU_MAX_SUBMIT (60 * 1024)
 
 typedef struct _ENTANGLED_GPU_CTX_CREATE {
     unsigned long CtxId;
@@ -64,9 +64,14 @@ typedef struct _ENTANGLED_GPU_CTX {
     unsigned long CtxId;
 } ENTANGLED_GPU_CTX;
 
+/* Flags of ENTANGLED_GPU_SUBMIT. */
+#define ENTANGLED_GPU_SUBMIT_FENCE 0x1 /* answer only once RingIdx's work is done */
+
 typedef struct _ENTANGLED_GPU_SUBMIT {
     unsigned long CtxId;
     unsigned long Size;
+    unsigned long RingIdx; /* the timeline (0: the context's CPU timeline) */
+    unsigned long Flags;
     /* followed by Size bytes of command stream */
 } ENTANGLED_GPU_SUBMIT;
 
@@ -81,7 +86,33 @@ typedef struct _ENTANGLED_GPU_BLOB_IN {
     unsigned long CtxId;
     unsigned long ResourceId;
     unsigned long long Size; /* a multiple of 4 KiB */
+    unsigned long long BlobId; /* 0: plain shared memory; else a VkDeviceMemory id */
 } ENTANGLED_GPU_BLOB_IN;
+
+/* Unmap and release a blob this handle created: in ENTANGLED_GPU_CTX-like
+ * { CtxId, ResourceId }, out ENTANGLED_GPU_RESPONSE. */
+#define IOCTL_ENTANGLED_GPU_BLOB_DESTROY     CTL_CODE(ENTANGLED_GPU_TYPE, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _ENTANGLED_GPU_BLOB_REF {
+    unsigned long CtxId;
+    unsigned long ResourceId;
+} ENTANGLED_GPU_BLOB_REF;
+
+/* A capset's bytes: in ENTANGLED_GPU_CAPSET_IN, out ENTANGLED_GPU_CAPSET_OUT. */
+#define IOCTL_ENTANGLED_GPU_CAPSET     CTL_CODE(ENTANGLED_GPU_TYPE, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define ENTANGLED_GPU_MAX_CAPSET 1024
+
+typedef struct _ENTANGLED_GPU_CAPSET_IN {
+    unsigned long Id;
+    unsigned long Version;
+} ENTANGLED_GPU_CAPSET_IN;
+
+typedef struct _ENTANGLED_GPU_CAPSET_OUT {
+    unsigned long Response;
+    unsigned long Size;
+    unsigned char Data[ENTANGLED_GPU_MAX_CAPSET];
+} ENTANGLED_GPU_CAPSET_OUT;
 
 typedef struct _ENTANGLED_GPU_BLOB_OUT {
     unsigned long long Address; /* in the calling process */

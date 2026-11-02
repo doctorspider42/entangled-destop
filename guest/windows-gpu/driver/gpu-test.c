@@ -58,6 +58,7 @@ static unsigned long submit(HANDLE dev, unsigned long ctxId, const STREAM *s)
         unsigned char bytes[512];
     } req;
     ENTANGLED_GPU_RESPONSE resp = {0};
+    memset(&req.head, 0, sizeof(req.head));
     req.head.CtxId = ctxId;
     req.head.Size = s->n;
     memcpy(req.bytes, s->b, s->n);

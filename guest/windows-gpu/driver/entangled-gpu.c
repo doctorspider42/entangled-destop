@@ -62,7 +62,16 @@
 #define MAX_QUEUE_SIZE 64
 /* Each command: the request in the first half of the page, the answer in
  * the second. */
-#define CMD_HALF 2048
+/* The command area: requests up to 64 KiB at its start, the answer after. */
+#define CMD_BYTES (72 * 1024)
+#define REQ_MAX (64 * 1024)
+#define CMD_HALF REQ_MAX
+#define ANSWER_MAX (8 * 1024)
+#define VIRTIO_GPU_CMD_GET_CAPSET 0x0109
+#define VIRTIO_GPU_CMD_RESOURCE_UNREF 0x0102
+#define VIRTIO_GPU_RESP_OK_CAPSET 0x1103
+#define VIRTIO_GPU_FLAG_FENCE 0x1
+#define VIRTIO_GPU_FLAG_INFO_RING_IDX 0x2
 
 #define VIRTIO_GPU_CMD_GET_CAPSET_INFO 0x0108
 #define VIRTIO_GPU_CMD_CTX_CREATE 0x0200
@@ -178,6 +187,7 @@ typedef struct {
     USHORT QueueNotifyOff;
     USHORT AvailIdx;
     USHORT LastUsed;
+    UINT64 FenceSeq;
 
     UINT64 DeviceFeatures;
     UINT64 DriverFeatures;
@@ -197,6 +207,7 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetCtx)
 typedef struct {
     struct {
         PMDL Mdl;
+        ULONG ResourceId;
         PVOID User;
         PVOID Kernel;
         SIZE_T Size;
@@ -374,7 +385,7 @@ NTSTATUS EgEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST T
         high.QuadPart = -1;
         ctx->Ring = MmAllocateContiguousMemorySpecifyCache(PAGE_SIZE, low, high, boundary,
                                                            MmCached);
-        ctx->Cmd = MmAllocateContiguousMemorySpecifyCache(PAGE_SIZE, low, high, boundary,
+        ctx->Cmd = MmAllocateContiguousMemorySpecifyCache(CMD_BYTES, low, high, boundary,
                                                           MmCached);
         if (ctx->Ring == NULL || ctx->Cmd == NULL) {
             return STATUS_INSUFFICIENT_RESOURCES;
@@ -472,7 +483,7 @@ static NTSTATUS Command(DEVICE_CONTEXT *ctx, ULONG request, ULONG answer)
     LARGE_INTEGER wait;
     ULONG tries;
 
-    if (!ctx->Ready || request > CMD_HALF || answer > CMD_HALF) {
+    if (!ctx->Ready || request > REQ_MAX || answer > ANSWER_MAX) {
         return STATUS_DEVICE_NOT_READY;
     }
     desc[0].Addr = ctx->CmdPa.QuadPart;
@@ -492,7 +503,8 @@ static NTSTATUS Command(DEVICE_CONTEXT *ctx, ULONG request, ULONG answer)
     W16(ctx->NotifyBase, ctx->QueueNotifyOff * ctx->NotifyMultiplier, 0);
 
     wait.QuadPart = -10 * 1000; /* 1 ms */
-    for (tries = 0; tries < 2000; tries++) {
+    /* Up to ten seconds: a fenced submit answers once the GPU is done. */
+    for (tries = 0; tries < 10000; tries++) {
         KeMemoryBarrier();
         if (used[1] != ctx->LastUsed) {
             ctx->LastUsed = used[1];
@@ -566,6 +578,11 @@ static NTSTATUS Submit3d(DEVICE_CONTEXT *ctx, const ENTANGLED_GPU_SUBMIT *in, si
     RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
     req->Hdr.Type = VIRTIO_GPU_CMD_SUBMIT_3D;
     req->Hdr.CtxId = in->CtxId;
+    if (in->Flags & ENTANGLED_GPU_SUBMIT_FENCE) {
+        req->Hdr.Flags = VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX;
+        req->Hdr.FenceId = ++ctx->FenceSeq;
+        req->Hdr.RingIdx = (UINT8)in->RingIdx;
+    }
     req->Size = in->Size;
     RtlCopyMemory(req + 1, in + 1, in->Size);
     return HeaderCommand(ctx, sizeof(*req) + in->Size, type);
@@ -601,6 +618,7 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         req->ResourceId = in->ResourceId;
         req->BlobMem = VIRTIO_GPU_BLOB_MEM_HOST3D;
         req->BlobFlags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+        req->BlobId = in->BlobId;
         req->Size = in->Size;
         status = HeaderCommand(ctx, sizeof(*req), &type);
         if (!NT_SUCCESS(status) || type != VIRTIO_GPU_RESP_OK_NODATA) {
@@ -664,12 +682,36 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     file->Maps[file->Count].Mdl = mdl;
+    file->Maps[file->Count].ResourceId = in->ResourceId;
     file->Maps[file->Count].User = user;
     file->Maps[file->Count].Kernel = kernel;
     file->Maps[file->Count].Size = (SIZE_T)in->Size;
     file->Count++;
     out->Address = (ULONG_PTR)user;
     return STATUS_SUCCESS;
+}
+
+/* Unmap one of this handle's blobs and release it on the host. */
+static NTSTATUS BlobDestroy(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
+                            const ENTANGLED_GPU_BLOB_REF *in, ULONG *type)
+{
+    ULONG i;
+    GPU_CTX_RESOURCE *req = (GPU_CTX_RESOURCE *)ctx->Cmd;
+    for (i = 0; i < file->Count; i++) {
+        if (file->Maps[i].ResourceId == in->ResourceId) {
+            MmUnmapLockedPages(file->Maps[i].User, file->Maps[i].Mdl);
+            IoFreeMdl(file->Maps[i].Mdl);
+            MmUnmapIoSpace(file->Maps[i].Kernel, file->Maps[i].Size);
+            file->Maps[i] = file->Maps[file->Count - 1];
+            file->Count--;
+            break;
+        }
+    }
+    RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+    req->Hdr.Type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    req->Hdr.CtxId = in->CtxId;
+    req->ResourceId = in->ResourceId;
+    return HeaderCommand(ctx, sizeof(*req), type);
 }
 
 VOID EgEvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
@@ -682,6 +724,25 @@ VOID EgEvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
 
     WDF_REQUEST_PARAMETERS_INIT(&params);
     WdfRequestGetParameters(Request, &params);
+    if (params.Type == WdfRequestTypeDeviceControl &&
+        params.Parameters.DeviceIoControl.IoControlCode == IOCTL_ENTANGLED_GPU_BLOB_DESTROY) {
+        ENTANGLED_GPU_BLOB_REF *ref = NULL;
+        ENTANGLED_GPU_RESPONSE *resp = NULL;
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(*ref), (PVOID *)&ref, NULL);
+        if (NT_SUCCESS(status)) {
+            status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*resp), (PVOID *)&resp, NULL);
+        }
+        if (NT_SUCCESS(status)) {
+            ENTANGLED_GPU_BLOB_REF copy = *ref;
+            WdfWaitLockAcquire(ctx->Lock, NULL);
+            status = BlobDestroy(ctx, GetFileCtx(WdfRequestGetFileObject(Request)), &copy,
+                                 &resp->Type);
+            WdfWaitLockRelease(ctx->Lock);
+        }
+        WdfRequestCompleteWithInformation(Request, status,
+                                          NT_SUCCESS(status) ? sizeof(*resp) : 0);
+        return;
+    }
     if (params.Type != WdfRequestTypeDeviceControl ||
         params.Parameters.DeviceIoControl.IoControlCode != IOCTL_ENTANGLED_GPU_BLOB_CREATE) {
         status = WdfDeviceEnqueueRequest(Device, Request);
@@ -751,6 +812,32 @@ VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLengt
             ULONG index = in->Index;
             status = CapsetInfo(ctx, index, out);
             if (NT_SUCCESS(status)) {
+                written = sizeof(*out);
+            }
+        }
+        break;
+    }
+    case IOCTL_ENTANGLED_GPU_CAPSET: {
+        ENTANGLED_GPU_CAPSET_IN *in = NULL;
+        ENTANGLED_GPU_CAPSET_OUT *out = NULL;
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in), (PVOID *)&in, NULL);
+        if (NT_SUCCESS(status)) {
+            status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, NULL);
+        }
+        if (NT_SUCCESS(status)) {
+            GPU_CTRL_HDR *req = (GPU_CTRL_HDR *)ctx->Cmd;
+            GPU_CTRL_HDR *resp = (GPU_CTRL_HDR *)(ctx->Cmd + CMD_HALF);
+            UINT32 *args = (UINT32 *)(req + 1);
+            RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+            req->Type = VIRTIO_GPU_CMD_GET_CAPSET;
+            args[0] = in->Id;
+            args[1] = in->Version;
+            status = Command(ctx, sizeof(*req) + 8,
+                             sizeof(*resp) + ENTANGLED_GPU_MAX_CAPSET);
+            if (NT_SUCCESS(status)) {
+                out->Response = resp->Type;
+                out->Size = resp->Type == VIRTIO_GPU_RESP_OK_CAPSET ? ENTANGLED_GPU_MAX_CAPSET : 0;
+                RtlCopyMemory(out->Data, resp + 1, ENTANGLED_GPU_MAX_CAPSET);
                 written = sizeof(*out);
             }
         }

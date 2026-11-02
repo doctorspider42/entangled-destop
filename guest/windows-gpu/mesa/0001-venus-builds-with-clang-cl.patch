@@ -15,16 +15,18 @@ index 9f79113..730c41c 100644
  #else
  #error "Unsupported platform"
 diff --git a/src/virtio/vulkan/meson.build b/src/virtio/vulkan/meson.build
-index fda382d..79f5643 100644
+index fda382d..3ae0baa 100644
 --- a/src/virtio/vulkan/meson.build
 +++ b/src/virtio/vulkan/meson.build
-@@ -124,6 +124,9 @@ vn_libs = []
+@@ -124,6 +124,11 @@ vn_libs = []
  
  if not with_platform_windows
    libvn_files += files('vn_renderer_vtest.c')
 +else
 +  # The lite runtime's pipeline code calls into vtn on Windows too.
 +  vn_deps += idep_vtn
++  # Entangled Desktop's renderer backend, over entangled-gpu.sys.
++  libvn_files += files('vn_renderer_entangled.c')
  endif
  
  if system_has_kms_drm
@@ -56,3 +58,28 @@ index 86235f6..cb97805 100644
  #include "util/u_math.h"
  #include "util/u_memset.h"
  #include "util/u_thread.h"
+diff --git a/src/virtio/vulkan/vn_renderer.h b/src/virtio/vulkan/vn_renderer.h
+index ea224ea..4673452 100644
+--- a/src/virtio/vulkan/vn_renderer.h
++++ b/src/virtio/vulkan/vn_renderer.h
+@@ -220,6 +220,11 @@ vn_renderer_create_virtgpu(struct vn_instance *instance,
+                            struct vn_renderer **renderer);
+ #endif
+ 
++VkResult
++vn_renderer_create_entangled(struct vn_instance *instance,
++                             const VkAllocationCallbacks *alloc,
++                             struct vn_renderer **renderer);
++
+ VkResult
+ vn_renderer_create_vtest(struct vn_instance *instance,
+                          const VkAllocationCallbacks *alloc,
+@@ -242,6 +247,8 @@ vn_renderer_create(struct vn_instance *instance,
+          result = vn_renderer_create_vtest(instance, alloc, renderer);
+    }
+    return result;
++#elif DETECT_OS_WINDOWS
++   return vn_renderer_create_entangled(instance, alloc, renderer);
+ #else
+    return vn_renderer_create_vtest(instance, alloc, renderer);
+ #endif

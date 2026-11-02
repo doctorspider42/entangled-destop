@@ -131,8 +131,15 @@ GCC atomics path; `pid_t`, `windows.h` and `sync_file` stubs for Windows; vtn
 linked) and `build.cmd` build the whole Venus driver with clang-cl, and the
 link stops at exactly one symbol — `vn_renderer_create_vtest`, the renderer
 backend, which on Windows is ours to write over `entangled-gpu.sys`'s IOCTLs.
-That backend (capset data, contexts, blobs created and mapped, `SUBMIT_3D`
-with ring-index fences, waits) is the rest of phase B.
+That backend is now `guest/windows-gpu/mesa/vn_renderer_entangled.c` (copied
+into Mesa's `src/virtio/vulkan`, with `public.h` as `entangled_gpu_public.h`,
+`vn_renderer_create` calling it on Windows): capset data and a Venus context
+at creation, shmem and device-memory blobs through `BLOB_CREATE`/`_DESTROY`,
+`SUBMIT_3D` on the batch's ring index, and syncs as plain counters — a submit
+that signals asks the driver for a fenced answer (`ENTANGLED_GPU_SUBMIT_FENCE`,
+the host answering once the ring's fence retires), so a returned submit is a
+finished one. The driver grew the IOCTLs for it and a 64 KiB command area.
+`vulkan_virtio.dll` links; not yet run in a guest.
 
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.
