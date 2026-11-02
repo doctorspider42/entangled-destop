@@ -503,7 +503,17 @@ static NTSTATUS Command(DEVICE_CONTEXT *ctx, ULONG request, ULONG answer)
     W16(ctx->NotifyBase, ctx->QueueNotifyOff * ctx->NotifyMultiplier, 0);
 
     wait.QuadPart = -10 * 1000; /* 1 ms */
-    /* Up to ten seconds: a fenced submit answers once the GPU is done. */
+    /* Most answers come within microseconds: spin up to ~2 ms first, since
+     * a 1 ms sleep really lasts a whole timer tick (~15 ms) on Windows. */
+    for (tries = 0; tries < 2000; tries++) {
+        KeMemoryBarrier();
+        if (used[1] != ctx->LastUsed) {
+            ctx->LastUsed = used[1];
+            return STATUS_SUCCESS;
+        }
+        KeStallExecutionProcessor(1);
+    }
+    /* Then up to ten seconds: a fenced submit answers once the GPU is done. */
     for (tries = 0; tries < 10000; tries++) {
         KeMemoryBarrier();
         if (used[1] != ctx->LastUsed) {
