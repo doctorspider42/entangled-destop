@@ -1237,6 +1237,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if self.scanout.is_some_and(|s| s.is_renderer_owned()) {
             tracing::warn!("the scanout was a renderer resource; the window keeps its last frame");
             self.scanout = None;
+            self.display.scanout_disabled();
         }
         // Every image the display imported was the renderer's.
         self.display.forget_shared(None);
@@ -1498,6 +1499,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 "scanout resource was unref'd; scanout 0 disabled"
             );
             self.scanout = None;
+            self.display.scanout_disabled();
         }
         tracing::debug!(resource = cmd.resource_id, "virtio-gpu resource unref'd");
         Ok(Reply::ok())
@@ -1623,6 +1625,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             if self.scanout.take().is_some() {
                 tracing::info!(scanout = cmd.scanout_id, "virtio-gpu scanout disabled");
                 self.display.forget_shared(None);
+                self.display.scanout_disabled();
             }
             return Ok(Reply::ok());
         }
@@ -2348,6 +2351,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             if self.scanout.take().is_some() {
                 tracing::info!(scanout = cmd.scanout_id, "virtio-gpu scanout disabled");
                 self.display.forget_shared(None);
+                self.display.scanout_disabled();
             }
             return Ok(Reply::ok());
         }

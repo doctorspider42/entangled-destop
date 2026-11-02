@@ -98,6 +98,21 @@ typedef struct _ENTANGLED_GPU_BLOB_REF {
     unsigned long ResourceId;
 } ENTANGLED_GPU_BLOB_REF;
 
+/* ADR-0009 phase E: show a blob's BGRA pixels at a place of the desktop, over
+ * it, instead of copying them through the window (the render-only function's
+ * scanout is the host display's overlay plane). ResourceId 0 hides it. In
+ * ENTANGLED_GPU_OVERLAY, out ENTANGLED_GPU_RESPONSE. */
+#define IOCTL_ENTANGLED_GPU_OVERLAY     CTL_CODE(ENTANGLED_GPU_TYPE, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _ENTANGLED_GPU_OVERLAY {
+    unsigned long ResourceId;
+    unsigned long Width;
+    unsigned long Height;
+    unsigned long Stride;
+    long X;
+    long Y;
+} ENTANGLED_GPU_OVERLAY;
+
 /* A capset's bytes: in ENTANGLED_GPU_CAPSET_IN, out ENTANGLED_GPU_CAPSET_OUT. */
 #define IOCTL_ENTANGLED_GPU_CAPSET     CTL_CODE(ENTANGLED_GPU_TYPE, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
 

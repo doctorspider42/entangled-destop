@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use virtio_gpu::BYTES_PER_PIXEL;
+use virtio_gpu::{Rect, BYTES_PER_PIXEL};
 use winit::window::Window;
 
 use crate::boost::{BoostPolicy, BoostStats};
@@ -469,6 +469,39 @@ impl Renderer {
         );
     }
 
+    /// Writes a tightly packed BGRA `rect` into the mirror texture.
+    fn write_rect(&mut self, rect: Rect, pixels: &[u8]) {
+        if !rect.fits_within(self.texture_size.0, self.texture_size.1) {
+            return;
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: rect.x,
+                    y: rect.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(rect.width * BYTES_PER_PIXEL),
+                rows_per_image: Some(rect.height),
+            },
+            wgpu::Extent3d {
+                width: rect.width,
+                height: rect.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.stats.uploads += 1;
+        self.stats.bytes_uploaded +=
+            u64::from(rect.width) * u64::from(rect.height) * u64::from(BYTES_PER_PIXEL);
+    }
+
     /// Uploads the scanout's dirty rect into the texture, reallocating first if
     /// the guest changed resolution (backlog MVP-703/704), then — when
     /// `with_cursor`, i.e. the mirror is what is drawn — paints the cursor
@@ -482,7 +515,8 @@ impl Renderer {
             self.generation = scanout.generation();
             scanout.mark_all_dirty();
         }
-        if let Some(rect) = scanout.take_dirty() {
+        let base = scanout.take_dirty();
+        if let Some(rect) = base {
             if !rect.fits_within(self.texture_size.0, self.texture_size.1) {
                 tracing::warn!(?rect, "dirty rect outside the texture; skipping upload");
                 return;
@@ -518,6 +552,12 @@ impl Renderer {
             self.stats.uploads += 1;
             self.stats.bytes_uploaded +=
                 u64::from(rect.width) * u64::from(rect.height) * u64::from(BYTES_PER_PIXEL);
+        }
+
+        // The overlay plane (ADR-0009 phase E), over the desktop and under the
+        // cursor: written when it changed or the base rect drew over it.
+        if let Some((rect, pixels)) = scanout.take_overlay_upload(base) {
+            self.write_rect(rect, &pixels);
         }
 
         // The cursor plane, composited on the CPU (it is at most 256×256) and

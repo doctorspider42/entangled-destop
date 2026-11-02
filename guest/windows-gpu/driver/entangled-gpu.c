@@ -82,6 +82,11 @@
 #define VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB 0x010c
 #define VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB 0x0208
 #define VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB 0x0209
+#define VIRTIO_GPU_CMD_RESOURCE_FLUSH 0x0104
+#define VIRTIO_GPU_CMD_SET_SCANOUT_BLOB 0x010d
+#define VIRTIO_GPU_CMD_UPDATE_CURSOR 0x0300
+#define VIRTIO_GPU_CMD_MOVE_CURSOR 0x0301
+#define VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM 2
 #define VIRTIO_GPU_RESP_OK_NODATA 0x1100
 #define VIRTIO_GPU_RESP_OK_MAP_INFO 0x1106
 #define VIRTIO_GPU_BLOB_MEM_HOST3D 2
@@ -165,6 +170,42 @@ typedef struct {
     UINT32 MapInfo;
     UINT32 Padding;
 } GPU_RESP_MAP_INFO;
+
+typedef struct {
+    UINT32 X, Y, Width, Height;
+} GPU_RECT;
+
+typedef struct {
+    GPU_CTRL_HDR Hdr;
+    GPU_RECT Rect;
+    UINT32 ScanoutId;
+    UINT32 ResourceId;
+    UINT32 Width;
+    UINT32 Height;
+    UINT32 Format;
+    UINT32 Padding;
+    UINT32 Strides[4];
+    UINT32 Offsets[4];
+} GPU_SET_SCANOUT_BLOB;
+
+typedef struct {
+    GPU_CTRL_HDR Hdr;
+    GPU_RECT Rect;
+    UINT32 ResourceId;
+    UINT32 Padding;
+} GPU_RESOURCE_FLUSH;
+
+typedef struct {
+    GPU_CTRL_HDR Hdr;
+    UINT32 ScanoutId;
+    UINT32 X;
+    UINT32 Y;
+    UINT32 Padding;
+    UINT32 ResourceId;
+    UINT32 HotX;
+    UINT32 HotY;
+    UINT32 Padding2;
+} GPU_UPDATE_CURSOR;
 #pragma pack(pop)
 
 typedef struct {
@@ -192,6 +233,20 @@ typedef struct {
     USHORT AvailIdx;
     USHORT LastUsed;
     UINT64 FenceSeq;
+
+    /* The cursor queue, queue 1 (phase E's overlay position): descriptors
+     * at 0, available ring at 1024, used ring at 2048, its one command at
+     * 3072 of its page. Size 0 when the device has none. */
+    PUCHAR CurRing;
+    PHYSICAL_ADDRESS CurRingPa;
+    USHORT CurQueueSize;
+    USHORT CurNotifyOff;
+    USHORT CurAvailIdx;
+    USHORT CurLastUsed;
+    /* What the overlay shows now: the scanout blob only changes with it. */
+    ULONG OverlayResource, OverlayWidth, OverlayHeight, OverlayStride;
+    LONG OverlayX, OverlayY;
+    BOOLEAN OverlayShown;
 
     UINT64 DeviceFeatures;
     UINT64 DriverFeatures;
@@ -418,9 +473,13 @@ NTSTATUS EgEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST T
                                                            MmCached);
         ctx->Cmd = MmAllocateContiguousMemorySpecifyCache(CMD_BYTES, low, high, boundary,
                                                           MmCached);
-        if (ctx->Ring == NULL || ctx->Cmd == NULL) {
+        ctx->CurRing = MmAllocateContiguousMemorySpecifyCache(PAGE_SIZE, low, high, boundary,
+                                                              MmCached);
+        if (ctx->Ring == NULL || ctx->Cmd == NULL || ctx->CurRing == NULL) {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
+        RtlZeroMemory(ctx->CurRing, PAGE_SIZE);
+        ctx->CurRingPa = MmGetPhysicalAddress(ctx->CurRing);
         RtlZeroMemory(ctx->Ring, PAGE_SIZE);
         RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
         ctx->RingPa = MmGetPhysicalAddress(ctx->Ring);
@@ -472,6 +531,27 @@ NTSTATUS EgEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST T
     W64(ctx->Common, COMMON_Q_USED, ctx->RingPa.QuadPart + 2048);
     ctx->QueueNotifyOff = R16(ctx->Common, COMMON_Q_NOFF);
     W16(ctx->Common, COMMON_Q_ENABLE, 1);
+
+    /* The cursor queue, queue 1, if the device has one. */
+    ctx->CurAvailIdx = 0;
+    ctx->CurLastUsed = 0;
+    ctx->OverlayResource = 0;
+    ctx->OverlayShown = FALSE;
+    W16(ctx->Common, COMMON_Q_SELECT, 1);
+    ctx->CurQueueSize = R16(ctx->Common, COMMON_Q_SIZE);
+    if (ctx->CurQueueSize > MAX_QUEUE_SIZE) {
+        ctx->CurQueueSize = MAX_QUEUE_SIZE;
+    }
+    if (ctx->CurQueueSize != 0) {
+        RtlZeroMemory(ctx->CurRing, PAGE_SIZE);
+        W16(ctx->Common, COMMON_Q_SIZE, ctx->CurQueueSize);
+        W16(ctx->Common, COMMON_Q_MSIX, VIRTIO_MSI_NO_VECTOR);
+        W64(ctx->Common, COMMON_Q_DESC, ctx->CurRingPa.QuadPart);
+        W64(ctx->Common, COMMON_Q_AVAIL, ctx->CurRingPa.QuadPart + 1024);
+        W64(ctx->Common, COMMON_Q_USED, ctx->CurRingPa.QuadPart + 2048);
+        ctx->CurNotifyOff = R16(ctx->Common, COMMON_Q_NOFF);
+        W16(ctx->Common, COMMON_Q_ENABLE, 1);
+    }
     W8(ctx->Common, COMMON_STATUS,
        STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
     ctx->Ready = TRUE;
@@ -500,6 +580,10 @@ NTSTATUS EgEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
     if (ctx->Cmd != NULL) {
         MmFreeContiguousMemory(ctx->Cmd);
         ctx->Cmd = NULL;
+    }
+    if (ctx->CurRing != NULL) {
+        MmFreeContiguousMemory(ctx->CurRing);
+        ctx->CurRing = NULL;
     }
     return STATUS_SUCCESS;
 }
@@ -554,6 +638,109 @@ static NTSTATUS Command(DEVICE_CONTEXT *ctx, ULONG request, ULONG answer)
         KeDelayExecutionThread(KernelMode, FALSE, &wait);
     }
     return STATUS_IO_TIMEOUT;
+}
+
+static NTSTATUS HeaderCommand(DEVICE_CONTEXT *ctx, ULONG request, ULONG *type);
+
+/* One cursor command (no answer), polled like a control command. */
+static NTSTATUS CursorCommand(DEVICE_CONTEXT *ctx, const GPU_UPDATE_CURSOR *cmd)
+{
+    VIRTQ_DESC *desc = (VIRTQ_DESC *)ctx->CurRing;
+    volatile UINT16 *avail = (volatile UINT16 *)(ctx->CurRing + 1024);
+    volatile UINT16 *used = (volatile UINT16 *)(ctx->CurRing + 2048);
+    ULONG tries;
+    if (!ctx->Ready || ctx->CurQueueSize == 0) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    RtlCopyMemory(ctx->CurRing + 3072, cmd, sizeof(*cmd));
+    desc[0].Addr = ctx->CurRingPa.QuadPart + 3072;
+    desc[0].Len = sizeof(*cmd);
+    desc[0].Flags = 0;
+    desc[0].Next = 0;
+    avail[2 + (ctx->CurAvailIdx % ctx->CurQueueSize)] = 0;
+    KeMemoryBarrier();
+    ctx->CurAvailIdx++;
+    avail[1] = ctx->CurAvailIdx;
+    KeMemoryBarrier();
+    W16(ctx->NotifyBase, ctx->CurNotifyOff * ctx->NotifyMultiplier, 1);
+    for (tries = 0; tries < 100000; tries++) {
+        KeMemoryBarrier();
+        if (used[1] != ctx->CurLastUsed) {
+            ctx->CurLastUsed = used[1];
+            return STATUS_SUCCESS;
+        }
+        KeStallExecutionProcessor(1);
+    }
+    return STATUS_IO_TIMEOUT;
+}
+
+/* Phase E: the render-only function's scanout is the host display's overlay
+ * plane. A blob's pixels are bound (only when that changes) and flushed, and
+ * the plane is put where the window is; ResourceId 0 hides it. */
+static NTSTATUS Overlay(DEVICE_CONTEXT *ctx, const ENTANGLED_GPU_OVERLAY *in, ULONG *type)
+{
+    GPU_UPDATE_CURSOR cursor;
+    NTSTATUS status;
+    *type = VIRTIO_GPU_RESP_OK_NODATA;
+    RtlZeroMemory(&cursor, sizeof(cursor));
+    if (in->ResourceId == 0) {
+        if (!ctx->OverlayShown) {
+            return STATUS_SUCCESS;
+        }
+        ctx->OverlayShown = FALSE;
+        cursor.Hdr.Type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
+        return CursorCommand(ctx, &cursor);
+    }
+    if (in->Width == 0 || in->Height == 0 || in->Stride < in->Width * 4) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (in->ResourceId != ctx->OverlayResource || in->Width != ctx->OverlayWidth ||
+        in->Height != ctx->OverlayHeight || in->Stride != ctx->OverlayStride) {
+        GPU_SET_SCANOUT_BLOB *req = (GPU_SET_SCANOUT_BLOB *)ctx->Cmd;
+        RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+        req->Hdr.Type = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
+        req->Rect.Width = in->Width;
+        req->Rect.Height = in->Height;
+        req->ResourceId = in->ResourceId;
+        req->Width = in->Width;
+        req->Height = in->Height;
+        req->Format = VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM;
+        req->Strides[0] = in->Stride;
+        status = HeaderCommand(ctx, sizeof(*req), type);
+        if (!NT_SUCCESS(status) || *type != VIRTIO_GPU_RESP_OK_NODATA) {
+            ctx->OverlayResource = 0;
+            return status;
+        }
+        ctx->OverlayResource = in->ResourceId;
+        ctx->OverlayWidth = in->Width;
+        ctx->OverlayHeight = in->Height;
+        ctx->OverlayStride = in->Stride;
+    }
+    {
+        GPU_RESOURCE_FLUSH *req = (GPU_RESOURCE_FLUSH *)ctx->Cmd;
+        RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+        req->Hdr.Type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+        req->Rect.Width = in->Width;
+        req->Rect.Height = in->Height;
+        req->ResourceId = in->ResourceId;
+        status = HeaderCommand(ctx, sizeof(*req), type);
+        if (!NT_SUCCESS(status) || *type != VIRTIO_GPU_RESP_OK_NODATA) {
+            return status;
+        }
+    }
+    if (!ctx->OverlayShown || in->X != ctx->OverlayX || in->Y != ctx->OverlayY) {
+        cursor.Hdr.Type = VIRTIO_GPU_CMD_MOVE_CURSOR;
+        cursor.X = (UINT32)in->X;
+        cursor.Y = (UINT32)in->Y;
+        status = CursorCommand(ctx, &cursor);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+        ctx->OverlayX = in->X;
+        ctx->OverlayY = in->Y;
+        ctx->OverlayShown = TRUE;
+    }
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS CapsetInfo(DEVICE_CONTEXT *ctx, ULONG index, ENTANGLED_GPU_CAPSET_INFO_OUT *out)
@@ -943,6 +1130,22 @@ VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLengt
         if (NT_SUCCESS(status)) {
             ULONG index = in->Index;
             status = CapsetInfo(ctx, index, out);
+            if (NT_SUCCESS(status)) {
+                written = sizeof(*out);
+            }
+        }
+        break;
+    }
+    case IOCTL_ENTANGLED_GPU_OVERLAY: {
+        ENTANGLED_GPU_OVERLAY *in = NULL;
+        ENTANGLED_GPU_RESPONSE *out = NULL;
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in), (PVOID *)&in, NULL);
+        if (NT_SUCCESS(status)) {
+            status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, NULL);
+        }
+        if (NT_SUCCESS(status)) {
+            ENTANGLED_GPU_OVERLAY copy = *in;
+            status = Overlay(ctx, &copy, &out->Type);
             if (NT_SUCCESS(status)) {
                 written = sizeof(*out);
             }

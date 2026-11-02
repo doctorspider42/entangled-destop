@@ -694,6 +694,9 @@ fn build_devices(
             .with_gpu_memory(cfg.display.gpu_memory_mib.map(|mib| u64::from(mib) << 20));
         let renderer = virtio_gpu::VenusRenderer::new(sinks)
             .with_host_visible_bytes(venus_host_visible_bytes(&cfg.display));
+        // The render-only function's scanout is this display's overlay plane
+        // (ADR-0009 phase E).
+        let overlay = display_handle.overlay_sink();
         let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
         let checkpoint_override = std::env::var(VENUS_CHECKPOINT_ENV).as_deref() == Ok("1");
         if cfg.display.venus_checkpoints || checkpoint_override {
@@ -714,15 +717,14 @@ fn build_devices(
         }
         devices.push(Box::new(gpu));
         // ADR-0009 phase A0: a second, render-only function. Its own
-        // executor over the same host Vulkan, and a display nothing shows.
+        // executor over the same host Vulkan; its one scanout is the
+        // display's overlay plane, where a guest window presents (phase E).
         if cfg.display.render_node {
             let sinks = virtio_gpu::ExecutorFactory::new(Arc::clone(&host))
                 .with_gpu_memory(cfg.display.gpu_memory_mib.map(|mib| u64::from(mib) << 20));
             let renderer = virtio_gpu::VenusRenderer::new(sinks)
                 .with_host_visible_bytes(venus_host_visible_bytes(&cfg.display));
-            let detached = display::DisplayHandle::detached(cfg.display.width, cfg.display.height)
-                .map_err(|e| format!("cannot make the render-only function's display: {e}"))?;
-            let render = virtio_gpu::GpuDevice::with_renderer(detached, Box::new(renderer));
+            let render = virtio_gpu::GpuDevice::with_renderer(overlay, Box::new(renderer));
             tracing::info!("attaching a render-only Venus function (ADR-0009 phase A0)");
             devices.push(Box::new(render));
         }

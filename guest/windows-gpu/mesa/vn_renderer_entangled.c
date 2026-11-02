@@ -135,6 +135,30 @@ entangled_submit(struct vn_renderer *renderer,
    return VK_SUCCESS;
 }
 
+/* ADR-0009 phase E: a window's finished frame shown by the host over the
+ * desktop, at its place, instead of copied through the window. */
+static VkResult
+entangled_overlay(struct vn_renderer *renderer,
+                  struct vn_renderer_bo *bo,
+                  uint32_t width,
+                  uint32_t height,
+                  uint32_t stride,
+                  int32_t x,
+                  int32_t y)
+{
+   struct entangled *gpu = (struct entangled *)renderer;
+   ENTANGLED_GPU_OVERLAY in = {bo ? bo->res_id : 0, width, height, stride, x, y};
+   ENTANGLED_GPU_RESPONSE resp = {0};
+   AcquireSRWLockExclusive(&gpu->lock);
+   const bool ok = ioctl(gpu, IOCTL_ENTANGLED_GPU_OVERLAY, &in, sizeof(in),
+                         &resp, sizeof(resp));
+   ReleaseSRWLockExclusive(&gpu->lock);
+   if (trace_on())
+      fprintf(stderr, "entangled: overlay %u %ux%u at %d,%d ->%s 0x%x\n",
+              in.ResourceId, width, height, x, y, ok ? "" : " failed", resp.Type);
+   return ok && resp.Type == 0x1100 ? VK_SUCCESS : VK_ERROR_UNKNOWN;
+}
+
 static VkResult
 entangled_wait(struct vn_renderer *renderer,
                const struct vn_renderer_wait *wait)
@@ -470,6 +494,7 @@ vn_renderer_create_entangled(struct vn_instance *instance,
    gpu->base.ops.destroy = entangled_destroy;
    gpu->base.ops.submit = entangled_submit;
    gpu->base.ops.wait = entangled_wait;
+   gpu->base.ops.overlay = entangled_overlay;
    gpu->base.shmem_ops.create = entangled_shmem_create;
    gpu->base.shmem_ops.destroy = entangled_shmem_destroy;
    gpu->base.bo_ops.create_from_device_memory =

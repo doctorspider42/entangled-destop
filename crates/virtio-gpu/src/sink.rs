@@ -121,6 +121,13 @@ pub trait ScanoutSink: Send {
     /// Hides the cursor plane (`UPDATE_CURSOR` with resource 0).
     fn hide_cursor(&self) -> Result<(), SinkError>;
 
+    /// The scanout lost its resource: disabled by the guest (`SET_SCANOUT` or
+    /// `SET_SCANOUT_BLOB` with resource 0), its resource unref'd, or its
+    /// renderer gone. A display keeps its last frame (the default); an
+    /// overlay plane (ADR-0009 phase E) hides, since the window that drew it
+    /// is gone.
+    fn scanout_disabled(&self) {}
+
     // ------------------------- shared presentation (ADR-0004, zero-copy)
 
     /// Whether [`Self::present_shared`] could take a frame right now — a
@@ -224,6 +231,10 @@ impl<S: ScanoutSink + ?Sized> ScanoutSink for Box<S> {
 
     fn hide_cursor(&self) -> Result<(), SinkError> {
         (**self).hide_cursor()
+    }
+
+    fn scanout_disabled(&self) {
+        (**self).scanout_disabled()
     }
 
     fn accepts_shared_scanout(&self) -> bool {

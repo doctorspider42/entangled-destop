@@ -33,6 +33,8 @@ pub struct ScanoutStats {
     pub bytes: u64,
     /// Resolution changes (each one reallocates the GPU texture).
     pub resolutions: u64,
+    /// Accepted [`Scanout::update_overlay`] calls (ADR-0009 phase E).
+    pub overlay_updates: u64,
 }
 
 /// The guest's hardware-cursor plane (MVP-812): a small premultiplied-BGRA
@@ -97,6 +99,58 @@ impl CursorPlane {
     }
 }
 
+/// A guest window's own frames over the desktop (ADR-0009 phase E): a render
+/// node's scanout, shown at a position of this one instead of being copied
+/// through the guest's desktop. Opaque, unlike the cursor.
+#[derive(Debug, Clone)]
+struct OverlayPlane {
+    width: u32,
+    height: u32,
+    /// `width * height * 4` bytes, BGRA.
+    pixels: Vec<u8>,
+    /// Top-left corner in scanout coordinates (signed, like the cursor's).
+    x: i64,
+    y: i64,
+    /// Whether it has been given pixels since its size was set.
+    shown: bool,
+    /// Changed (pixels or position) since the renderer last drew it.
+    changed: bool,
+}
+
+impl OverlayPlane {
+    fn clipped_rect(&self, w: u32, h: u32) -> Option<Rect> {
+        let x0 = self.x.max(0);
+        let y0 = self.y.max(0);
+        let x1 = (self.x + i64::from(self.width)).min(i64::from(w));
+        let y1 = (self.y + i64::from(self.height)).min(i64::from(h));
+        if x0 >= x1 || y0 >= y1 {
+            return None;
+        }
+        // All four values are in 0..=u32::MAX after the clamps above.
+        Some(Rect {
+            x: x0 as u32,
+            y: y0 as u32,
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        })
+    }
+
+    /// The pixels of `rect` (scanout coordinates, inside the plane), tightly
+    /// packed.
+    fn pixels_of(&self, rect: Rect) -> Option<Vec<u8>> {
+        let ox = usize::try_from(i64::from(rect.x) - self.x).ok()?;
+        let oy = usize::try_from(i64::from(rect.y) - self.y).ok()?;
+        let row_bytes = rect.width as usize * BPP;
+        let stride = self.width as usize * BPP;
+        let mut out = Vec::with_capacity(row_bytes * rect.height as usize);
+        for row in 0..rect.height as usize {
+            let at = (oy + row) * stride + ox * BPP;
+            out.extend_from_slice(self.pixels.get(at..at + row_bytes)?);
+        }
+        Some(out)
+    }
+}
+
 /// The host copy of one guest scanout.
 #[derive(Debug)]
 pub struct Scanout {
@@ -112,6 +166,8 @@ pub struct Scanout {
     cursor: Option<CursorPlane>,
     /// The next cursor image's [`CursorPlane::serial`].
     cursor_serial: u64,
+    /// The overlay plane, when a render node shows one ([`OverlayPlane`]).
+    overlay: Option<OverlayPlane>,
     stats: ScanoutStats,
 }
 
@@ -132,6 +188,7 @@ impl Scanout {
             generation: 0,
             cursor: None,
             cursor_serial: 0,
+            overlay: None,
             stats: ScanoutStats::default(),
         })
     }
@@ -375,6 +432,7 @@ impl Scanout {
         out.update(0, 0, self.width, self.height, pixels)?;
         out.cursor = self.cursor.clone();
         out.cursor_serial = self.cursor_serial;
+        out.overlay = self.overlay.clone();
         Ok(out)
     }
 
@@ -404,6 +462,31 @@ impl Scanout {
             };
             dst.copy_from_slice(src);
         }
+        // The overlay plane, where it lies under the cursor: the cursor is
+        // drawn over it, not over the desktop it hides.
+        if let Some((orect, opixels)) = self.overlay_composite() {
+            let x0 = rect.x.max(orect.x);
+            let y0 = rect.y.max(orect.y);
+            let x1 = (rect.x + rect.width).min(orect.x + orect.width);
+            let y1 = (rect.y + rect.height).min(orect.y + orect.height);
+            if x0 < x1 && y0 < y1 {
+                let bytes = (x1 - x0) as usize * BPP;
+                for y in y0..y1 {
+                    let src = ((y - orect.y) as usize * orect.width as usize
+                        + (x0 - orect.x) as usize)
+                        * BPP;
+                    let dst = ((y - rect.y) as usize * rect.width as usize
+                        + (x0 - rect.x) as usize)
+                        * BPP;
+                    let (Some(src), Some(dst)) =
+                        (opixels.get(src..src + bytes), out.get_mut(dst..dst + bytes))
+                    else {
+                        return None;
+                    };
+                    dst.copy_from_slice(src);
+                }
+            }
+        }
         // Blend the overlapping part of the cursor image. The offsets of the
         // clipped rect inside the cursor image are non-negative by clipping.
         let cur_x0 = (i64::from(rect.x) - cursor.x) as usize;
@@ -428,6 +511,157 @@ impl Scanout {
             }
         }
         Some((rect, out))
+    }
+
+    // --------------------------------------------------- the overlay plane
+
+    /// Gives the overlay plane a `width`x`height` image (black, not shown
+    /// until [`Self::update_overlay`] fills it); a plane of that size already
+    /// there keeps its pixels and position.
+    pub fn set_overlay_size(&mut self, width: u32, height: u32) -> Result<(), DisplayError> {
+        let len = Self::checked_len(width, height)?;
+        if let Some(plane) = &self.overlay {
+            if (plane.width, plane.height) == (width, height) {
+                return Ok(());
+            }
+        }
+        self.dirty_under_overlay();
+        let (x, y) = self.overlay.as_ref().map_or((0, 0), |p| (p.x, p.y));
+        self.overlay = Some(OverlayPlane {
+            width,
+            height,
+            pixels: vec![0; len],
+            x,
+            y,
+            shown: false,
+            changed: true,
+        });
+        Ok(())
+    }
+
+    /// Copies a tightly packed `width`x`height` BGRA block to (`x`, `y`) of the
+    /// overlay plane and shows it. Rejects a rect outside the plane, a short
+    /// buffer, or a plane with no size; a rejected update changes nothing.
+    pub fn update_overlay(
+        &mut self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Result<(), DisplayError> {
+        let plane = self
+            .overlay
+            .as_mut()
+            .ok_or(DisplayError::Config("an overlay update before its size"))?;
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        if !rect.fits_within(plane.width, plane.height) {
+            return Err(DisplayError::RectOutOfBounds {
+                x,
+                y,
+                width,
+                height,
+                scanout_width: plane.width,
+                scanout_height: plane.height,
+            });
+        }
+        let row_bytes = width as usize * BPP;
+        let needed = row_bytes * height as usize;
+        if data.len() < needed {
+            return Err(DisplayError::ShortPixelData {
+                expected: needed,
+                actual: data.len(),
+            });
+        }
+        let stride = plane.width as usize * BPP;
+        for row in 0..height as usize {
+            let at = (y as usize + row) * stride + x as usize * BPP;
+            let (Some(dst), Some(src)) = (
+                plane.pixels.get_mut(at..at + row_bytes),
+                data.get(row * row_bytes..(row + 1) * row_bytes),
+            ) else {
+                // Unreachable given the checks above; still no panic.
+                return Err(DisplayError::Config("overlay rect outside the plane"));
+            };
+            dst.copy_from_slice(src);
+        }
+        plane.shown = true;
+        plane.changed = true;
+        self.stats.overlay_updates += 1;
+        Ok(())
+    }
+
+    /// Puts the overlay plane's top-left corner at (`x`, `y`), the guest's
+    /// signed 32-bit coordinates.
+    pub fn move_overlay(&mut self, x: u32, y: u32) {
+        self.dirty_under_overlay();
+        if let Some(plane) = &mut self.overlay {
+            plane.x = i64::from(x as i32);
+            plane.y = i64::from(y as i32);
+            plane.changed = true;
+        }
+    }
+
+    /// Hides the overlay plane until it is updated again; the desktop under it
+    /// is drawn again.
+    pub fn hide_overlay(&mut self) {
+        self.dirty_under_overlay();
+        if let Some(plane) = &mut self.overlay {
+            plane.shown = false;
+        }
+    }
+
+    /// Whether an overlay plane is shown.
+    pub fn overlay_visible(&self) -> bool {
+        self.overlay.as_ref().is_some_and(|p| p.shown)
+    }
+
+    /// What the renderer draws of the overlay after uploading the base rect
+    /// `base` (if any): the clipped plane and its pixels, when it is shown
+    /// and either changed or was drawn over by that rect. Clears `changed`.
+    pub fn take_overlay_upload(&mut self, base: Option<Rect>) -> Option<(Rect, Vec<u8>)> {
+        let (w, h) = (self.width, self.height);
+        let plane = self.overlay.as_mut()?;
+        if !plane.shown {
+            return None;
+        }
+        let rect = plane.clipped_rect(w, h)?;
+        let overdrawn = base.is_some_and(|b| intersects(b, rect));
+        if !plane.changed && !overdrawn {
+            return None;
+        }
+        plane.changed = false;
+        Some((rect, plane.pixels_of(rect)?))
+    }
+
+    /// The overlay as a screenshot composites it: the clipped plane and its
+    /// pixels, when shown.
+    pub fn overlay_composite(&self) -> Option<(Rect, Vec<u8>)> {
+        let plane = self.overlay.as_ref().filter(|p| p.shown)?;
+        let rect = plane.clipped_rect(self.width, self.height)?;
+        Some((rect, plane.pixels_of(rect)?))
+    }
+
+    /// Marks the scanout area under a shown overlay dirty, so the renderer
+    /// draws the desktop there again when it moves away or hides.
+    fn dirty_under_overlay(&mut self) {
+        let Some(rect) = self
+            .overlay
+            .as_ref()
+            .filter(|p| p.shown)
+            .and_then(|p| p.clipped_rect(self.width, self.height))
+        else {
+            return;
+        };
+        self.dirty = Some(match self.dirty {
+            Some(existing) => union(existing, rect),
+            None => rect,
+        });
     }
 
     /// Marks the scanout area under the cursor dirty, so the renderer restores
@@ -497,6 +731,11 @@ impl Scanout {
         writer.finish()?;
         Ok(())
     }
+}
+
+/// Whether two rects share at least one pixel.
+fn intersects(a: Rect, b: Rect) -> bool {
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
 }
 
 /// Smallest rect covering both inputs.
@@ -839,5 +1078,79 @@ mod tests {
             }
         );
         assert_eq!(union(b, a), union(a, b));
+    }
+
+    /// ADR-0009 phase E: a render node's frames land on the overlay plane,
+    /// drawn over the desktop at its position without touching the mirror.
+    #[test]
+    fn the_overlay_plane_draws_over_the_desktop_and_gives_it_back() {
+        let mut s = Scanout::new(8, 8).unwrap();
+        s.fill([1, 1, 1, 255]);
+        s.take_dirty();
+        assert!(
+            s.update_overlay(0, 0, 1, 1, &[0; 4]).is_err(),
+            "no size yet"
+        );
+        s.set_overlay_size(4, 2).unwrap();
+        assert!(!s.overlay_visible(), "sized but not drawn");
+        assert!(s.take_overlay_upload(None).is_none());
+        s.move_overlay(6, 1);
+        s.update_overlay(0, 0, 4, 2, &[9; 32]).unwrap();
+        assert!(s.overlay_visible());
+        // Clipped at the right edge: two of its four columns are on screen.
+        let (rect, pixels) = s.take_overlay_upload(None).expect("changed, so drawn");
+        assert_eq!(
+            rect,
+            Rect {
+                x: 6,
+                y: 1,
+                width: 2,
+                height: 2
+            }
+        );
+        assert_eq!(pixels, vec![9; 16]);
+        assert!(s.take_overlay_upload(None).is_none(), "unchanged");
+        // A desktop update under it draws it again; one beside it does not.
+        let under = Rect {
+            x: 5,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        assert!(s.take_overlay_upload(Some(under)).is_some());
+        let beside = Rect {
+            x: 0,
+            y: 5,
+            width: 2,
+            height: 2,
+        };
+        assert!(s.take_overlay_upload(Some(beside)).is_none());
+        // The mirror is untouched; a screenshot composites the plane.
+        assert_eq!(&s.pixels()[..4], &[1, 1, 1, 255]);
+        let (shot_rect, _) = s.overlay_composite().expect("shown");
+        assert_eq!(shot_rect, rect);
+        // Moving and hiding give the desktop under it back.
+        s.move_overlay(0, 0);
+        assert_eq!(s.take_dirty(), Some(rect), "the vacated area is redrawn");
+        s.hide_overlay();
+        assert!(!s.overlay_visible());
+        assert!(s.take_dirty().is_some());
+        assert!(s.take_overlay_upload(None).is_none());
+        // An update outside the plane, or short, changes nothing.
+        assert!(s.update_overlay(3, 0, 2, 1, &[0; 8]).is_err());
+        assert!(s.update_overlay(0, 0, 4, 2, &[0; 8]).is_err());
+        assert!(!s.overlay_visible());
+    }
+
+    #[test]
+    fn the_cursor_is_drawn_over_the_overlay_not_the_desktop_under_it() {
+        let mut s = Scanout::new(4, 4).unwrap();
+        s.fill([1, 1, 1, 255]);
+        s.set_overlay_size(4, 4).unwrap();
+        s.update_overlay(0, 0, 4, 4, &[7; 64]).unwrap();
+        // A fully transparent cursor shows what is under it: the overlay.
+        s.set_cursor(1, 1, 0, 0, 1, 1, &[0; 4]).unwrap();
+        let (_, under) = s.cursor_overlay().expect("cursor shown");
+        assert_eq!(under, vec![7; 4]);
     }
 }

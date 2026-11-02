@@ -482,6 +482,9 @@ impl DisplayHandle {
                 };
                 if let Some(based) = based {
                     let mut snapshot = based?;
+                    if let Some((rect, plane)) = snapshot.overlay_composite() {
+                        snapshot.update(rect.x, rect.y, rect.width, rect.height, &plane)?;
+                    }
                     if let Some((rect, composited)) = snapshot.cursor_overlay() {
                         snapshot.update(rect.x, rect.y, rect.width, rect.height, &composited)?;
                     }
@@ -491,17 +494,110 @@ impl DisplayHandle {
                 // current one.
             }
         }
-        let (width, height, pixels, overlay) = {
+        let (width, height, pixels, plane, overlay) = {
             let scanout = lock_scanout(&self.scanout);
             let (w, h) = scanout.size();
-            (w, h, scanout.pixels().to_vec(), scanout.cursor_overlay())
+            (
+                w,
+                h,
+                scanout.pixels().to_vec(),
+                scanout.overlay_composite(),
+                scanout.cursor_overlay(),
+            )
         };
         let mut snapshot = Scanout::new(width, height)?;
         snapshot.update(0, 0, width, height, &pixels)?;
+        if let Some((rect, plane)) = plane {
+            snapshot.update(rect.x, rect.y, rect.width, rect.height, &plane)?;
+        }
         if let Some((rect, composited)) = overlay {
             snapshot.update(rect.x, rect.y, rect.width, rect.height, &composited)?;
         }
         Ok(snapshot)
+    }
+}
+
+/// A render node's scanout as this display's **overlay plane** (ADR-0009
+/// phase E): a Windows guest's Vulkan window presents its frames to the
+/// render-only virtio-gpu function, whose one scanout is drawn over the
+/// desktop at the window's place instead of being copied through the guest's
+/// desktop. The render node has no display of its own, so its cursor commands
+/// are free to say where: `MOVE_CURSOR` puts the plane's top-left corner at
+/// that desktop position, `UPDATE_CURSOR` with resource 0 hides it.
+#[derive(Debug, Clone)]
+pub struct OverlaySink {
+    scanout: SharedScanout,
+    waker: Waker,
+}
+
+impl DisplayHandle {
+    /// This display's overlay plane, for a render node's device to drive.
+    pub fn overlay_sink(&self) -> OverlaySink {
+        OverlaySink {
+            scanout: Arc::clone(&self.scanout),
+            waker: self.waker.clone(),
+        }
+    }
+}
+
+impl virtio_gpu::ScanoutSink for OverlaySink {
+    /// The desktop's size: the largest plane that fits on it.
+    fn resolution(&self) -> (u32, u32) {
+        lock_scanout(&self.scanout).size()
+    }
+
+    fn set_resolution(&self, width: u32, height: u32) -> Result<(), virtio_gpu::SinkError> {
+        lock_scanout(&self.scanout)
+            .set_overlay_size(width, height)
+            .map_err(sink_error)
+    }
+
+    fn update_scanout(
+        &self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Result<(), virtio_gpu::SinkError> {
+        lock_scanout(&self.scanout)
+            .update_overlay(x, y, width, height, data)
+            .map_err(sink_error)?;
+        self.waker.frame();
+        Ok(())
+    }
+
+    fn set_cursor(
+        &self,
+        _width: u32,
+        _height: u32,
+        _hot_x: u32,
+        _hot_y: u32,
+        x: u32,
+        y: u32,
+        _data: &[u8],
+    ) -> Result<(), virtio_gpu::SinkError> {
+        // A render node's cursor has no image of its own: only its place.
+        self.move_cursor(x, y)
+    }
+
+    fn move_cursor(&self, x: u32, y: u32) -> Result<(), virtio_gpu::SinkError> {
+        lock_scanout(&self.scanout).move_overlay(x, y);
+        self.waker.wake();
+        Ok(())
+    }
+
+    fn hide_cursor(&self) -> Result<(), virtio_gpu::SinkError> {
+        lock_scanout(&self.scanout).hide_overlay();
+        self.waker.wake();
+        Ok(())
+    }
+
+    /// The window that presented is gone (its program exited without
+    /// hiding the plane, say): the desktop under it shows again.
+    fn scanout_disabled(&self) {
+        lock_scanout(&self.scanout).hide_overlay();
+        self.waker.wake();
     }
 }
 
@@ -609,6 +705,29 @@ fn sink_error(error: DisplayError) -> virtio_gpu::SinkError {
 mod tests {
     use super::*;
     use virtio_gpu::ScanoutSink;
+
+    /// ADR-0009 phase E: a render node drives the display's overlay plane
+    /// through the plain sink calls, its cursor saying where.
+    #[test]
+    fn a_render_node_draws_the_overlay_plane_through_its_sink() {
+        let handle = DisplayHandle::detached(8, 8).expect("detached handle");
+        let overlay = handle.overlay_sink();
+        let sink: &dyn ScanoutSink = &overlay;
+        assert_eq!(sink.resolution(), (8, 8), "the desktop bounds the plane");
+        sink.set_resolution(2, 2).expect("a plane size");
+        sink.move_cursor(3, 4).expect("its place");
+        sink.update_scanout(0, 0, 2, 2, &[5; 16]).expect("a frame");
+        let shot = handle.snapshot().expect("snapshot");
+        let at = |x: usize, y: usize| shot.pixels()[(y * 8 + x) * 4];
+        assert_eq!(at(3, 4), 5, "the plane is in the screenshot");
+        assert_eq!(at(0, 0), 0, "the desktop beside it is not");
+        // The window's program went without hiding it: the device says the
+        // scanout lost its resource, and the plane goes.
+        sink.scanout_disabled();
+        assert_eq!(handle.snapshot().expect("snapshot").pixels()[(4 * 8 + 3) * 4], 0);
+        // And the desktop handle itself is not affected by any of it.
+        assert_eq!(DisplayHandle::resolution(&handle), (8, 8));
+    }
 
     #[test]
     fn the_handle_is_a_scanout_sink() {

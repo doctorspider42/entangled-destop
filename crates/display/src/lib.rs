@@ -109,7 +109,7 @@ mod windows_keyboard;
 
 pub use boost::BoostPolicy;
 pub use error::DisplayError;
-pub use handle::DisplayHandle;
+pub use handle::{DisplayHandle, OverlaySink};
 pub use host::DisplayHost;
 pub use input::{ControlEvent, ControlQueue, InputCapture, InputQueue, KeyOutcome, WindowAction};
 pub use renderer::FrameStats;

@@ -259,6 +259,43 @@ gone) and `gl-test` passes at ~51 fps, and the WebGL Aquarium
 done.** Left:
 async/interrupt submits, zero-copy present (E) and signing (F).
 
+**Phase E, the overlay plane (2026-11-03):** a finished frame used to take two
+CPU copies in the guest (Mesa's win32 WSI: a `memcpy` into a DIB, then
+`StretchBlt`), DWM's software composition and `viogpudo`'s transfer before the
+host uploaded the desktop. Now the render-only function's one scanout *is* the
+host display's **overlay plane**, drawn over the desktop at the window's
+place:
+
+- Mesa's win32 WSI asks the device first (`wsi_device::win32.present_overlay`,
+  in `0001-venus-builds-with-clang-cl.patch`): when the window is the
+  foreground one, not minimised, its client area the swapchain's size and
+  entirely on screen, Venus hands the image memory's blob to our backend
+  (`vn_renderer_ops::overlay`), and the window's own pixels are refreshed only
+  every 60th frame (what Windows shows if the overlay goes). Otherwise the
+  overlay is hidden and the old path runs.
+- `IOCTL_ENTANGLED_GPU_OVERLAY` speaks plain virtio-gpu to the render-only
+  function: `SET_SCANOUT_BLOB` (only when the blob or size changes),
+  `RESOURCE_FLUSH`, and the place through the cursor queue — `MOVE_CURSOR`, the
+  render node having no pointer of its own; `UPDATE_CURSOR` with resource 0
+  hides it. The driver now brings the cursor queue up too.
+- The host gives the render node a `display::OverlaySink` instead of a
+  detached display: a plane in `Scanout` (size, pixels, signed position),
+  written into the window's texture after the desktop's dirty rect and under
+  the cursor (which blends over it), in screenshots too, and hidden when the
+  device's scanout loses its resource (`ScanoutSink::scanout_disabled`: a
+  program that exits without destroying its swapchain leaves nothing behind).
+
+**Verified 2026-11-03** on the fresh install: the host log shows the render
+node scanning out `vk-present`'s and `gl-test`'s blobs, the frames appear in
+their windows through the plane and vanish when the programs exit;
+`vk-present` 300 frames at 620 fps, `gl-test` at 52-54 fps (the copies were
+not what bound either). What remains of a copy is the host's: the plane's
+pixels are read out of the blob (host memory the GPU wrote) into the plane
+and uploaded. Taking that to zero means the guest allocating the WSI image's
+memory exportable, a canonical image recorded on the handle blob, and the
+window importing it as it does for a Linux guest's GPU desktop (the shared
+lease, ADR-0004) — the plane's `present_shared` is the hook for it.
+
 Phases A0–D are the replacement; this machine has the WDK (10.0.26100) to
 build A; E is performance; F is distribution.
 
@@ -275,8 +312,9 @@ build A; E is performance; F is distribution.
 - **DXVK is per application** (its DLLs beside the game, or installed into
   `System32` by our installer, which then affects every D3D9–11 program in
   the guest). The installer choice is a phase D decision.
-- **Present copies** until phase E: one CPU copy of each finished frame in
-  the guest, on top of the host's own copy (ADR-0008's performance notes).
+- **Present copies:** since phase E none in the guest while a window is in
+  front and on screen (the overlay plane); the host still reads the plane's
+  pixels out of the blob (see phase E for the rest of the way).
 - **Signing is the long pole.** Test-signing is fine for development; a
   driver users install without test mode needs Microsoft's attestation
   signature, which needs an organisation with an EV certificate.
