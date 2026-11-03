@@ -251,7 +251,8 @@ pub fn installed_refresh_hz_here(args: &InstallArgs) -> u32 {
             refresh_hz,
             monitor_hz = monitor.refresh_hz,
             source = %monitor.source,
-            "installed machine: the host monitor's refresh, up to the 144 Hz the GPU desktop              keeps up with and a whole fraction of it above (--refresh-hz to choose)"
+            "installed machine: the host monitor's refresh, up to the 144 Hz the GPU desktop \
+             keeps up with and a whole fraction of it above (--refresh-hz to choose)"
         ),
         None => tracing::info!(
             refresh_hz,

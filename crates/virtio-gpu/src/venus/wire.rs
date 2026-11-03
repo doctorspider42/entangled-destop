@@ -1963,7 +1963,9 @@ mod tests {
         assert_eq!(
             d.alloc_budget(),
             64,
-            "a reset restores the budget this decoder was BUILT with, not the              protocol maximum — otherwise `with_alloc_budget` would be a              promise that expired after one command"
+            "a reset restores the budget this decoder was BUILT with, not the \
+             protocol maximum — otherwise `with_alloc_budget` would be a \
+             promise that expired after one command"
         );
         assert!(d.is_fatal(), "a budget reset is not a fatal reset");
         assert_eq!(d.u32(), Err(WireError::Poisoned));

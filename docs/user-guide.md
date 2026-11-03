@@ -60,9 +60,9 @@ What it can do today:
 
 ## What this is not
 
-- **Not a Windows-guest solution.** Nothing about the machine model is
-  Windows-specific and nobody has made a Windows guest boot; assume it does not
-  work. Linux guests are what is tested, on every commit.
+- **Not a polished Windows-guest product yet.** Windows 10 installs and runs
+  on the Windows host (see [Windows guests](#windows-guests)), but Linux
+  guests are what CI boots on every commit, and Windows 3D needs test mode.
 - **Not a container runtime.** These are full virtual machines with their own
   kernel. If you want process isolation with a shared kernel, use containers.
 - **Not a server or cloud product.** There is no daemon, no REST API, no
@@ -678,6 +678,98 @@ which is what a *private* repository needs and what the unauthenticated rate
 limit sometimes needs. The same is true of `entangled fetch bootstrap-kernel`,
 and none of it affects the installer's copy, which is already on disk.
 
+## Windows guests
+
+Windows 10 installs unattended from Microsoft's own ISO and runs with its
+desktop following the window, sound, a shared clipboard, shared folders as
+drives and suspend to a file. All of that has been verified on the Windows
+host (WHP). Windows 11 installs too, with its TPM, Secure Boot and CPU checks
+bypassed (`LabConfig`), because this machine has no TPM. A Windows guest on a
+Linux/KVM host is built and unit-tested but **has never been booted**.
+
+In the manager: **New machine → Windows**, choose the ISO, and that is all. The
+CLI does the same:
+
+```bash
+entangled install windows --iso Win10_22H2_English_x64.iso --disk win10.raw --size 64G --memory-mib 8192
+entangled run win10.toml
+```
+
+What the install does by itself:
+
+- **Downloads the drivers.** virtio-win (about 840 MiB, from fedorapeople.org)
+  and WinFsp (2 MiB, from GitHub) are fetched once into the cache and checked
+  against SHA-256 digests compiled into `entangled`
+  ([`guest/windows/pinned.toml`](../guest/windows/pinned.toml)). `--drivers` and
+  `--winfsp` use your own copies, `--no-shared-folders` skips WinFsp, and
+  `entangled fetch virtio-win` downloads ahead of time.
+- **Answers Setup.** The edition is Pro unless the disc has no Pro. No product
+  key is entered, so Windows runs unactivated until you activate it. The local
+  account is **`entangled` with no password**, logged in automatically. Set a
+  password for a machine you keep.
+- **Sets up the first logon.** The guest agent (the shared clipboard), the
+  resolution follower (the desktop takes the window's size), WinFsp with the
+  virtio-fs service, and the 3D package when you gave one. Then it powers off
+  and writes the profile, without the install discs.
+
+The installed machine uses virtio-pci, UEFI with persistent NVRAM, the
+virtio-vga display, an Intel HD Audio sound card (Windows' in-box driver),
+user-mode networking, the Hyper-V reference clock and the agent's console.
+
+**Shared folders.** Add one under *Configure → Storage → Shared folders*. For
+a Windows machine it is served as virtio-fs and the first one appears as
+**`Z:`** at the next start. Only the first share mounts by itself.
+
+**Suspend.** It works, and is measured: 4 GiB, 8 vCPUs, 808 MiB written in
+3.9 s. It is refused while 3D is in use (the host-side Vulkan objects cannot
+be saved) and while a shared folder has open files. It is also refused on a
+host whose WHP grants the Hyper-V enlightenments itself (Windows 11 hosts),
+because that state lives in the hypervisor and cannot be saved. This
+development host emulates the clock instead, and there it works.
+
+### 3D for Windows guests, and test mode
+
+Entangled has its own Windows GPU stack ([ADR-0009](adr/0009-own-windows-gpu-driver.md)):
+
+- **Vulkan 1.3.** A KMDF driver (`entangled-gpu.sys`) and Mesa's Venus driver
+  forward the guest's Vulkan to the host GPU.
+- **OpenGL.** Zink translates it to Vulkan.
+- **Direct3D 9-11.** DXVK translates it to Vulkan.
+- **WebGL in Edge.** ANGLE runs on Vulkan.
+
+Windows are composited by the host GPU, with no copy through the guest's CPU.
+Measured on an RTX 2070:
+
+- the D3D11 test runs at 532 fps;
+- OpenGL runs at about 51 fps (Zink's present is the limit);
+- the WebGL Aquarium runs at about 44 fps.
+
+These numbers come from tests chosen by the project. They do not promise that
+any particular game will run, or how fast.
+
+**The catch: the driver is test-signed.** Windows loads a third-party kernel
+driver only if it is signed by Microsoft (attestation signing needs an EV
+certificate and a Partner Center account) or if Windows is in **test mode**. So
+a guest with 3D:
+
+- has test-signing on (`bcdedit /set testsigning on`) and shows "Test Mode" in
+  the corner of the desktop;
+- cannot use Secure Boot, which this machine does not have anyway;
+- **will not run games whose anti-cheat refuses test mode** (most kernel
+  anti-cheats do). This is a property of test mode, not something to fix in
+  the guest;
+- trusts the package's test certificate, which the installer adds to the
+  guest's root store. Anyone holding the certificate's private key could sign
+  code that this guest trusts. Keep it to yourself.
+
+All of this happens inside the guest. The host is not put in test mode and
+trusts nothing new. Without a 3D package a Windows guest is 2D and needs none
+of it.
+
+The 3D package is not downloadable yet: it is built from
+[`guest/windows-gpu`](../guest/windows-gpu) (driver, Mesa) with the WDK and
+LLVM. Point the wizard's *3D* row, or `--gpu3d`, at the folder.
+
 ## Living with a VM
 
 ### The window
@@ -1033,7 +1125,7 @@ and nothing has to be installed in the guest. What to expect:
   relative and stays inside the share. On Windows, creating a symlink needs
   Developer Mode.
 - **At most four shares per machine**, and each one takes one of the
-  machine's eight device slots.
+  machine's device slots.
 - **A mounted share cannot be suspended.** Its open files live on the host and
   cannot go into a snapshot, so *Suspend* is refused until you `umount` it.
 
@@ -1483,15 +1575,18 @@ page** link otherwise, and **Skip** to hide the banner for this session.
 Everything here is a real limitation of the current build, not a caveat about
 configuration:
 
-0. **Eight devices per machine.** Each disk, the CD-ROM, the network card,
-   the GPU, the keyboard, the tablet, the sound card, each gamepad player,
-   each shared folder and memory reclaim is one device, and a machine has
-   eight slots. A profile that needs more is refused when it is loaded or
+0. **Eight devices per machine on virtio-mmio, ten on virtio-pci.** Each disk,
+   the CD-ROM, the network card, the GPU and its render-only function, the
+   keyboard, the tablet, the relative mouse, the sound card, each gamepad
+   player, each shared folder, memory reclaim, the agent's console and the
+   optical drives' controller takes one slot. A profile that needs more is refused when it is loaded or
    saved, with every device named. A start does not fail halfway because of
    it.
 
-1. **No Windows guests.** Untested and unsupported; Linux guests are what CI
-   boots.
+1. **Windows guests are verified by hand, on the Windows host only.** CI
+   boots Linux. A Windows guest on KVM has never been booted, its 3D needs
+   test mode (no kernel anti-cheat), and Windows 11 runs with its hardware
+   checks bypassed. See [Windows guests](#windows-guests).
 2. **The GPU desktop needs the guest's cooperation and a Vulkan host.**
    `[display] venus = true` runs the guest's Vulkan, and its OpenGL through
    Zink, on the host GPU, on either host — but the guest must send its GL to

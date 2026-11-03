@@ -598,7 +598,8 @@ impl WhpVcpu {
                         tracing::warn!(
                             vcpu = self.index,
                             %site,
-                            "unrecoverable exception with no power-off latched and no lifecycle                              to restart the machine: ending the VM"
+                            "unrecoverable exception with no power-off latched and no lifecycle \
+                             to restart the machine: ending the VM"
                         );
                         return Ok(RunOutcome::Shutdown);
                     };
@@ -617,7 +618,8 @@ impl WhpVcpu {
                             %site,
                             reason = exit.ExitReason.0,
                             code = ?code,
-                            "unrecoverable exception on the boot CPU with no power-off latched:                              treating it as a reboot"
+                            "unrecoverable exception on the boot CPU with no power-off latched: \
+                             treating it as a reboot"
                         );
                         if !lifecycle.request_guest_reset() {
                             return Ok(RunOutcome::Shutdown);
@@ -631,7 +633,8 @@ impl WhpVcpu {
                     tracing::warn!(
                         vcpu = self.index,
                         %site,
-                        "unrecoverable exception on an application processor: parking it and                          leaving the machine running"
+                        "unrecoverable exception on an application processor: parking it and \
+                         leaving the machine running"
                     );
                     match park(self, lifecycle, running, None) {
                         Parked::Reset => continue,

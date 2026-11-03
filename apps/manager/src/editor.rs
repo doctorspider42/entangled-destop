@@ -301,6 +301,13 @@ enabled = true
         }
     }
 
+    /// A Windows guest: the Hyper-V enlightenments are what `install windows`
+    /// turns on and no Linux profile has. Its shares are served as virtio-fs,
+    /// since Windows has no 9P client.
+    pub fn windows_guest(&self) -> bool {
+        self.base.hyperv_enlightenments
+    }
+
     /// The form applied to the original config. Every rule `control-api`
     /// enforces is re-checked by serialize + reparse, so the error the modal
     /// shows is exactly the one `entangled run` would raise.

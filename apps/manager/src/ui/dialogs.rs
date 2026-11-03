@@ -965,7 +965,10 @@ fn edit_hardware(
             "Give memory the guest frees back to this computer",
         )
         .on_hover_text(
-            "Without it, memory the guest has used stays taken on this computer until the              machine stops, even after the guest frees it. With it, Linux guests report free              memory (in 2 MiB blocks, a moment after it is freed) and Entangled hands it back.              Costs one of the machine's eight device slots.",
+            "Without it, memory the guest has used stays taken on this computer until the \
+             machine stops, even after the guest frees it. With it, Linux guests report free \
+             memory (in 2 MiB blocks, a moment after it is freed) and Entangled hands it back. \
+             Costs one of the machine's eight device slots.",
         );
     });
     ui.add_space(6.0);
@@ -1311,7 +1314,8 @@ fn edit_display_gpu(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
                 theme::ACCENT,
             )
             .on_hover_text(
-                "This computer's primary monitor, snapped to a standard rate and held to                  what the GPU desktop keeps up with.",
+                "This computer's primary monitor, snapped to a standard rate and held to \
+                 what the GPU desktop keeps up with.",
             )
             .clicked()
             {
@@ -1374,7 +1378,10 @@ fn edit_display_gpu(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
         ui::form_row(
             ui,
             "GPU BOOST",
-            "Asks the graphics driver to run the card at full clocks while the guest is              drawing, and lets it settle a second after it stops. Makes the guest's 3D              noticeably faster on a 60 Hz desktop and costs nothing while it is idle;              turn it off to save power. NVIDIA only — other cards ignore it.",
+            "Asks the graphics driver to run the card at full clocks while the guest is \
+             drawing, and lets it settle a second after it stops. Makes the guest's 3D \
+             noticeably faster on a 60 Hz desktop and costs nothing while it is idle; \
+             turn it off to save power. NVIDIA only — other cards ignore it.",
             |ui, _| {
                 ui.checkbox(&mut form.gpu_boost, "Full GPU clocks while the guest draws");
             },
@@ -1383,7 +1390,10 @@ fn edit_display_gpu(ui: &mut egui::Ui, form: &mut crate::editor::EditForm) {
         ui::form_row(
             ui,
             "VIDEO MEMORY",
-            "The most of this computer's video memory the guest's programs may take              together. Unlimited, they get three quarters of it and your own desktop              keeps the rest; a cap protects the host from a guest that runs away with              memory. Never more than the card has, whatever it says.",
+            "The most of this computer's video memory the guest's programs may take \
+             together. Unlimited, they get three quarters of it and your own desktop \
+             keeps the rest; a cap protects the host from a guest that runs away with \
+             memory. Never more than the card has, whatever it says.",
             |ui, _| {
                 ui.checkbox(&mut form.gpu_memory_limit, "Cap at");
                 ui.add_enabled(
@@ -1755,10 +1765,16 @@ fn edit_storage(ui: &mut egui::Ui, form: &mut crate::editor::EditForm, actions: 
     });
 
     ui.add_space(18.0);
+    let windows = form.windows_guest();
+    let share_tip = if windows {
+        SHARE_TIP_WINDOWS
+    } else {
+        SHARE_TIP
+    };
     let mut remove = None;
     for (index, share) in form.shares.iter_mut().enumerate() {
         let (label, tip) = if index == 0 {
-            ("SHARED FOLDERS", SHARE_TIP)
+            ("SHARED FOLDERS", share_tip)
         } else {
             ("", "")
         };
@@ -1800,6 +1816,15 @@ fn edit_storage(ui: &mut egui::Ui, form: &mut crate::editor::EditForm, actions: 
                     .color(theme::WARN)
                     .size(11.0),
             );
+        } else if windows && share.virtiofs {
+            ui::form_note(
+                ui,
+                ui::faint(if index == 0 {
+                    "in Windows: drive Z:".to_string()
+                } else {
+                    "in Windows: only the first share mounts by itself".to_string()
+                }),
+            );
         } else {
             ui::form_note(
                 ui,
@@ -1821,7 +1846,7 @@ fn edit_storage(ui: &mut egui::Ui, form: &mut crate::editor::EditForm, actions: 
         } else {
             ""
         },
-        SHARE_TIP,
+        share_tip,
         &mut form.add_share,
         "choose a folder…",
         !full,
@@ -1845,7 +1870,8 @@ fn edit_storage(ui: &mut egui::Ui, form: &mut crate::editor::EditForm, actions: 
                 path,
                 tag,
                 read_only: false,
-                virtiofs: false,
+                // Windows mounts virtio-fs; everything else 9P.
+                virtiofs: windows,
             });
             form.add_share.clear();
         }
@@ -1859,6 +1885,12 @@ const SHARE_TIP: &str = "A folder on this computer the machine can open as a dri
      Read-only lets the guest look but never change anything. Files appear to belong to \
      whoever looks at them in the guest; what they can really do is what this computer \
      lets Entangled do.";
+
+/// The same, for a Windows guest (virtio-fs through WinFsp).
+const SHARE_TIP_WINDOWS: &str = "A folder on this computer that Windows opens as a drive \
+     of its own: the first one is Z:, mounted at every start by the virtio-fs service \
+     the installer set up (WinFsp). Read-only lets the guest look but never change \
+     anything; what Windows can really do is what this computer lets Entangled do.";
 
 /// `C:\Users\…\Projects` — the start and the end of a long path.
 fn shorten_middle(text: &str, max: usize) -> String {
@@ -2941,11 +2973,13 @@ fn wizard_step(
                     if ui::path_row(
                         ui,
                         "DRIVERS",
-                        "The virtio-win driver ISO (fedorapeople.org/groups/virt/virtio-win). \
-                         Windows cannot see this machine's disk or network without it; \
-                         the drivers are installed during setup.",
+                        "The virtio-win drivers: Windows cannot see this machine's disk \
+                         or network without them, and they are installed during setup. \
+                         Leave empty and Entangled downloads the release it was tested \
+                         with from fedorapeople.org, checked against a digest built into \
+                         it. Choose an ISO only to use another version.",
                         &mut state.machine.drivers_path,
-                        "choose virtio-win.iso",
+                        "downloaded and verified automatically",
                         true,
                     ) {
                         actions.push(Action::PickPath(PickTarget::WizardDrivers));
@@ -2953,13 +2987,30 @@ fn wizard_step(
                     if ui::path_row(
                         ui,
                         "3D (OPTIONAL)",
-                        "Experimental: Vulkan, OpenGL and WebGL on this computer's GPU. A                          folder holding the viogpu3d driver package and LunarG's Vulkan                          runtime installer (VulkanRT-*.exe). The driver is test-signed, so                          Windows runs in test mode. Leave empty for 2D.",
+                        "Experimental: Vulkan, OpenGL, Direct3D 9-11 and WebGL on this \
+                         computer's GPU. A folder holding Entangled's 3D package \
+                         (entangled-gpu.inf, vulkan_virtio.dll, the Vulkan runtime \
+                         installer). The driver is test-signed, so Windows runs in test \
+                         mode, where some anti-cheat refuses to start. Leave empty for 2D.",
                         &mut state.machine.gpu3d_path,
                         "no 3D",
                         true,
                     ) {
                         actions.push(Action::PickPath(PickTarget::WizardGpu3d));
                     }
+                    ui::form_row(
+                        ui,
+                        "SHARED FOLDERS",
+                        "Installs WinFsp (downloaded and verified like the drivers), so \
+                         a folder shared from this computer appears in Windows as a \
+                         drive of its own. Untick it to keep the guest without it.",
+                        |ui, _| {
+                            ui.checkbox(
+                                &mut state.machine.shared_folders,
+                                "Show shared folders as drives",
+                            );
+                        },
+                    );
                     ui.label(ui::dim(
                         "Installs on its own and powers off when it is done. No product key is entered.",
                     ));

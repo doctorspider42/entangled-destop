@@ -192,10 +192,21 @@ pub struct ShareSection {
 
 /// Shared folders one machine may have.
 pub const MAX_SHARES: usize = 4;
-/// virtio devices one machine may have: the mmio bus's slots
-/// (`machine_x86::virtio::MAX_VIRTIO_SLOTS`) and the pci bus's device slots
-/// (`machine_x86::pci::MAX_PCI_DEVICES` less the host bridge) are both 8.
+/// Devices one virtio-mmio machine may have: the mmio bus's slots
+/// (`machine_x86::virtio::MAX_VIRTIO_SLOTS`).
 pub const MAX_VIRTIO_DEVICES: usize = 8;
+/// Functions one virtio-pci machine may have besides the host bridge
+/// (`machine_x86::layout::PCI_MMIO_SLOTS`): the virtio devices, and the AHCI
+/// and HD Audio controllers beside them.
+pub const MAX_PCI_FUNCTIONS: usize = 10;
+
+/// How many of [`VmConfig::virtio_devices`] fit on `transport`'s bus.
+pub const fn max_devices(transport: VirtioTransport) -> usize {
+    match transport {
+        VirtioTransport::Mmio => MAX_VIRTIO_DEVICES,
+        VirtioTransport::Pci => MAX_PCI_FUNCTIONS,
+    }
+}
 /// The longest mount tag (what `virtio-9p` offers).
 pub const MAX_SHARE_TAG_LEN: usize = 31;
 
@@ -1152,9 +1163,11 @@ impl VmConfig {
         self.validate()
     }
 
-    /// The virtio devices `entangled run` attaches for this profile, by kind,
-    /// in its order: every disk, the CD-ROM, the NIC, the GPU, keyboard and
-    /// tablet (always), sound, each gamepad player, each share, the balloon.
+    /// The bus slots `entangled run` fills for this profile, by kind, in its
+    /// order: every disk, the CD-ROM, the NIC, the GPU (or the framebuffer in
+    /// its place), its render-only function, keyboard and tablet (always), the
+    /// relative mouse, sound, each gamepad player, each share, the balloon,
+    /// the agent's console and the optical drives' controller.
     pub fn virtio_devices(&self) -> Vec<&'static str> {
         let mut out = vec!["disk"; self.disks.len()];
         if self.cdrom.is_some() {
@@ -1163,7 +1176,14 @@ impl VmConfig {
         if self.network.is_some() {
             out.push("network");
         }
-        out.extend(["gpu", "keyboard", "tablet"]);
+        out.push("gpu");
+        if self.display.render_node {
+            out.push("render node");
+        }
+        out.extend(["keyboard", "tablet"]);
+        if self.display.relative_mouse_enabled(self.transport) {
+            out.push("mouse");
+        }
         if self.sound.enabled {
             out.push("sound");
         }
@@ -1176,6 +1196,12 @@ impl VmConfig {
         out.extend(std::iter::repeat_n("share", self.shares.len()));
         if self.reclaim_memory {
             out.push("memory reclaim");
+        }
+        if self.guest_agent {
+            out.push("agent console");
+        }
+        if !self.optical.is_empty() {
+            out.push("optical drives");
         }
         out
     }
@@ -1235,9 +1261,10 @@ impl VmConfig {
             ));
         }
         let devices = self.virtio_devices();
-        if devices.len() > MAX_VIRTIO_DEVICES {
+        let fit = max_devices(self.transport);
+        if devices.len() > fit {
             return err(format!(
-                "this machine needs {} devices ({}) and at most {MAX_VIRTIO_DEVICES} fit — turn one \
+                "this machine needs {} devices ({}) and at most {fit} fit — turn one \
                  of the optional ones off (sound, a gamepad player, a shared folder, memory \
                  reclaim, a disk)",
                 devices.len(),
@@ -1313,7 +1340,8 @@ impl VmConfig {
         }
         if self.display.render_node && !self.display.venus {
             return err(
-                "display.render_node = true adds a second, render-only Venus function, but                  this machine has no Venus renderer; set venus = true or drop render_node"
+                "display.render_node = true adds a second, render-only Venus function, but \
+                 this machine has no Venus renderer; set venus = true or drop render_node"
                     .into(),
             );
         }
@@ -2522,23 +2550,27 @@ path = "/home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-desktop-amd64.iso"
         cfg.gamepad.enabled = true;
         cfg.gamepad.players = 1;
         cfg.reclaim_memory = true;
+        let limit = max_devices(cfg.transport);
+        assert_eq!(limit, MAX_PCI_FUNCTIONS, "the example is a pci machine");
         let fits = cfg.virtio_devices().len();
         let text = toml::to_string(&cfg).unwrap();
-        if fits <= MAX_VIRTIO_DEVICES {
+        if fits <= limit {
             assert!(VmConfig::from_toml(&text).is_ok(), "{fits} devices fit");
         }
-        while cfg.virtio_devices().len() <= MAX_VIRTIO_DEVICES {
-            cfg.shares.push(ShareSection {
-                path: PathBuf::from("/srv/x"),
-                tag: format!("s{}", cfg.shares.len()),
-                read_only: false,
-                virtiofs: false,
+        // The agent's console and the render-only function count too.
+        cfg.guest_agent = true;
+        assert!(cfg.virtio_devices().contains(&"agent console"));
+        while cfg.virtio_devices().len() <= limit {
+            cfg.disks.push(DiskSection {
+                path: PathBuf::from(format!("/srv/d{}.raw", cfg.disks.len())),
+                writable: true,
             });
         }
         let error =
             VmConfig::from_toml(&toml::to_string(&cfg).unwrap()).expect_err("one device too many");
         let message = error.to_string();
-        assert!(message.contains("at most 8 fit"), "{message}");
+        assert!(message.contains("at most 10 fit"), "{message}");
         assert!(message.contains("memory reclaim"), "{message}");
+        assert!(message.contains("agent console"), "{message}");
     }
 }

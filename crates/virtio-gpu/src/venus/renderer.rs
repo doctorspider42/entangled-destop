@@ -3090,10 +3090,12 @@ impl<F: SinkFactory> VenusRenderer<F> {
                     .and_then(|rows| rows.checked_add(u64::from(spec.offset)))
                     .and_then(|at| at.checked_add(u64::from(spec.width).checked_mul(4)?));
                 match last {
-                    Some(end) if spec.width > 0 && spec.height > 0 && end <= pages.mapped_len() => {}
+                    Some(end) if spec.width > 0 && spec.height > 0 && end <= pages.mapped_len() => {
+                    }
                     _ => {
                         return Err(refused(format!(
-                            "{}x{} at stride {} from offset {} does not fit the {:#x} host bytes                              of the memory",
+                            "{}x{} at stride {} from offset {} does not fit the {:#x} host bytes \
+                             of the memory",
                             spec.width,
                             spec.height,
                             spec.stride,
@@ -3111,7 +3113,8 @@ impl<F: SinkFactory> VenusRenderer<F> {
                     .ok_or_else(|| refused("the handle blob is not in the directory".into()))?;
                 let Some(newest) = images.first() else {
                     return Err(refused(
-                        "no canonical DRM-modifier image is bound to its memory, so nothing says                          how its bytes are laid out"
+                        "no canonical DRM-modifier image is bound to its memory, so nothing says \
+                         how its bytes are laid out"
                             .into(),
                     ));
                 };
@@ -3271,7 +3274,8 @@ impl<F: SinkFactory> VenusRenderer<F> {
                     .and_then(|(_, _, release)| release)
                     .ok_or_else(|| {
                         failed(
-                            "the guest has not released its image to a queue family outside                              its instance yet, so there is no frame to acquire"
+                            "the guest has not released its image to a queue family outside \
+                             its instance yet, so there is no frame to acquire"
                                 .into(),
                         )
                     })?;

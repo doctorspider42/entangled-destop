@@ -677,7 +677,9 @@ impl VirglRenderer {
             }
         }
         let lib = opened.ok_or_else(|| {
-            "libvirglrenderer.so.1 not found: install libvirglrenderer1              (Debian/Ubuntu), build one with guest/virglrenderer/build-virglrenderer.sh              and point ENTANGLED_VIRGL_LIB at it, or disable [display] virgl"
+            "libvirglrenderer.so.1 not found: install libvirglrenderer1 \
+             (Debian/Ubuntu), build one with guest/virglrenderer/build-virglrenderer.sh \
+             and point ENTANGLED_VIRGL_LIB at it, or disable [display] virgl"
                 .to_string()
         })?;
 
@@ -917,7 +919,10 @@ impl VirglRenderer {
                     // told the capset exists.
                     self.venus_lost = true;
                     tracing::error!(
-                        "virglrenderer would not initialize with VENUS | RENDER_SERVER;                          3D falls back to classic virgl and every Venus command will be                          refused in band. Check that virgl_render_server is installed                          beside the library, or set RENDER_SERVER_EXEC_PATH (VEN-2003)"
+                        "virglrenderer would not initialize with VENUS | RENDER_SERVER; \
+                         3D falls back to classic virgl and every Venus command will be \
+                         refused in band. Check that virgl_render_server is installed \
+                         beside the library, or set RENDER_SERVER_EXEC_PATH (VEN-2003)"
                     );
                 } else if got_venus {
                     tracing::info!("virglrenderer initialized with Venus (VEN-2003)");

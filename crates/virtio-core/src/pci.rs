@@ -1422,7 +1422,8 @@ mod tests {
             assert_eq!(record[3], VIRTIO_PCI_CAP_SHARED_MEMORY_CFG);
             assert_eq!(
                 record[4], VIRTIO_PCI_SHM_BAR_INDEX,
-                "never the register BAR: a 32 KiB 32-bit window cannot hold a                  host-visible blob region"
+                "never the register BAR: a 32 KiB 32-bit window cannot hold a \
+                 host-visible blob region"
             );
             assert_eq!(record[5], placement.id, "id carries the shmid");
             let dword = |at: usize| {

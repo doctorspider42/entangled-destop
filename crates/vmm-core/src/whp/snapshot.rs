@@ -383,6 +383,19 @@ impl WhpVcpu {
 
     /// Everything this vCPU is. See the module docs for what is left out.
     pub(crate) fn snapshot(&self) -> Result<X86CpuState, HvError> {
+        // Enlightenments WHP grants itself keep their state in the hypervisor
+        // (the hypercall page, SynIC, synthetic timers), and WHP names none
+        // of it for saving: a guest resumed without it would be subtly wrong
+        // (ADR-0008 §6), so it is refused by name. The emulated clock is ours
+        // and travels below.
+        if self.partition().whp_hyperv() {
+            return Err(HvError::Registers(
+                "this partition's Hyper-V enlightenments are WHP's own, and their \
+                 state (hypercall page, SynIC, synthetic timers) cannot be saved, \
+                 so this machine cannot be suspended on this host; shut it down instead"
+                    .into(),
+            ));
+        }
         let registers = self.get_registers()?;
         let special_registers = self.get_special_registers()?;
 
@@ -487,7 +500,9 @@ impl WhpVcpu {
             }
             None if clock_msrs.iter().any(|msr| msr.data != 0) => {
                 return Err(HvError::Registers(
-                    "the snapshot's guest uses the Hyper-V reference clock, which this                      partition does not emulate (hyperv_enlightenments is off, or WHP                      grants the enlightenments itself)"
+                    "the snapshot's guest uses the Hyper-V reference clock, which this \
+                     partition does not emulate (hyperv_enlightenments is off, or WHP \
+                     grants the enlightenments itself)"
                         .into(),
                 ))
             }

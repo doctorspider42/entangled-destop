@@ -792,7 +792,8 @@ fn everything_the_format_queries_advertise_a_create_accepts() {
                 assert_eq!(
                     image_answer(&mut h, &query).0,
                     VK_SUCCESS,
-                    "format {format}: Zink's usage {usage:#x} from the advertised features                      {features:#x}"
+                    "format {format}: Zink's usage {usage:#x} from the advertised features \
+                     {features:#x}"
                 );
                 let infos: Vec<_> = namings(format, 1074)
                     .into_iter()

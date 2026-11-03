@@ -290,11 +290,15 @@ pub struct NewMachine {
     /// Local ISO; required for Other Linux and Windows, otherwise empty uses
     /// the verified cache.
     pub iso_path: String,
-    /// The virtio-win driver ISO; Windows only, and required there.
+    /// The virtio-win driver ISO; Windows only. Empty lets the engine
+    /// download the pinned release and verify it.
     pub drivers_path: String,
-    /// The folder holding the experimental 3D package (viogpu3d plus the
-    /// Vulkan runtime installer); Windows only, optional: empty installs 2D.
+    /// The folder holding the experimental 3D package (ADR-0009: our driver,
+    /// Mesa's Venus ICD and the Vulkan runtime installer); Windows only,
+    /// optional: empty installs 2D.
     pub gpu3d_path: String,
+    /// Windows only: install WinFsp, so a shared folder shows as a drive.
+    pub shared_folders: bool,
     pub variant: String,
     pub automated: bool,
     pub headless: bool,
@@ -392,11 +396,14 @@ pub fn install_spec(
         if machine.iso_path.trim().is_empty() {
             return Err("Choose the Windows 10 or 11 installation ISO first.".into());
         }
-        if machine.drivers_path.trim().is_empty() {
-            return Err("Choose the virtio-win driver ISO first.".into());
+        // Absent, the engine downloads the pinned virtio-win and WinFsp.
+        if !machine.drivers_path.trim().is_empty() {
+            args.push("--drivers".to_string());
+            args.push(runner.path_arg(Path::new(machine.drivers_path.trim()))?);
         }
-        args.push("--drivers".to_string());
-        args.push(runner.path_arg(Path::new(machine.drivers_path.trim()))?);
+        if !machine.shared_folders {
+            args.push("--no-shared-folders".to_string());
+        }
         if !machine.gpu3d_path.trim().is_empty() {
             args.push("--gpu3d".to_string());
             args.push(runner.path_arg(Path::new(machine.gpu3d_path.trim()))?);
@@ -759,6 +766,7 @@ mod tests {
             iso_path: String::new(),
             drivers_path: String::new(),
             gpu3d_path: String::new(),
+            shared_folders: true,
             variant: "text-netboot".into(),
             automated: true,
             headless: false,
@@ -852,7 +860,14 @@ mod tests {
         };
         assert!(spec(&m).is_err(), "no Windows ISO");
         m.iso_path = "/isos/Win10.iso".into();
-        assert!(spec(&m).is_err(), "no driver ISO");
+        let line = spec(&m)
+            .expect("the engine downloads the drivers")
+            .command_line();
+        assert!(!line.contains("--drivers"), "{line}");
+        assert!(!line.contains("--no-shared-folders"), "{line}");
+        m.shared_folders = false;
+        let line = spec(&m).expect("spec").command_line();
+        assert!(line.contains("--no-shared-folders"), "{line}");
         m.drivers_path = "/isos/virtio-win.iso".into();
         let line = spec(&m).expect("spec").command_line();
         for needle in [

@@ -662,7 +662,8 @@ impl Lifecycle {
         let cpus = self.capture_cpus()?;
         if cpus.len() as u32 != self.vcpus {
             return Err(LifecycleError::Save(format!(
-                "only {} of {} vCPUs reported their state; a snapshot missing a CPU would                  restore a guest with one fewer",
+                "only {} of {} vCPUs reported their state; a snapshot missing a CPU would \
+                 restore a guest with one fewer",
                 cpus.len(),
                 self.vcpus
             )));

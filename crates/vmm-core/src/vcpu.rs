@@ -427,7 +427,8 @@ impl Vcpu {
                             tracing::warn!(
                                 vcpu = index,
                                 %site,
-                                "triple fault with no power-off latched and no lifecycle to                                  restart the machine: ending the VM"
+                                "triple fault with no power-off latched and no lifecycle to \
+                                 restart the machine: ending the VM"
                             );
                             return Ok(RunOutcome::Shutdown);
                         }
@@ -435,7 +436,8 @@ impl Vcpu {
                             tracing::info!(
                                 vcpu = index,
                                 %site,
-                                "triple fault on the boot CPU with no power-off latched:                                  treating it as a reboot"
+                                "triple fault on the boot CPU with no power-off latched: \
+                                 treating it as a reboot"
                             );
                             let Some(lifecycle) = lifecycle else {
                                 return Ok(RunOutcome::Shutdown);
@@ -453,7 +455,8 @@ impl Vcpu {
                             tracing::warn!(
                                 vcpu = index,
                                 %site,
-                                "triple fault on an application processor: parking it and                                  leaving the machine running"
+                                "triple fault on an application processor: parking it and \
+                                 leaving the machine running"
                             );
                             let Some(lifecycle) = lifecycle else {
                                 return Ok(RunOutcome::Shutdown);

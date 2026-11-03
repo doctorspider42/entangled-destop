@@ -964,6 +964,7 @@ impl ManagerApp {
                 iso_path: String::new(),
                 drivers_path: String::new(),
                 gpu3d_path: String::new(),
+                shared_folders: true,
                 variant: self.settings.default_variant.clone(),
                 automated: true,
                 headless: self.settings.headless_install,

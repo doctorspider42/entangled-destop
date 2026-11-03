@@ -282,7 +282,8 @@ fn refuse_dynamic_xstate(xsave: &kvm_xsave, index: u32) -> Result<(), HvError> {
     let claimed = (word(XSTATE_BV_AT) | word(XCOMP_BV_AT)) & DYNAMIC_XSTATE_MASK;
     if claimed != 0 {
         return Err(HvError::Registers(format!(
-            "vCPU {index}: snapshot XSAVE area claims dynamically enabled XSTATE components              ({claimed:#x}); this build carries only the fixed 4 KiB area"
+            "vCPU {index}: snapshot XSAVE area claims dynamically enabled XSTATE components \
+             ({claimed:#x}); this build carries only the fixed 4 KiB area"
         )));
     }
     Ok(())

@@ -13,6 +13,7 @@
   <a href="https://github.com/doctorspider42/entangled-destop/actions/workflows/ci.yml"><img src="https://github.com/doctorspider42/entangled-destop/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-8cc8e0?style=flat-square&amp;labelColor=11161e" alt="License: Apache-2.0"></a>
   <a href="#hosts"><img src="https://img.shields.io/badge/hosts-Linux%20%C2%B7%20Windows-8cc8e0?style=flat-square&amp;labelColor=11161e" alt="Hosts: Linux and Windows"></a>
+  <a href="docs/user-guide.md#windows-guests"><img src="https://img.shields.io/badge/guests-Linux%20%C2%B7%20Windows%2010%2F11-8cc8e0?style=flat-square&amp;labelColor=11161e" alt="Guests: Linux and Windows 10/11"></a>
   <a href="docs/adr/0007-macos-arm64.md"><img src="https://img.shields.io/badge/Apple%20Silicon-macOS-8cc8e0?style=flat-square&amp;labelColor=11161e" alt="Apple Silicon: macOS"></a>
 </p>
 
@@ -29,7 +30,9 @@
 Entangled Desktop installs Linux, gives it a disk, network, graphics and input,
 and puts it in a window on your desktop. Use the native manager or drive the
 same machine from the CLI. Debian, Ubuntu and Fedora installations are
-unattended, using verified media; Apple Silicon installs Ubuntu ARM64.
+unattended, using verified media; Apple Silicon installs Ubuntu ARM64. On a
+Windows host, Windows 10 installs unattended too, from Microsoft's own ISO,
+with its own GPU driver stack.
 
 Underneath is a VMM built on **KVM**, **Windows Hypervisor Platform**, and
 **Hypervisor.framework**. The virtio device implementations,
@@ -66,6 +69,13 @@ x86 interrupt controllers, ACPI tables and PCI bus live here in Rust.
 - **Graphics that reach the host GPU.** Vulkan through Venus, OpenGL through
   Mesa Zink, and VirGL on Linux. The installer can configure the GPU desktop
   with `--venus`; `entangled doctor` checks host requirements.
+- **Windows guests, with a GPU stack of our own.** One click from an untouched
+  Microsoft ISO: the virtio drivers and WinFsp are downloaded and verified for
+  you. In the guest, our KMDF driver and Mesa Venus run Vulkan 1.3 on the host
+  GPU, with OpenGL (Zink), Direct3D 9–11 (DXVK) and WebGL on top. Frames go to
+  the host's overlay plane with no copy on the guest's CPU. You also get a
+  shared clipboard, shared folders as drives, HD Audio and suspend to a file.
+  [What works and what it costs](docs/user-guide.md#windows-guests).
 - **A machine you can put down and pick up.** Pause, resume, reboot in place,
   or suspend to a file and restore in a new process on Linux/Windows.
 - **Networking without the ceremony.** User-mode NAT needs no administrator
@@ -81,9 +91,9 @@ x86 interrupt controllers, ACPI tables and PCI bus live here in Rust.
 |---|---|---|---|
 | Host CPU | x86-64 | x86-64 | Apple Silicon |
 | Hypervisor | KVM | WHP, native | Hypervisor.framework |
-| Guest installation | Debian, Ubuntu, Fedora | Debian, Ubuntu, Fedora | Ubuntu ARM64 |
+| Guest installation | Debian, Ubuntu, Fedora | Debian, Ubuntu, Fedora, **Windows 10/11** | Ubuntu ARM64 |
 | Boot | UEFI or direct Linux | UEFI or direct Linux | Direct Linux |
-| Graphics | 2D, Venus/Zink, VirGL | 2D, Venus/Zink | Venus/Zink |
+| Graphics | 2D, Venus/Zink, VirGL | 2D, Venus/Zink; Windows guests: Vulkan, GL, D3D9–11, WebGL | Venus/Zink |
 | Networking | User-mode NAT, TAP | User-mode NAT | User-mode NAT |
 | Audio playback | ALSA | WASAPI | Not connected |
 | Pause / reboot / suspend to file | Implemented | Implemented | Not connected |
@@ -195,11 +205,31 @@ is an unmodified EDK2 `CloudHv` build from pinned sources.
 | Freeze, reset, save, restore | [Lifecycle ADR](docs/adr/0005-vm-lifecycle.md), [snapshot ADR](docs/adr/0006-suspend-restore.md) |
 | Native manager and CLI | [`apps/manager`](apps/manager), [`apps/entangled`](apps/entangled) |
 
+## Windows guests: the honest version
+
+| | Status |
+|---|---|
+| Unattended install of Windows 10 from the manager or CLI | ✅ verified on the Windows host |
+| Windows 11 | ⚠️ installs with its TPM/Secure Boot/CPU checks bypassed: the machine has no TPM |
+| Desktop follows the window, clipboard, HD Audio, shared folders (`Z:`) | ✅ verified |
+| Suspend to a file and resume | ✅ 2D; refused while 3D is in use |
+| Vulkan · OpenGL · D3D9–11 · WebGL on the host GPU | ✅ D3D11 test 532 fps, WebGL Aquarium ~44 fps (RTX 2070) |
+| Windows guest on a Linux/KVM host | ❓ built and unit-tested, never booted |
+| Games with kernel anti-cheat | ❌ see below |
+
+**3D means test mode.** Windows loads a kernel driver that Microsoft has not
+signed only in *test-signing mode*, and we do not have the EV certificate that
+Microsoft's attestation signing needs. So a guest with 3D runs in test mode:
+the desktop shows a "Test Mode" watermark, and anti-cheat that refuses test
+mode refuses to start. This applies to the guest only. The host is not changed,
+and a 2D guest needs none of it.
+[Details](docs/user-guide.md#3d-for-windows-guests-and-test-mode).
+
 ## Current boundaries
 
-Linux guests are the tested path; assume Windows guests do not work. There is
-no USB or PCI passthrough, live migration, clustering or server daemon.
-Anti-cheat games will not run. GPU support depends on the host driver and guest
+Linux guests are the path CI boots on every commit; Windows guests are verified
+by hand on the Windows host (above). There is no USB or PCI passthrough, live
+migration, clustering or server daemon. Kernel anti-cheat games will not run. GPU support depends on the host driver and guest
 configuration; a successful selected graphics test is not a general game or
 performance guarantee. macOS has the additional gaps listed above.
 

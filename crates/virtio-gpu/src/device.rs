@@ -704,7 +704,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if self.restored_3d_lost && !self.restored_3d_reported {
             self.restored_3d_reported = true;
             return Err(DeviceError::Backend(
-                "this VM was restored from a snapshot; the guest's host-side GPU state (3D                  contexts, blob resources) could not be restored and the device must be                  re-initialised"
+                "this VM was restored from a snapshot; the guest's host-side GPU state (3D \
+                 contexts, blob resources) could not be restored and the device must be \
+                 re-initialised"
                     .into(),
             ));
         }

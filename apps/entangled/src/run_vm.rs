@@ -612,7 +612,10 @@ fn build_devices(
         }
         tracing::warn!(
             prefix = %prefix.display(),
-            "attaching the Venus TRANSPORT renderer: it advertises the Venus capset and              captures each command ring to <prefix>.ctx<N>.ring<M>.bin, and executes no              Vulkan — a guest will reach a ring, send its first command, and be told the              ring is fatal"
+            "attaching the Venus TRANSPORT renderer: it advertises the Venus capset and \
+             captures each command ring to <prefix>.ctx<N>.ring<M>.bin, and executes no \
+             Vulkan — a guest will reach a ring, send its first command, and be told the \
+             ring is fatal"
         );
         let mut next_ring = 0u64;
         let sinks = move |ctx_id: u32,
@@ -769,7 +772,8 @@ fn build_devices(
                     let renderer = virtio_gpu::virgl::VirglRenderer::load()
                         .map_err(|e| format!("[display] virgl = true, but {e}"))?;
                     tracing::warn!(
-                        "attaching virtio-gpu with an in-process virgl 3D renderer: a crash                          inside the host GL driver will take this VM down (ADR-0004 GPU-012)"
+                        "attaching virtio-gpu with an in-process virgl 3D renderer: a crash \
+                         inside the host GL driver will take this VM down (ADR-0004 GPU-012)"
                     );
                     Box::new(renderer)
                 }
@@ -781,7 +785,8 @@ fn build_devices(
             if !fences.is_deferred() {
                 tracing::warn!(
                     var = virtio_gpu::FENCE_MODE_ENV,
-                    "virtio-gpu fences forced synchronous: the guest gets no host/guest                      pipelining (this is the phase-1 baseline)"
+                    "virtio-gpu fences forced synchronous: the guest gets no host/guest \
+                     pipelining (this is the phase-1 baseline)"
                 );
             }
             gpu.set_fence_mode(fences);
@@ -2396,7 +2401,8 @@ mod host_api {
                         reported_pages = missed.reported_pages,
                         missing_pages = missed.missing_pages,
                         missing_bytes = missed.missing_bytes,
-                        "pages this snapshot carries that the write log never reported                          (host writes: boot images, device completions, used rings)"
+                        "pages this snapshot carries that the write log never reported \
+                         (host writes: boot images, device completions, used rings)"
                     );
                 }
             }

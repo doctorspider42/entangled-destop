@@ -207,7 +207,8 @@ fn assert_venus_probe_is_self_consistent(renderer: &VirglRenderer) {
             );
         }
         None => eprintln!(
-            "VEN-2003: this host's virglrenderer has no Venus support;              the device stays on classic virgl"
+            "VEN-2003: this host's virglrenderer has no Venus support; \
+             the device stays on classic virgl"
         ),
     }
 }

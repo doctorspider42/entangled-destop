@@ -1773,7 +1773,8 @@ mod tests {
         assert_eq!(
             sizes,
             vec![8_394_899_456, 1 << 30, 224_395_264],
-            "system memory holds our pages and is the share; VRAM and the BAR              (no longer host visible to the guest) are the host's"
+            "system memory holds our pages and is the share; VRAM and the BAR \
+             (no longer host visible to the guest) are the host's"
         );
         // Nothing else moves: heap count and flags, type count, every type's
         // heap index and flags.

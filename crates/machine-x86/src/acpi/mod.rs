@@ -1000,7 +1000,8 @@ mod tests {
         assert_eq!(
             (dsdt[at + 5] >> 1) & 0x03,
             3,
-            "the window must be prefetchable, or Linux will not claim a              prefetchable BAR inside it"
+            "the window must be prefetchable, or Linux will not claim a \
+             prefetchable BAR inside it"
         );
         let min = u64_at(dsdt, at + 14);
         let max = u64_at(dsdt, at + 22);
