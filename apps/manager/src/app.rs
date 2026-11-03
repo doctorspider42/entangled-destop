@@ -1349,7 +1349,7 @@ impl ManagerApp {
 
     /// Collects the update-check and update-download answers; both channels
     /// deliver at most one message.
-    fn collect_update_events(&mut self) {
+    fn collect_update_events(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.update_check {
             let result = match rx.try_recv() {
                 Ok(result) => Some(result),
@@ -1388,6 +1388,14 @@ impl ManagerApp {
                                 path.display()
                             ),
                         );
+                        // Get out of the installer's way. Its CloseApplications
+                        // step goes through the Restart Manager, which asks with
+                        // WM_QUERYENDSESSION/WM_ENDSESSION — and winit answers
+                        // neither, so the manager used to stay open and Setup
+                        // reported it could not close it. Running VMs are
+                        // detached children (process.rs) and keep running; the
+                        // installer's finished page relaunches the manager.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     Err(e) => self.toast(ToastLevel::Error, format!("update failed: {e}")),
                 }
@@ -4590,7 +4598,7 @@ impl eframe::App for ManagerApp {
         self.collect_scan();
         self.open_screenshot_surface();
         self.collect_task_results();
-        self.collect_update_events();
+        self.collect_update_events(ctx);
         self.collect_wsl_events();
         self.collect_move_events();
         self.collect_clone_events();
@@ -4786,8 +4794,9 @@ mod tests {
 
     #[test]
     fn update_checks_report_completion_and_allow_retry_after_worker_failure() {
+        let ctx = egui::Context::default();
         let mut app = ManagerApp::new(
-            &egui::Context::default(),
+            &ctx,
             Startup {
                 vm_dir: None,
                 entangled: None,
@@ -4807,13 +4816,13 @@ mod tests {
             let (tx, rx) = mpsc::channel();
             app.update_check = Some(rx);
             app.update_check_status = update::CheckStatus::Checking;
-            app.collect_update_events();
+            app.collect_update_events(&ctx);
             assert!(matches!(
                 app.update_check_status,
                 update::CheckStatus::Checking
             ));
             tx.send(result.clone()).expect("send result");
-            app.collect_update_events();
+            app.collect_update_events(&ctx);
             assert!(app.update_check.is_none());
             match result {
                 Ok(Some(info)) => {
@@ -4844,12 +4853,51 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.update_check = Some(rx);
         drop(tx);
-        app.collect_update_events();
+        app.collect_update_events(&ctx);
         assert!(app.update_check.is_none());
         assert!(matches!(
             app.update_check_status,
             update::CheckStatus::Failed(_)
         ));
+    }
+
+    /// Setup's CloseApplications cannot close a winit window, so a launched
+    /// installer must be followed by the manager closing itself — and a failed
+    /// download must not take the window away with it.
+    #[test]
+    fn a_launched_installer_closes_the_manager() {
+        let closes = |result: Result<PathBuf, String>| {
+            let ctx = egui::Context::default();
+            let mut app = ManagerApp::new(
+                &ctx,
+                Startup {
+                    vm_dir: None,
+                    entangled: None,
+                    screenshot: None,
+                    screenshot_view: ScreenshotView::Settings,
+                    mock: true,
+                },
+            );
+            let (tx, rx) = mpsc::channel();
+            app.update_download = Some(rx);
+            app.update_downloading = true;
+            tx.send(result).expect("send result");
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                app.collect_update_events(ctx);
+            });
+            assert!(!app.update_downloading);
+            output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|viewport| {
+                    viewport
+                        .commands
+                        .iter()
+                        .any(|command| matches!(command, egui::ViewportCommand::Close))
+                })
+        };
+        assert!(closes(Ok(PathBuf::from("setup.exe"))));
+        assert!(!closes(Err("offline".into())));
     }
 
     #[test]

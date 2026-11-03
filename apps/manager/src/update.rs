@@ -254,8 +254,9 @@ fn download_and_launch(info: &UpdateInfo) -> Result<PathBuf, String> {
 
 #[cfg(windows)]
 fn launch_installer(path: &std::path::Path) -> Result<(), String> {
-    // The installer takes over from here: its CloseApplications step asks this
-    // manager to exit before files are replaced.
+    // The installer takes over from here. The manager closes its own window
+    // once this returns (app.rs, collect_update_events): Setup's
+    // CloseApplications cannot close a winit window, see entangled.iss.
     std::process::Command::new(path)
         .spawn()
         .map(|_| ())
