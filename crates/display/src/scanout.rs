@@ -115,6 +115,9 @@ struct OverlayPlane {
     shown: bool,
     /// Changed (pixels or position) since the renderer last drew it.
     changed: bool,
+    /// Its pixels are the overlay presenter's texture on the GPU, not
+    /// `pixels` (ADR-0009 phase E, host pages copied on the GPU).
+    on_gpu: bool,
 }
 
 impl OverlayPlane {
@@ -168,6 +171,9 @@ pub struct Scanout {
     cursor_serial: u64,
     /// The overlay plane, when a render node shows one ([`OverlayPlane`]).
     overlay: Option<OverlayPlane>,
+    /// Where the overlay plane goes: kept apart from it, so a move that
+    /// arrives before the plane has a size is not lost.
+    overlay_place: (i64, i64),
     stats: ScanoutStats,
 }
 
@@ -189,6 +195,7 @@ impl Scanout {
             cursor: None,
             cursor_serial: 0,
             overlay: None,
+            overlay_place: (0, 0),
             stats: ScanoutStats::default(),
         })
     }
@@ -433,6 +440,7 @@ impl Scanout {
         out.cursor = self.cursor.clone();
         out.cursor_serial = self.cursor_serial;
         out.overlay = self.overlay.clone();
+        out.overlay_place = self.overlay_place;
         Ok(out)
     }
 
@@ -526,7 +534,7 @@ impl Scanout {
             }
         }
         self.dirty_under_overlay();
-        let (x, y) = self.overlay.as_ref().map_or((0, 0), |p| (p.x, p.y));
+        let (x, y) = self.overlay_place;
         self.overlay = Some(OverlayPlane {
             width,
             height,
@@ -535,8 +543,32 @@ impl Scanout {
             y,
             shown: false,
             changed: true,
+            on_gpu: false,
         });
         Ok(())
+    }
+
+    /// The overlay plane is shown from the overlay presenter's texture
+    /// (`width`x`height`): the renderer draws that on the GPU, and the
+    /// mirror path writes nothing of it.
+    pub fn show_overlay_on_gpu(&mut self, width: u32, height: u32) {
+        // A plane of that size already there keeps its place.
+        if self.set_overlay_size(width, height).is_err() {
+            return;
+        }
+        if let Some(plane) = &mut self.overlay {
+            plane.shown = true;
+            plane.on_gpu = true;
+        }
+    }
+
+    /// Where the overlay plane is drawn from the GPU: its rect, unclipped
+    /// (signed top-left and size), when it is shown that way.
+    pub fn overlay_on_gpu(&self) -> Option<(i64, i64, u32, u32)> {
+        self.overlay
+            .as_ref()
+            .filter(|p| p.shown && p.on_gpu)
+            .map(|p| (p.x, p.y, p.width, p.height))
     }
 
     /// Copies a tightly packed `width`x`height` BGRA block to (`x`, `y`) of the
@@ -592,6 +624,7 @@ impl Scanout {
         }
         plane.shown = true;
         plane.changed = true;
+        plane.on_gpu = false;
         self.stats.overlay_updates += 1;
         Ok(())
     }
@@ -600,9 +633,9 @@ impl Scanout {
     /// signed 32-bit coordinates.
     pub fn move_overlay(&mut self, x: u32, y: u32) {
         self.dirty_under_overlay();
+        self.overlay_place = (i64::from(x as i32), i64::from(y as i32));
         if let Some(plane) = &mut self.overlay {
-            plane.x = i64::from(x as i32);
-            plane.y = i64::from(y as i32);
+            (plane.x, plane.y) = self.overlay_place;
             plane.changed = true;
         }
     }
@@ -627,7 +660,7 @@ impl Scanout {
     pub fn take_overlay_upload(&mut self, base: Option<Rect>) -> Option<(Rect, Vec<u8>)> {
         let (w, h) = (self.width, self.height);
         let plane = self.overlay.as_mut()?;
-        if !plane.shown {
+        if !plane.shown || plane.on_gpu {
             return None;
         }
         let rect = plane.clipped_rect(w, h)?;
@@ -642,7 +675,7 @@ impl Scanout {
     /// The overlay as a screenshot composites it: the clipped plane and its
     /// pixels, when shown.
     pub fn overlay_composite(&self) -> Option<(Rect, Vec<u8>)> {
-        let plane = self.overlay.as_ref().filter(|p| p.shown)?;
+        let plane = self.overlay.as_ref().filter(|p| p.shown && !p.on_gpu)?;
         let rect = plane.clipped_rect(self.width, self.height)?;
         Some((rect, plane.pixels_of(rect)?))
     }

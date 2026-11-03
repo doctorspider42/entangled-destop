@@ -152,9 +152,15 @@ pub fn request_device(
                 .iter()
                 .all(|name| caps.supports_extension(name));
         let hints = wgpu::MemoryHints::default();
+        // ADR-0009 phase E: a renderer blob's host pages are imported as
+        // host memory and copied on the GPU, when the adapter can.
+        let host = caps.supports_extension(ash::ext::external_memory_host::NAME);
         let add_foreign: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> = Box::new(
             move |args: wgpu::hal::vulkan::CreateDeviceCallbackArgs<'_, '_, '_>| {
                 args.extensions.push(ash::ext::queue_family_foreign::NAME);
+                if host {
+                    args.extensions.push(ash::ext::external_memory_host::NAME);
+                }
                 if latency {
                     args.extensions.extend(crate::latency::EXTENSIONS);
                 }
@@ -193,6 +199,20 @@ struct Import {
     memory: vk::DeviceMemory,
 }
 
+/// One renderer blob's host pages imported onto the display's device
+/// (ADR-0009 phase E): a transfer-source buffer over them.
+struct HostImport {
+    base: usize,
+    len: u64,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    /// The pages stay alive while their import does.
+    _pages: Arc<dyn virtio_gpu::HostPages>,
+}
+
+/// Host-page imports kept at once; past it the least recently used goes.
+const MAX_HOST_IMPORTS: usize = 8;
+
 /// The display's copy of the shared scanout: wgpu's texture and its image.
 struct Target {
     view: wgpu::TextureView,
@@ -206,6 +226,8 @@ struct Target {
 struct Work {
     /// Least recently presented first.
     imports: Vec<Import>,
+    /// Host-page imports, least recently presented first.
+    host_imports: Vec<HostImport>,
     refused: Vec<u64>,
     target: Option<Target>,
     next_generation: u64,
@@ -226,8 +248,9 @@ struct Published {
 struct Outstanding {
     done: Arc<AtomicBool>,
     submitted: Instant,
-    /// Held for its drop, which ends the renderer's claim.
-    _lease: SharedScanoutLease,
+    /// Held for its drop: the renderer's claim, or the host pages a copy
+    /// reads.
+    _keep: Box<dyn Send>,
 }
 
 #[derive(Default)]
@@ -371,6 +394,9 @@ pub struct GpuScanout {
     family: u32,
     memory_types: u32,
     info: PresenterDevice,
+    /// `vkGetMemoryHostPointerPropertiesEXT` and the import alignment, when
+    /// the device was opened with `VK_EXT_external_memory_host`.
+    host: Option<(vk::PFN_vkGetMemoryHostPointerPropertiesEXT, u64)>,
     work: Mutex<Work>,
     published: Mutex<Published>,
     retire: Arc<Retire>,
@@ -383,6 +409,41 @@ impl std::fmt::Debug for GpuScanout {
             .field("family", &self.family)
             .finish_non_exhaustive()
     }
+}
+
+/// `vkGetMemoryHostPointerPropertiesEXT` of `device` and the physical
+/// device's `minImportedHostPointerAlignment` (ADR-0009 phase E). Resolved by
+/// hand: `ash::ext::external_memory_host`'s fallback for a missing entry
+/// point panics.
+fn host_import_entry(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    device: &ash::Device,
+) -> Option<(vk::PFN_vkGetMemoryHostPointerPropertiesEXT, u64)> {
+    let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+    let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
+    // SAFETY: `physical` is the device wgpu opened, of `instance` (Vulkan
+    // 1.1 at least); `props` and its chain are locals that outlive the call.
+    unsafe { instance.get_physical_device_properties2(physical, &mut props) };
+    let align = host.min_imported_host_pointer_alignment.max(1);
+    // SAFETY: `device` is live and was opened with the extension; the name
+    // is a NUL-terminated literal.
+    let raw = unsafe {
+        instance.get_device_proc_addr(
+            device.handle(),
+            c"vkGetMemoryHostPointerPropertiesEXT".as_ptr(),
+        )
+    }?;
+    // SAFETY: the loader returned this pointer for exactly this entry point,
+    // whose C signature `PFN_vkGetMemoryHostPointerPropertiesEXT` is; both are
+    // `extern "system"` function pointers of one ABI.
+    let entry = unsafe {
+        std::mem::transmute::<
+            unsafe extern "system" fn(),
+            vk::PFN_vkGetMemoryHostPointerPropertiesEXT,
+        >(raw)
+    };
+    Some((entry, align))
 }
 
 /// `(device, driver)` UUIDs and `maxImageDimension2D` of a physical device.
@@ -418,7 +479,7 @@ impl GpuScanout {
     /// # Errors
     /// Not a Vulkan device, or one without the two extensions.
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Result<Self, String> {
-        let (raw, family, info, memory_types) = {
+        let (raw, family, info, memory_types, host) = {
             // SAFETY: the hal device is only used inside this block, while
             // `device` is alive; the raw device cloned out of it is kept
             // together with `device` (fields of one value), so it never
@@ -440,11 +501,17 @@ impl GpuScanout {
             }
             let instance = hal.shared_instance().raw_instance();
             let (info, memory) = identity(instance, hal.raw_physical_device());
+            let host = if enabled.contains(&ash::ext::external_memory_host::NAME) {
+                host_import_entry(instance, hal.raw_physical_device(), hal.raw_device())
+            } else {
+                None
+            };
             (
                 hal.raw_device().clone(),
                 hal.queue_family_index(),
                 info,
                 memory.memory_type_count,
+                host,
             )
         };
         let retire = Arc::new(Retire::default());
@@ -467,8 +534,10 @@ impl GpuScanout {
             family,
             memory_types,
             info,
+            host,
             work: Mutex::new(Work {
                 imports: Vec::new(),
+                host_imports: Vec::new(),
                 refused: Vec::new(),
                 target: None,
                 next_generation: 1,
@@ -934,6 +1003,350 @@ impl GpuScanout {
         Ok(self.done_flag())
     }
 
+    /// Destroys a host-page import; the caller made sure no copy of it runs.
+    fn destroy_host(&self, import: HostImport) {
+        // SAFETY: both were created on `self.raw` by `import_host`, are
+        // destroyed exactly once (the value is consumed), and no GPU work
+        // using them is in flight (`idle`, or `Drop`'s wait). The pages they
+        // cover outlive them (`_pages` drops after).
+        unsafe {
+            self.raw.destroy_buffer(import.buffer, None);
+            self.raw.free_memory(import.memory, None);
+        }
+    }
+
+    /// Imports `pages` as host memory under a transfer-source buffer.
+    fn import_host(&self, pages: &Arc<dyn virtio_gpu::HostPages>) -> Result<HostImport, String> {
+        let (properties, align) = self
+            .host
+            .ok_or("the display's device has no VK_EXT_external_memory_host")?;
+        let base = pages.base();
+        let len = pages.len();
+        if len == 0 || (base as usize as u64) % align != 0 || len % align != 0 {
+            return Err(format!(
+                "host pages at {base:p}, {len:#x} bytes, are not {align:#x}-aligned"
+            ));
+        }
+        let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+        let mut host_props = vk::MemoryHostPointerPropertiesEXT::default();
+        // SAFETY: the entry point was resolved for this very device, which
+        // was opened with the extension; `base` is valid for `len` bytes for
+        // as long as `pages` lives (the `HostPages` contract), which outlives
+        // the call; `host_props` is a local.
+        let result = unsafe { properties(self.raw.handle(), handle, base.cast(), &mut host_props) };
+        if result != vk::Result::SUCCESS {
+            return Err(format!("vkGetMemoryHostPointerPropertiesEXT ({result})"));
+        }
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle);
+        let create = vk::BufferCreateInfo::default()
+            .size(len)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut external);
+        // SAFETY: `self.raw` is the display's live device; the create info
+        // and its chain are locals that outlive the call.
+        let buffer = unsafe { self.raw.create_buffer(&create, None) }
+            .map_err(|e| format!("vkCreateBuffer over host pages ({e})"))?;
+        // SAFETY: `buffer` was just created on `self.raw`.
+        let req = unsafe { self.raw.get_buffer_memory_requirements(buffer) };
+        let types = req.memory_type_bits & host_props.memory_type_bits;
+        if types == 0 || req.size > len {
+            // SAFETY: created above, never used, destroyed once.
+            unsafe { self.raw.destroy_buffer(buffer, None) };
+            return Err(format!(
+                "no memory type imports these host pages for a buffer (buffer {:#x}, host {:#x})",
+                req.memory_type_bits, host_props.memory_type_bits
+            ));
+        }
+        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(handle)
+            .host_pointer(base.cast_mut().cast());
+        let allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(len)
+            .memory_type_index(types.trailing_zeros())
+            .push_next(&mut import);
+        // SAFETY: an import of `len` aligned bytes at `base`, valid while the
+        // import lives (it holds `pages`), of a memory type the pointer's
+        // properties allow; the allocate info and its chain are locals.
+        let memory = match unsafe { self.raw.allocate_memory(&allocate, None) } {
+            Ok(memory) => memory,
+            Err(e) => {
+                // SAFETY: created above, never used, destroyed once.
+                unsafe { self.raw.destroy_buffer(buffer, None) };
+                return Err(format!("vkAllocateMemory importing host pages ({e})"));
+            }
+        };
+        // SAFETY: both are ours and unbound; offset 0 of an allocation `len`
+        // long, which covers the buffer (checked above).
+        if let Err(e) = unsafe { self.raw.bind_buffer_memory(buffer, memory, 0) } {
+            // SAFETY: created above, never used, destroyed once each.
+            unsafe {
+                self.raw.destroy_buffer(buffer, None);
+                self.raw.free_memory(memory, None);
+            }
+            return Err(format!("vkBindBufferMemory of the host pages ({e})"));
+        }
+        Ok(HostImport {
+            base: base as usize,
+            len,
+            buffer,
+            memory,
+            _pages: Arc::clone(pages),
+        })
+    }
+
+    /// The buffer over `pages`, imported if need be, moved to the back of
+    /// the eviction order.
+    fn host_import_for(
+        &self,
+        work: &mut Work,
+        pages: &Arc<dyn virtio_gpu::HostPages>,
+    ) -> Result<vk::Buffer, String> {
+        let key = (pages.base() as usize, pages.len());
+        if let Some(at) = work
+            .host_imports
+            .iter()
+            .position(|i| (i.base, i.len) == key)
+        {
+            let hit = work.host_imports.remove(at);
+            let buffer = hit.buffer;
+            work.host_imports.push(hit);
+            return Ok(buffer);
+        }
+        let made = self.import_host(pages)?;
+        work.stats.imports += 1;
+        if work.host_imports.len() >= MAX_HOST_IMPORTS {
+            self.idle();
+            let oldest = work.host_imports.remove(0);
+            self.destroy_host(oldest);
+        }
+        let buffer = made.buffer;
+        work.host_imports.push(made);
+        Ok(buffer)
+    }
+
+    /// ADR-0009 phase E: `frame`'s damage copied out of its host pages into
+    /// the display's texture on the GPU. See [`SharedPresenter::present_host`].
+    pub fn present_host_pages(&self, frame: &virtio_gpu::HostPagesFrame) -> SharedPresent {
+        let started = Instant::now();
+        let mut work = lock(&self.work, "shared scanout");
+        if let Some(why) = &work.broken {
+            return SharedPresent::never(why.clone());
+        }
+        if self.host.is_none() {
+            return SharedPresent::never("the display's device has no VK_EXT_external_memory_host");
+        }
+        let size = (frame.width, frame.height);
+        let damage = frame.damage;
+        let row = u64::from(frame.width) * 4;
+        let end = frame
+            .offset
+            .checked_add(u64::from(frame.stride).saturating_mul(u64::from(frame.height)));
+        if frame.width == 0
+            || frame.height == 0
+            || frame.width > self.info.max_dimension
+            || frame.height > self.info.max_dimension
+            || u64::from(frame.stride) < row
+            || frame.stride % 4 != 0
+            || frame.offset % 4 != 0
+            || end.is_none_or(|end| end > frame.pages.len())
+            || !damage.fits_within(frame.width, frame.height)
+        {
+            work.stats.declined += 1;
+            return SharedPresent::not_now("the frame does not fit its host pages");
+        }
+        if let Err(why) = self.retire.make_room() {
+            work.stats.failed += 1;
+            return SharedPresent::Failed(why);
+        }
+        let src = match self.host_import_for(&mut work, &frame.pages) {
+            Ok(src) => src,
+            Err(why) => {
+                tracing::warn!(%why, "display: host pages did not import; their flips are read back");
+                work.stats.declined += 1;
+                return SharedPresent::never(why);
+            }
+        };
+        let fresh = match self.ensure_target(&mut work, size) {
+            Ok(fresh) => fresh,
+            Err(why) => {
+                work.broken = Some(why.clone());
+                return SharedPresent::never(why);
+            }
+        };
+        let Some((dst, generation, view)) = work
+            .target
+            .as_ref()
+            .map(|t| (t.raw, t.generation, t.view.clone()))
+        else {
+            return SharedPresent::not_now("no shared scanout texture");
+        };
+        // A fresh texture holds nothing yet: the whole image, not the damage.
+        let region = if fresh {
+            Rect {
+                x: 0,
+                y: 0,
+                width: frame.width,
+                height: frame.height,
+            }
+        } else {
+            damage
+        };
+        let done = match self.copy_from_host(src, dst, frame, region) {
+            Ok(done) => done,
+            Err(why) => {
+                work.broken = Some(why.clone());
+                return SharedPresent::never(why);
+            }
+        };
+        self.retire.push(Outstanding {
+            done,
+            submitted: Instant::now(),
+            _keep: Box::new(Arc::clone(&frame.pages)),
+        });
+        {
+            let mut published = lock(&self.published, "shared scanout published");
+            published.active = true;
+            published.current = Some(SharedTexture {
+                generation,
+                view,
+                size,
+            });
+        }
+        let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let stats = &mut work.stats;
+        stats.presented += 1;
+        stats.full_copies += u64::from(fresh);
+        stats.pixels += u64::from(region.width) * u64::from(region.height);
+        stats.present_us = stats.present_us.saturating_add(us);
+        stats.present_max_us = stats.present_max_us.max(us);
+        let presented = stats.presented;
+        drop(work);
+        self.report(presented);
+        SharedPresent::Presented
+    }
+
+    /// Records the buffer-to-texture copy of `region` out of `frame`'s host
+    /// pages into a wgpu encoder, submits it and returns its done-flag.
+    fn copy_from_host(
+        &self,
+        src: vk::Buffer,
+        dst: vk::Image,
+        frame: &virtio_gpu::HostPagesFrame,
+        region: Rect,
+    ) -> Result<Arc<AtomicBool>, String> {
+        let color = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let before = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst)
+            .subresource_range(color)];
+        // The host wrote the pages (the renderer's GPU, through its own
+        // import, or the guest): visible to the transfer.
+        let host = [vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(src)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)];
+        let after = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst)
+            .subresource_range(color)];
+        let copy = vk::BufferImageCopy {
+            buffer_offset: frame.offset
+                + u64::from(region.y) * u64::from(frame.stride)
+                + u64::from(region.x) * 4,
+            buffer_row_length: frame.stride / 4,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D {
+                x: i32::try_from(region.x).unwrap_or(i32::MAX),
+                y: i32::try_from(region.y).unwrap_or(i32::MAX),
+                z: 0,
+            },
+            image_extent: vk::Extent3D {
+                width: region.width,
+                height: region.height,
+                depth: 1,
+            },
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("shared-scanout-host-copy"),
+            });
+        let raw = &self.raw;
+        // SAFETY: the callback runs while the encoder is recording and gets
+        // its open hal encoder; every command goes into that command buffer,
+        // which wgpu submits below and keeps alive until it has run. `src` is
+        // an import of ours on this device over pages the outstanding copy
+        // holds; `dst` is the display's texture, which wgpu holds in
+        // `SHADER_READ_ONLY_OPTIMAL` (`ensure_target`) and gets back in
+        // exactly that layout. The region lies inside both: the texture is the
+        // image's size and `region` inside it, and the rows it reads end
+        // inside the pages (`present_host_pages` checked the whole image).
+        let recorded = unsafe {
+            encoder.as_hal_mut::<Vulkan, _, _>(|hal| {
+                let hal = hal?;
+                let cb = hal.raw_handle();
+                raw.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &host,
+                    &before,
+                );
+                raw.cmd_copy_buffer_to_image(
+                    cb,
+                    src,
+                    dst,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[copy],
+                );
+                raw.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &after,
+                );
+                Some(())
+            })
+        };
+        if recorded.is_none() {
+            return Err("the display's command encoder is not a Vulkan one".into());
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        Ok(self.done_flag())
+    }
+
     fn report(&self, presented: u64) {
         if presented % REPORT_EVERY != 0 || presented == 0 {
             return;
@@ -1154,7 +1567,7 @@ impl SharedPresenter for GpuScanout {
         self.retire.push(Outstanding {
             done,
             submitted: Instant::now(),
-            _lease: lease,
+            _keep: Box::new(lease),
         });
         {
             let mut published = lock(&self.published, "shared scanout published");
@@ -1176,6 +1589,10 @@ impl SharedPresenter for GpuScanout {
         drop(work);
         self.report(presented);
         SharedPresent::Presented
+    }
+
+    fn present_host(&self, frame: &virtio_gpu::HostPagesFrame) -> SharedPresent {
+        self.present_host_pages(frame)
     }
 
     fn forget(&self, resource_id: Option<u32>) {
@@ -1246,12 +1663,16 @@ impl Drop for GpuScanout {
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let imports = std::mem::take(&mut work.imports);
+        let host_imports = std::mem::take(&mut work.host_imports);
         // Nothing of ours may still run when its image goes, nor when a lease
         // is handed back.
         let _ = self.device.poll(wgpu::PollType::Wait);
         drop(std::mem::take(&mut self.retire.lock().queue));
         for import in imports {
             self.destroy(import);
+        }
+        for import in host_imports {
+            self.destroy_host(import);
         }
         if stats.presented > 0 {
             tracing::info!(

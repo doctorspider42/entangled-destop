@@ -418,6 +418,10 @@ pub struct GpuDevice<S: ScanoutSink> {
     shared_declined: bool,
     /// Whether the first shared present since the last reset was logged.
     shared_logged: bool,
+    /// The display said it never reads host pages ([`ScanoutSink::present_host_pages`]).
+    host_pages_declined: bool,
+    /// The host-pages path has been logged once.
+    host_pages_logged: bool,
     /// Frame-interval statistics of the scanout path (phase 2 measurement).
     pacing: FramePacing,
     /// Where `--frame-stats` mirrors those statistics as JSON, if anywhere.
@@ -484,6 +488,8 @@ impl<S: ScanoutSink> GpuDevice<S> {
             shared_active: false,
             shared_declined: false,
             shared_logged: false,
+            host_pages_declined: false,
+            host_pages_logged: false,
             pacing: FramePacing::new(),
             frame_stats: None,
             refresh_hz: crate::edid::DEFAULT_REFRESH_HZ,
@@ -1859,7 +1865,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
             // (a guest `VkDeviceMemory`). First the shared path: hand the
             // display the image itself, which it copies on the GPU
             // (ADR-0004, zero-copy presentation).
-            if !self.present_shared(cmd.resource_id, &spec, scanout.rect, clip)? {
+            if !self.present_host_pages(cmd.resource_id, clip)?
+                && !self.present_shared(cmd.resource_id, &spec, scanout.rect, clip)?
+            {
                 // The copy path: read the clipped rect back in the layout the
                 // renderer accepted, into the buffer reused frame to frame,
                 // and push it down the same sink every other path uses. After
@@ -2517,6 +2525,56 @@ impl<S: ScanoutSink> GpuDevice<S> {
     ///
     /// `visible` is the bound region of the framebuffer and `damage` the
     /// flushed rect clipped to it, both already validated against `spec`.
+    /// ADR-0009 phase E: hand the display a page blob's host pages, which
+    /// its GPU copies itself. `Ok(true)` when it took them, `Ok(false)` when
+    /// another path must serve this flush.
+    fn present_host_pages(&mut self, resource_id: u32, damage: Rect) -> Result<bool, CommandError> {
+        if self.host_pages_declined || !self.display.accepts_host_pages() {
+            return Ok(false);
+        }
+        let Some(gpu) = self.three_d.as_mut() else {
+            return Ok(false);
+        };
+        let Some((pages, spec)) = gpu.scanout_pages(resource_id) else {
+            return Ok(false);
+        };
+        let frame = crate::shared::HostPagesFrame {
+            resource_id,
+            pages,
+            offset: u64::from(spec.offset),
+            stride: spec.stride,
+            width: spec.width,
+            height: spec.height,
+            damage,
+        };
+        match self.display.present_host_pages(&frame) {
+            crate::shared::SharedPresent::Presented => {
+                self.pacing.note_shared();
+                if !self.host_pages_logged {
+                    self.host_pages_logged = true;
+                    tracing::info!(
+                        resource = resource_id,
+                        width = spec.width,
+                        height = spec.height,
+                        "virtio-gpu presents a renderer blob's host pages through the display's \
+                         GPU: no readback, no CPU copy"
+                    );
+                }
+                Ok(true)
+            }
+            crate::shared::SharedPresent::Declined { reason, retry } => {
+                if !retry {
+                    self.host_pages_declined = true;
+                    tracing::info!(%reason, "the display does not read host pages; the copy path serves");
+                } else {
+                    tracing::debug!(%reason, "the display declined host pages for this flush");
+                }
+                Ok(false)
+            }
+            crate::shared::SharedPresent::Failed(reason) => Err(CommandError::Display(reason)),
+        }
+    }
+
     fn present_shared(
         &mut self,
         resource_id: u32,
@@ -3255,6 +3313,8 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
         self.shared_active = false;
         self.shared_declined = false;
         self.shared_logged = false;
+        self.host_pages_declined = false;
+        self.host_pages_logged = false;
     }
 }
 

@@ -84,7 +84,7 @@ Venus renderer this stack talks to.
 | B — **done 2026-11-02** | Mesa Venus Windows winsys + registry ICD | `vk-smoke` passes 9/9 on our stack with Yttrium uninstalled |
 | C — **done 2026-11-02** | Software WSI for `VK_KHR_win32_surface` | `vkcube` spins in a window |
 | D — **done 2026-11-02** | DXVK + Zink in the install (`install windows --gpu3d` with no third-party package) | WebGL Aquarium through ANGLE's D3D11 backend, an OpenGL demo and a D3D11 game run |
-| E | Zero-copy present (the guest image shared with the display path instead of copied) | presenting costs no CPU copy per frame |
+| E — **done 2026-11-03** | Zero-copy present (the guest image shared with the display path instead of copied) | presenting costs no CPU copy per frame |
 | F | Signing | Microsoft attestation signing (EV certificate + Partner Center account), so test-signing mode is not needed |
 
 **Phase A, first slice (2026-11-02):** `guest/windows-gpu/driver` —
@@ -289,12 +289,38 @@ place:
 node scanning out `vk-present`'s and `gl-test`'s blobs, the frames appear in
 their windows through the plane and vanish when the programs exit;
 `vk-present` 300 frames at 620 fps, `gl-test` at 52-54 fps (the copies were
-not what bound either). What remains of a copy is the host's: the plane's
-pixels are read out of the blob (host memory the GPU wrote) into the plane
-and uploaded. Taking that to zero means the guest allocating the WSI image's
-memory exportable, a canonical image recorded on the handle blob, and the
-window importing it as it does for a Linux guest's GPU desktop (the shared
-lease, ADR-0004) — the plane's `present_shared` is the hook for it.
+not what bound either). **No CPU copy on the host either (2026-11-03).** The plane's pixels live
+in a page blob — host-visible guest memory, host pages the renderer's GPU
+already reaches through `VK_EXT_external_memory_host` — so the window's GPU
+imports the same pages the same way and copies them itself:
+
+- `virtio_gpu::HostPages`/`HostPagesFrame`, `Renderer3d::scanout_pages` (a page
+  blob's pages and accepted layout) and `ScanoutSink::present_host_pages`: on
+  `RESOURCE_FLUSH` of a renderer blob the device offers the pages first, then
+  the shared image, then reads back.
+- `GpuScanout` opens the window's device with `VK_EXT_external_memory_host`
+  too, imports the pages under a transfer-source buffer (aligned to
+  `minImportedHostPointerAlignment`; eight imports kept) and records
+  `vkCmdCopyBufferToImage` of the damage into its texture; the retirer holds
+  the pages until the copy has run. A second presenter on the window's
+  device, in the second place of `SharedSlot`, serves the plane, and the
+  renderer draws its texture at the plane's place, scaled as the desktop is,
+  with the cursor drawn over it by the GPU.
+- The copy is handed to a thread of the overlay's (`OverlayCopier`, newest
+  frame wins): the window's GPU queue is shared with its swapchain, and a
+  submit there waits while the window waits for vsync. Submitted from the
+  device's queue worker it held every guest present to the host's refresh —
+  measured: `gl-test` fell to 18-21 fps. A frame copied late after the plane
+  went does not bring it back (an epoch per withdrawal).
+
+**Verified 2026-11-03:** the host logs "presents a renderer blob's host pages
+through the display's GPU: no readback, no CPU copy"; 600 presents, none
+declined or failed, the GPU copy 0.75 ms on average; `vk-present` 748 fps,
+`gl-test` 53-56 fps (both faster than the CPU path), the frames in their
+windows and in screenshots, gone when the programs exit. What remains per
+frame is GPU work only: the WSI's own blit of the rendered image into its
+linear buffer on the renderer's GPU, and the window GPU's copy out of it.
+**Phase E is done.**
 
 **Phase F, signing (2026-11-03): everything but the publisher's step.**
 Attestation signing needs two things only the publisher can have: an EV
@@ -336,9 +362,10 @@ build A; E is performance; F is distribution.
 - **DXVK is per application** (its DLLs beside the game, or installed into
   `System32` by our installer, which then affects every D3D9–11 program in
   the guest). The installer choice is a phase D decision.
-- **Present copies:** since phase E none in the guest while a window is in
-  front and on screen (the overlay plane); the host still reads the plane's
-  pixels out of the blob (see phase E for the rest of the way).
+- **Present copies:** since phase E none by the CPU, guest or host, while a
+  window is in front and on screen (the overlay plane, copied on the GPU out
+  of its host pages); otherwise the old path, two guest copies and a host
+  readback.
 - **Signing is the long pole.** Test-signing is fine for development; a
   driver users install without test mode needs Microsoft's attestation
   signature, which needs an organisation with an EV certificate.

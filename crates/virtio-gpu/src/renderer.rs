@@ -431,6 +431,22 @@ pub trait Renderer3d: Send {
         Ok(None)
     }
 
+    /// A page blob accepted for scanout ([`Self::scanout_blob`]) as the host
+    /// pages its pixels are in and the layout accepted, for a display whose
+    /// GPU copies them itself (ADR-0009 phase E). `None` — the default, and
+    /// the answer for a handle blob or anything not accepted — means another
+    /// path serves the flush.
+    fn scanout_pages(
+        &mut self,
+        resource_id: u32,
+    ) -> Option<(
+        std::sync::Arc<dyn crate::shared::HostPages>,
+        ScanoutBlobSpec,
+    )> {
+        let _ = resource_id;
+        None
+    }
+
     // ------------------------------------- blob resources (EPIC 20/VEN-2001)
 
     /// Which blob memory types this renderer serves, and whether it has a
@@ -1173,6 +1189,18 @@ impl Gpu3d {
         resource_id: u32,
     ) -> Result<Option<crate::shared::SharedScanoutLease>, CommandError> {
         self.renderer.begin_shared_scanout(resource_id)
+    }
+
+    /// A page blob's host pages for a display's own GPU copy
+    /// ([`Renderer3d::scanout_pages`]); this front only forwards.
+    pub fn scanout_pages(
+        &mut self,
+        resource_id: u32,
+    ) -> Option<(
+        std::sync::Arc<dyn crate::shared::HostPages>,
+        ScanoutBlobSpec,
+    )> {
+        self.renderer.scanout_pages(resource_id)
     }
 
     /// Zero-copy export of a scanout resource, when the host can do it.

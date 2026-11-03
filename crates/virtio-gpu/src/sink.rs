@@ -128,6 +128,24 @@ pub trait ScanoutSink: Send {
     /// is gone.
     fn scanout_disabled(&self) {}
 
+    /// Whether [`Self::present_host_pages`] could take a frame now — asked
+    /// before the renderer is, so a sink that never does costs nothing. The
+    /// default: never.
+    fn accepts_host_pages(&self) -> bool {
+        false
+    }
+
+    /// Present a renderer blob's host pages instead of their pixels
+    /// (ADR-0009 phase E): the sink's GPU imports them as host memory and
+    /// copies `frame.damage` into its own texture, holding `frame.pages` until
+    /// the copy has run. The device has checked the layout against the pages
+    /// (`SET_SCANOUT_BLOB`). Any doubt is [`SharedPresent::Declined`], and the
+    /// copy path serves the flush. The default declines for good.
+    fn present_host_pages(&self, frame: &crate::shared::HostPagesFrame) -> SharedPresent {
+        let _ = frame;
+        SharedPresent::never("this display does not read host pages on its GPU")
+    }
+
     // ------------------------- shared presentation (ADR-0004, zero-copy)
 
     /// Whether [`Self::present_shared`] could take a frame right now — a
@@ -235,6 +253,14 @@ impl<S: ScanoutSink + ?Sized> ScanoutSink for Box<S> {
 
     fn scanout_disabled(&self) {
         (**self).scanout_disabled()
+    }
+
+    fn accepts_host_pages(&self) -> bool {
+        (**self).accepts_host_pages()
+    }
+
+    fn present_host_pages(&self, frame: &crate::shared::HostPagesFrame) -> SharedPresent {
+        (**self).present_host_pages(frame)
     }
 
     fn accepts_shared_scanout(&self) -> bool {

@@ -4010,6 +4010,22 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
     /// scanout, leased to the display with the same claim on its payload the
     /// readback takes (`executor::writes`). A page blob, or an image the
     /// factory cannot share, is `None` — the readback serves it.
+    /// ADR-0009 phase E: a page blob's pages, in the layout accepted for it.
+    fn scanout_pages(
+        &mut self,
+        resource_id: u32,
+    ) -> Option<(Arc<dyn crate::shared::HostPages>, ScanoutBlobSpec)> {
+        let blob = self.blobs.get(&resource_id)?;
+        let accepted = blob.scanout.as_ref()?;
+        match (&blob.backing, &accepted.image) {
+            (ExportedMemory::Pages(pages), None) => {
+                let pages: Arc<dyn crate::shared::HostPages> = Arc::clone(pages) as _;
+                Some((pages, accepted.spec))
+            }
+            _ => None,
+        }
+    }
+
     fn begin_shared_scanout(
         &mut self,
         resource_id: u32,

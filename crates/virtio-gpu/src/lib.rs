@@ -107,8 +107,8 @@ pub use renderer::{CapsetInfo, FenceOutcome, Gpu3d, Renderer3d, ScanoutBlobSpec,
 pub use resource::{Resource, ResourceTable};
 pub use save::{GpuState, GpuStateError, SavedResource, SavedScanout};
 pub use shared::{
-    ExternalHandle, ImageRelease, ScanoutPath, SharedImageInfo, SharedPresent, SharedScanoutFrame,
-    SharedScanoutImage, SharedScanoutLease, SCANOUT_PATH_ENV,
+    ExternalHandle, HostPages, HostPagesFrame, ImageRelease, ScanoutPath, SharedImageInfo,
+    SharedPresent, SharedScanoutFrame, SharedScanoutImage, SharedScanoutLease, SCANOUT_PATH_ENV,
 };
 pub use sink::{DisplayListener, ScanoutSink, SinkError};
 pub use venus::executor::ExecutorFactory;

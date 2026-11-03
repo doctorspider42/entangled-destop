@@ -741,6 +741,16 @@ unsafe impl Send for RingPages {}
 // SAFETY: see the `Send` impl directly above.
 unsafe impl Sync for RingPages {}
 
+impl crate::shared::HostPages for RingPages {
+    fn base(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    fn len(&self) -> u64 {
+        self.mapped_len()
+    }
+}
+
 impl RingPages {
     /// Allocate `size` bytes of zeroed, page-aligned host memory for one
     /// shared-memory resource.

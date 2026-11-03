@@ -673,6 +673,7 @@ impl App {
         // renderer's shared frame, when that is what the scanout shows, is
         // already on the GPU (ADR-0004, zero-copy presentation).
         let shared_frame = self.shared.get().and_then(|p| p.current());
+        let overlay_frame = self.shared.overlay().and_then(|p| p.current());
         let mirror = Arc::clone(&self.scanout);
         let (guest_size, guest_pointer, viewport) = {
             let mut scanout = lock_scanout(&mirror);
@@ -685,7 +686,7 @@ impl App {
                 return;
             };
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.prepare(&mut scanout, shared_frame);
+                renderer.prepare(&mut scanout, shared_frame, overlay_frame);
             }
             (size, scanout.cursor_position(), viewport)
         };

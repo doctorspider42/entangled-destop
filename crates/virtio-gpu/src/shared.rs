@@ -335,6 +335,47 @@ pub struct SharedScanoutFrame {
     pub damage: Rect,
 }
 
+/// Host pages a renderer blob's pixels live in (host-visible guest memory,
+/// stage 5b.1), for a display whose GPU reads them itself — imported as host
+/// memory and copied into its texture, no CPU copy (ADR-0009 phase E).
+///
+/// The guest may be writing them at any time (they are mapped into it);
+/// a GPU read racing a write tears a frame at worst, which is the guest's
+/// own doing. No CPU ever reads them through this.
+pub trait HostPages: Send + Sync + std::fmt::Debug {
+    /// The base address: aligned to the host page size, valid for
+    /// [`Self::len`] bytes for as long as `self` lives.
+    fn base(&self) -> *const u8;
+    /// How many bytes from [`Self::base`] are valid; a multiple of the page
+    /// size.
+    fn len(&self) -> u64;
+
+    /// Whether there are none.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A frame on [`HostPages`]: `width` x `height` BGRA pixels at `offset`,
+/// rows `stride` bytes apart, of which `damage` changed.
+#[derive(Debug, Clone)]
+pub struct HostPagesFrame {
+    /// The resource the pages belong to.
+    pub resource_id: u32,
+    /// The pages, held for as long as the display's copy may read them.
+    pub pages: Arc<dyn HostPages>,
+    /// Where the image starts in them.
+    pub offset: u64,
+    /// Bytes from one row to the next.
+    pub stride: u32,
+    /// The image's width.
+    pub width: u32,
+    /// The image's height.
+    pub height: u32,
+    /// What changed, inside the image.
+    pub damage: Rect,
+}
+
 /// What the display did with a [`SharedScanoutFrame`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharedPresent {

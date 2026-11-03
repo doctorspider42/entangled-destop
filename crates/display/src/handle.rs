@@ -472,6 +472,43 @@ impl DisplayHandle {
     /// it is drawn on the display's GPU into an off-screen target through the
     /// window's own image pipeline and read back, and the cursor is composited
     /// over it on the CPU exactly as it is over the mirror.
+    /// The overlay plane drawn from its presenter's texture (ADR-0009 phase
+    /// E), as a screenshot composites it: its clipped rect on the desktop and
+    /// those pixels, read back from the GPU.
+    fn gpu_overlay(&self) -> Option<(virtio_gpu::Rect, Vec<u8>)> {
+        let (place, desktop) = {
+            let scanout = lock_scanout(&self.scanout);
+            (scanout.overlay_on_gpu()?, scanout.size())
+        };
+        let presenter = self.shared.overlay().filter(|p| p.shown())?;
+        let (w, h, pixels) = presenter.read_back().ok()?;
+        let (x, y, pw, ph) = place;
+        if (w, h) != (pw, ph) {
+            return None;
+        }
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = (x + i64::from(w)).min(i64::from(desktop.0));
+        let y1 = (y + i64::from(h)).min(i64::from(desktop.1));
+        if x0 >= x1 || y0 >= y1 {
+            return None;
+        }
+        let rect = virtio_gpu::Rect {
+            x: u32::try_from(x0).ok()?,
+            y: u32::try_from(y0).ok()?,
+            width: u32::try_from(x1 - x0).ok()?,
+            height: u32::try_from(y1 - y0).ok()?,
+        };
+        let (ox, oy) = (usize::try_from(x0 - x).ok()?, usize::try_from(y0 - y).ok()?);
+        let row = rect.width as usize * 4;
+        let mut out = Vec::with_capacity(row * rect.height as usize);
+        for r in 0..rect.height as usize {
+            let at = ((oy + r) * w as usize + ox) * 4;
+            out.extend_from_slice(pixels.get(at..at + row)?);
+        }
+        Some((rect, out))
+    }
+
     fn snapshot(&self) -> Result<Scanout, DisplayError> {
         if let Some(presenter) = self.shared.get() {
             if presenter.shown() {
@@ -482,7 +519,8 @@ impl DisplayHandle {
                 };
                 if let Some(based) = based {
                     let mut snapshot = based?;
-                    if let Some((rect, plane)) = snapshot.overlay_composite() {
+                    let plane = snapshot.overlay_composite().or_else(|| self.gpu_overlay());
+                    if let Some((rect, plane)) = plane {
                         snapshot.update(rect.x, rect.y, rect.width, rect.height, &plane)?;
                     }
                     if let Some((rect, composited)) = snapshot.cursor_overlay() {
@@ -507,7 +545,7 @@ impl DisplayHandle {
         };
         let mut snapshot = Scanout::new(width, height)?;
         snapshot.update(0, 0, width, height, &pixels)?;
-        if let Some((rect, plane)) = plane {
+        if let Some((rect, plane)) = plane.or_else(|| self.gpu_overlay()) {
             snapshot.update(rect.x, rect.y, rect.width, rect.height, &plane)?;
         }
         if let Some((rect, composited)) = overlay {
@@ -528,6 +566,126 @@ impl DisplayHandle {
 pub struct OverlaySink {
     scanout: SharedScanout,
     waker: Waker,
+    /// The display's presenters; the overlay's is the second.
+    shared: SharedSlot,
+    /// Where host-page frames go to be copied ([`OverlayCopier`]).
+    copier: Arc<OverlayCopier>,
+}
+
+/// The overlay's host-page copies, off the device's queue worker: the
+/// display's GPU queue is the window's too, and a submit there waits while
+/// the window waits for its swapchain (vsync), which would hold every guest
+/// present to the host's refresh. The device hands the newest frame over and
+/// goes on; a thread of the copier's takes it, newest wins (a frame overtaken
+/// before it was copied is one the window could not have shown anyway).
+#[derive(Debug)]
+struct OverlayCopier {
+    mailbox: Arc<CopyMailbox>,
+}
+
+#[derive(Debug, Default)]
+struct CopyMailbox {
+    state: Mutex<CopyState>,
+    wake: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct CopyState {
+    /// The newest frame not yet taken, and the epoch it was given in.
+    next: Option<(virtio_gpu::HostPagesFrame, u64)>,
+    /// Bumped when the plane goes ([`OverlayCopier::withdraw`]): a frame of
+    /// an older epoch, copied late, does not bring it back.
+    epoch: u64,
+    stop: bool,
+    /// The presenter refused host pages for good: the device is told so.
+    refused: Option<String>,
+}
+
+impl OverlayCopier {
+    fn start(scanout: SharedScanout, waker: Waker, shared: SharedSlot) -> Arc<Self> {
+        let mailbox = Arc::new(CopyMailbox::default());
+        let worker = Arc::clone(&mailbox);
+        let spawned = std::thread::Builder::new()
+            .name("overlay-copy".into())
+            .spawn(move || loop {
+                let (frame, epoch) = {
+                    let mut state = crate::sync::lock(&worker.state, "overlay copier");
+                    loop {
+                        if state.stop {
+                            return;
+                        }
+                        if let Some(next) = state.next.take() {
+                            break next;
+                        }
+                        state = worker
+                            .wake
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                };
+                let Some(presenter) = shared.overlay() else {
+                    continue;
+                };
+                match presenter.present_host(&frame) {
+                    virtio_gpu::SharedPresent::Presented => {
+                        let current =
+                            crate::sync::lock(&worker.state, "overlay copier").epoch == epoch;
+                        if current {
+                            lock_scanout(&scanout).show_overlay_on_gpu(frame.width, frame.height);
+                            waker.frame();
+                        }
+                    }
+                    virtio_gpu::SharedPresent::Declined {
+                        reason,
+                        retry: false,
+                    } => {
+                        crate::sync::lock(&worker.state, "overlay copier").refused = Some(reason);
+                    }
+                    virtio_gpu::SharedPresent::Declined {
+                        reason,
+                        retry: true,
+                    } => {
+                        tracing::debug!(%reason, "display: an overlay frame was not copied");
+                    }
+                    virtio_gpu::SharedPresent::Failed(reason) => {
+                        tracing::warn!(%reason, "display: an overlay frame's copy failed");
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            crate::sync::lock(&mailbox.state, "overlay copier").refused =
+                Some(format!("no overlay copy thread: {error}"));
+        }
+        Arc::new(Self { mailbox })
+    }
+
+    /// Hands `frame` over (replacing one not yet taken), or says why the
+    /// copies stopped for good.
+    fn give(&self, frame: &virtio_gpu::HostPagesFrame) -> Result<(), String> {
+        let mut state = crate::sync::lock(&self.mailbox.state, "overlay copier");
+        if let Some(why) = &state.refused {
+            return Err(why.clone());
+        }
+        state.next = Some((frame.clone(), state.epoch));
+        drop(state);
+        self.mailbox.wake.notify_one();
+        Ok(())
+    }
+
+    /// The plane is gone: a frame not yet copied is dropped, and one being
+    /// copied does not show it again.
+    fn withdraw(&self) {
+        let mut state = crate::sync::lock(&self.mailbox.state, "overlay copier");
+        state.next = None;
+        state.epoch = state.epoch.wrapping_add(1);
+    }
+}
+
+impl Drop for OverlayCopier {
+    fn drop(&mut self) {
+        crate::sync::lock(&self.mailbox.state, "overlay copier").stop = true;
+        self.mailbox.wake.notify_all();
+    }
 }
 
 impl DisplayHandle {
@@ -536,6 +694,12 @@ impl DisplayHandle {
         OverlaySink {
             scanout: Arc::clone(&self.scanout),
             waker: self.waker.clone(),
+            shared: self.shared.clone(),
+            copier: OverlayCopier::start(
+                Arc::clone(&self.scanout),
+                self.waker.clone(),
+                self.shared.clone(),
+            ),
         }
     }
 }
@@ -588,6 +752,7 @@ impl virtio_gpu::ScanoutSink for OverlaySink {
     }
 
     fn hide_cursor(&self) -> Result<(), virtio_gpu::SinkError> {
+        self.copier.withdraw();
         lock_scanout(&self.scanout).hide_overlay();
         self.waker.wake();
         Ok(())
@@ -596,8 +761,30 @@ impl virtio_gpu::ScanoutSink for OverlaySink {
     /// The window that presented is gone (its program exited without
     /// hiding the plane, say): the desktop under it shows again.
     fn scanout_disabled(&self) {
+        self.copier.withdraw();
         lock_scanout(&self.scanout).hide_overlay();
+        if let Some(presenter) = self.shared.overlay() {
+            presenter.deactivate();
+            presenter.forget(None);
+        }
         self.waker.wake();
+    }
+
+    fn accepts_host_pages(&self) -> bool {
+        self.shared.overlay().is_some()
+    }
+
+    /// The plane's pixels copied out of the blob's host pages on the
+    /// display's GPU: no CPU copy on either side. The copy runs on the
+    /// copier's thread ([`OverlayCopier`]); the device goes on at once.
+    fn present_host_pages(&self, frame: &virtio_gpu::HostPagesFrame) -> virtio_gpu::SharedPresent {
+        if self.shared.overlay().is_none() {
+            return virtio_gpu::SharedPresent::not_now("the display's GPU is not up yet");
+        }
+        match self.copier.give(frame) {
+            Ok(()) => virtio_gpu::SharedPresent::Presented,
+            Err(why) => virtio_gpu::SharedPresent::never(why),
+        }
     }
 }
 
@@ -864,6 +1051,110 @@ mod tests {
             visible,
             damage: visible,
         }
+    }
+
+    /// An overlay presenter that "copies" host pages: it counts them, and its
+    /// texture reads back as one colour.
+    #[derive(Default)]
+    struct FakeHost {
+        copies: AtomicUsize,
+        shown: AtomicBool,
+    }
+
+    impl SharedPresenter for FakeHost {
+        fn present(&self, _: &SharedScanoutFrame, _: SharedScanoutLease) -> SharedPresent {
+            SharedPresent::never("only host pages")
+        }
+        fn present_host(&self, _frame: &virtio_gpu::HostPagesFrame) -> SharedPresent {
+            self.copies.fetch_add(1, Ordering::SeqCst);
+            self.shown.store(true, Ordering::SeqCst);
+            SharedPresent::Presented
+        }
+        fn forget(&self, _resource_id: Option<u32>) {}
+        fn deactivate(&self) {
+            self.shown.store(false, Ordering::SeqCst);
+        }
+        fn current(&self) -> Option<SharedTexture> {
+            None
+        }
+        fn shown(&self) -> bool {
+            self.shown.load(Ordering::SeqCst)
+        }
+        fn read_back(&self) -> Result<(u32, u32, Vec<u8>), DisplayError> {
+            Ok((2, 2, [5u8, 6, 7, 0xff].repeat(4)))
+        }
+        fn stats(&self) -> SharedStats {
+            SharedStats::default()
+        }
+    }
+
+    #[derive(Debug)]
+    struct Pages(Vec<u8>);
+
+    impl virtio_gpu::HostPages for Pages {
+        fn base(&self) -> *const u8 {
+            self.0.as_ptr()
+        }
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+    }
+
+    /// ADR-0009 phase E: a render node's frame on host pages goes to the
+    /// overlay presenter on the copier's thread — the device is answered at
+    /// once — and the plane is then drawn from the GPU, in screenshots too;
+    /// when the scanout goes, so does the plane.
+    #[test]
+    fn overlay_frames_on_host_pages_are_copied_off_the_device_and_go_with_the_plane() {
+        let handle = DisplayHandle::detached(8, 8).unwrap();
+        let overlay = handle.overlay_sink();
+        let sink: &dyn ScanoutSink = &overlay;
+        assert!(!sink.accepts_host_pages(), "no GPU yet");
+        let fake = Arc::new(FakeHost::default());
+        handle
+            .shared
+            .set_overlay(Some(Arc::clone(&fake) as Arc<dyn SharedPresenter>));
+        assert!(sink.accepts_host_pages());
+        sink.move_cursor(2, 3).unwrap();
+        let frame = virtio_gpu::HostPagesFrame {
+            resource_id: 1,
+            pages: Arc::new(Pages(vec![0; 4096])),
+            offset: 0,
+            stride: 8,
+            width: 2,
+            height: 2,
+            damage: Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+        };
+        assert_eq!(sink.present_host_pages(&frame), SharedPresent::Presented);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock_scanout(&handle.scanout).overlay_on_gpu().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the copier never showed the plane"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(fake.copies.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            lock_scanout(&handle.scanout).overlay_on_gpu(),
+            Some((2, 3, 2, 2))
+        );
+        let (_, _, pixels) = handle.screenshot_bgra().unwrap();
+        let at = (3 * 8 + 2) * 4;
+        assert_eq!(
+            &pixels[at..at + 4],
+            &[5, 6, 7, 0xff],
+            "the plane, read back"
+        );
+        assert_eq!(&pixels[..4], &[0, 0, 0, 0], "the desktop beside it");
+        sink.scanout_disabled();
+        assert!(lock_scanout(&handle.scanout).overlay_on_gpu().is_none());
+        assert!(!fake.shown());
     }
 
     /// No presenter: nothing is accepted, and a frame handed over anyway is

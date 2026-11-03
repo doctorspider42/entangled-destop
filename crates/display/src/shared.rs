@@ -267,14 +267,30 @@ pub trait SharedPresenter: Send + Sync {
 
     /// Its counters.
     fn stats(&self) -> SharedStats;
+
+    /// Take a frame on a renderer blob's host pages (ADR-0009 phase E):
+    /// import them as host memory, copy the damage into the texture on the
+    /// GPU, and hold the pages until the copy has run. The default declines
+    /// for good.
+    fn present_host(&self, frame: &virtio_gpu::HostPagesFrame) -> SharedPresent {
+        let _ = frame;
+        SharedPresent::never("this presenter does not import host memory")
+    }
 }
 
 /// Where a display's presenter lives once it has one: shared between the
 /// device-facing [`crate::DisplayHandle`] (every clone of it) and the window,
 /// which fills it when its GPU is up. Empty — no GPU of the display's own yet,
 /// or none that can share — means every flush takes the copy path.
+///
+/// It has a second place, for the **overlay plane**'s presenter (ADR-0009
+/// phase E): the same GPU, a texture of its own, which the window draws over
+/// the desktop where the plane is.
 #[derive(Clone, Default)]
-pub struct SharedSlot(Arc<Mutex<Option<Arc<dyn SharedPresenter>>>>);
+pub struct SharedSlot(
+    Arc<Mutex<Option<Arc<dyn SharedPresenter>>>>,
+    Arc<Mutex<Option<Arc<dyn SharedPresenter>>>>,
+);
 
 impl std::fmt::Debug for SharedSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -293,6 +309,16 @@ impl SharedSlot {
     /// Installs (or, with `None`, removes) the presenter.
     pub fn set(&self, presenter: Option<Arc<dyn SharedPresenter>>) {
         *lock(&self.0, "shared presenter") = presenter;
+    }
+
+    /// The overlay plane's presenter, if there is one.
+    pub fn overlay(&self) -> Option<Arc<dyn SharedPresenter>> {
+        lock(&self.1, "overlay presenter").clone()
+    }
+
+    /// Installs (or, with `None`, removes) the overlay plane's presenter.
+    pub fn set_overlay(&self, presenter: Option<Arc<dyn SharedPresenter>>) {
+        *lock(&self.1, "overlay presenter") = presenter;
     }
 }
 

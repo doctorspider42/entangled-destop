@@ -153,6 +153,11 @@ impl StatsReporter {
     }
 }
 
+/// The overlay plane as the GPU draws it: its place on the guest desktop
+/// (signed top-left, size), its presenter's texture and the bind group
+/// sampling that.
+type GpuOverlay = ((i64, i64, u32, u32), SharedTexture, wgpu::BindGroup);
+
 /// Owns the surface, device and scanout texture for one window.
 pub(crate) struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -175,6 +180,12 @@ pub(crate) struct Renderer {
     /// sampling it (rebuilt when its generation changes); `None` while the
     /// mirror is what the scanout shows.
     shared: Option<(SharedTexture, wgpu::BindGroup)>,
+    /// The overlay plane drawn from its presenter's texture (ADR-0009 phase
+    /// E): where on the guest desktop (signed top-left, size), the texture
+    /// and its bind group; `None` while it is not drawn that way.
+    overlay: Option<GpuOverlay>,
+    /// The guest desktop's size this frame, for placing the overlay.
+    guest_size: (u32, u32),
     /// Size of the currently allocated scanout texture.
     texture_size: (u32, u32),
     /// Scanout generation the texture was allocated for.
@@ -310,6 +321,8 @@ impl Renderer {
             texture,
             bind_group,
             shared: None,
+            overlay: None,
+            guest_size: (guest_w, guest_h),
             texture_size: (guest_w, guest_h),
             generation: 0,
             stats: FrameStats {
@@ -446,9 +459,38 @@ impl Renderer {
     /// it is what the scanout shows (and then the cursor plane is drawn over
     /// it by the GPU), else the mirror. The mirror's texture is kept up to date
     /// either way ([`Self::upload`]), so switching back shows no stale rect.
-    pub(crate) fn prepare(&mut self, scanout: &mut Scanout, shared: Option<SharedTexture>) {
+    pub(crate) fn prepare(
+        &mut self,
+        scanout: &mut Scanout,
+        shared: Option<SharedTexture>,
+        overlay: Option<SharedTexture>,
+    ) {
         let shared = shared.filter(|s| s.size == scanout.size());
-        self.upload(scanout, shared.is_none());
+        self.guest_size = scanout.size();
+        // The overlay plane from its presenter's texture: the GPU draws it
+        // over the desktop, and the cursor over that (so the mirror's copy
+        // of the cursor would be under it).
+        let overlay = scanout
+            .overlay_on_gpu()
+            .zip(overlay)
+            .filter(|((_, _, w, h), t)| t.size == (*w, *h));
+        self.overlay = overlay.map(|(rect, texture)| {
+            let bind = match self.overlay.take() {
+                Some((_, old, bind)) if old.generation == texture.generation => bind,
+                _ => self.image.bind(&self.device, &texture.view),
+            };
+            (rect, texture, bind)
+        });
+        let gpu_cursor = shared.is_some() || self.overlay.is_some();
+        self.upload(scanout, !gpu_cursor);
+        if gpu_cursor {
+            self.cursor.prepare(
+                &self.device,
+                &self.queue,
+                scanout.cursor_image(),
+                scanout.size(),
+            );
+        }
         let Some(texture) = shared else {
             self.shared = None;
             return;
@@ -752,9 +794,50 @@ impl Renderer {
                     None => pass.set_bind_group(0, &self.bind_group, &[]),
                 }
                 pass.draw(0..3, 0..1);
-                if self.shared.is_some() {
+                // The overlay plane (ADR-0009 phase E), at its place of the
+                // desktop, scaled as the desktop is.
+                if let Some(((ox, oy, ow, oh), _, bind)) = &self.overlay {
+                    let (gw, gh) = self.guest_size;
+                    let sx = f64::from(width) / f64::from(gw.max(1));
+                    let sy = f64::from(height) / f64::from(gh.max(1));
+                    let x0 = f64::from(viewport.x) + *ox as f64 * sx;
+                    let y0 = f64::from(viewport.y) + *oy as f64 * sy;
+                    let x1 = x0 + f64::from(*ow) * sx;
+                    let y1 = y0 + f64::from(*oh) * sy;
+                    let (vx0, vy0) = (f64::from(viewport.x), f64::from(viewport.y));
+                    let (vx1, vy1) = (vx0 + f64::from(width), vy0 + f64::from(height));
+                    // Only a plane wholly on the desktop is drawn from the
+                    // GPU (the guest shows it only then).
+                    if x0 >= vx0
+                        && y0 >= vy0
+                        && x1 <= vx1 + 0.5
+                        && y1 <= vy1 + 0.5
+                        && x1 > x0
+                        && y1 > y0
+                    {
+                        pass.set_viewport(
+                            x0 as f32,
+                            y0 as f32,
+                            (x1.min(vx1) - x0) as f32,
+                            (y1.min(vy1) - y0) as f32,
+                            0.0,
+                            1.0,
+                        );
+                        pass.set_bind_group(0, bind, &[]);
+                        pass.draw(0..3, 0..1);
+                        pass.set_viewport(
+                            viewport.x as f32,
+                            viewport.y as f32,
+                            width as f32,
+                            height as f32,
+                            0.0,
+                            1.0,
+                        );
+                    }
+                }
+                if self.shared.is_some() || self.overlay.is_some() {
                     // No CPU mirror holds the pixels under the cursor: the GPU
-                    // draws it over the shared frame.
+                    // draws it over the shared frame and the overlay.
                     self.cursor.draw(&mut pass);
                 }
             }
@@ -843,6 +926,13 @@ fn install_presenter(
         Err(why) => {
             tracing::warn!(%why, "no shared presenter; the GPU desktop takes the copy path")
         }
+    }
+    // The overlay plane's (ADR-0009 phase E): a render node's window frames,
+    // copied out of their host pages on this GPU.
+    #[cfg(windows)]
+    match crate::gpu_scanout::GpuScanout::new(device.clone(), queue.clone()) {
+        Ok(presenter) => slot.set_overlay(Some(Arc::new(presenter))),
+        Err(why) => tracing::warn!(%why, "no overlay presenter; the overlay takes the copy path"),
     }
     #[cfg(not(windows))]
     let _ = (slot, device, queue);
