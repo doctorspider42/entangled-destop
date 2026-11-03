@@ -1202,12 +1202,16 @@ mod tests {
     fn the_host_clock_ticks_at_the_pit_frequency() {
         let clock = Clock::Host(Instant::now());
         let first = clock.ticks();
+        let started = Instant::now();
         std::thread::sleep(Duration::from_millis(30));
         let elapsed = clock.ticks() - first;
-        let expected = PIT_FREQUENCY_HZ * 30 / 1000;
+        // Against the time that really passed: a loaded CI runner has slept
+        // 310 ms for a 30 ms sleep, which is no fault of the clock.
+        let waited = started.elapsed();
+        let expected = (u128::from(PIT_FREQUENCY_HZ) * waited.as_micros() / 1_000_000) as u64;
         assert!(
-            elapsed >= expected / 2 && elapsed < expected * 8,
-            "30 ms produced {elapsed} ticks, expected around {expected}"
+            elapsed >= expected / 2 && elapsed < expected * 2 + PIT_FREQUENCY_HZ / 100,
+            "{waited:?} produced {elapsed} ticks, expected around {expected}"
         );
     }
 
