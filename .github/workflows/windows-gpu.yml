@@ -145,7 +145,8 @@ jobs:
           foreach ($f in 'd3d9.dll', 'd3d10core.dll', 'd3d11.dll', 'dxgi.dll') {
             Copy-Item "C:\dxvk-$env:DXVK_VERSION\x64\$f" $pkg
           }
-          Copy-Item "C:\dxvk-$env:DXVK_VERSION\LICENSE" "$pkg\LICENSE-dxvk.txt"
+          # The release tarball holds the DLLs alone; the licence is the tag's.
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/doitsujin/dxvk/v$env:DXVK_VERSION/LICENSE" -OutFile "$pkg\LICENSE-dxvk.txt"
           Copy-Item C:\mesa\docs\license.rst "$pkg\LICENSE-mesa.txt"
           Get-Pinned "https://sdk.lunarg.com/sdk/download/$env:VULKANRT_VERSION/windows/VulkanRT-$env:VULKANRT_VERSION-Installer.exe" $env:VULKANRT_SHA256 "$pkg\VulkanRT-Installer.exe"
           Get-ChildItem $pkg | Format-Table Name, Length

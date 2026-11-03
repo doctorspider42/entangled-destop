@@ -269,6 +269,11 @@ pub struct RingService<S> {
     spin: Duration,
     /// `IDLE` is up and the ring is waiting for a doorbell.
     parked: bool,
+    /// The last pass stopped at a command that cannot run yet. Such a ring
+    /// has work, so it never goes idle — not even when this thread was
+    /// descheduled for longer than `idleTimeout` between two passes, which
+    /// a loaded host does.
+    blocked: bool,
     /// Set once the ring is dead; every later step answers it.
     stopped: Option<RingStop>,
 }
@@ -287,6 +292,7 @@ impl<S: RingSink> RingService<S> {
             relax_iter: 0,
             spin: Duration::ZERO,
             parked: false,
+            blocked: false,
             stopped: None,
         }
     }
@@ -359,6 +365,7 @@ impl<S: RingSink> RingService<S> {
     #[must_use]
     pub fn idle_due(&self, now: Duration) -> bool {
         !self.parked
+            && !self.blocked
             && self.stopped.is_none()
             && now >= self.last_progress.saturating_add(self.pump.idle_timeout())
     }
@@ -392,12 +399,17 @@ impl<S: RingSink> RingService<S> {
 
         match self.pump.pump(backing, &mut self.sink) {
             Ok(Pass::Progress { .. }) => {
+                self.blocked = false;
                 self.last_progress = now;
                 self.relax_iter = 0;
                 Step::Again
             }
-            Ok(Pass::Idle | Pass::Stalled { .. }) => self.relax(now),
+            Ok(Pass::Idle | Pass::Stalled { .. }) => {
+                self.blocked = false;
+                self.relax(now)
+            }
             Ok(Pass::Blocked { consumed, .. }) => {
+                self.blocked = true;
                 // Not idle: the ring has work, it just cannot run it yet. The
                 // idle clock restarts so `IDLE` is not published under a
                 // command the ring is about to run.
