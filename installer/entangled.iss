@@ -93,9 +93,15 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 
 ; Upgrade-in-place: reinstalling over an older version replaces files in the
-; same {app}. CloseApplications asks a running entangled-manager politely to
-; close (WM_CLOSE first) instead of failing on locked files;
-; RestartApplications relaunches it afterwards.
+; same {app}. CloseApplications goes through the Windows Restart Manager, which
+; asks a GUI process to quit with WM_QUERYENDSESSION/WM_ENDSESSION — messages
+; winit (the manager's and the VM window's toolkit) does not act on, so it
+; cannot actually close either of them. The manager's "Download & install"
+; therefore closes the manager itself once Setup is running, and the "Launch"
+; checkbox on the finished page brings it back. What this still catches is an
+; installer started by hand: it lists whatever holds {app} open instead of
+; failing on a locked file halfway through. RestartApplications only restarts
+; programs registered with RegisterApplicationRestart, which ours are not.
 CloseApplications=yes
 CloseApplicationsFilter=*.exe
 RestartApplications=yes
