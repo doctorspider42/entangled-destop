@@ -44,6 +44,9 @@ const GPU3D_EDGE: &str = include_str!("../../../assets/unattend/gpu3d-edge.ps1")
 /// (ADR-0009).
 const OWNGPU_BIND: &str = include_str!("../../../assets/unattend/owngpu-bind.ps1");
 
+/// `--gpu3d auto`: download the pinned package instead of naming a folder.
+pub const GPU3D_AUTO: &str = "auto";
+
 /// The WIM header's magic.
 const WIM_MAGIC: &[u8; 8] = b"MSWIM\0\0\0";
 /// Where the WIM header keeps the resource header of its XML data.
@@ -216,6 +219,14 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
         (None, true) => None,
         (None, false) => Some(media(crate::windows_media::Media::WinFsp)?),
     };
+    // `--gpu3d auto`: the 3D package this build pins (`entangled fetch gpu3d`).
+    let gpu3d = match args.gpu3d.as_deref() {
+        Some(path) if path == Path::new(GPU3D_AUTO) => {
+            Some(media(crate::windows_media::Media::Gpu3d)?)
+        }
+        Some(path) => Some(absolute(path)?),
+        None => None,
+    };
     for (what, path) in [("Windows ISO", &iso), ("virtio-win ISO", &drivers)] {
         if !path.is_file() {
             return Err(format!("the {what} {} was not found", path.display()));
@@ -279,7 +290,7 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
             .transpose()?
             .as_deref(),
         Extras {
-            gpu3d: args.gpu3d.as_deref(),
+            gpu3d: gpu3d.as_deref(),
             winfsp: winfsp.as_deref(),
         },
     )?;
@@ -315,8 +326,8 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
             adapter: DisplayAdapter::VirtioVga,
             // Either package drives Venus beside the VGA function; our own
             // (ADR-0009) needs its render-only function for that.
-            venus: args.gpu3d.is_some(),
-            render_node: args.gpu3d.as_deref().is_some_and(is_own_gpu_package),
+            venus: gpu3d.is_some(),
+            render_node: gpu3d.as_deref().is_some_and(is_own_gpu_package),
             refresh_hz: install::installed_refresh_hz_here(args),
             ..Default::default()
         },
@@ -569,11 +580,16 @@ fn own_gpu_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
         files.push((name.to_owned(), read(&path)?));
     }
     // Optional: Mesa's OpenGL over Vulkan (Zink) and DXVK's Direct3D 9-11,
-    // each a folder of DLLs an application takes from beside itself.
+    // each a folder of DLLs an application takes from beside itself. The
+    // published package (windows-gpu.yml) is flat, a release being a list of
+    // files: its DLLs sit beside the driver and go into their folders here.
     for (folder, wanted) in OPTIONAL_GPU_FOLDERS {
-        let at = dir.join(folder);
+        let mut at = dir.join(folder);
         if !at.is_dir() {
-            continue;
+            if !wanted.iter().all(|name| dir.join(name).is_file()) {
+                continue;
+            }
+            at = dir.to_path_buf();
         }
         for name in *wanted {
             let path = at.join(name);
@@ -1233,6 +1249,24 @@ mod tests {
                 "gpu-test.exe",
                 "vulkan_virtio.dll",
             ]
+        );
+        // The published package is flat: OpenGL's DLLs beside the driver
+        // still land in their folder on the disc.
+        for name in ["opengl32.dll", "libgallium_wgl.dll"] {
+            std::fs::write(dir.join(name), b"dll").unwrap();
+        }
+        let names: Vec<String> = own_gpu_files(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            names.contains(&"opengl/opengl32.dll".to_owned()),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"opengl/libgallium_wgl.dll".to_owned()),
+            "{names:?}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

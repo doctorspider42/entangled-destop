@@ -1,15 +1,18 @@
 @echo off
 rem Builds entangled-gpu.sys without the WDK's Visual Studio integration:
 rem cl and link from the MSVC build tools, headers and libraries from the WDK.
-rem Usage: build.cmd <output directory>   (then sign.cmd in the same directory)
+rem Usage: build.cmd <output directory>   (then sign.ps1 in the same directory)
+rem The defaults are the development host's; CI sets WDK (a kit root laid out
+rem like the installed one), MSVC (the toolset directory) and MESA_INCLUDE.
 setlocal
 if "%~1"=="" (echo usage: build.cmd ^<output directory^> & exit /b 2)
 set "OUT=%~1"
 set "SRC=%~dp0"
-set "WDK=C:\Program Files (x86)\Windows Kits\10"
+if not defined WDK set "WDK=C:\Program Files (x86)\Windows Kits\10"
 set "V=10.0.26100.0"
 set "KMDF=1.15"
-for /d %%d in ("C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\*") do set "MSVC=%%d"
+if not defined MSVC for /d %%d in ("C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\*") do set "MSVC=%%d"
+if not defined MESA_INCLUDE set "MESA_INCLUDE=F:\entangled-targets\mesa\include"
 set "BIN=%MSVC%\bin\Hostx64\x64"
 if not exist "%BIN%\cl.exe" goto :nomsvc
 mkdir "%OUT%" 2>nul
@@ -35,7 +38,7 @@ set "ULIB=/LIBPATH:"%WDK%\Lib\%V%\um\x64" /LIBPATH:"%WDK%\Lib\%V%\ucrt\x64" /LIB
 "%BIN%\cl.exe" /nologo /W4 /WX /O2 /MT %UINC% /Fo"%OUT%\gpu-test.obj" /Fe"%OUT%\gpu-test.exe" "%SRC%gpu-test.c" /link %ULIB%
 if errorlevel 1 exit /b 1
 rem The presentation test (phase C), against Mesa's Vulkan headers.
-"%BIN%\cl.exe" /nologo /W3 /O2 /MT %UINC% /I"F:\entangled-targets\mesa\include" /Fo"%OUT%\vk-present.obj" /Fe"%OUT%\vk-present.exe" "%SRC%vk-present.c" /link %ULIB% user32.lib
+"%BIN%\cl.exe" /nologo /W3 /O2 /MT %UINC% /I"%MESA_INCLUDE%" /Fo"%OUT%\vk-present.obj" /Fe"%OUT%\vk-present.exe" "%SRC%vk-present.c" /link %ULIB% user32.lib
 if errorlevel 1 exit /b 1
 rem The OpenGL test (phase D), for Mesa's opengl32.dll with Zink.
 "%BIN%\cl.exe" /nologo /W3 /O2 /MT %UINC% /Fo"%OUT%\gl-test.obj" /Fe"%OUT%\gl-test.exe" "%SRC%gl-test.c" /link %ULIB% user32.lib gdi32.lib opengl32.lib

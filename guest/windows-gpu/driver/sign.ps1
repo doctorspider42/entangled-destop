@@ -4,9 +4,16 @@
 # certificate store right after). The guest needs test-signing on and the
 # .cer in its Root and TrustedPublisher stores.
 # Usage: powershell -File sign.ps1 <output directory>
-param([Parameter(Mandatory)][string]$Out)
+#
+# CI (windows-gpu.yml) signs each release under a certificate made for that
+# run and deletes the .pfx before publishing: the private key exists nowhere
+# afterwards, so trusting the .cer lets no one sign anything else.
+param(
+    [Parameter(Mandatory)][string]$Out,
+    [string]$Kit = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0'
+)
 $ErrorActionPreference = 'Stop'
-$kit = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0'
+$kit = $Kit
 $pfx = Join-Path $Out 'entangled-gpu-test.pfx'
 $cer = Join-Path $Out 'entangled-gpu-test.cer'
 $password = ConvertTo-SecureString -String 'entangled-test' -Force -AsPlainText

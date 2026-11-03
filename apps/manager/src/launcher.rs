@@ -297,6 +297,9 @@ pub struct NewMachine {
     /// Mesa's Venus ICD and the Vulkan runtime installer); Windows only,
     /// optional: empty installs 2D.
     pub gpu3d_path: String,
+    /// Windows only: 3D from the package this engine pins, downloaded
+    /// (`--gpu3d auto`) — what an empty [`Self::gpu3d_path`] means when on.
+    pub gpu3d_download: bool,
     /// Windows only: install WinFsp, so a shared folder shows as a drive.
     pub shared_folders: bool,
     pub variant: String,
@@ -407,6 +410,8 @@ pub fn install_spec(
         if !machine.gpu3d_path.trim().is_empty() {
             args.push("--gpu3d".to_string());
             args.push(runner.path_arg(Path::new(machine.gpu3d_path.trim()))?);
+        } else if machine.gpu3d_download {
+            args.extend(["--gpu3d".to_string(), "auto".to_string()]);
         }
     }
     // Windows is always unattended, from its own answer file, and refuses
@@ -766,6 +771,7 @@ mod tests {
             iso_path: String::new(),
             drivers_path: String::new(),
             gpu3d_path: String::new(),
+            gpu3d_download: false,
             shared_folders: true,
             variant: "text-netboot".into(),
             automated: true,
@@ -882,6 +888,9 @@ mod tests {
             !line.contains("--gpu3d"),
             "2D unless a 3D package is chosen: {line}"
         );
+        m.gpu3d_download = true;
+        let line = spec(&m).expect("spec").command_line();
+        assert!(line.contains("--gpu3d auto"), "{line}");
         m.gpu3d_path = "/drivers/gpu3d".into();
         let line = spec(&m).expect("spec").command_line();
         assert!(line.contains("--gpu3d /drivers/gpu3d"), "{line}");

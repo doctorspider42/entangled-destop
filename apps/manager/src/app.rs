@@ -752,8 +752,8 @@ impl ManagerApp {
                     state.machine.disk_gib = state.machine.disk_gib.max(64);
                     state.machine.memory_mib = state.machine.memory_mib.max(4096);
                     state.machine.iso_path = r"C:\Images\Win10_22H2_English_x64.iso".into();
-                    state.machine.drivers_path = r"C:\Images\virtio-win.iso".into();
-                    state.machine.gpu3d_path = r"C:\Images\gpu3d".into();
+                    // Drivers and the 3D package downloaded: nothing to find.
+                    state.machine.gpu3d_download = true;
                 }
             }
             ScreenshotView::WizardMore => {
@@ -964,6 +964,7 @@ impl ManagerApp {
                 iso_path: String::new(),
                 drivers_path: String::new(),
                 gpu3d_path: String::new(),
+                gpu3d_download: false,
                 shared_folders: true,
                 variant: self.settings.default_variant.clone(),
                 automated: true,

@@ -766,9 +766,17 @@ All of this happens inside the guest. The host is not put in test mode and
 trusts nothing new. Without a 3D package a Windows guest is 2D and needs none
 of it.
 
-The 3D package is not downloadable yet: it is built from
-[`guest/windows-gpu`](../guest/windows-gpu) (driver, Mesa) with the WDK and
-LLVM. Point the wizard's *3D* row, or `--gpu3d`, at the folder.
+**Where the package comes from.** CI builds it from
+[`guest/windows-gpu`](../guest/windows-gpu) (`.github/workflows/windows-gpu.yml`):
+the driver, Mesa 26.2.6 with our patch, DXVK and LunarG's Vulkan runtime. It
+signs it under a certificate made for that run and **deletes the private key
+before publishing**, so trusting that certificate lets no one sign anything
+else. Then it publishes the package as a `gpu3d-<n>` release.
+
+The wizard's *3D* switch, `--gpu3d auto` or `entangled fetch gpu3d` downloads
+the release this build pins, checked file by file against SHA-256 digests in
+`guest/windows/pinned.toml`. A build that pins none says so. To use a package
+you built yourself, choose its folder in *3D package*, or pass `--gpu3d <dir>`.
 
 ## Living with a VM
 

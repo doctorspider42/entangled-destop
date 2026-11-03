@@ -68,12 +68,19 @@ pub fn run(args: &FetchArgs) -> Result<(), String> {
         )?;
         let pin = crate::windows_media::pin(media)?;
         println!("{} {} [verified]", media.target(), pin.version);
-        println!(
-            "  sha256    : {} (pinned in this binary; no signature)",
-            pin.assets[0].sha256
-        );
+        if let [asset] = pin.assets.as_slice() {
+            println!(
+                "  sha256    : {} (pinned in this binary; no signature)",
+                asset.sha256
+            );
+        } else {
+            println!(
+                "  files     : {}, each sha256 pinned in this binary; no signature",
+                pin.assets.len()
+            );
+        }
         println!("  source    : {}", pin.source);
-        println!("  file      : {}", path.display());
+        println!("  path      : {}", path.display());
         return Ok(());
     }
     if args.distro.eq_ignore_ascii_case(VIRGL_TARGET) || args.distro.eq_ignore_ascii_case("virgl") {

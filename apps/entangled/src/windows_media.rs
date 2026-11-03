@@ -1,5 +1,6 @@
 //! What a Windows guest needs besides Microsoft's own ISO (ADR-0008,
-//! ADR-0009): the virtio-win drivers, and WinFsp for shared folders —
+//! ADR-0009): the virtio-win drivers, WinFsp for shared folders, and our 3D
+//! package (published by `.github/workflows/windows-gpu.yml`) —
 //! downloaded from their publishers and verified against SHA-256 digests
 //! compiled into this binary (`guest/windows/pinned.toml`), through the same
 //! machinery as the firmware ([`crate::artifact`]). With them `install
@@ -28,6 +29,9 @@ pub enum Media {
     VirtioWin,
     /// WinFsp's installer: a shared folder as a drive (virtio-fs).
     WinFsp,
+    /// Our 3D package (ADR-0009): the driver, Mesa, DXVK and the Vulkan
+    /// runtime — a directory of files, not one.
+    Gpu3d,
 }
 
 impl Media {
@@ -36,6 +40,7 @@ impl Media {
         match self {
             Self::VirtioWin => "virtio-win",
             Self::WinFsp => "winfsp",
+            Self::Gpu3d => "gpu3d",
         }
     }
 
@@ -44,12 +49,13 @@ impl Media {
         match self {
             Self::VirtioWin => "the virtio-win drivers",
             Self::WinFsp => "WinFsp",
+            Self::Gpu3d => "the 3D package",
         }
     }
 
     /// The `entangled fetch` target named `name`, if it is one of these.
     pub fn from_target(name: &str) -> Option<Self> {
-        [Self::VirtioWin, Self::WinFsp]
+        [Self::VirtioWin, Self::WinFsp, Self::Gpu3d]
             .into_iter()
             .find(|m| m.target().eq_ignore_ascii_case(name))
     }
@@ -69,6 +75,9 @@ pub struct Pin {
 struct Pins {
     virtio_win: Pin,
     winfsp: Pin,
+    /// Absent until the workflow has published a package and its pin is
+    /// committed.
+    gpu3d: Option<Pin>,
 }
 
 /// The compiled-in pin of `media`. A parse failure is a build mistake, so it
@@ -79,9 +88,13 @@ pub fn pin(media: Media) -> Result<Pin, String> {
     let pin = match media {
         Media::VirtioWin => pins.virtio_win,
         Media::WinFsp => pins.winfsp,
+        Media::Gpu3d => pins.gpu3d.ok_or(
+            "this build pins no 3D package yet; build one from guest/windows-gpu \
+             and pass its folder to --gpu3d",
+        )?,
     };
     artifact::validate_digests(PIN_PATH, &pin.assets)?;
-    if pin.assets.len() != 1 {
+    if media != Media::Gpu3d && pin.assets.len() != 1 {
         return Err(format!(
             "{PIN_PATH}: {} must name exactly one file",
             media.target()
@@ -98,13 +111,15 @@ pub fn cache_dir(media: Media, pin: &Pin) -> Result<PathBuf, String> {
 }
 
 /// Where the pinned file lands in the cache — whether or not it is there yet.
+/// For the 3D package, its first file.
 pub fn cached_path(media: Media) -> Result<PathBuf, String> {
     let pin = pin(media)?;
     Ok(cache_dir(media, &pin)?.join(artifact::sanitize(&pin.assets[0].name)))
 }
 
 /// The pinned file, from the verified cache when it is there and matches,
-/// downloaded and verified otherwise (unless `options.offline`).
+/// downloaded and verified otherwise (unless `options.offline`). For the 3D
+/// package, the directory holding all of its files.
 pub fn fetch(media: Media, options: FetchOptions) -> Result<PathBuf, String> {
     fetch_with(&debian_media::UreqTransport::new(), media, options)
 }
@@ -135,6 +150,9 @@ pub fn fetch_with(
         },
     };
     let mut fetched = artifact::fetch_into(transport, &release, &dir, options)?;
+    if media == Media::Gpu3d {
+        return Ok(dir);
+    }
     fetched
         .pop()
         .map(|asset| asset.path)

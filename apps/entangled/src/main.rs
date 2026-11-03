@@ -448,8 +448,9 @@ pub struct InstallArgs {
     /// files), and in both cases the LunarG Vulkan runtime installer
     /// (`VulkanRT-*.exe`). A test-signed driver comes with its `*.cer` and
     /// the guest runs in test-signing mode; a Microsoft-signed one needs
-    /// neither.
-    #[arg(long, value_name = "DIR")]
+    /// neither. `auto` downloads the package this build pins, built and
+    /// test-signed by CI (`entangled fetch gpu3d`).
+    #[arg(long, value_name = "DIR|auto")]
     pub gpu3d: Option<PathBuf>,
     /// Windows only: WinFsp's installer (`winfsp-*.msi`, from winfsp.dev),
     /// for shared folders over virtio-fs (`[[share]] virtiofs = true`). With

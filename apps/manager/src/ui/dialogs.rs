@@ -2984,16 +2984,36 @@ fn wizard_step(
                     ) {
                         actions.push(Action::PickPath(PickTarget::WizardDrivers));
                     }
+                    ui::form_row(
+                        ui,
+                        "3D",
+                        "Experimental: Vulkan, OpenGL, Direct3D 9-11 and WebGL on this \
+                         computer's GPU, through Entangled's own Windows driver. The \
+                         driver is test-signed (Microsoft's signature needs an EV \
+                         certificate), so Windows runs in test mode with a watermark, \
+                         and games whose anti-cheat refuses test mode will not start. \
+                         The test certificate's private key was destroyed after \
+                         signing. Leave it off for 2D.",
+                        |ui, _| {
+                            ui.checkbox(
+                                &mut state.machine.gpu3d_download,
+                                "GPU acceleration (test mode)",
+                            );
+                        },
+                    );
                     if ui::path_row(
                         ui,
-                        "3D (OPTIONAL)",
-                        "Experimental: Vulkan, OpenGL, Direct3D 9-11 and WebGL on this \
-                         computer's GPU. A folder holding Entangled's 3D package \
-                         (entangled-gpu.inf, vulkan_virtio.dll, the Vulkan runtime \
-                         installer). The driver is test-signed, so Windows runs in test \
-                         mode, where some anti-cheat refuses to start. Leave empty for 2D.",
+                        "3D PACKAGE",
+                        "A folder holding a 3D package you built yourself \
+                         (guest/windows-gpu: entangled-gpu.inf, vulkan_virtio.dll, the \
+                         Vulkan runtime installer). Leave empty to use the one \
+                         Entangled downloads when 3D is on.",
                         &mut state.machine.gpu3d_path,
-                        "no 3D",
+                        if state.machine.gpu3d_download {
+                            "downloaded and verified automatically"
+                        } else {
+                            "no 3D"
+                        },
                         true,
                     ) {
                         actions.push(Action::PickPath(PickTarget::WizardGpu3d));

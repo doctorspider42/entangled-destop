@@ -1,0 +1,158 @@
+name: Windows GPU package
+
+# Builds the 3D package for Windows guests (ADR-0009) — our KMDF driver, Mesa's
+# Venus ICD with our renderer backend, Mesa's OpenGL over Zink, DXVK and the
+# Vulkan runtime installer — and publishes it as an immutable GitHub Release
+# that `entangled fetch gpu3d` downloads and `install windows --gpu3d auto`
+# puts on the answer disc. Without it a user had to build all of that by hand.
+#
+# THE SIGNATURE
+#   Windows loads a driver Microsoft has not signed only in test-signing mode,
+#   and only under a certificate the guest trusts. Each run makes a fresh
+#   self-signed certificate, signs with it, and deletes the private key before
+#   anything is published: the release carries the .cer alone. So trusting it
+#   in a guest lets no one sign anything else — the key is gone. (Microsoft's
+#   attestation signing, which needs no test mode, needs an EV certificate.)
+#
+# WHY ITS OWN RELEASE
+#   As with guest-artifacts.yml: the pin in guest/windows/pinned.toml names a
+#   tag, and bytes behind a pinned tag must never change; the package changes
+#   when the driver or Mesa does, not on every commit. `--latest=false` keeps
+#   /releases/latest on the installer release.
+#
+# AFTER IT RUNS
+#   The job summary has the [gpu3d] block for guest/windows/pinned.toml.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - guest/windows-gpu/**
+      - .github/workflows/windows-gpu.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-gpu
+  cancel-in-progress: false
+
+env:
+  WDK_VERSION: 10.0.26100.1
+  DXVK_VERSION: 3.1.1
+  DXVK_SHA256: 40565b4a724aadc4433fa4e010b4b23916d9b1f1baeee64e17186db94f54e608
+  VULKANRT_VERSION: 1.4.363.0
+  VULKANRT_SHA256: 3f03bda2522d1d10d05461ce8a47364f9af6f5dc8642b7c45e43943dba164303
+
+jobs:
+  build-and-publish:
+    name: Build, test-sign and publish the Windows 3D package
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tools (meson, win_flex/bison, the WDK from NuGet)
+        shell: pwsh
+        run: |
+          python -m pip install --quiet meson==1.7.0 ninja mako packaging pyyaml
+          choco install winflexbison3 -y --no-progress
+          foreach ($p in 'Microsoft.Windows.SDK.CPP', 'Microsoft.Windows.SDK.CPP.x64', 'Microsoft.Windows.WDK.x64') {
+            nuget install $p -Version $env:WDK_VERSION -OutputDirectory C:\nuget -NonInteractive | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "nuget install $p failed" }
+          }
+          # One kit root laid out like an installed kit, which is what the
+          # build scripts expect.
+          New-Item -ItemType Directory -Force C:\kit | Out-Null
+          foreach ($d in Get-ChildItem C:\nuget -Directory) {
+            $c = Join-Path $d.FullName 'c'
+            if (Test-Path $c) { robocopy $c C:\kit /E /NFL /NDL /NJH /NJS /NP | Out-Null }
+          }
+          Get-ChildItem C:\kit\Include, C:\kit\Lib, C:\kit\bin -Directory | Select-Object FullName
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $msvc = (Get-ChildItem "$vs\VC\Tools\MSVC" -Directory | Sort-Object Name | Select-Object -Last 1).FullName
+          "VCVARS=$vs\VC\Auxiliary\Build\vcvarsall.bat" >> $env:GITHUB_ENV
+          "MSVC=$msvc" >> $env:GITHUB_ENV
+          "WDK=C:\kit" >> $env:GITHUB_ENV
+          "LLVM_BIN=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          "WINFLEXBISON=C:\ProgramData\chocolatey\bin" >> $env:GITHUB_ENV
+          "MESA_SRC=C:\mesa" >> $env:GITHUB_ENV
+          "MESA_INCLUDE=C:\mesa\include" >> $env:GITHUB_ENV
+
+      - name: Mesa 26.2.6 with our patch and renderer backend
+        shell: pwsh
+        run: powershell -File guest/windows-gpu/mesa/prepare.ps1 C:\mesa
+
+      - name: Venus (vulkan_virtio.dll)
+        shell: cmd
+        env:
+          MESA_BUILD: C:\mesa-venus
+        run: call guest\windows-gpu\mesa\build.cmd
+
+      - name: OpenGL over Zink (opengl32.dll, libgallium_wgl.dll)
+        shell: cmd
+        env:
+          MESA_BUILD: C:\mesa-zink
+        run: call guest\windows-gpu\mesa\build-zink.cmd
+
+      - name: The driver and gpu-test.exe
+        shell: cmd
+        run: call guest\windows-gpu\driver\build.cmd C:\drv
+
+      - name: Test-sign under a certificate whose key is then destroyed
+        shell: pwsh
+        run: |
+          powershell -File guest/windows-gpu/driver/sign.ps1 -Out C:\drv -Kit C:\kit\bin\10.0.26100.0
+          if ($LASTEXITCODE -ne 0) { throw 'signing failed' }
+          Remove-Item C:\drv\entangled-gpu-test.pfx
+          Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -eq 'CN=Entangled GPU test' | Remove-Item
+
+      - name: Assemble the package
+        shell: pwsh
+        run: |
+          $pkg = 'C:\gpu3d'
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          foreach ($f in 'entangled-gpu.inf', 'entangled-gpu.sys', 'entangled-gpu.cat', 'gpu-test.exe') {
+            Copy-Item "C:\drv\$f" $pkg
+          }
+          Copy-Item C:\drv\entangled-gpu-test.cer "$pkg\entangled-gpu.cer"
+          Copy-Item C:\mesa-venus\src\virtio\vulkan\vulkan_virtio.dll $pkg
+          foreach ($f in 'opengl32.dll', 'libgallium_wgl.dll') {
+            $found = Get-ChildItem C:\mesa-zink -Recurse -Filter $f | Select-Object -First 1
+            if (-not $found) { throw "the Zink build made no $f" }
+            Copy-Item $found.FullName $pkg
+          }
+          function Get-Pinned($url, $sha, $out) {
+            Invoke-WebRequest -Uri $url -OutFile $out
+            $got = (Get-FileHash -Algorithm SHA256 $out).Hash.ToLower()
+            if ($got -ne $sha) { throw "$url is $got, pinned $sha" }
+          }
+          Get-Pinned "https://github.com/doitsujin/dxvk/releases/download/v$env:DXVK_VERSION/dxvk-$env:DXVK_VERSION.tar.gz" $env:DXVK_SHA256 C:\dxvk.tar.gz
+          tar -xzf C:\dxvk.tar.gz -C C:\
+          foreach ($f in 'd3d9.dll', 'd3d10core.dll', 'd3d11.dll', 'dxgi.dll') {
+            Copy-Item "C:\dxvk-$env:DXVK_VERSION\x64\$f" $pkg
+          }
+          Copy-Item "C:\dxvk-$env:DXVK_VERSION\LICENSE" "$pkg\LICENSE-dxvk.txt"
+          Copy-Item C:\mesa\docs\license.rst "$pkg\LICENSE-mesa.txt"
+          Get-Pinned "https://sdk.lunarg.com/sdk/download/$env:VULKANRT_VERSION/windows/VulkanRT-$env:VULKANRT_VERSION-Installer.exe" $env:VULKANRT_SHA256 "$pkg\VulkanRT-Installer.exe"
+          Get-ChildItem $pkg | Format-Table Name, Length
+
+      - name: Publish the release and print the pin
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "gpu3d-$env:GITHUB_RUN_NUMBER"
+          $files = Get-ChildItem C:\gpu3d -File | Sort-Object Name
+          $notes = "The 3D package for Windows guests (ADR-0009), built by $env:GITHUB_WORKFLOW run $env:GITHUB_RUN_ID from $env:GITHUB_SHA. " +
+            "The driver is test-signed under a certificate made for this run whose private key was deleted before publishing; a guest needs test-signing mode. " +
+            "Mesa 26.2.6 (MIT), DXVK $env:DXVK_VERSION (zlib), LunarG Vulkan runtime $env:VULKANRT_VERSION."
+          gh release create $tag --title "Windows 3D package $tag" --notes $notes --latest=false $files.FullName
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
+          $toml = @("[gpu3d]", "version = `"$tag`"", "base_url = `"https://github.com/$env:GITHUB_REPOSITORY/releases/download`"",
+                    "tag = `"$tag`"", "source = `"https://github.com/$env:GITHUB_REPOSITORY/tree/$env:GITHUB_SHA/guest/windows-gpu`"", "")
+          foreach ($f in $files) {
+            $toml += "[[gpu3d.assets]]", "name = `"$($f.Name)`"",
+              "sha256 = `"$((Get-FileHash -Algorithm SHA256 $f.FullName).Hash.ToLower())`"", "bytes = $($f.Length)", ""
+          }
+          "## Pin for guest/windows/pinned.toml`n`n``````toml`n$($toml -join "`n")`n``````" >> $env:GITHUB_STEP_SUMMARY
