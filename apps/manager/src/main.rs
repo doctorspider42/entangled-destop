@@ -107,6 +107,9 @@ enum ScreenshotView {
     /// *Add 3D graphics* done on a Linux machine: the line to run in it.
     #[value(name = "enable-3d-done")]
     Enable3dDone,
+    /// *Import…* of a Windows machine whose disk is on the machines folder's
+    /// drive, before anything is written.
+    Import,
     Settings,
     /// Settings with the advanced path overrides expanded.
     SettingsAdvanced,

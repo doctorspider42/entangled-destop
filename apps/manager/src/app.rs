@@ -161,6 +161,22 @@ pub struct Enable3dState {
     pub rx: Option<mpsc::Receiver<Result<(), String>>>,
 }
 
+/// *Add a machine*: a profile from another folder, and whether its files come
+/// along into the VM directory.
+pub struct ImportState {
+    pub plan: discovery::ImportPlan,
+    /// The name it will have here, as typed.
+    pub name: String,
+    pub move_files: bool,
+    pub error: Option<String>,
+    /// `(copied, total)` while a copy to another drive runs.
+    pub progress: Option<(u64, u64)>,
+    pub running: bool,
+    pub events: Option<mpsc::Receiver<MoveEvent>>,
+    /// The profile already written, while its files are still being copied.
+    pub imported: Option<PathBuf>,
+}
+
 /// "New disk" dialog state.
 pub struct CreateDiskState {
     pub name: String,
@@ -318,6 +334,7 @@ pub enum Modal {
     DeleteSnapshot(DeleteSnapshotState),
     DiscardSnapshot(DiscardSnapshotState),
     Enable3d(Enable3dState),
+    Import(ImportState),
 }
 
 impl Modal {
@@ -437,6 +454,8 @@ pub enum Action {
     /// Files dropped on the window: an ISO opens the new-machine wizard, a
     /// profile is imported.
     FilesDropped(Vec<PathBuf>),
+    /// *Add machine* in the import dialog.
+    SubmitImport,
     // ---- Move to another drive ----------------------------------------------
     AskMoveDisk(PathBuf),
     SubmitMoveDisk,
@@ -864,6 +883,35 @@ impl ManagerApp {
                         result: done.then_some(Ok(())),
                         rx: None,
                     });
+                }
+            }
+            ScreenshotView::Import => {
+                let profile = "name = \"win7\"\nmemory_mib = 8192\nvcpus = 8\n\
+                               transport = \"pci\"\nhyperv_enlightenments = true\n\
+                               [boot]\nmode = \"uefi\"\nfirmware = \"CLOUDHV.fd\"\n\
+                               [[disk]]\npath = \"F:/scratch/win7.raw\"\nwritable = true\n";
+                match control_api::VmConfig::from_toml(profile) {
+                    Err(e) => tracing::warn!(error = %e, "the import screenshot's profile"),
+                    Ok(config) => {
+                        app.modal = Modal::Import(ImportState {
+                            plan: discovery::ImportPlan {
+                                source: PathBuf::from("F:/scratch/win7.toml"),
+                                config,
+                                movable: vec![PathBuf::from("F:/scratch/win7.raw")],
+                                data_bytes: 11_400 << 20,
+                                apparent_bytes: 64 << 30,
+                                same_volume: true,
+                                collisions: Vec::new(),
+                            },
+                            name: "win7".into(),
+                            move_files: true,
+                            error: None,
+                            progress: None,
+                            running: false,
+                            events: None,
+                            imported: None,
+                        })
+                    }
                 }
             }
             ScreenshotView::Main
@@ -2867,6 +2915,12 @@ impl ManagerApp {
     fn files_dropped(&mut self, paths: Vec<PathBuf>) {
         let is = |p: &Path, ext: &str| p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext));
         let profiles: Vec<PathBuf> = paths.iter().filter(|p| is(p, "toml")).cloned().collect();
+        if let [profile] = profiles.as_slice() {
+            if !self.modal.is_open() {
+                self.ask_import(profile);
+                return;
+            }
+        }
         if !profiles.is_empty() {
             for profile in profiles {
                 self.import_profile(&profile);
@@ -2951,6 +3005,247 @@ impl ManagerApp {
                 format!("cannot import {}: {e}", path.display()),
             ),
         }
+    }
+
+    /// *Import…*: reads the profile and opens the dialog that says what the
+    /// machine is and asks whether its files come along.
+    fn ask_import(&mut self, path: &Path) {
+        if self.mock_mode {
+            self.toast(
+                ToastLevel::Success,
+                format!("mock: would import {}", path.display()),
+            );
+            return;
+        }
+        let plan = match discovery::plan_import(path, &self.settings.vm_dir) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.toast(
+                    ToastLevel::Error,
+                    format!("cannot import {}: {e}", path.display()),
+                );
+                return;
+            }
+        };
+        if plan.source.parent().is_some_and(|dir| {
+            std::fs::canonicalize(dir).ok() == std::fs::canonicalize(&self.settings.vm_dir).ok()
+        }) {
+            self.toast(
+                ToastLevel::Info,
+                format!("{} is already in the machines folder", path.display()),
+            );
+            return;
+        }
+        let name = self.free_import_name(&plan.config.name);
+        let move_files = plan.can_move() && plan.same_volume;
+        self.modal = Modal::Import(ImportState {
+            plan,
+            name,
+            move_files,
+            error: None,
+            progress: None,
+            running: false,
+            events: None,
+            imported: None,
+        });
+    }
+
+    /// The profile's own name, or `<name>-2`, `-3`… when one is taken here.
+    fn free_import_name(&self, wanted: &str) -> String {
+        let taken = |name: &str| {
+            self.vm(name).is_some() || self.settings.vm_dir.join(format!("{name}.toml")).exists()
+        };
+        if !taken(wanted) {
+            return wanted.to_string();
+        }
+        (2..100)
+            .map(|n| format!("{wanted}-{n}"))
+            .find(|name| !taken(name))
+            .unwrap_or_else(|| wanted.to_string())
+    }
+
+    fn submit_import(&mut self) {
+        let vm_dir = self.settings.vm_dir.clone();
+        let (plan, name, move_files) = match &self.modal {
+            Modal::Import(state) if !state.running => (
+                state.plan.clone(),
+                state.name.trim().to_string(),
+                state.move_files && state.plan.can_move(),
+            ),
+            _ => return,
+        };
+        let refuse = |app: &mut Self, message: String| {
+            if let Modal::Import(state) = &mut app.modal {
+                state.error = Some(message);
+            }
+        };
+        if let Err(e) = discovery::validate_name(&name) {
+            return refuse(self, e);
+        }
+        if self.vm(&name).is_some() || vm_dir.join(format!("{name}.toml")).exists() {
+            return refuse(
+                self,
+                format!("a machine named '{name}' is already here — choose another name"),
+            );
+        }
+        let finished = |app: &mut Self, message: String| {
+            app.modal = Modal::None;
+            app.toast(ToastLevel::Success, message);
+            app.request_scan(true);
+        };
+        if !move_files {
+            match discovery::write_import(&plan, &name, &vm_dir, &[]) {
+                Ok(_) => finished(
+                    self,
+                    format!("added '{name}' — its files stay where they are"),
+                ),
+                Err(e) => refuse(self, e),
+            }
+            return;
+        }
+        if plan.same_volume {
+            // One drive: a rename, so it is done before the frame is.
+            let moved = match discovery::rename_into(&plan.movable, &vm_dir) {
+                Ok(moved) => moved,
+                Err(e) => return refuse(self, e),
+            };
+            match discovery::write_import(&plan, &name, &vm_dir, &moved) {
+                Ok(_) => finished(
+                    self,
+                    format!("added '{name}' — its files are in the machines folder now"),
+                ),
+                Err(e) => {
+                    for (from, to) in moved.iter().rev() {
+                        let _ = std::fs::rename(to, from);
+                    }
+                    refuse(self, e);
+                }
+            }
+            return;
+        }
+        // Another drive: the profile first, pointing where the files are now,
+        // then a verified copy that rewrites it — a failure part-way leaves a
+        // machine that still runs from where it was.
+        let imported = match discovery::write_import(&plan, &name, &vm_dir, &[]) {
+            Ok(path) => path,
+            Err(e) => return refuse(self, e),
+        };
+        let (tx, rx) = mpsc::channel::<MoveEvent>();
+        let waker = Arc::clone(&self.waker);
+        let disks = plan.movable.clone();
+        let total = plan.data_bytes;
+        let profiles = vec![imported.clone()];
+        let dest = vm_dir.clone();
+        let spawned = std::thread::Builder::new()
+            .name("import-move".to_string())
+            .spawn(move || {
+                let mut before = 0u64;
+                let mut merged: Option<disk_image::MoveOutcome> = None;
+                for disk in disks {
+                    let progress_tx = tx.clone();
+                    let progress_waker = Arc::clone(&waker);
+                    let mut last_percent = u64::MAX;
+                    let offset = before;
+                    let mut progress = move |done: u64, _: u64| {
+                        let done = offset + done;
+                        let percent = (done * 100).checked_div(total).unwrap_or(100);
+                        if percent != last_percent {
+                            last_percent = percent;
+                            let _ = progress_tx.send(MoveEvent::Progress(done, total));
+                            progress_waker();
+                        }
+                    };
+                    match disk_image::move_disk(&disk, &dest, &profiles, &mut progress) {
+                        Ok(outcome) => {
+                            before += outcome.data_bytes;
+                            match &mut merged {
+                                Some(all) => {
+                                    all.moved.extend(outcome.moved);
+                                    all.leftover_sources.extend(outcome.leftover_sources);
+                                    all.data_bytes += outcome.data_bytes;
+                                }
+                                None => merged = Some(outcome),
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(MoveEvent::Done(Box::new(Err(e.to_string()))));
+                            waker();
+                            return;
+                        }
+                    }
+                }
+                let result = merged.ok_or_else(|| "there was nothing to move".to_string());
+                let _ = tx.send(MoveEvent::Done(Box::new(result)));
+                waker();
+            });
+        match spawned {
+            Ok(_) => {
+                if let Modal::Import(state) = &mut self.modal {
+                    state.running = true;
+                    state.error = None;
+                    state.progress = Some((0, total));
+                    state.events = Some(rx);
+                    state.imported = Some(imported);
+                }
+            }
+            Err(e) => {
+                self.modal = Modal::None;
+                self.toast(
+                    ToastLevel::Warn,
+                    format!("added '{name}', but its files stay where they are: {e}"),
+                );
+                self.request_scan(true);
+            }
+        }
+    }
+
+    /// Drains the import copy's channel; called once per frame.
+    fn collect_import(&mut self) {
+        let Modal::Import(state) = &mut self.modal else {
+            return;
+        };
+        let Some(events) = &state.events else { return };
+        let mut finished: Option<Result<disk_image::MoveOutcome, String>> = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                MoveEvent::Progress(done, total) => state.progress = Some((done, total)),
+                MoveEvent::Done(result) => finished = Some(*result),
+            }
+        }
+        let Some(result) = finished else { return };
+        let name = state.name.trim().to_string();
+        let home = state
+            .plan
+            .home()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        self.modal = Modal::None;
+        match result {
+            Ok(outcome) => {
+                self.toast(
+                    ToastLevel::Success,
+                    format!(
+                        "added '{name}' — {} copied into the machines folder and verified",
+                        discovery::format_bytes(outcome.data_bytes)
+                    ),
+                );
+                for leftover in outcome.leftover_sources {
+                    self.toast(
+                        ToastLevel::Warn,
+                        format!(
+                            "could not delete the original {} — the verified copy is in use, \
+                             remove the leftover by hand",
+                            leftover.display()
+                        ),
+                    );
+                }
+            }
+            Err(e) => self.toast(
+                ToastLevel::Warn,
+                format!("added '{name}', but its files stay in {home}: {e}"),
+            ),
+        }
+        self.request_scan(true);
     }
 
     fn toggle_autostart(&mut self, name: &str) {
@@ -3521,7 +3816,7 @@ impl ManagerApp {
             // The engine picker is also reachable from the "engine missing"
             // banner, where no form exists to hold the answer. Applying it
             // straight away is the point of that button: one click, fixed.
-            None if target == PickTarget::ImportProfile => self.import_profile(&path),
+            None if target == PickTarget::ImportProfile => self.ask_import(&path),
             None if target == PickTarget::EngineBinary => {
                 self.settings.entangled_binary = Some(path);
                 self.persist_settings_quietly();
@@ -4019,7 +4314,8 @@ impl ManagerApp {
                 // worker and closing the dialog would orphan its progress.
                 let copying = matches!(&self.modal, Modal::MoveDisk(state) if state.running)
                     || matches!(&self.modal, Modal::CloneVm(state) if state.running)
-                    || matches!(&self.modal, Modal::Enable3d(state) if state.running);
+                    || matches!(&self.modal, Modal::Enable3d(state) if state.running)
+                    || matches!(&self.modal, Modal::Import(state) if state.running);
                 if !copying {
                     self.modal = Modal::None;
                 }
@@ -4105,6 +4401,7 @@ impl ManagerApp {
             Action::AskCloneVm(name) => self.ask_clone_vm(&name),
             Action::AskEnable3d(name) => self.ask_enable_3d(&name),
             Action::SubmitEnable3d => self.submit_enable_3d(),
+            Action::SubmitImport => self.submit_import(),
             Action::SubmitCloneVm => self.submit_clone_vm(),
             Action::AskRenameVm(profile) => self.ask_rename_vm(&profile),
             Action::SubmitRenameVm => self.submit_rename_vm(),
@@ -4294,6 +4591,7 @@ impl eframe::App for ManagerApp {
         self.collect_diagnostics();
         self.collect_fetch();
         self.collect_enable_3d();
+        self.collect_import();
         self.supervisor.prune(12);
         self.ensure_log_selection();
         self.expire_toasts(ctx.input(|i| i.time));

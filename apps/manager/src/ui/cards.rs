@@ -110,9 +110,9 @@ fn heading(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
             }
             if ui::secondary_button(ui, "Import…", true)
                 .on_hover_text(
-                    "Bring in a machine profile (.toml) from another folder. It is \
-                     copied here with its paths made absolute; the files stay put. \
-                     Dropping a profile on the window does the same.",
+                    "Add a machine made somewhere else (its .toml profile) and, if \
+                     you like, move its disk into the machines folder. Dropping a \
+                     profile on the window does the same.",
                 )
                 .clicked()
             {

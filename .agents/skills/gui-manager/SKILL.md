@@ -285,6 +285,36 @@ it that way:
 - `--screenshot-view wizard-windows` shows the setup step for a recognised
   Windows ISO: drivers downloaded, 3D on, Advanced open.
 
+### Machines made elsewhere: *Import…* (`discovery::plan_import`)
+
+A profile written by the CLI (`entangled install … --disk <somewhere>`) or
+copied from another computer is not in the VM directory, so the manager does
+not see it. *Import…* (header button, the welcome page, or one `.toml` dropped
+on the window) opens a dialog, never a silent copy. It shows what the machine
+is (Windows = `hyperv_enlightenments`) and takes a name: `<name>-2` is proposed
+when the name is taken, because the name is the key for logs, sessions and
+autostart, so two machines may never share one. Then it asks whether the
+files come along:
+
+- **Move it into the machines folder**:
+  - On the same drive, `discovery::rename_into` renames the writable disks and
+    their `.nvram` sidecars first, then writes the profile pointing at them,
+    renaming them back if that write fails.
+  - On another drive, the profile is written first (pointing where the files
+    still are), then `disk_image::move_disk` copies, verifies and rewrites it.
+    A failure therefore leaves a machine that still runs from where it was.
+- **Leave its files where they are**: only the profile is written, with every
+  path made absolute. Delete then keeps those files (`kept_outside_vm_dir`).
+
+Rules:
+
+- Read-only disks never move: they may be shared bases or ISOs.
+- A file name already used in the VM directory disables *Move*, and the dialog
+  says why.
+- Dropping several profiles at once still imports them all directly, leaving
+  the files where they are.
+- `--screenshot-view import` shows the dialog.
+
 ## Form conventions — read before adding any field
 
 The GUI is the product; the CLI is the engine underneath it. Two rules follow,

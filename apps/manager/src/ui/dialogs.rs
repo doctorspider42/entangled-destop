@@ -426,6 +426,9 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             560.0,
             |ui| enable_3d_body(ui, state, actions),
         ),
+        Modal::Import(state) => frame(ctx, "import", "Add an existing machine", 560.0, |ui| {
+            import_body(ui, state, actions)
+        }),
     };
 
     if closed {
@@ -2463,6 +2466,160 @@ fn enable_3d_body(ui: &mut egui::Ui, state: &crate::app::Enable3dState, actions:
             });
         }
     }
+}
+
+/// *Import…*: what the machine is, the name it gets here, and whether its
+/// files move into the machines folder or stay where they are.
+fn import_body(ui: &mut egui::Ui, state: &mut crate::app::ImportState, actions: &mut Vec<Action>) {
+    let plan = &state.plan;
+    let family = if plan.config.hyperv_enlightenments {
+        launcher::GuestFamily::Windows
+    } else {
+        launcher::GuestFamily::OtherLinux
+    };
+    ui.horizontal(|ui| {
+        paint_family_mark(ui, family, 44.0);
+        ui.add_space(6.0);
+        ui.vertical(|ui| {
+            ui.label(
+                RichText::new(if plan.config.hyperv_enlightenments {
+                    "Windows"
+                } else {
+                    "Linux"
+                })
+                .size(15.0)
+                .color(theme::TEXT)
+                .strong(),
+            );
+            let mut facts = vec![
+                format!("{} GiB memory", plan.config.memory_mib / 1024),
+                format!("{} processors", plan.config.vcpus),
+            ];
+            if plan.apparent_bytes > 0 {
+                facts.push(format!("{} disk", format_bytes(plan.apparent_bytes)));
+            }
+            if plan.config.display.venus {
+                facts.push("3D".into());
+            }
+            ui.label(ui::dim(facts.join(" · ")));
+        });
+    });
+    ui.add_space(6.0);
+    let home = plan
+        .home()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_default();
+    ui.label(ui::faint(format!("in {}", shorten_middle(&home, 70))));
+    ui.add_space(16.0);
+
+    ui::form_scope(ui);
+    ui::form_row(
+        ui,
+        "NAME",
+        "What the machine is called here. Letters, digits, '-', '_' and '.', starting \
+         with a letter or digit. Its disk keeps its own file name.",
+        |ui, field_w| {
+            ui.add_enabled(
+                !state.running,
+                egui::TextEdit::singleline(&mut state.name).desired_width(field_w),
+            );
+        },
+    );
+    ui.add_space(14.0);
+
+    if plan.movable.is_empty() {
+        ui.label(ui::dim(
+            "Its disk is already in the machines folder; only the profile is added.",
+        ));
+    } else {
+        let gap = 12.0;
+        let width = (ui.available_width() - gap) / 2.0;
+        let move_detail = if !plan.collisions.is_empty() {
+            "A file of the same name is already in the machines folder.".to_string()
+        } else if plan.same_volume {
+            "Instant — the same drive, nothing is copied.".to_string()
+        } else {
+            format!(
+                "Copies {} of data and checks it, then removes the originals.",
+                format_bytes(plan.data_bytes)
+            )
+        };
+        let can_move = plan.can_move();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            if option_card(
+                ui,
+                width,
+                "Move it into the machines folder",
+                &move_detail,
+                state.move_files && can_move,
+                can_move && !state.running,
+                theme::ACCENT,
+            )
+            .clicked()
+            {
+                state.move_files = true;
+            }
+            if option_card(
+                ui,
+                width,
+                "Leave its files where they are",
+                "It runs from that folder; deleting it here leaves them alone.",
+                !state.move_files || !can_move,
+                !state.running,
+                theme::ACCENT,
+            )
+            .clicked()
+            {
+                state.move_files = false;
+            }
+        });
+    }
+
+    if let Some((done, total)) = state.progress {
+        ui.add_space(14.0);
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 14.0), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, egui::CornerRadius::same(7), theme::INSET);
+        let fraction = if total == 0 {
+            0.0
+        } else {
+            (done as f32 / total as f32).clamp(0.0, 1.0)
+        };
+        if fraction > 0.0 {
+            let fill = egui::Rect::from_min_size(
+                rect.min,
+                Vec2::new(rect.width() * fraction, rect.height()),
+            );
+            painter.rect_filled(fill, egui::CornerRadius::same(2), theme::ACCENT);
+        }
+        ui.label(ui::faint(format!(
+            "copied {} / {}",
+            format_bytes(done),
+            format_bytes(total)
+        )));
+    }
+
+    if let Some(error) = &state.error {
+        ui.add_space(8.0);
+        ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+    }
+
+    ui.add_space(18.0);
+    ui.horizontal(|ui| {
+        if state.running {
+            ui.add(egui::Spinner::new().size(16.0).color(theme::ACCENT));
+            ui.label(ui::dim("Moving its files…"));
+        } else {
+            if ui::primary_button(ui, "Add machine").clicked() {
+                actions.push(Action::SubmitImport);
+            }
+            if ui::text_button(ui, "Cancel", theme::TEXT_DIM).clicked() {
+                actions.push(Action::CloseModal);
+            }
+        }
+    });
 }
 
 /// The wizard's "Advanced options": every setting the presets and the

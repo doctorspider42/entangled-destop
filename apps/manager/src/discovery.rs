@@ -565,15 +565,52 @@ fn write_validated(profile: &Path, cfg: &VmConfig) -> Result<(), String> {
     std::fs::write(profile, out).map_err(|e| e.to_string())
 }
 
-/// Brings a profile from anywhere into the VM directory, so the manager can
-/// see and run it: every path it names (disks, CD-ROM, kernel, initramfs,
-/// firmware, NVRAM, shared folders) is made absolute against the profile's
-/// own directory — the copy no longer sits beside the files it means — and
-/// the result is re-validated and written as `<vm_dir>/<name>.toml`, never
-/// over an existing file. The original is not touched. Answers the new path.
-pub fn import_profile(source: &Path, vm_dir: &Path) -> Result<PathBuf, String> {
+/// What *Add a machine* knows before it writes anything: the profile, read and
+/// with every path made absolute, and which of its files could come along
+/// into the VM directory.
+#[derive(Debug, Clone)]
+pub struct ImportPlan {
+    pub source: PathBuf,
+    /// The profile with every path absolute against its own directory.
+    pub config: VmConfig,
+    /// Writable disk images outside the VM directory: what "move its files
+    /// here" moves, each with its `.nvram` sidecar.
+    pub movable: Vec<PathBuf>,
+    /// Allocated data of `movable`, summed — what a copy would write.
+    pub data_bytes: u64,
+    /// Nominal size of every disk the machine has.
+    pub apparent_bytes: u64,
+    /// Every movable file is on the VM directory's drive, so moving is a
+    /// rename: instant, nothing copied.
+    pub same_volume: bool,
+    /// Files of the same name already in the VM directory; moving would
+    /// collide with them.
+    pub collisions: Vec<PathBuf>,
+}
+
+impl ImportPlan {
+    /// The folder the machine's files live in now.
+    pub fn home(&self) -> Option<&Path> {
+        self.movable
+            .first()
+            .and_then(|disk| disk.parent())
+            .or_else(|| self.source.parent())
+    }
+
+    /// Moving is offered: something to move, nothing in the way.
+    pub fn can_move(&self) -> bool {
+        !self.movable.is_empty() && self.collisions.is_empty()
+    }
+}
+
+/// Reads a profile from anywhere for import: every path it names (disks,
+/// CD-ROM, kernel, initramfs, firmware, NVRAM, shared folders) is made
+/// absolute against the profile's own directory — the copy will no longer sit
+/// beside the files it means.
+pub fn plan_import(source: &Path, vm_dir: &Path) -> Result<ImportPlan, String> {
     let text = std::fs::read_to_string(source).map_err(|e| format!("cannot read it: {e}"))?;
     let mut cfg = VmConfig::from_toml(&text).map_err(|e| format!("not a machine profile: {e}"))?;
+    let source = std::path::absolute(source).unwrap_or_else(|_| source.to_path_buf());
     let base = source
         .parent()
         .map(Path::to_path_buf)
@@ -603,8 +640,77 @@ pub fn import_profile(source: &Path, vm_dir: &Path) -> Result<PathBuf, String> {
     for share in &mut cfg.shares {
         absolute(&mut share.path);
     }
-    let target = vm_dir.join(format!("{}.toml", cfg.name));
-    if same_file(source, &target) {
+
+    let in_vm_dir = |disk: &Path| disk.parent().is_some_and(|dir| same_file(dir, vm_dir));
+    let movable: Vec<PathBuf> = cfg
+        .disks
+        .iter()
+        .filter(|disk| disk.writable && disk.path.is_file() && !in_vm_dir(&disk.path))
+        .map(|disk| disk.path.clone())
+        .collect();
+    let mut data_bytes = 0;
+    for disk in &movable {
+        if let Some((data, _)) = disk_image::relocate::copy_bill(disk) {
+            data_bytes += data;
+        }
+    }
+    let apparent_bytes = cfg
+        .disks
+        .iter()
+        .filter_map(|disk| disk.path.metadata().ok())
+        .map(|m| m.len())
+        .sum();
+    let home = volume_of(vm_dir);
+    let same_volume = home.is_some() && movable.iter().all(|disk| volume_of(disk) == home);
+    let mut collisions = Vec::new();
+    for disk in &movable {
+        let mut files = vec![disk.clone()];
+        files.extend(disk_image::existing_nvram_sidecar(disk));
+        for file in files {
+            if let Some(name) = file.file_name() {
+                let target = vm_dir.join(name);
+                if target.exists() {
+                    collisions.push(target);
+                }
+            }
+        }
+    }
+    Ok(ImportPlan {
+        source,
+        config: cfg,
+        movable,
+        data_bytes,
+        apparent_bytes,
+        same_volume,
+        collisions,
+    })
+}
+
+/// Writes an import as `<vm_dir>/<name>.toml`, re-validated and never over an
+/// existing file. `moved` maps files that already went into the VM directory
+/// (`rename_into`) to where they are now. The original is not touched.
+/// Answers the new path.
+pub fn write_import(
+    plan: &ImportPlan,
+    name: &str,
+    vm_dir: &Path,
+    moved: &[(PathBuf, PathBuf)],
+) -> Result<PathBuf, String> {
+    let mut cfg = plan.config.clone();
+    cfg.name = name.to_string();
+    let follow = |path: &mut PathBuf| {
+        if let Some((_, to)) = moved.iter().find(|(from, _)| same_spelling(from, path)) {
+            *path = to.clone();
+        }
+    };
+    for disk in &mut cfg.disks {
+        follow(&mut disk.path);
+    }
+    if let Some(nvram) = &mut cfg.boot.nvram {
+        follow(nvram);
+    }
+    let target = vm_dir.join(format!("{name}.toml"));
+    if same_file(&plan.source, &target) {
         return Err("it is already in the VM directory".into());
     }
     let out = toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
@@ -616,14 +722,82 @@ pub fn import_profile(source: &Path, vm_dir: &Path) -> Result<PathBuf, String> {
         .open(&target)
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::AlreadyExists => format!(
-                "{} already exists — a machine named '{}' is already here",
-                target.display(),
-                cfg.name
+                "{} already exists — a machine named '{name}' is already here",
+                target.display()
             ),
             _ => e.to_string(),
         })?;
     std::io::Write::write_all(&mut file, out.as_bytes()).map_err(|e| e.to_string())?;
     Ok(target)
+}
+
+/// Brings a profile from anywhere into the VM directory with its files left
+/// where they are — what dropping several profiles on the window does.
+pub fn import_profile(source: &Path, vm_dir: &Path) -> Result<PathBuf, String> {
+    let plan = plan_import(source, vm_dir)?;
+    let name = plan.config.name.clone();
+    write_import(&plan, &name, vm_dir, &[])
+}
+
+/// Renames disk images (and their `.nvram` sidecars) into `vm_dir` on the
+/// same drive: no copy, so nothing to verify. All or nothing — a failure puts
+/// back what already moved. Answers `(from, to)` for every file.
+pub fn rename_into(disks: &[PathBuf], vm_dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let mut files = Vec::new();
+    for disk in disks {
+        files.push(disk.clone());
+        files.extend(disk_image::existing_nvram_sidecar(disk));
+    }
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for from in files {
+        let Some(name) = from.file_name() else {
+            continue;
+        };
+        let to = vm_dir.join(name);
+        let result = if to.exists() {
+            Err(format!("{} already exists", to.display()))
+        } else {
+            std::fs::rename(&from, &to).map_err(|e| format!("cannot move {}: {e}", from.display()))
+        };
+        if let Err(message) = result {
+            for (back_from, back_to) in moved.iter().rev() {
+                let _ = std::fs::rename(back_to, back_from);
+            }
+            return Err(message);
+        }
+        moved.push((from, to));
+    }
+    Ok(moved)
+}
+
+/// The same path as written — case-insensitively on Windows. Used where a
+/// file has already moved and can no longer be canonicalized.
+fn same_spelling(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
+    } else {
+        a == b
+    }
+}
+
+/// Which drive (Windows) or filesystem (Unix) a path is on, through its
+/// nearest existing ancestor: a rename works within one and not across.
+fn volume_of(path: &Path) -> Option<String> {
+    let existing = path.ancestors().find(|p| p.exists())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        existing.metadata().ok().map(|m| m.dev().to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let canonical = std::fs::canonicalize(existing).ok()?;
+        canonical
+            .components()
+            .next()
+            .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+    }
 }
 
 /// The `name =` a profile declares, without importing it.
@@ -1016,6 +1190,57 @@ interface = "entangled0"
         // Twice is refused, and the first copy is untouched.
         let again = import_profile(&profile, &vm_dir).expect_err("already there");
         assert!(again.contains("already"), "{again}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_import_can_bring_its_disk_and_nvram_along_under_a_new_name() {
+        let root = temp_dir("import-move");
+        let elsewhere = root.join("elsewhere");
+        let vm_dir = root.join("vms");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        std::fs::write(elsewhere.join("win.raw"), b"disk").unwrap();
+        std::fs::write(elsewhere.join("win.nvram"), b"vars").unwrap();
+        std::fs::write(elsewhere.join("installer.iso"), b"iso").unwrap();
+        let profile = elsewhere.join("win.toml");
+        std::fs::write(
+            &profile,
+            "name = \"win\"\nmemory_mib = 1024\nvcpus = 1\ntransport = \"pci\"\n\
+             hyperv_enlightenments = true\n\
+             [boot]\nmode = \"uefi\"\nfirmware = \"fw.fd\"\nnvram = \"win.nvram\"\n\
+             [[disk]]\npath = \"win.raw\"\nwritable = true\n\
+             [[disk]]\npath = \"installer.iso\"\n",
+        )
+        .unwrap();
+
+        let plan = plan_import(&profile, &vm_dir).expect("plan");
+        // Only the writable image moves; the read-only one may be shared.
+        assert_eq!(plan.movable, vec![elsewhere.join("win.raw")]);
+        assert!(plan.same_volume, "a temp dir and its sibling share a drive");
+        assert!(plan.can_move());
+        assert_eq!(plan.home(), Some(elsewhere.as_path()));
+
+        let moved = rename_into(&plan.movable, &vm_dir).expect("rename");
+        assert_eq!(moved.len(), 2, "the sidecar comes along: {moved:?}");
+        let imported = write_import(&plan, "win-2", &vm_dir, &moved).expect("write");
+        assert_eq!(imported, vm_dir.join("win-2.toml"));
+        let cfg = VmConfig::from_toml(&std::fs::read_to_string(&imported).unwrap()).unwrap();
+        assert_eq!(cfg.name, "win-2");
+        assert_eq!(cfg.disks[0].path, vm_dir.join("win.raw"));
+        assert_eq!(cfg.disks[1].path, elsewhere.join("installer.iso"));
+        assert_eq!(cfg.boot.nvram, Some(vm_dir.join("win.nvram")));
+        assert_eq!(cfg.boot.firmware, Some(elsewhere.join("fw.fd")));
+        assert!(vm_dir.join("win.raw").is_file() && !elsewhere.join("win.raw").exists());
+
+        // A second machine whose files would land on the same names is told
+        // so up front, and a forced rename puts everything back.
+        std::fs::write(elsewhere.join("win.raw"), b"other").unwrap();
+        let clash = plan_import(&profile, &vm_dir).expect("plan");
+        assert!(!clash.can_move());
+        assert_eq!(clash.collisions, vec![vm_dir.join("win.raw")]);
+        rename_into(&clash.movable, &vm_dir).expect_err("collides");
+        assert_eq!(std::fs::read(elsewhere.join("win.raw")).unwrap(), b"other");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
