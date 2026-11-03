@@ -117,6 +117,45 @@ it and the `?` never answered.
 
 ## Install flow (GUI-1602)
 
+**ISO first (2026-11-03).** The wizard is two steps, *Installer* and *Name &
+size*, and the first one is the person giving an ISO — chosen, dropped on the
+window, or from the first-launch page's *From an ISO file* card. The image is
+read (`disk_image::optical::identify`: `sources/install.wim|esd|swm` means
+Windows Setup, then `.disk/info`, then the ISO 9660 label; everything bounded and
+cleaned, junk is `Unknown`, never an error) and turned into a
+`launcher::Installer` (`from_identified` is pure and tested): Ubuntu
+(`desktop` or not), Fedora (a Live image becomes a manual install — it cannot
+be kickstarted), Windows, Debian (honoured with Debian's own verified download,
+because `install debian` takes no ISO — say so in `note`), or OtherLinux.
+`ManagerApp::choose_installer` applies it: family, Windows' 64 GiB / 4 GiB
+floor, and a re-suggested name unless the person typed one
+(`WizardState::name_suggested`). The only ISO-less choice is **Debian**,
+because it is the only installer the engine downloads itself on Windows — the
+Ubuntu and Fedora ISOs are fetched only by the bash scripts. Do not offer an
+Ubuntu download until the engine has one. Windows cannot be downloaded at all;
+the step links to Microsoft. Reading the ISO happens in `apply` (a few sectors);
+`--mock` turns *choose an ISO* into a sample Ubuntu Desktop image so the whole
+flow clicks through. Step 1 is presets, disk chips and the **3D graphics**
+switch (Windows' package with the test-mode note shown only once it is on;
+Ubuntu Desktop installed automatically gets `--venus`), with every other
+setting under *Advanced options*. A wizard opened with untouched Settings
+defaults starts on a preset (Balanced if the host default is ≥ 4 cores, else
+Light) and a 64 GiB disk. The footer carries the one-line summary that replaced
+the Review step.
+
+**3D after the install.** *… → Add 3D graphics…* on a stopped machine whose
+profile has no `venus` (`VmEntry::venus`, `VmEntry::windows_guest`) opens
+`Modal::Enable3d`, which runs `entangled enable-3d <profile>` on a worker
+(`Runner::enable_3d_command`; Windows may download the package first) and then
+says what to run inside the guest. The CLI sets the host half in the profile and
+attaches a disc labelled `ENTANGLED3D`: Windows gets the package plus
+`Install 3D.cmd` (self-elevating, it calls the 3D half of `first-logon.cmd` and
+restarts) as `[[optical]]`; Linux gets `enable-3d.sh`
+(`seed::venus_guest_script`, the same files `--venus` writes) as a read-only
+`[[disk]]`. The label, script names and the Linux one-liner live in
+`control_api::enable_3d`, so the instruction on screen always matches the disc.
+Surfaces: `enable-3d`, `enable-3d-done`.
+
 The x86-64 wizard also offers Fedora and **Other Linux / own ISO**. Fedora
 uses the existing `install fedora` path (Everything netinst, cached or local,
 Kickstart when automatic). Other Linux uses `install other --iso`, always
@@ -127,26 +166,24 @@ The manager tracks this child as `TaskKind::Run`, with a control pipe, not as
 a completed automatic installation; never stamp resources over its live profile.
 After powering off, the user ejects the ISO in Settings > Startup and saves.
 The console offers named `serial-key` controls (shared vocabulary in control-api)
-for the serial-only firmware/bootloader menus. ISO drag-and-drop selects this
-manual path; native Apple Silicon keeps its Ubuntu ARM64-only provisioning.
+for the serial-only firmware/bootloader menus. An ISO nobody recognises (or a
+Fedora Live image) selects this manual path; native Apple Silicon keeps its
+Ubuntu ARM64-only provisioning.
 
-**Windows 10 / 11** (`GuestFamily::Windows`, ADR-0008) is a full-width card
-under the Linux pairs. It needs two images, both required at submit time: the
-untouched Microsoft ISO (`iso_path`, `PickTarget::WizardIso`) and the virtio-win
-ISO (`drivers_path`, `PickTarget::WizardDrivers`), which become `install
-windows --iso … --drivers …`. Never `--auto`: Windows is always unattended and
-the engine refuses the flag. Choosing the card raises the disk to 64 GiB and
-memory to 4 GiB, the engine's own Windows minimums for comfort. Pre-flight is
-the UEFI firmware, as for Ubuntu. Its screenshot surface is `wizard-windows`. An optional third path row, **3D (OPTIONAL)**, takes the folder with the
-experimental viogpu3d package and LunarG's Vulkan runtime installer and passes it as
-`install windows --gpu3d` (`NewMachine::gpu3d_path`, picked with
-`PickTarget::WizardGpu3d`); empty installs 2D, and the launcher test asserts both.
+**Windows 10 / 11** (`GuestFamily::Windows`, ADR-0008) is what a Windows Setup
+ISO is recognised as. The untouched Microsoft ISO (`iso_path`) is the only
+thing required; the virtio-win ISO (`drivers_path`, under Advanced) is
+optional and downloaded when empty. They become `install windows --iso …
+[--drivers …]`. Never `--auto`: Windows is always unattended and the engine
+refuses the flag. Recognising it raises the disk to 64 GiB and memory to 4 GiB,
+the engine's own Windows minimums for comfort. Pre-flight is the UEFI firmware,
+as for Ubuntu. Its screenshot surface is `wizard-windows`.
+`NewMachine::gpu3d_path` still becomes `--gpu3d <dir>`, but the wizard no
+longer has a row for it; the 3D switch is `--gpu3d auto`.
 
-The four-stage wizard collects system/media, name/resources, storage and a
-review before it launches anything. It supports Debian's verified variants and
-Ubuntu through the verified cache or an explicit local `--iso`. Storage is an
-explicit choice between a new sparse RAW image and an existing image in the VM
-directory; the latter is never recreated or truncated.
+Storage (under Advanced) is an explicit choice between a new sparse RAW image
+and an existing image in the VM directory; the latter is never recreated or
+truncated.
 
 Which family the wizard *opens* on is per host: `GuestFamily::default_for_host()`
 is Ubuntu on Windows and Debian on Linux. That is now a *preference*, not a
@@ -242,8 +279,11 @@ it that way:
 - A profile with `hyperv_enlightenments` is how the editor knows a Windows
   guest (`EditForm::windows_guest`): its shares are written `virtiofs =
   true` and the hint names drive `Z:`, never a `mount -t 9p` line.
-- `--screenshot-view wizard-windows` shows the defaults: drivers and 3D
-  downloaded.
+- The *3D package* folder row is gone from the wizard (nobody brings their
+  own driver); `--gpu3d <dir>` and `enable-3d --package <dir>` keep it for
+  developers.
+- `--screenshot-view wizard-windows` shows the setup step for a recognised
+  Windows ISO: drivers downloaded, 3D on, Advanced open.
 
 ## Form conventions — read before adding any field
 
@@ -518,10 +558,12 @@ Health, Activity, Settings — with one line of host numbers, the version and th
   along the top, a fixed footer with Save. Processor & memory opens with the
   Light / Balanced / Performance presets (`POWER_PRESETS`, shared with the
   wizard) above the sliders.
-- **The wizard** is three steps — System, Name & size, Review. Name & size is
-  the presets, disk-size chips and a "More options" toggle
-  (`WizardState::more`) that reveals every manual setting: exact memory and
-  cores, unattended / headless install, new vs existing disk.
+- **The wizard** is two steps — Installer (an ISO, recognised; or Debian from
+  the internet) and Name & size: the presets, disk-size chips, the 3D switch
+  and an "Advanced options" toggle (`WizardState::more`) that reveals every
+  manual setting: exact memory and cores, new vs existing disk, the Debian
+  variant, Windows' drivers and shared folders, manual / background install,
+  and where it runs.
 - **Storage** is Disks and Saved sessions behind one sidebar item, switched by
   the tabs in `ui::storage_header`. **Health** is the old Diagnostics view.
 - A machine page whose name has gone (deleted, renamed, moved) says so with a
@@ -585,10 +627,13 @@ wsl -d Ubuntu -e bash -c 'cd /mnt/d/entangled-desktop && \
 - `--screenshot <png> [--screenshot-view <surface>]` renders a few frames, saves
   a PNG through `ViewportCommand::Screenshot` and exits — the quickest way to
   review a visual change without a human at the keyboard. Surfaces:
-  `main`, `machine` (the running machine's page), `wizard`, `wizard-wsl`
-  (the system step with WSL chosen and no
-  Linux engine), `wizard-wsl-review` (the same machine on the review step,
-  where Create is unavailable), `settings`, `settings-advanced`, `disks`, `snapshots`,
+  `main`, `machine` (the running machine's page), `wizard` (the drop zone),
+  `wizard-fedora` and `wizard-iso` (a recognised Fedora netinst / an unknown
+  ISO on the installer step), `wizard-iso-review` (that ISO on the setup
+  step), `wizard-more` (Ubuntu Desktop, Advanced open), `wizard-windows`,
+  `wizard-wsl` (WSL chosen under Advanced with no Linux engine),
+  `wizard-wsl-review` (the same with Advanced closed, where Create is
+  unavailable), `enable-3d`, `enable-3d-done`, `settings`, `settings-advanced`, `disks`, `snapshots`,
   `snapshot-delete`, `snapshot-discard`, `diagnostics`, and one per editor
   section: `editor` (Hardware), `editor-boot`, `editor-display` (Display &
   GPU), `editor-network` (Network & devices), `editor-storage`. **Every new

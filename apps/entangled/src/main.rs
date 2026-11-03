@@ -13,6 +13,8 @@ mod artifact;
 mod bootstrap;
 mod disk;
 mod doctor;
+#[cfg(any(target_os = "linux", windows))]
+mod enable_3d;
 mod fetch;
 /// The UEFI firmware every UEFI guest boots through: the five places it can
 /// come from, in order, and what to tell a user who has none. Portable for the
@@ -231,6 +233,22 @@ enum Command {
     },
     /// Check host prerequisites (KVM, capabilities, graphics backend).
     Doctor,
+    /// Turn 3D graphics on for an installed machine.
+    ///
+    /// Sets `[display] venus = true` in the profile and attaches a small disc
+    /// with what the guest needs: on Windows the 3D package and an
+    /// "Install 3D" script (downloaded and verified like `install windows
+    /// --gpu3d auto`), on Linux `enable-3d.sh`. Prints what to run inside the
+    /// machine; the guest's own administrator has to run it.
+    #[command(name = "enable-3d")]
+    Enable3d {
+        /// The machine's profile.
+        profile: PathBuf,
+        /// Windows only: a 3D package folder you built yourself, instead of
+        /// the pinned download.
+        #[arg(long)]
+        package: Option<PathBuf>,
+    },
     /// The Linux engine inside WSL (Windows hosts).
     ///
     /// A Windows install has no Linux half, so the "WSL (KVM)" backend has
@@ -507,6 +525,17 @@ fn run(command: Command) -> Result<(), String> {
             DiskCommand::Move { path, to } => disk::mv(&path, &to),
         },
         Command::Doctor => doctor::run(),
+        Command::Enable3d { profile, package } => {
+            #[cfg(any(target_os = "linux", windows))]
+            {
+                enable_3d::run(&profile, package.as_deref())
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
+            {
+                let _ = (profile, package);
+                Err("enable-3d is for x86-64 machines on Linux or Windows hosts".to_string())
+            }
+        }
         Command::GpuRenderer => {
             #[cfg(target_os = "linux")]
             {

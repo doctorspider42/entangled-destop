@@ -390,6 +390,8 @@ mod tests {
             uefi: true,
             shares: Vec::new(),
             forwards: Vec::new(),
+            venus: false,
+            windows_guest: false,
         }
     }
 

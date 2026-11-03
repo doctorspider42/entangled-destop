@@ -96,6 +96,12 @@ pub struct VmEntry {
     pub shares: Vec<control_api::ShareSection>,
     /// Port forwards that parse, for the card's chip and *Copy SSH command*.
     pub forwards: Vec<control_api::PortForwardRule>,
+    /// `[display] venus`: the machine already has 3D, so *Add 3D graphics*
+    /// is not offered.
+    pub venus: bool,
+    /// A Windows guest (`hyperv_enlightenments`, the same marker the editor
+    /// uses): what adding 3D asks the person to run differs.
+    pub windows_guest: bool,
 }
 
 impl VmEntry {
@@ -233,6 +239,8 @@ fn entry_from_config(path: &Path, cfg: &VmConfig, work_dir: Option<&Path>) -> Vm
             .as_ref()
             .and_then(|n| n.forwards().ok())
             .unwrap_or_default(),
+        venus: cfg.display.venus,
+        windows_guest: cfg.hyperv_enlightenments,
     }
 }
 

@@ -723,38 +723,45 @@ fn welcome(ui: &mut egui::Ui, app: &ManagerApp, actions: &mut Vec<Action>) {
             Layout::left_to_right(Align::Min),
             |ui| {
                 ui.spacing_mut().item_spacing.x = gap;
-                let ubuntu_first = GuestFamily::default_for_host() == GuestFamily::Ubuntu;
-                for (family, title, text) in [
-                    (
-                        GuestFamily::Ubuntu,
-                        "Ubuntu desktop",
-                        "A full desktop with GPU acceleration. Installs offline from a \
-                         verified image.",
-                    ),
-                    (
-                        GuestFamily::Debian,
-                        "Debian",
-                        "A smaller system that downloads its packages while it installs.",
-                    ),
-                ] {
-                    let recommended = (family == GuestFamily::Ubuntu) == ubuntu_first;
-                    if choice_card(ui, card_w, title, text, recommended).clicked() {
+                // Apple Silicon installs one system, from its own download;
+                // everywhere else a machine starts from the person's ISO, with
+                // Debian — which downloads itself — beside it.
+                let native_arm = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+                let cards: [(GuestFamily, &str, &str); 2] = if native_arm {
+                    [
+                        (
+                            GuestFamily::Ubuntu,
+                            "Ubuntu desktop",
+                            "A full desktop with GPU acceleration, downloaded and verified for you.",
+                        ),
+                        (
+                            GuestFamily::Ubuntu,
+                            "Ubuntu server",
+                            "The same verified image, for terminals and services.",
+                        ),
+                    ]
+                } else {
+                    [
+                        (
+                            GuestFamily::Ubuntu,
+                            "From an ISO file",
+                            "Ubuntu, Fedora, Windows 10 / 11 or any Linux installer you have. Entangled recognises it and sets it up.",
+                        ),
+                        (
+                            GuestFamily::Debian,
+                            "Debian, no ISO needed",
+                            "A smaller system that downloads itself, verified, while it installs.",
+                        ),
+                    ]
+                };
+                for (index, (family, title, text)) in cards.into_iter().enumerate() {
+                    if choice_card(ui, card_w, title, text, index == 0).clicked() {
                         actions.push(Action::OpenWizardFor(family));
                     }
                 }
             },
         );
         ui.add_space(20.0);
-        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            ui.horizontal(|ui| {
-                for family in [GuestFamily::Fedora, GuestFamily::OtherLinux] {
-                    if ui::secondary_button(ui, family.label(), true).clicked() {
-                        actions.push(Action::OpenWizardFor(family));
-                    }
-                }
-            });
-            ui.add_space(12.0);
-        }
         ui.horizontal(|ui| {
             ui.add_space((width * 0.5 - 140.0).max(0.0));
             ui.label(

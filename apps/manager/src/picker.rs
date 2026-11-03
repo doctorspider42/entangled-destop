@@ -35,8 +35,6 @@ pub enum PickTarget {
     WizardIso,
     /// The new-machine wizard's virtio-win driver image (Windows).
     WizardDrivers,
-    /// The experimental Windows 3D package folder.
-    WizardGpu3d,
     /// The new-machine wizard's existing disk image.
     WizardDisk,
     EditorKernel,
@@ -98,11 +96,6 @@ fn spec(target: PickTarget) -> Spec {
             title: "Choose the virtio-win driver image",
             kind: Kind::File,
             filter: Some(ISO_FILTER),
-        },
-        PickTarget::WizardGpu3d => Spec {
-            title: "Choose the folder with the 3D driver package",
-            kind: Kind::Directory,
-            filter: None,
         },
         PickTarget::WizardDisk | PickTarget::EditorAddDisk => Spec {
             title: "Choose a disk image",
@@ -263,7 +256,6 @@ mod tests {
             PickTarget::WorkDir,
             PickTarget::WizardIso,
             PickTarget::WizardDrivers,
-            PickTarget::WizardGpu3d,
             PickTarget::WizardDisk,
             PickTarget::EditorKernel,
             PickTarget::EditorInitramfs,
