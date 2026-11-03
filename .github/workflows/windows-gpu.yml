@@ -51,6 +51,9 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The release tag's target is looked for in the history (below).
+          fetch-depth: 50
 
       - name: Build tools (meson, win_flex/bison, the WDK from NuGet)
         shell: pwsh
@@ -161,7 +164,15 @@ jobs:
           $notes = "The 3D package for Windows guests (ADR-0009), built by $env:GITHUB_WORKFLOW run $env:GITHUB_RUN_ID from $env:GITHUB_SHA. " +
             "The driver is test-signed under a certificate made for this run whose private key was deleted before publishing; a guest needs test-signing mode. " +
             "Mesa 26.2.6 (MIT), DXVK $env:DXVK_VERSION (zlib), LunarG Vulkan runtime $env:VULKANRT_VERSION."
-          gh release create $tag --title "Windows 3D package $tag" --notes $notes --latest=false $files.FullName
+          # GITHUB_TOKEN may not create a tag on a commit that changes a
+          # workflow (403), so the tag goes on the newest commit that does
+          # not; guest/windows-gpu is the same there or the run would differ.
+          $target = git rev-list HEAD | Where-Object {
+            -not (git diff-tree --no-commit-id --name-only -r $_ | Where-Object { $_ -like '.github/workflows/*' })
+          } | Select-Object -First 1
+          $changed = git diff --name-only $target HEAD -- guest/windows-gpu
+          if ($changed) { throw "guest/windows-gpu differs between $target and HEAD: $changed" }
+          gh release create $tag --target $target --title "Windows 3D package $tag" --notes $notes --latest=false $files.FullName
           if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
           $toml = @("[gpu3d]", "version = `"$tag`"", "base_url = `"https://github.com/$env:GITHUB_REPOSITORY/releases/download`"",
                     "tag = `"$tag`"", "source = `"https://github.com/$env:GITHUB_REPOSITORY/tree/$env:GITHUB_SHA/guest/windows-gpu`"", "")
