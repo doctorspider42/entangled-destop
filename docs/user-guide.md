@@ -720,6 +720,13 @@ user-mode networking, the Hyper-V reference clock and the agent's console.
 a Windows machine it is served as virtio-fs and the first one appears as
 **`Z:`** at the next start. Only the first share mounts by itself.
 
+**Gamepads do not reach Windows yet.** With `[gamepad] enabled = true` the
+virtio gamepad is on the bus and virtio-win's `vioinput` binds it, but it
+makes no game controller of it (checked 2026-11-03, virtio-win 0.1.302:
+`joy.cpl` lists nothing, and only the keyboard, mouse and tablet become HID
+devices). That is the guest driver's limit, so the installer leaves the
+gamepad off.
+
 **Suspend.** It works, and is measured: 4 GiB, 8 vCPUs, 808 MiB written in
 3.9 s. It is refused while 3D is in use (the host-side Vulkan objects cannot
 be saved) and while a shared folder has open files. It is also refused on a

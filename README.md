@@ -214,6 +214,7 @@ is an unmodified EDK2 `CloudHv` build from pinned sources.
 | Desktop follows the window, clipboard, HD Audio, shared folders (`Z:`) | ✅ verified |
 | Suspend to a file and resume | ✅ 2D; refused while 3D is in use |
 | Vulkan · OpenGL · D3D9–11 · WebGL on the host GPU | ✅ D3D11 test 532 fps, WebGL Aquarium ~44 fps (RTX 2070) |
+| Gamepad | ❌ virtio-win's `vioinput` makes no game controller of it |
 | Windows guest on a Linux/KVM host | ❓ built and unit-tested, never booted |
 | Games with kernel anti-cheat | ❌ see below |
 
