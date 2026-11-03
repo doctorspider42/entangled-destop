@@ -135,10 +135,30 @@ pub enum RefreshState {
 /// Wizard state (GUI-1602).
 pub struct WizardState {
     pub machine: NewMachine,
+    /// 0: choose the installer (an ISO, or Debian from the internet);
+    /// 1: name it, size it, create it.
     pub step: usize,
-    /// "More options" is open: every setting the presets choose, by hand.
+    /// "Advanced options" is open: every setting the presets choose, by hand.
     pub more: bool,
     pub error: Option<String>,
+    /// What step 0 settled; `None` until an ISO is chosen or Debian is.
+    pub installer: Option<launcher::Installer>,
+    /// The name is still the one the wizard proposed, so choosing another
+    /// system may propose another (`ubuntu-1` → `windows-1`); a typed name is
+    /// never replaced.
+    pub name_suggested: bool,
+}
+
+/// *Add 3D graphics* on an installed machine (`entangled enable-3d`): what it
+/// will do, then the engine at work, then what to run inside the guest.
+pub struct Enable3dState {
+    pub name: String,
+    pub profile: PathBuf,
+    pub windows: bool,
+    pub running: bool,
+    /// `Some(Ok)` once the profile and the disc are in place.
+    pub result: Option<Result<(), String>>,
+    pub rx: Option<mpsc::Receiver<Result<(), String>>>,
 }
 
 /// "New disk" dialog state.
@@ -297,6 +317,7 @@ pub enum Modal {
     ResizeDisk(ResizeDiskState),
     DeleteSnapshot(DeleteSnapshotState),
     DiscardSnapshot(DiscardSnapshotState),
+    Enable3d(Enable3dState),
 }
 
 impl Modal {
@@ -341,6 +362,9 @@ pub enum Action {
     OpenWizard,
     /// The wizard, with the system already chosen (the first-launch page).
     OpenWizardFor(launcher::GuestFamily),
+    /// The wizard's first step settled without an ISO (Debian from the
+    /// internet).
+    WizardInstaller(launcher::Installer),
     CloseModal,
     SubmitWizard,
     OpenSettings,
@@ -398,6 +422,9 @@ pub enum Action {
     SubmitEditVm,
     /// Copy a stopped machine (disks, NVRAM, profile) under a new name.
     AskCloneVm(String),
+    /// *Add 3D graphics…* on a stopped machine without it.
+    AskEnable3d(String),
+    SubmitEnable3d,
     SubmitCloneVm,
     /// Give a stopped machine another name, and its files with it.
     AskRenameVm(PathBuf),
@@ -727,37 +754,51 @@ impl ManagerApp {
             ScreenshotView::WizardFedora
             | ScreenshotView::WizardIso
             | ScreenshotView::WizardIsoReview => {
+                use disk_image::optical::identify::InstallerKind;
                 app.open_wizard();
+                let (kind, title, iso) = if startup.screenshot_view == ScreenshotView::WizardFedora
+                {
+                    (
+                        InstallerKind::Fedora { live: false },
+                        "Fedora-E-dvd-x86_64-44",
+                        r"C:\Images\Fedora-Everything-netinst-x86_64-44.iso",
+                    )
+                } else {
+                    (
+                        InstallerKind::Unknown,
+                        "ARCH_202611",
+                        r"C:\Images\linux-installer.iso",
+                    )
+                };
                 if let Modal::Wizard(state) = &mut app.modal {
-                    state.machine.family =
-                        if startup.screenshot_view == ScreenshotView::WizardFedora {
-                            launcher::GuestFamily::Fedora
-                        } else {
-                            launcher::GuestFamily::OtherLinux
-                        };
-                    state.machine.name = state.machine.family.cli_name().to_string();
-                    if startup.screenshot_view != ScreenshotView::WizardFedora {
-                        state.machine.iso_path = "C:\\Images\\linux-installer.iso".into();
-                    }
+                    state.machine.iso_path = iso.into();
+                }
+                app.choose_installer(launcher::Installer::from_identified(kind, title.into()));
+                if let Modal::Wizard(state) = &mut app.modal {
                     if startup.screenshot_view == ScreenshotView::WizardIsoReview {
-                        state.step = 2;
+                        state.step = 1;
                     }
                 }
             }
             ScreenshotView::WizardWindows => {
                 app.open_wizard();
                 if let Modal::Wizard(state) = &mut app.modal {
-                    state.machine.family = launcher::GuestFamily::Windows;
-                    state.machine.name = "windows-1".into();
-                    state.machine.disk_gib = state.machine.disk_gib.max(64);
-                    state.machine.memory_mib = state.machine.memory_mib.max(4096);
                     state.machine.iso_path = r"C:\Images\Win10_22H2_English_x64.iso".into();
                     // Drivers and the 3D package downloaded: nothing to find.
                     state.machine.gpu3d_download = true;
                 }
+                app.choose_installer(launcher::Installer::from_identified(
+                    disk_image::optical::identify::InstallerKind::Windows,
+                    String::new(),
+                ));
+                if let Modal::Wizard(state) = &mut app.modal {
+                    state.step = 1;
+                    state.more = true;
+                }
             }
             ScreenshotView::WizardMore => {
                 app.open_wizard();
+                app.ask_wizard_iso();
                 if let Modal::Wizard(state) = &mut app.modal {
                     state.step = 1;
                     state.more = true;
@@ -768,11 +809,13 @@ impl ManagerApp {
             // which is the point of it.
             ScreenshotView::WizardWsl | ScreenshotView::WizardWslReview => {
                 app.open_wizard();
+                app.choose_installer(launcher::Installer::debian_download());
                 if let Modal::Wizard(state) = &mut app.modal {
                     state.machine.backend = Backend::Wsl;
-                    if startup.screenshot_view == ScreenshotView::WizardWslReview {
-                        state.step = 2;
-                    }
+                    state.step = 1;
+                    // The backend row lives under Advanced; the other surface
+                    // shows the refusal where Create is.
+                    state.more = startup.screenshot_view == ScreenshotView::WizardWsl;
                 }
             }
             ScreenshotView::Settings | ScreenshotView::SettingsAdvanced => {
@@ -799,6 +842,30 @@ impl ManagerApp {
             // The discard confirmation belongs to a card, so it is reviewed
             // over the Machines grid it is opened from.
             ScreenshotView::SnapshotDiscard => app.view = View::Machines,
+            ScreenshotView::Enable3d | ScreenshotView::Enable3dDone => {
+                let done = startup.screenshot_view == ScreenshotView::Enable3dDone;
+                let vm = app
+                    .scan
+                    .vms
+                    .iter()
+                    .find(|vm| vm.name == "ubuntu-lab")
+                    .cloned();
+                if let Some(vm) = vm {
+                    app.view = View::Machine(vm.name.clone());
+                    app.modal = Modal::Enable3d(Enable3dState {
+                        name: if done {
+                            vm.name.clone()
+                        } else {
+                            "windows-11".into()
+                        },
+                        profile: vm.profile_path.clone(),
+                        windows: !done,
+                        running: false,
+                        result: done.then_some(Ok(())),
+                        rx: None,
+                    });
+                }
+            }
             ScreenshotView::Main
             | ScreenshotView::Machine
             | ScreenshotView::MachineSuspending
@@ -966,6 +1033,7 @@ impl ManagerApp {
                 gpu3d_path: String::new(),
                 gpu3d_download: false,
                 shared_folders: true,
+                venus: false,
                 variant: self.settings.default_variant.clone(),
                 automated: true,
                 headless: self.settings.headless_install,
@@ -974,7 +1042,83 @@ impl ManagerApp {
             step: 0,
             more: false,
             error: None,
+            installer: cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                .then(launcher::Installer::ubuntu_arm64),
+            name_suggested: true,
         });
+        // Someone who never set their own defaults in Settings starts on a
+        // preset card — Balanced where the host can spare four cores, else
+        // Light — and a 64 GiB disk (sparse: it costs what the guest writes),
+        // rather than on "Custom" before they have touched anything.
+        let stock = crate::settings::Settings::default();
+        if !cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && self.settings.default_memory_mib == stock.default_memory_mib
+            && self.settings.default_disk_gib == stock.default_disk_gib
+        {
+            if let Modal::Wizard(state) = &mut self.modal {
+                let (vcpus, memory_mib) = if state.machine.vcpus >= 4 {
+                    (4, 8192)
+                } else {
+                    (2, 4096)
+                };
+                state.machine.vcpus = vcpus;
+                state.machine.memory_mib = memory_mib;
+                state.machine.disk_gib = 64;
+            }
+        }
+    }
+
+    /// Step 0's answer: `installer` becomes the machine's family, with what
+    /// that family needs to be comfortable, and a fresh name if the person
+    /// has not typed one.
+    fn choose_installer(&mut self, installer: launcher::Installer) {
+        let name = self.suggest_name_for(installer.family);
+        let Modal::Wizard(state) = &mut self.modal else {
+            return;
+        };
+        let machine = &mut state.machine;
+        machine.family = installer.family;
+        if !installer.from_iso {
+            machine.iso_path.clear();
+        }
+        if installer.family == launcher::GuestFamily::Windows {
+            // What Windows needs to be comfortable, as the engine's own
+            // defaults are (install windows).
+            machine.disk_gib = machine.disk_gib.max(64);
+            machine.memory_mib = machine.memory_mib.max(4096);
+        }
+        machine.venus = machine.venus && installer.desktop;
+        if state.name_suggested {
+            machine.name = name;
+        }
+        state.installer = Some(installer);
+        state.error = None;
+    }
+
+    /// The wizard's file dialog for an installer ISO; under `--mock`, a sample
+    /// Ubuntu Desktop image instead of a dialog.
+    fn ask_wizard_iso(&mut self) {
+        if self.mock_mode {
+            self.wizard_iso_chosen(Path::new(r"C:\Images\ubuntu-26.04.1-desktop-amd64.iso"));
+        } else {
+            self.open_picker(PickTarget::WizardIso);
+        }
+    }
+
+    /// An ISO picked or dropped on the wizard: read it and say what it is.
+    fn wizard_iso_chosen(&mut self, iso: &Path) {
+        let installer = if self.mock_mode {
+            launcher::Installer::from_identified(
+                disk_image::optical::identify::InstallerKind::Ubuntu { desktop: true },
+                "Ubuntu 26.04.1 LTS \"Resolute Raccoon\" - Release amd64".into(),
+            )
+        } else {
+            launcher::Installer::from_iso(iso)
+        };
+        if let Modal::Wizard(state) = &mut self.modal {
+            state.machine.iso_path = iso.display().to_string();
+        }
+        self.choose_installer(installer);
     }
 
     /// A free name for a new machine, prefixed with the distribution the wizard
@@ -2753,9 +2897,9 @@ impl ManagerApp {
             self.open_wizard();
         }
         if let Modal::Wizard(state) = &mut self.modal {
-            state.machine.family = launcher::GuestFamily::OtherLinux;
-            state.machine.iso_path = iso.display().to_string();
+            state.step = 0;
         }
+        self.wizard_iso_chosen(&iso);
         self.toast(
             ToastLevel::Info,
             format!(
@@ -2991,6 +3135,115 @@ impl ManagerApp {
             .unwrap_or_else(|| format!("{source}-copy"))
     }
 
+    fn ask_enable_3d(&mut self, name: &str) {
+        if self.is_busy(name) {
+            self.toast(
+                ToastLevel::Warn,
+                format!("'{name}' is running — shut it down before adding 3D"),
+            );
+            return;
+        }
+        let Some(vm) = self.vm(name) else {
+            self.toast(ToastLevel::Error, format!("'{name}' is gone from disk"));
+            return;
+        };
+        self.modal = Modal::Enable3d(Enable3dState {
+            name: name.to_string(),
+            profile: vm.profile_path.clone(),
+            windows: vm.windows_guest,
+            running: false,
+            result: None,
+            rx: None,
+        });
+    }
+
+    /// Runs `entangled enable-3d` on a worker: on Windows it may download the
+    /// 3D package first, which takes longer than a frame by far.
+    fn submit_enable_3d(&mut self) {
+        let Modal::Enable3d(state) = &self.modal else {
+            return;
+        };
+        if state.running {
+            return;
+        }
+        if self.mock_mode {
+            if let Modal::Enable3d(state) = &mut self.modal {
+                state.result = Some(Ok(()));
+            }
+            return;
+        }
+        let (name, profile) = (state.name.clone(), state.profile.clone());
+        let Some(engine) = self.engine_path() else {
+            if let Modal::Enable3d(state) = &mut self.modal {
+                state.result = Some(Err(
+                    "part of Entangled is missing — reinstalling it fixes this".into(),
+                ));
+            }
+            return;
+        };
+        let runner = Runner::new(self.backend_of(&name), engine, &self.settings);
+        let cwd = self.settings.child_cwd();
+        let (program, args) = match runner.enable_3d_command(&cwd, &profile) {
+            Ok(pair) => pair,
+            Err(e) => {
+                if let Modal::Enable3d(state) = &mut self.modal {
+                    state.result = Some(Err(e));
+                }
+                return;
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        let waker = Arc::clone(&self.waker);
+        let spawned = std::thread::Builder::new()
+            .name("enable-3d".to_string())
+            .spawn(move || {
+                let mut command = std::process::Command::new(&program);
+                command.args(&args).current_dir(&cwd);
+                crate::process::quiet_command(&mut command);
+                let result = match command.output() {
+                    Ok(output) if output.status.success() => Ok(()),
+                    Ok(output) => {
+                        let text = String::from_utf8_lossy(&output.stderr);
+                        let last = text.lines().rev().find(|l| !l.trim().is_empty());
+                        Err(last
+                            .unwrap_or("3D could not be added")
+                            .trim()
+                            .trim_start_matches("error: ")
+                            .to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = tx.send(result);
+                waker();
+            });
+        if let Modal::Enable3d(state) = &mut self.modal {
+            match spawned {
+                Ok(_) => {
+                    state.running = true;
+                    state.rx = Some(rx);
+                }
+                Err(e) => state.result = Some(Err(e.to_string())),
+            }
+        }
+    }
+
+    fn collect_enable_3d(&mut self) {
+        let Modal::Enable3d(state) = &mut self.modal else {
+            return;
+        };
+        let Some(Ok(result)) = state.rx.as_ref().map(|rx| rx.try_recv()) else {
+            return;
+        };
+        state.running = false;
+        state.rx = None;
+        let ok = result.is_ok();
+        state.result = Some(result);
+        if ok {
+            // The profile has changed: the page reads it again.
+            self.last_scan = Instant::now() - SCAN_INTERVAL;
+        }
+    }
+
     fn ask_clone_vm(&mut self, name: &str) {
         if self.is_busy(name) {
             self.toast(
@@ -3209,7 +3462,6 @@ impl ManagerApp {
             (Modal::Wizard(state), PickTarget::WizardDrivers) => {
                 Some(&mut state.machine.drivers_path)
             }
-            (Modal::Wizard(state), PickTarget::WizardGpu3d) => Some(&mut state.machine.gpu3d_path),
             (Modal::Wizard(state), PickTarget::WizardDisk) => Some(&mut state.machine.disk_path),
             (Modal::MoveDisk(state), PickTarget::MoveDestination) => Some(&mut state.dest),
             (Modal::EditVm(state), target) => match target {
@@ -3258,6 +3510,12 @@ impl ManagerApp {
         self.picker = None;
         let Some(path) = answer else { return }; // cancelled
         let text = path.display().to_string();
+        // An installer ISO is not just text for a field: what is on it
+        // decides the rest of the wizard.
+        if target == PickTarget::WizardIso && matches!(self.modal, Modal::Wizard(_)) {
+            self.wizard_iso_chosen(&path);
+            return;
+        }
         match self.picker_field(target) {
             Some(field) => *field = text,
             // The engine picker is also reachable from the "engine missing"
@@ -3693,6 +3951,11 @@ impl ManagerApp {
                 self.doctor = Some(crate::hostcheck::mock_report());
                 self.toast(ToastLevel::Info, "Mock: showing a sample host report");
             }
+            // The wizard's ISO stands for a sample Ubuntu Desktop image, so the
+            // whole flow can be clicked through without a file.
+            Action::PickPath(PickTarget::WizardIso) if matches!(self.modal, Modal::Wizard(_)) => {
+                self.ask_wizard_iso();
+            }
             Action::PickPath(_) => {
                 // A native dialog is not a host *mutation*, but it is modal and
                 // unpredictable — a screenshot run must never stop on one.
@@ -3740,21 +4003,23 @@ impl ManagerApp {
                 }
             }
             Action::OpenWizard => self.open_wizard(),
+            Action::WizardInstaller(installer) => self.choose_installer(installer),
             Action::OpenWizardFor(family) => {
                 self.open_wizard();
-                let name = self.suggest_name_for(family);
-                if let Modal::Wizard(state) = &mut self.modal {
-                    if state.machine.family != family {
-                        state.machine.family = family;
-                        state.machine.name = name;
-                    }
+                // Debian needs nothing from the person; every other system
+                // starts from its ISO, which the picker asks for straight away.
+                if family == launcher::GuestFamily::Debian {
+                    self.choose_installer(launcher::Installer::debian_download());
+                } else if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                    self.ask_wizard_iso();
                 }
             }
             Action::CloseModal => {
                 // A move in flight owns its modal: the copy is running on the
                 // worker and closing the dialog would orphan its progress.
                 let copying = matches!(&self.modal, Modal::MoveDisk(state) if state.running)
-                    || matches!(&self.modal, Modal::CloneVm(state) if state.running);
+                    || matches!(&self.modal, Modal::CloneVm(state) if state.running)
+                    || matches!(&self.modal, Modal::Enable3d(state) if state.running);
                 if !copying {
                     self.modal = Modal::None;
                 }
@@ -3838,6 +4103,8 @@ impl ManagerApp {
                 }
             }
             Action::AskCloneVm(name) => self.ask_clone_vm(&name),
+            Action::AskEnable3d(name) => self.ask_enable_3d(&name),
+            Action::SubmitEnable3d => self.submit_enable_3d(),
             Action::SubmitCloneVm => self.submit_clone_vm(),
             Action::AskRenameVm(profile) => self.ask_rename_vm(&profile),
             Action::SubmitRenameVm => self.submit_rename_vm(),
@@ -4026,6 +4293,7 @@ impl eframe::App for ManagerApp {
         self.collect_picker();
         self.collect_diagnostics();
         self.collect_fetch();
+        self.collect_enable_3d();
         self.supervisor.prune(12);
         self.ensure_log_selection();
         self.expire_toasts(ctx.input(|i| i.time));

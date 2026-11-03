@@ -308,6 +308,17 @@ fn more_menu(
             actions.push(Action::AskRenameVm(vm.profile_path.clone()));
         }
         let at_rest = matches!(status, Status::Stopped | Status::Suspended);
+        if !vm.venus
+            && ui
+                .add_enabled(status == Status::Stopped, egui::Button::new("Add 3D graphics…"))
+                .on_hover_text(
+                    "3D for a machine installed without it: games, Vulkan and a smoother desktop on this computer's graphics card",
+                )
+                .on_disabled_hover_text("Shut the machine down first")
+                .clicked()
+        {
+            actions.push(Action::AskEnable3d(vm.name.clone()));
+        }
         if ui
             .add_enabled(at_rest, egui::Button::new("Clone…"))
             .on_hover_text(

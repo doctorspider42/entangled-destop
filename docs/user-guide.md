@@ -474,9 +474,19 @@ Linux host the renderer serves Vulkan and GL programs the same way, but GNOME's
 own scanout buffers stay plain memory (there is no shared-memory export there
 yet), and under WSL the only Vulkan device is lavapipe, which runs on the CPU.
 
-**An existing machine** needs the same two halves by hand: `venus = true` under
-`[display]` (or *3D → GPU desktop (Venus)* in the manager's Edit dialog), and
-the guest set up as above — as root, write the `/etc/drirc` below, then
+**An existing machine** gets both halves from its page: *… → Add 3D
+graphics…*, or `entangled enable-3d <profile>`. That sets `venus = true` (and
+at least 4096 MiB) in the profile and attaches a read-only disc labelled
+`ENTANGLED3D` with `enable-3d.sh`, which writes exactly the files `--venus`
+writes at install time. Inside the machine, run
+
+```bash
+sudo mount -o ro LABEL=ENTANGLED3D /mnt && sudo sh /mnt/enable-3d.sh; sudo umount /mnt
+```
+
+and log out and back in. By hand it is `venus = true` under `[display]` (or
+*3D → GPU desktop (Venus)* in the manager's Edit dialog), and the guest set up
+as above — as root, write the `/etc/drirc` below, then
 
 ```bash
 printf '%s\n' '[org.gnome.desktop.session]' 'idle-delay=uint32 0' \
@@ -546,11 +556,13 @@ so rather than booting a machine that cannot find the media.
 
 ## Manual installation: other Linux / own ISO
 
-On Linux and Windows, choose **Other Linux / own ISO** in the create-machine
-wizard, select a local **x86-64 UEFI** installer image, choose resources and
-storage, then press **Create and boot ISO**. Dropping an ISO onto the manager
-opens this same path. The image is used as supplied; obtain and verify it from
-the distribution's publisher before selecting it.
+On Linux and Windows, give the create-machine wizard a local **x86-64 UEFI**
+installer image (choose it, or drop it on the manager's window). An image the
+wizard does not recognise as Ubuntu, Debian, Fedora or Windows is marked
+*Manual install*; choose resources and press **Create and boot ISO**. A Fedora
+Live image takes the same path, because it cannot install unattended. The image
+is used as supplied; obtain and verify it from the distribution's publisher
+before selecting it.
 
 Complete the installation in the guest window. Firmware and bootloader menus
 appear in the manager's **Console**, with serial input and boot-menu key buttons;
@@ -687,8 +699,8 @@ host (WHP). Windows 11 installs too, with its TPM, Secure Boot and CPU checks
 bypassed (`LabConfig`), because this machine has no TPM. A Windows guest on a
 Linux/KVM host is built and unit-tested but **has never been booted**.
 
-In the manager: **New machine → Windows**, choose the ISO, and that is all. The
-CLI does the same:
+In the manager: **New machine**, choose the ISO (the wizard recognises it as
+Windows Setup media), and that is all. The CLI does the same:
 
 ```bash
 entangled install windows --iso Win10_22H2_English_x64.iso --disk win10.raw --size 64G --memory-mib 8192
@@ -780,10 +792,21 @@ signs it under a certificate made for that run and **deletes the private key
 before publishing**, so trusting that certificate lets no one sign anything
 else. Then it publishes the package as a `gpu3d-<n>` release.
 
-The wizard's *3D* switch, `--gpu3d auto` or `entangled fetch gpu3d` downloads
-the release this build pins, checked file by file against SHA-256 digests in
-`guest/windows/pinned.toml`. A build that pins none says so. To use a package
-you built yourself, choose its folder in *3D package*, or pass `--gpu3d <dir>`.
+The wizard's *3D graphics* switch, `--gpu3d auto` or `entangled fetch gpu3d`
+downloads the release this build pins, checked file by file against SHA-256
+digests in `guest/windows/pinned.toml`. A build that pins none says so. To use a
+package you built yourself, pass `--gpu3d <dir>` (the wizard no longer offers a
+folder for it).
+
+**Adding 3D after the install.** A Windows machine installed without 3D gets it
+from its page: *… → Add 3D graphics…* (the machine must be shut down), or
+`entangled enable-3d <profile>` (`--package <dir>` for your own build). It turns
+3D on in the profile (`[display] venus = true`, plus `render_node = true` for
+our own driver) and attaches a disc, `ENTANGLED3D`, holding the package and
+**Install 3D.cmd**. Start the machine, open that drive in File Explorer and
+double-click *Install 3D*: it asks for administrator rights, runs the same 3D
+steps the unattended install runs at first logon, and restarts Windows. The
+disc stays in the drive until you remove it under *Configure → Storage*.
 
 ## Living with a VM
 
@@ -1463,15 +1486,26 @@ before the click, not in an error afterwards — and **Start fresh…** asks bef
 throwing the session away, because booting the machine from scratch is exactly
 what makes it unrestorable.
 
-**Create machine** opens a four-step wizard — *System*, *Hardware*, *Storage*,
-*Review*. You pick Debian or Ubuntu and its installer media, name the machine
-and size its memory and vCPUs (the vCPU slider starts where `entangled install`
-would: half this host's logical CPUs, 2 to 8), either create a new sparse disk
-or install onto an existing image, and then read a summary before anything
-happens. The last
-step has an *Advanced: command preview* section showing the exact
-`entangled install …` command it is about to run, which is the honest way to
-learn the CLI.
+**Create machine** opens a two-step wizard — *Installer*, then *Name & size*.
+
+1. **Installer.** Give it the ISO of the system you want, by choosing it or
+   dropping it on the window. The wizard reads the image (`.disk/info`, the
+   volume label, and for Windows `sources/install.wim`; `disk_image::optical::identify`)
+   and says what it is: Ubuntu (Desktop or Server), Fedora, Windows 10 / 11, or
+   an unknown Linux installer, which becomes a manual install. With no ISO,
+   **Debian** installs from the internet through its verified network
+   installer. Windows cannot be downloaded for you; the wizard links to
+   Microsoft's download page.
+2. **Name & size.** The name (proposed from the system), a size preset
+   (Light, Balanced, Performance), a disk size, and the **3D graphics** switch
+   where 3D can be installed with the system: Windows (the test-signed driver
+   package, downloaded and verified) and Ubuntu Desktop installed automatically
+   (`--venus`). Everything else is under **Advanced options**: exact cores and
+   memory (the vCPU slider starts where `entangled install` would: half this
+   host's logical CPUs, 2 to 8), a new sparse disk or an existing image, the
+   Debian installer variant, Windows' drivers and shared folders, manual or
+   background installation, and where the machine runs. The footer sums the
+   machine up in one line before **Create and install**.
 
 **Configure** (the machine editor) edits the profile in five sections, all saved
 together: *Hardware* (memory, vCPUs, `mmio`/`pci`), *Boot & media* (direct-Linux
@@ -1523,7 +1557,7 @@ gives a login prompt on `ttyS0`, a shell on a headless machine, or GRUB before
 the graphics come up.
 
 **Dropping an installer image** (`.iso`) anywhere on the manager's window opens
-the new-machine wizard with that image already filled in.
+the new-machine wizard with that image already read and recognised.
 
 **Import** (in the header), or dropping a profile (`.toml`) on the window,
 brings in a machine whose profile lives in another folder. The profile is

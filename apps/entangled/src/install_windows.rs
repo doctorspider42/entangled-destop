@@ -190,7 +190,7 @@ fn absolute(path: &Path) -> Result<PathBuf, String> {
 
 /// One of the downloads a Windows guest needs, from the verified cache or
 /// its publisher, said aloud because the first one is ~840 MiB.
-fn media(media: crate::windows_media::Media) -> Result<PathBuf, String> {
+pub(crate) fn media(media: crate::windows_media::Media) -> Result<PathBuf, String> {
     if let Ok(path) = crate::windows_media::cached_path(media) {
         if !path.is_file() {
             eprintln!(
@@ -445,21 +445,7 @@ fn answer_disc(
         ),
     }
     if let Some(dir) = gpu3d {
-        disc.add_file("entangled/gpu3d-msi.ps1", crlf(GPU3D_MSI))
-            .map_err(|e| e.to_string())?;
-        disc.add_file("entangled/gpu3d-edge.ps1", crlf(GPU3D_EDGE))
-            .map_err(|e| e.to_string())?;
-        let (at, files) = if is_own_gpu_package(dir) {
-            disc.add_file("entangled/owngpu-bind.ps1", crlf(OWNGPU_BIND))
-                .map_err(|e| e.to_string())?;
-            ("owngpu", own_gpu_files(dir)?)
-        } else {
-            ("gpu3d", gpu3d_files(dir)?)
-        };
-        for (path, data) in files {
-            disc.add_file(&format!("entangled/{at}/{path}"), data)
-                .map_err(|e| e.to_string())?;
-        }
+        add_gpu3d(&mut disc, dir)?;
     }
     if let Some(msi) = winfsp {
         disc.add_file("entangled/winfsp.msi", winfsp_installer(msi)?)
@@ -473,6 +459,60 @@ fn answer_disc(
             .map_err(|e| e.to_string())?;
     }
     Ok((disc.build(), image))
+}
+
+/// The 3D package `dir` and the scripts that install it, under `entangled/`
+/// — where `first-logon.cmd` looks for them, on the answer disc and on the
+/// disc [`gpu3d_disc`] makes for an installed guest alike.
+fn add_gpu3d(disc: &mut IsoBuilder, dir: &Path) -> Result<(), String> {
+    disc.add_file("entangled/gpu3d-msi.ps1", crlf(GPU3D_MSI))
+        .map_err(|e| e.to_string())?;
+    disc.add_file("entangled/gpu3d-edge.ps1", crlf(GPU3D_EDGE))
+        .map_err(|e| e.to_string())?;
+    let (at, files) = if is_own_gpu_package(dir) {
+        disc.add_file("entangled/owngpu-bind.ps1", crlf(OWNGPU_BIND))
+            .map_err(|e| e.to_string())?;
+        ("owngpu", own_gpu_files(dir)?)
+    } else {
+        ("gpu3d", gpu3d_files(dir)?)
+    };
+    for (path, data) in files {
+        disc.add_file(&format!("entangled/{at}/{path}"), data)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// `Install 3D.cmd`, at the root of [`gpu3d_disc`]: asks for administrator
+/// rights (UAC) when it lacks them, runs the 3D half of `first-logon.cmd` —
+/// the rest of that script finds nothing of its own on this disc and does
+/// nothing — and restarts Windows, which test-signing and the driver need.
+const INSTALL_3D_CMD: &str = r#"@echo off
+rem Entangled: adds 3D graphics to this Windows (ADR-0009). Double-click it.
+net session >nul 2>&1
+if errorlevel 1 (
+  powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0'"
+  exit /b
+)
+echo Installing 3D graphics...
+call "%~d0\entangled\first-logon.cmd" %~d0
+echo.
+echo Done. Windows restarts in 20 seconds to finish (it shows "Test Mode" afterwards).
+shutdown /r /t 20 /c "Entangled: finishing 3D graphics"
+pause
+"#;
+
+/// The disc that adds 3D to an **installed** Windows guest (`entangled
+/// enable-3d`): the package and scripts the answer disc would have carried,
+/// and `Install 3D.cmd` to run them.
+pub(crate) fn gpu3d_disc(dir: &Path) -> Result<Vec<u8>, String> {
+    let mut disc = IsoBuilder::new(control_api::enable_3d::DISC_LABEL);
+    disc.add_file(control_api::enable_3d::WINDOWS_SCRIPT, crlf(INSTALL_3D_CMD))
+        .map_err(|e| e.to_string())?;
+    disc.add_file("entangled/first-logon.cmd", crlf(FIRST_LOGON))
+        .map_err(|e| e.to_string())?;
+    add_gpu3d(&mut disc, dir)?;
+    Ok(disc.build())
 }
 
 /// The 3D package's files, as the answer disc carries them under
@@ -527,7 +567,7 @@ fn gpu3d_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 
 /// Whether `--gpu3d` names Entangled's own package (ADR-0009) rather than
 /// Yttrium's.
-fn is_own_gpu_package(dir: &Path) -> bool {
+pub(crate) fn is_own_gpu_package(dir: &Path) -> bool {
     dir.join("entangled-gpu.inf").is_file()
 }
 

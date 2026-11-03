@@ -44,6 +44,8 @@ pub fn scan() -> Scan {
                 .iter()
                 .filter_map(|r| control_api::PortForwardRule::parse(r).ok())
                 .collect(),
+            venus: true,
+            windows_guest: false,
             disks: vec![disk_info(&nebula_disk, 64 * GIB, 18 * GIB)],
         },
         VmEntry {
@@ -59,6 +61,8 @@ pub fn scan() -> Scan {
             uefi: true,
             shares: Vec::new(),
             forwards: Vec::new(),
+            venus: false,
+            windows_guest: false,
             disks: vec![disk_info(&ubuntu_disk, 32 * GIB, 9 * GIB)],
         },
         VmEntry {
@@ -72,6 +76,8 @@ pub fn scan() -> Scan {
             uefi: false,
             shares: Vec::new(),
             forwards: Vec::new(),
+            venus: false,
+            windows_guest: false,
             disks: Vec::new(),
         },
         // The third resting state: stopped, but with a session on disk. Its
@@ -88,6 +94,8 @@ pub fn scan() -> Scan {
             uefi: true,
             shares: Vec::new(),
             forwards: Vec::new(),
+            venus: false,
+            windows_guest: false,
             disks: vec![disk_info(&aurora_disk, 40 * GIB, 11 * GIB)],
         },
         // And the state in between: on its way into a file.
@@ -102,6 +110,8 @@ pub fn scan() -> Scan {
             uefi: false,
             shares: Vec::new(),
             forwards: Vec::new(),
+            venus: false,
+            windows_guest: false,
             disks: vec![disk_info(&orion_disk, 16 * GIB, 3 * GIB)],
         },
     ];

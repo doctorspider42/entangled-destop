@@ -196,6 +196,17 @@ impl Runner {
         self.command(cwd, vec!["fetch".to_string(), what.to_string()])
     }
 
+    /// `(program, argv)` for `entangled enable-3d <profile>`: *Add 3D
+    /// graphics* on a machine's page.
+    pub fn enable_3d_command(
+        &self,
+        cwd: &Path,
+        profile: &Path,
+    ) -> Result<(PathBuf, Vec<String>), String> {
+        let args = vec!["enable-3d".to_string(), self.path_arg(profile)?];
+        self.command(cwd, args)
+    }
+
     /// `(program, argv)` for an engine command line.
     fn command(&self, cwd: &Path, args: Vec<String>) -> Result<(PathBuf, Vec<String>), String> {
         match self.backend {
@@ -262,6 +273,145 @@ impl GuestFamily {
     }
 }
 
+/// What the wizard's first step settled: which installer runs, and where it
+/// comes from. The person gives an ISO and the image says what it is
+/// ([`Installer::from_iso`]); or, with no ISO, Entangled gets the installer
+/// itself ([`Installer::debian_download`], and on Apple Silicon
+/// [`Installer::ubuntu_arm64`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installer {
+    pub family: GuestFamily,
+    /// What it is, in words: the disc's own description, or the system's name.
+    pub title: String,
+    /// The ISO is the person's (and goes on the command line as `--iso`).
+    pub from_iso: bool,
+    /// An Ubuntu Desktop image: the only one the GPU desktop (`--venus`) can
+    /// be installed from.
+    pub desktop: bool,
+    /// Why the image will not be used the way it was given, when that is so.
+    pub note: Option<&'static str>,
+}
+
+impl Installer {
+    /// Reads `iso` and turns what it says into an installer. An image that
+    /// cannot be read at all is still offered as a manual install: the
+    /// person may know better than this reader.
+    pub fn from_iso(iso: &Path) -> Self {
+        use disk_image::optical::identify::{identify, Identified, InstallerKind};
+        let found = identify(iso).unwrap_or(Identified {
+            kind: InstallerKind::Unknown,
+            title: String::new(),
+        });
+        Self::from_identified(found.kind, found.title)
+    }
+
+    /// The decision, from an identification — pure, so the mock screenshots
+    /// and the tests need no ISO on disk.
+    pub fn from_identified(
+        kind: disk_image::optical::identify::InstallerKind,
+        title: String,
+    ) -> Self {
+        use disk_image::optical::identify::InstallerKind;
+        // `Ubuntu 26.04.1 LTS "Resolute Raccoon" - Release amd64 (20260826)`:
+        // the part before " - " is the name; the rest is build detail.
+        let title = title
+            .split(" - ")
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let titled = |fallback: &str| {
+            if title.is_empty() {
+                fallback.to_string()
+            } else {
+                title.clone()
+            }
+        };
+        match kind {
+            InstallerKind::Windows => Self {
+                family: GuestFamily::Windows,
+                title: titled("Windows 10 / 11"),
+                from_iso: true,
+                desktop: true,
+                note: None,
+            },
+            InstallerKind::Ubuntu { desktop } => Self {
+                family: GuestFamily::Ubuntu,
+                title: titled("Ubuntu"),
+                from_iso: true,
+                desktop,
+                note: None,
+            },
+            InstallerKind::Fedora { live: false } => Self {
+                family: GuestFamily::Fedora,
+                title: titled("Fedora"),
+                from_iso: true,
+                desktop: false,
+                note: None,
+            },
+            InstallerKind::Fedora { live: true } => Self {
+                family: GuestFamily::OtherLinux,
+                title: titled("Fedora Live"),
+                from_iso: true,
+                desktop: false,
+                note: Some(
+                    "A Fedora Live image cannot install by itself, so it boots and you \
+                     install it in the machine's window. The Everything netinst image \
+                     installs automatically.",
+                ),
+            },
+            // `install debian` boots its own verified installer and takes no
+            // ISO, so a Debian disc is honoured by installing Debian — from
+            // the copy Entangled checks — rather than by a manual install.
+            InstallerKind::Debian => Self {
+                note: Some(
+                    "Entangled installs Debian from its own verified download, so this \
+                     file is not needed.",
+                ),
+                ..Self::debian_download()
+            },
+            InstallerKind::Unknown => Self {
+                family: GuestFamily::OtherLinux,
+                title: titled("Linux installer"),
+                from_iso: true,
+                desktop: false,
+                note: Some(
+                    "Entangled does not know this system, so it boots the ISO and you \
+                     install it in the machine's window. It needs UEFI and virtio support.",
+                ),
+            },
+        }
+    }
+
+    /// Debian with nothing given: its verified installer downloads the system.
+    pub fn debian_download() -> Self {
+        Self {
+            family: GuestFamily::Debian,
+            title: "Debian".to_string(),
+            from_iso: false,
+            desktop: false,
+            note: None,
+        }
+    }
+
+    /// The one thing the Apple Silicon backend installs: Ubuntu ARM64 from a
+    /// verified cloud image.
+    pub fn ubuntu_arm64() -> Self {
+        Self {
+            family: GuestFamily::Ubuntu,
+            title: "Ubuntu ARM64".to_string(),
+            from_iso: false,
+            desktop: true,
+            note: None,
+        }
+    }
+
+    /// Whether it installs by itself (the wizard's badge).
+    pub fn automatic(&self) -> bool {
+        self.family != GuestFamily::OtherLinux
+    }
+}
+
 /// Whether the installer receives a fresh sparse disk or an existing image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskMode {
@@ -302,6 +452,8 @@ pub struct NewMachine {
     pub gpu3d_download: bool,
     /// Windows only: install WinFsp, so a shared folder shows as a drive.
     pub shared_folders: bool,
+    /// Ubuntu Desktop, unattended: the GPU desktop (`install ubuntu --venus`).
+    pub venus: bool,
     pub variant: String,
     pub automated: bool,
     pub headless: bool,
@@ -423,6 +575,11 @@ pub fn install_spec(
         )
     {
         args.push("--auto".to_string());
+    }
+    // `--venus` configures the guest from the autoinstall seed, so it needs
+    // `--auto`; the engine refuses it otherwise, and so does this.
+    if machine.venus && machine.family == GuestFamily::Ubuntu && machine.automated {
+        args.push("--venus".to_string());
     }
     if machine.headless && machine.family != GuestFamily::OtherLinux {
         args.push("--headless".to_string());
@@ -773,6 +930,7 @@ mod tests {
             gpu3d_path: String::new(),
             gpu3d_download: false,
             shared_folders: true,
+            venus: false,
             variant: "text-netboot".into(),
             automated: true,
             headless: false,
@@ -847,6 +1005,57 @@ mod tests {
         );
         // The one default on both hosts, spelled out for an older engine.
         assert!(line.contains("--network usernet"), "{line}");
+    }
+
+    /// What an image says decides the installer; a stranger is a manual
+    /// install, and a Debian disc is honoured with Debian's own verified
+    /// download, which is all `install debian` takes.
+    #[test]
+    fn an_identified_image_picks_the_installer() {
+        use disk_image::optical::identify::InstallerKind;
+        let ubuntu = Installer::from_identified(
+            InstallerKind::Ubuntu { desktop: true },
+            "Ubuntu 26.04.1 LTS \"Resolute Raccoon\" - Release amd64 (20260826)".into(),
+        );
+        assert_eq!(ubuntu.family, GuestFamily::Ubuntu);
+        assert_eq!(ubuntu.title, "Ubuntu 26.04.1 LTS \"Resolute Raccoon\"");
+        assert!(ubuntu.from_iso && ubuntu.desktop && ubuntu.automatic());
+        let windows = Installer::from_identified(InstallerKind::Windows, String::new());
+        assert_eq!(windows.family, GuestFamily::Windows);
+        let live = Installer::from_identified(InstallerKind::Fedora { live: true }, String::new());
+        assert_eq!(live.family, GuestFamily::OtherLinux);
+        assert!(!live.automatic() && live.note.is_some());
+        let debian = Installer::from_identified(InstallerKind::Debian, "Debian 13".into());
+        assert_eq!(debian.family, GuestFamily::Debian);
+        assert!(!debian.from_iso && debian.note.is_some());
+        let other = Installer::from_identified(InstallerKind::Unknown, String::new());
+        assert_eq!(other.family, GuestFamily::OtherLinux);
+        assert_eq!(other.title, "Linux installer");
+    }
+
+    /// The GPU desktop rides on the automatic Ubuntu install only: the engine
+    /// configures the guest from the autoinstall seed.
+    #[test]
+    fn venus_needs_ubuntu_and_the_automatic_install() {
+        let mut m = machine();
+        m.family = GuestFamily::Ubuntu;
+        m.venus = true;
+        let line = |m: &NewMachine| {
+            install_spec(
+                &native("entangled"),
+                Path::new("/vms"),
+                PathBuf::from("/srv"),
+                m,
+            )
+            .expect("spec")
+            .command_line()
+        };
+        assert!(line(&m).contains("--venus"), "{}", line(&m));
+        m.automated = false;
+        assert!(!line(&m).contains("--venus"));
+        m.automated = true;
+        m.family = GuestFamily::Fedora;
+        assert!(!line(&m).contains("--venus"));
     }
 
     /// Windows: both images on the command line, and no `--auto`, which
@@ -1154,6 +1363,8 @@ mod tests {
             uefi: false,
             shares: Vec::new(),
             forwards: Vec::new(),
+            venus: false,
+            windows_guest: false,
         }
     }
 

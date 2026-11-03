@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+pub mod identify;
 pub mod iso9660;
 pub mod udf;
 

@@ -3,6 +3,7 @@
 
 mod config;
 pub mod control;
+pub mod enable_3d;
 /// The refresh rate a new machine's virtual monitor gets: the host monitor's,
 /// rounded and clamped ([`refresh::default_refresh_hz`]); the host query is
 /// behind the `host-display` feature.

@@ -83,13 +83,22 @@ pub enum BuiltinProfile {
 }
 
 impl BuiltinProfile {
-    /// The profile an ISO needs, from its file name — which is Canonical's
+    /// The profile an ISO needs, from what the image says it is, else from its
+    /// file name — which is Canonical's
     /// (`ubuntu-26.04.1-desktop-amd64.iso`, `ubuntu-26.04-live-server-amd64.iso`)
     /// for everything `scripts/fetch-ubuntu-iso.sh` verifies into the cache.
     /// Each profile names an install source only its own ISO carries, so
     /// guessing wrong fails the install; a renamed ISO reads as a server one,
     /// which is what `--auto` always meant before the desktop profile existed.
     pub fn for_iso(iso: &Path) -> Self {
+        // The disc's own words first (`.disk/info`, its label): a renamed ISO
+        // is still the image it was. The file name is the fallback for an
+        // image that cannot be read here.
+        if let Ok(found) = disk_image::optical::identify::identify(iso) {
+            if let disk_image::optical::identify::InstallerKind::Ubuntu { desktop } = found.kind {
+                return if desktop { Self::Desktop } else { Self::Server };
+            }
+        }
         let name = iso
             .file_name()
             .map(|n| n.to_string_lossy().to_ascii_lowercase())
@@ -287,6 +296,51 @@ pub fn venus_late_commands(user: &str) -> Vec<String> {
         "curtin in-target -- glib-compile-schemas /usr/share/glib-2.0/schemas".to_string(),
         format!("curtin in-target -- usermod -aG render {user}"),
     ]
+}
+
+/// The same four steps as [`venus_late_commands`], as a shell script a person
+/// runs with `sudo` inside an **installed** guest (`entangled enable-3d`):
+/// there is no `/target` and no autoinstall identity, so the desktop user is
+/// the one who ran `sudo`.
+///
+/// Every line it writes comes from the constants above, so a machine given 3D
+/// afterwards ends up exactly like one installed with `--venus`.
+pub fn venus_guest_script() -> String {
+    let printf = |lines: &[&str], path: &str| {
+        let mut command = String::from("printf '%s\\n'");
+        for line in lines {
+            command.push_str(&format!(" \\\n  '{line}'"));
+        }
+        command.push_str(&format!(" \\\n  > {path}\n"));
+        command
+    };
+    let mut script = String::from(
+        "#!/bin/sh\n\
+         # Entangled: puts this Linux desktop on the host's graphics card, over\n\
+         # Venus (ADR-0004) -- what `entangled install ubuntu --venus` does at\n\
+         # install time. Run it once, as root:\n\
+         #   sudo sh enable-3d.sh\n\
+         set -e\n\
+         if [ \"$(id -u)\" != 0 ]; then\n\
+         \x20 echo 'Run this with sudo: sudo sh enable-3d.sh' >&2\n\
+         \x20 exit 1\n\
+         fi\n\
+         user=\"${SUDO_USER:-$(logname 2>/dev/null || true)}\"\n",
+    );
+    script.push_str(&printf(VENUS_DRIRC, "/etc/drirc"));
+    script.push_str("mkdir -p /etc/environment.d\n");
+    script.push_str(&printf(VENUS_ENVIRONMENT_LINES, VENUS_ENVIRONMENT_D));
+    script.push_str("if [ -d /usr/share/glib-2.0/schemas ]; then\n");
+    script.push_str(&printf(VENUS_GSCHEMA_LINES, VENUS_GSCHEMA_OVERRIDE));
+    script.push_str(
+        "  glib-compile-schemas /usr/share/glib-2.0/schemas\n\
+         fi\n\
+         if [ -n \"$user\" ] && [ \"$user\" != root ]; then\n\
+         \x20 usermod -aG render \"$user\"\n\
+         fi\n\
+         echo '3D graphics are set up. Log out and back in (or restart) to use them.'\n",
+    );
+    script
 }
 
 /// `user_data` with [`venus_late_commands`] put at the head of its

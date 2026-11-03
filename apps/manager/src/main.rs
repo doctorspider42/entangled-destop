@@ -80,22 +80,33 @@ enum ScreenshotView {
     Machine,
     MachineSuspending,
     MachineResuming,
+    /// The installer step, nothing chosen yet: the drop zone.
     Wizard,
+    /// The installer step with a Fedora netinst ISO recognised.
     WizardFedora,
-    /// The system step with Windows chosen and both images filled in.
+    /// The setup step for a recognised Windows ISO, 3D on and Advanced open.
     WizardWindows,
+    /// The installer step with an ISO nobody recognises (a manual install).
     WizardIso,
+    /// The same ISO on the setup step.
     WizardIsoReview,
-    /// The wizard's sizing step with "More options" open: taller than a laptop
-    /// screen, so it is the surface that shows the step body scrolling.
+    /// The setup step for an Ubuntu Desktop ISO with "Advanced options" open:
+    /// taller than a laptop screen, so it is the surface that shows the step
+    /// body scrolling.
     WizardMore,
-    /// The wizard on the backend step with WSL chosen and no Linux engine
+    /// The setup step with WSL chosen under Advanced and no Linux engine
     /// installed: the state a fresh Windows install is in, and the one this
     /// pre-flight exists for.
     WizardWsl,
-    /// The same machine on the review step, where the refusal is shown and the
-    /// Create button is unavailable.
+    /// The same machine with Advanced closed, where the refusal is shown and
+    /// the Create button is unavailable.
     WizardWslReview,
+    /// *Add 3D graphics* on a Windows machine, before anything runs.
+    #[value(name = "enable-3d")]
+    Enable3d,
+    /// *Add 3D graphics* done on a Linux machine: the line to run in it.
+    #[value(name = "enable-3d-done")]
+    Enable3dDone,
     Settings,
     /// Settings with the advanced path overrides expanded.
     SettingsAdvanced,

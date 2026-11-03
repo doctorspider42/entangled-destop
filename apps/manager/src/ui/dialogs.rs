@@ -49,9 +49,9 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                 ui.add_space(18.0);
 
                 // The step body scrolls, the progress bar above and the
-                // buttons below stay put: "More options" alone is taller than a
-                // laptop screen, and an egui modal never grows a scroll bar of
-                // its own — it would just run off the bottom of the window.
+                // buttons below stay put: "Advanced options" alone is taller
+                // than a laptop screen, and an egui modal never grows a scroll
+                // bar of its own — it would just run off the bottom of the window.
                 let body_max = (ctx.screen_rect().height() - WIZARD_CHROME_H).max(160.0);
                 egui::ScrollArea::vertical()
                     .id_salt("wizard-body")
@@ -79,9 +79,15 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                         actions.push(Action::CloseModal);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if state.step < 2 {
-                            if ui::primary_button(ui, "Continue").clicked() {
-                                state.step += 1;
+                        if state.step == 0 {
+                            // Nothing to continue with until the installer is
+                            // known: an ISO read, or Debian chosen.
+                            let ready = state.installer.is_some();
+                            let button = ui::primary_button_enabled(ui, "Continue", ready);
+                            if !ready {
+                                button.on_hover_text("Choose an installer ISO first");
+                            } else if button.clicked() {
+                                state.step = 1;
                                 state.error = None;
                             }
                         } else {
@@ -108,12 +114,13 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
                                 None if button.clicked() => actions.push(Action::SubmitWizard),
                                 None => {}
                             }
+                            if !native_arm && ui::secondary_button(ui, "Back", true).clicked() {
+                                state.step = 0;
+                                state.error = None;
+                            }
+                            ui.add_space(8.0);
+                            ui.label(ui::faint(machine_summary(state)));
                         }
-                        if state.step > 0 && ui::secondary_button(ui, "Back", true).clicked() {
-                            state.step -= 1;
-                            state.error = None;
-                        }
-                        ui.label(ui::faint(format!("Step {} of 3", state.step + 1)));
                     });
                 });
             })
@@ -411,6 +418,13 @@ pub fn show(ctx: &egui::Context, app: &mut ManagerApp, actions: &mut Vec<Action>
             &format!("Start {} from scratch?", state.vm),
             520.0,
             |ui| discard_snapshot_body(ui, state, actions),
+        ),
+        Modal::Enable3d(state) => frame(
+            ctx,
+            "enable-3d",
+            &format!("Add 3D graphics to {}", state.name),
+            560.0,
+            |ui| enable_3d_body(ui, state, actions),
         ),
     };
 
@@ -2346,19 +2360,127 @@ fn discard_snapshot_body(
     });
 }
 
-/// The wizard's "More options": every setting the presets choose for you,
-/// by hand — exact cores and memory, how the installer runs, and where the
-/// disk comes from.
-fn more_options(
+/// *Add 3D graphics*: what it does and costs, the work, then the one thing
+/// left to do inside the machine.
+fn enable_3d_body(ui: &mut egui::Ui, state: &crate::app::Enable3dState, actions: &mut Vec<Action>) {
+    use control_api::enable_3d::{DISC_LABEL, LINUX_COMMAND, WINDOWS_SCRIPT};
+    let body = |ui: &mut egui::Ui, text: &str| {
+        ui.label(RichText::new(text).color(theme::TEXT).size(13.0));
+    };
+    match &state.result {
+        None => {
+            if state.windows {
+                body(
+                    ui,
+                    "Games, Vulkan, Direct3D and WebGL on this computer's graphics card. Entangled downloads its graphics driver, checks it, and puts it on a disc in the machine with an installer to run.",
+                );
+                ui.add_space(10.0);
+                ui.label(ui::dim(
+                    "Windows then shows a small \"Test Mode\" label in the corner, and games with anti-cheat may refuse to start. The driver is test-signed: Microsoft's signature needs a certificate this project does not have yet.",
+                ));
+            } else {
+                body(
+                    ui,
+                    "A smoother desktop and apps, drawn by this computer's graphics card. Nothing is downloaded: Entangled turns 3D on for the machine and puts a small setup script on a disc in it, for you to run once.",
+                );
+                ui.add_space(10.0);
+                ui.label(ui::dim(
+                    "The machine gets at least 4 GiB of memory. This computer needs an up-to-date graphics driver; Health checks it.",
+                ));
+            }
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if state.running {
+                    ui.add(egui::Spinner::new().size(16.0).color(theme::ACCENT));
+                    ui.label(ui::dim(if state.windows {
+                        "Downloading and preparing the driver…"
+                    } else {
+                        "Preparing…"
+                    }));
+                } else {
+                    if ui::primary_button(ui, "Add 3D graphics").clicked() {
+                        actions.push(Action::SubmitEnable3d);
+                    }
+                    if ui::text_button(ui, "Cancel", theme::TEXT_DIM).clicked() {
+                        actions.push(Action::CloseModal);
+                    }
+                }
+            });
+        }
+        Some(Ok(())) => {
+            body(ui, "3D is on. One step is left, inside the machine:");
+            ui.add_space(10.0);
+            if state.windows {
+                ui.label(ui::dim(format!(
+                    "1. Start the machine.\n2. Open the {DISC_LABEL} drive in File Explorer and \
+                     double-click \"{WINDOWS_SCRIPT}\" (it asks for administrator rights).\n\
+                     3. Windows restarts by itself when it is done."
+                )));
+            } else {
+                ui.label(ui::dim(
+                    "Start the machine, open a terminal in it and run this line, then log out and back in:",
+                ));
+                ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(theme::INSET)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                    .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS))
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new(LINUX_COMMAND)
+                                .monospace()
+                                .size(12.0)
+                                .color(theme::TEXT),
+                        );
+                    });
+                ui.add_space(8.0);
+                if ui::secondary_button(ui, "Copy the command", true).clicked() {
+                    ui.ctx().copy_text(LINUX_COMMAND.to_string());
+                }
+            }
+            ui.add_space(16.0);
+            if ui::primary_button(ui, "Done").clicked() {
+                actions.push(Action::CloseModal);
+            }
+        }
+        Some(Err(error)) => {
+            body(
+                ui,
+                "3D could not be added. Nothing in the machine was changed.",
+            );
+            ui.add_space(8.0);
+            ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if ui::secondary_button(ui, "Try again", true).clicked() {
+                    actions.push(Action::SubmitEnable3d);
+                }
+                if ui::text_button(ui, "Close", theme::TEXT_DIM).clicked() {
+                    actions.push(Action::CloseModal);
+                }
+            });
+        }
+    }
+}
+
+/// The wizard's "Advanced options": every setting the presets and the
+/// recognised ISO choose for you, by hand — exact cores and memory, the disk,
+/// how the installer runs, Windows' drivers and where the machine runs.
+#[allow(clippy::too_many_arguments)]
+fn advanced_options(
     ui: &mut egui::Ui,
     state: &mut crate::app::WizardState,
     settings: &crate::settings::Settings,
     scan: &crate::discovery::Scan,
+    wsl_engine: &wslengine::Status,
+    wsl_install_running: bool,
     native_arm: bool,
     actions: &mut Vec<Action>,
 ) {
-    ui.label(ui::caption("Processor & memory"));
-    ui.add_space(6.0);
+    ui::form_scope(ui);
+    ui.label(ui::caption("Hardware"));
     ui.add_space(10.0);
     ui::form_row(
         ui,
@@ -2393,19 +2515,9 @@ fn more_options(
             ui.add(egui::Slider::new(&mut state.machine.vcpus, 1..=maximum).suffix(" vCPU"));
         },
     );
-    ui.add_space(12.0);
-    if native_arm {
-        ui.label(ui::dim(
-            "Ubuntu is installed automatically, in the background.",
-        ));
-    } else if state.machine.family != launcher::GuestFamily::OtherLinux {
-        ui.checkbox(&mut state.machine.automated, "Install automatically")
-            .on_hover_text("Answers the installer's questions for you");
-        ui.checkbox(&mut state.machine.headless, "Install in the background")
-            .on_hover_text("No installer window; follow it on the machine's page");
-    }
+
     ui.add_space(18.0);
-    ui.label(ui::caption("Storage"));
+    ui.label(ui::caption("Disk"));
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         let card_width = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
@@ -2520,6 +2632,103 @@ fn more_options(
             }
         }
     }
+
+    let family = state.machine.family;
+    ui.add_space(18.0);
+    ui.label(ui::caption("Setup"));
+    ui.add_space(10.0);
+    if family == launcher::GuestFamily::Debian {
+        ui::form_row(
+            ui,
+            "INSTALLER",
+            "Which Debian installer runs: the graphical one, the fast \
+             keyboard-driven one, or the official netinst disc image — each \
+             downloaded and signature-checked for you.",
+            |ui, field_w| {
+                egui::ComboBox::from_id_salt("variant")
+                    .selected_text(variant_label(&state.machine.variant))
+                    .width(ui::combo_width(field_w))
+                    .show_ui(ui, |ui| {
+                        for variant in VARIANTS {
+                            ui.selectable_value(
+                                &mut state.machine.variant,
+                                variant.to_string(),
+                                variant_label(variant),
+                            );
+                        }
+                    });
+            },
+        );
+    }
+    if family == launcher::GuestFamily::Windows {
+        if ui::path_row(
+            ui,
+            "DRIVERS",
+            "The virtio-win drivers: Windows cannot see this machine's disk \
+             or network without them, and they are installed during setup. \
+             Leave empty and Entangled downloads the release it was tested \
+             with, checked against a digest built into it. Choose an ISO \
+             only to use another version.",
+            &mut state.machine.drivers_path,
+            "downloaded and verified automatically",
+            true,
+        ) {
+            actions.push(Action::PickPath(PickTarget::WizardDrivers));
+        }
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut state.machine.shared_folders,
+            "Show shared folders as drives (installs WinFsp)",
+        );
+    }
+    if native_arm {
+        ui.label(ui::dim(
+            "Ubuntu is installed automatically, in the background.",
+        ));
+    } else if family != launcher::GuestFamily::OtherLinux {
+        if family != launcher::GuestFamily::Windows {
+            let mut manual = !state.machine.automated;
+            if ui
+                .checkbox(&mut manual, "Manual installation")
+                .on_hover_text(
+                    "Answer the installer's questions yourself in the machine's window, \
+                     instead of Entangled answering them",
+                )
+                .changed()
+            {
+                state.machine.automated = !manual;
+            }
+        }
+        ui.checkbox(
+            &mut state.machine.headless,
+            "Install in the background (no window; follow it on the machine's page)",
+        );
+    } else {
+        ui.label(ui::dim(
+            "Manual install. After installing, power off and eject the ISO under \
+             Settings > Startup.",
+        ));
+    }
+
+    let choices = Backend::ALL
+        .into_iter()
+        .filter(|backend| backend.available_on_host())
+        .count();
+    if choices >= 2 {
+        ui.add_space(18.0);
+        ui.label(ui::caption("Runs on"));
+        ui.add_space(10.0);
+        backend_row(ui, &mut state.machine.backend, wsl_engine);
+        if state.machine.backend == Backend::Wsl {
+            wsl_setup_note(
+                ui,
+                wsl_engine,
+                wsl_install_running,
+                ui::FORM_LABEL_W,
+                actions,
+            );
+        }
+    }
 }
 
 /// One click sizes a machine. The numbers are the ones a desktop guest is
@@ -2604,11 +2813,12 @@ fn choice_chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response 
 }
 
 /// Where the wizard is: a check for each step done, a filled dot for this one,
-/// an open dot for the ones to come, joined by short rules.
+/// an open dot for the one to come, joined by a short rule.
 fn wizard_progress(ui: &mut egui::Ui, current: usize) {
+    const STEPS: [&str; 2] = ["Installer", "Name & size"];
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        for (index, label) in ["System", "Name & size", "Review"].into_iter().enumerate() {
+        for (index, label) in STEPS.into_iter().enumerate() {
             let (dot, _) = ui.allocate_exact_size(Vec2::new(16.0, 20.0), egui::Sense::hover());
             let c = dot.center();
             let painter = ui.painter();
@@ -2635,7 +2845,7 @@ fn wizard_progress(ui: &mut egui::Ui, current: usize) {
                         std::cmp::Ordering::Greater => theme::TEXT_FAINT,
                     }),
             );
-            if index < 2 {
+            if index + 1 < STEPS.len() {
                 let (rule, _) = ui.allocate_exact_size(Vec2::new(28.0, 20.0), egui::Sense::hover());
                 ui.painter().hline(
                     rule.x_range(),
@@ -2748,19 +2958,6 @@ fn variant_label(variant: &str) -> &'static str {
     }
 }
 
-fn summary_row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(
-            Vec2::new(104.0, 22.0),
-            Layout::left_to_right(Align::Center),
-            |ui| {
-                ui.label(ui::faint(label.to_uppercase()));
-            },
-        );
-        ui.label(RichText::new(value).size(13.0).color(theme::TEXT));
-    });
-}
-
 // `text_row` and `slider_row` used to live here, each with its own hard-coded
 // 78 px label column. They are gone: every labelled row in the product now goes
 // through `ui::form_row` / `ui::path_row`, which is what keeps the fields in one
@@ -2784,471 +2981,602 @@ fn wizard_step(
     cli_label: &str,
     actions: &mut Vec<Action>,
 ) {
-    match state.step {
-        0 => {
-            wizard_heading(
-                ui,
-                "Choose an operating system",
-                "Choose a supported installer, Windows, or another Linux from your own ISO.",
-            );
-            ui.add_space(14.0);
-            // An installer this backend cannot run is greyed out
-            // with the reason on hover, rather than failing forty
-            // minutes later inside the engine.
-            ui.horizontal(|ui| {
-                let card_width = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
-                // Debian is offered on both hosts now: its bootstrap
-                // kernel is downloaded rather than built where it
-                // cannot be built. Whether *this* machine has it yet
-                // is a pre-flight question with a command as its
-                // answer (launcher::missing_install_artifact), not a
-                // backend capability, so nothing is greyed out here.
-                let debian = option_card(
-                    ui,
-                    card_width,
-                    "Debian",
-                    "Verified network or official installer media",
-                    state.machine.family == launcher::GuestFamily::Debian,
-                    !native_arm,
-                    theme::ACCENT,
-                );
-                if debian.clicked() {
-                    state.machine.family = launcher::GuestFamily::Debian;
-                }
-                if option_card(
-                    ui,
-                    card_width,
-                    "Ubuntu",
-                    if native_arm {
-                        "Verified ARM64 download with accelerated GNOME"
-                    } else {
-                        "UEFI installer from cache or a local ISO"
-                    },
-                    state.machine.family == launcher::GuestFamily::Ubuntu,
-                    true,
-                    theme::ACCENT,
-                )
-                .clicked()
-                {
-                    state.machine.family = launcher::GuestFamily::Ubuntu;
-                }
-            });
-            if !native_arm {
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let card_width = (ui.available_width() - ui.spacing().item_spacing.x) * 0.5;
-                    for (family, detail) in [
-                        (
-                            launcher::GuestFamily::Fedora,
-                            "Workstation via network installer or a local ISO",
-                        ),
-                        (
-                            launcher::GuestFamily::OtherLinux,
-                            "Manual installation from a Linux x86-64 UEFI ISO",
-                        ),
-                    ] {
-                        if option_card(
-                            ui,
-                            card_width,
-                            family.label(),
-                            detail,
-                            state.machine.family == family,
-                            true,
-                            theme::ACCENT,
-                        )
-                        .clicked()
-                        {
-                            state.machine.family = family;
-                        }
-                    }
-                });
-                ui.add_space(8.0);
-                let card_width = ui.available_width();
-                if option_card(
-                    ui,
-                    card_width,
-                    launcher::GuestFamily::Windows.label(),
-                    "Unattended, from Microsoft's ISO and the virtio-win drivers",
-                    state.machine.family == launcher::GuestFamily::Windows,
-                    true,
-                    theme::ACCENT,
-                )
-                .clicked()
-                {
-                    state.machine.family = launcher::GuestFamily::Windows;
-                    // What Windows needs to be comfortable, as the engine's
-                    // own defaults are (install windows).
-                    state.machine.disk_gib = state.machine.disk_gib.max(64);
-                    state.machine.memory_mib = state.machine.memory_mib.max(4096);
-                }
-            }
-            ui.add_space(16.0);
-            match state.machine.family {
-                launcher::GuestFamily::Debian => {
-                    ui::form_row(
-                        ui,
-                        "INSTALLER",
-                        "Which Debian installer runs: the fast keyboard-driven one, \
-                         the graphical one, or the official netinst disc image, \
-                         downloaded and signature-checked for you.",
-                        |ui, field_w| {
-                            egui::ComboBox::from_id_salt("variant")
-                                .selected_text(variant_label(&state.machine.variant))
-                                .width(ui::combo_width(field_w))
-                                .show_ui(ui, |ui| {
-                                    for variant in VARIANTS {
-                                        ui.selectable_value(
-                                            &mut state.machine.variant,
-                                            variant.to_string(),
-                                            variant_label(variant),
-                                        );
-                                    }
-                                });
-                        },
-                    );
-                }
-                launcher::GuestFamily::Ubuntu => {
-                    if native_arm {
-                        ui.label(
-                            RichText::new(
-                                "Ubuntu ARM64 is downloaded and verified for you. \
-                                 Installing needs internet access.",
-                            )
-                            .size(13.0)
-                            .color(theme::TEXT_DIM),
-                        );
-                    } else if ui::path_row(
-                        ui,
-                        "INSTALLER",
-                        "The Ubuntu disc image to install from. Leave it empty and \
-                         Entangled uses the newest one it has already downloaded and \
-                         signature-checked.",
-                        &mut state.machine.iso_path,
-                        "newest verified download",
-                        true,
-                    ) {
-                        actions.push(Action::PickPath(PickTarget::WizardIso));
-                    }
-                }
-                launcher::GuestFamily::Fedora | launcher::GuestFamily::OtherLinux => {
-                    let manual = state.machine.family == launcher::GuestFamily::OtherLinux;
-                    if ui::path_row(
-                        ui,
-                        "INSTALLER",
-                        if manual {
-                            "Choose a Linux x86-64 ISO that supports UEFI and virtio devices. Complete installation in the guest window. Boot menus appear in the serial console. After installing, power off, open Settings > Startup and eject the ISO, then save. Compatibility depends on the distribution."
-                        } else {
-                            "For automatic installation use Fedora Everything netinst. Packages are downloaded over the network. Leave empty to use a previously verified cached netinst image; local images are used as supplied."
-                        },
-                        &mut state.machine.iso_path,
-                        if manual {
-                            "choose an installer ISO"
-                        } else {
-                            "newest verified Fedora netinst download"
-                        },
-                        true,
-                    ) {
-                        actions.push(Action::PickPath(PickTarget::WizardIso));
-                    }
-                    if manual {
-                        ui.label(ui::dim("Manual install. After installing, power off and eject the ISO under Settings > Startup."));
-                    }
-                }
-                launcher::GuestFamily::Windows => {
-                    // Two path rows: one measured width for both, or the
-                    // second ends a few pixels right of the first.
-                    ui::form_scope(ui);
-                    if ui::path_row(
-                        ui,
-                        "WINDOWS ISO",
-                        "Microsoft's Windows 10 or 11 installation ISO, as downloaded \
-                         from Microsoft. It is used untouched; the edition is Pro unless \
-                         the disc has no Pro.",
-                        &mut state.machine.iso_path,
-                        "choose the Windows ISO",
-                        true,
-                    ) {
-                        actions.push(Action::PickPath(PickTarget::WizardIso));
-                    }
-                    if ui::path_row(
-                        ui,
-                        "DRIVERS",
-                        "The virtio-win drivers: Windows cannot see this machine's disk \
-                         or network without them, and they are installed during setup. \
-                         Leave empty and Entangled downloads the release it was tested \
-                         with from fedorapeople.org, checked against a digest built into \
-                         it. Choose an ISO only to use another version.",
-                        &mut state.machine.drivers_path,
-                        "downloaded and verified automatically",
-                        true,
-                    ) {
-                        actions.push(Action::PickPath(PickTarget::WizardDrivers));
-                    }
-                    ui::form_row(
-                        ui,
-                        "3D",
-                        "Experimental: Vulkan, OpenGL, Direct3D 9-11 and WebGL on this \
-                         computer's GPU, through Entangled's own Windows driver. The \
-                         driver is test-signed (Microsoft's signature needs an EV \
-                         certificate), so Windows runs in test mode with a watermark, \
-                         and games whose anti-cheat refuses test mode will not start. \
-                         The test certificate's private key was destroyed after \
-                         signing. Leave it off for 2D.",
-                        |ui, _| {
-                            ui.checkbox(
-                                &mut state.machine.gpu3d_download,
-                                "GPU acceleration (test mode)",
-                            );
-                        },
-                    );
-                    if ui::path_row(
-                        ui,
-                        "3D PACKAGE",
-                        "A folder holding a 3D package you built yourself \
-                         (guest/windows-gpu: entangled-gpu.inf, vulkan_virtio.dll, the \
-                         Vulkan runtime installer). Leave empty to use the one \
-                         Entangled downloads when 3D is on.",
-                        &mut state.machine.gpu3d_path,
-                        if state.machine.gpu3d_download {
-                            "downloaded and verified automatically"
-                        } else {
-                            "no 3D"
-                        },
-                        true,
-                    ) {
-                        actions.push(Action::PickPath(PickTarget::WizardGpu3d));
-                    }
-                    ui::form_row(
-                        ui,
-                        "SHARED FOLDERS",
-                        "Installs WinFsp (downloaded and verified like the drivers), so \
-                         a folder shared from this computer appears in Windows as a \
-                         drive of its own. Untick it to keep the guest without it.",
-                        |ui, _| {
-                            ui.checkbox(
-                                &mut state.machine.shared_folders,
-                                "Show shared folders as drives",
-                            );
-                        },
-                    );
-                    ui.label(ui::dim(
-                        "Installs on its own and powers off when it is done. No product key is entered.",
-                    ));
-                }
-            }
-            ui.add_space(16.0);
-            backend_row(ui, &mut state.machine.backend, wsl_engine);
-            if state.machine.backend == Backend::Wsl {
-                wsl_setup_note(
-                    ui,
-                    wsl_engine,
-                    wsl_install_running,
-                    ui::FORM_LABEL_W,
-                    actions,
-                );
-            }
-        }
-        1 => {
-            wizard_heading(
-                ui,
-                "Name it and size it",
-                "You can change all of this later from the machine's page.",
-            );
-            ui.add_space(18.0);
-            ui::form_row(
-                ui,
-                "NAME",
-                "Names the machine, its disk file and the guest's own hostname, so \
-                 pick something you will recognise later.",
-                |ui, field_w| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.machine.name)
-                            .desired_width(field_w)
-                            .hint_text("my-machine"),
-                    );
-                },
-            );
-            ui.add_space(18.0);
-            ui.label(RichText::new("Power").size(13.5).color(theme::TEXT));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let gap = ui.spacing().item_spacing.x;
-                let card_width = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
-                for preset in POWER_PRESETS {
-                    let selected = state.machine.vcpus == preset.vcpus
-                        && state.machine.memory_mib == preset.memory_mib;
-                    if option_card(
-                        ui,
-                        card_width,
-                        preset.name,
-                        &format!(
-                            "{} cores · {} GiB · {}",
-                            preset.vcpus,
-                            preset.memory_mib / 1024,
-                            preset.hint
-                        ),
-                        selected,
-                        true,
-                        theme::ACCENT,
-                    )
-                    .clicked()
-                    {
-                        state.machine.vcpus = preset.vcpus;
-                        state.machine.memory_mib = preset.memory_mib;
-                    }
-                }
-            });
-            if !POWER_PRESETS
-                .iter()
-                .any(|p| p.vcpus == state.machine.vcpus && p.memory_mib == state.machine.memory_mib)
-            {
-                ui.add_space(6.0);
-                ui.label(ui::faint(format!(
-                    "Custom: {} cores · {} — set under More options",
-                    state.machine.vcpus,
-                    format_bytes(state.machine.memory_mib * 1024 * 1024)
-                )));
-            }
-            if state.machine.disk_mode == launcher::DiskMode::CreateNew {
-                ui.add_space(18.0);
-                ui.label(RichText::new("Disk").size(13.5).color(theme::TEXT));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    for gib in DISK_CHOICES_GIB {
-                        if choice_chip(ui, &format!("{gib} GiB"), state.machine.disk_gib == gib)
-                            .clicked()
-                        {
-                            state.machine.disk_gib = gib;
-                        }
-                    }
-                });
-                ui.add_space(6.0);
-                ui.label(ui::faint(
-                    "Takes only what the guest writes — a fresh install uses a \
-                     fraction of it.",
-                ));
-            }
-
-            ui.add_space(18.0);
-            let toggle = if state.more {
-                "Fewer options"
-            } else {
-                "More options — every setting by hand"
-            };
-            if ui::text_button(ui, toggle, theme::ACCENT).clicked() {
-                state.more = !state.more;
-            }
-            if state.more {
-                ui.add_space(8.0);
-                more_options(ui, state, settings, scan, native_arm, actions);
-            }
-        }
-        _ => {
-            wizard_heading(
-                ui,
-                "Ready to build",
-                "Review the plan. Nothing starts until you confirm.",
-            );
-            ui.add_space(14.0);
-            egui::Frame::new()
-                .fill(theme::CARD)
-                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE_STRONG))
-                .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
-                .inner_margin(egui::Margin::same(16))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    summary_row(ui, "Machine", &state.machine.name);
-                    summary_row(
-                        ui,
-                        "Installer",
-                        &format!(
-                            "{} · {}",
-                            state.machine.family.label(),
-                            if state.machine.automated
-                                && state.machine.family != launcher::GuestFamily::OtherLinux
-                            {
-                                "automatic"
-                            } else {
-                                "interactive"
-                            }
-                        ),
-                    );
-                    summary_row(
-                        ui,
-                        "Hardware",
-                        &format!(
-                            "{} cores · {} memory",
-                            state.machine.vcpus,
-                            format_bytes(state.machine.memory_mib * 1024 * 1024)
-                        ),
-                    );
-                    let disk = state.machine.disk_path(&settings.vm_dir);
-                    summary_row(
-                        ui,
-                        "Storage",
-                        &format!(
-                            "{} · {}",
-                            disk.display(),
-                            if state.machine.disk_mode == launcher::DiskMode::CreateNew {
-                                format!("new {} GiB sparse disk", state.machine.disk_gib)
-                            } else {
-                                "existing disk, preserved".to_string()
-                            }
-                        ),
-                    );
-                    if state.machine.family != launcher::GuestFamily::Debian {
-                        summary_row(
-                            ui,
-                            if native_arm { "Ubuntu" } else { "ISO" },
-                            if native_arm {
-                                "Verified ARM64 cloud image; GNOME with hardware 3D"
-                            } else if state.machine.iso_path.trim().is_empty() {
-                                if state.machine.family == launcher::GuestFamily::Fedora {
-                                    "Newest verified cached Fedora netinst ISO"
-                                } else {
-                                    "Newest verified cached Ubuntu ISO"
-                                }
-                            } else {
-                                state.machine.iso_path.trim()
-                            },
-                        );
-                    }
-                    if Backend::Wsl.available_on_host() {
-                        summary_row(ui, "Runs on", state.machine.backend.label());
-                    }
-                });
-            let runner = launcher::Runner::new(
-                state.machine.backend,
-                std::path::PathBuf::from(&cli_label),
-                settings,
-            );
-            let preview = launcher::install_spec(
-                &runner,
-                &settings.vm_dir,
-                settings.child_cwd(),
-                &state.machine,
-            );
-            // A machine whose files the chosen backend cannot see
-            // is refused here, on the review step, with the fix —
-            // not after the button is pressed.
-            if let Err(message) = &preview {
-                ui.add_space(10.0);
-                ui.label(RichText::new(message).color(theme::ERR).size(12.5));
-            }
-            // …and neither is a backend whose engine is not there.
-            // The same refusal `ManagerApp::backend_block` gives the
-            // Start button, shown before the last click rather than
-            // after it, with the install offer attached.
-            if state.machine.backend == Backend::Wsl && wsl_engine.refusal().is_some() {
-                ui.add_space(6.0);
-                wsl_setup_note(ui, wsl_engine, wsl_install_running, 0.0, actions);
-            }
-        }
+    if state.step == 0 {
+        installer_step(ui, state, actions);
+    } else {
+        setup_step(
+            ui,
+            state,
+            settings,
+            scan,
+            wsl_engine,
+            wsl_install_running,
+            native_arm,
+            cli_label,
+            actions,
+        );
     }
-
     if let Some(error) = &state.error {
         ui.add_space(10.0);
         ui.label(RichText::new(error).color(theme::ERR).size(12.5));
+    }
+}
+
+/// Step 0: the person gives the ISO and the image says what it is. Getting
+/// the installer some other way — Debian, which downloads itself — is the
+/// smaller choice under it.
+fn installer_step(
+    ui: &mut egui::Ui,
+    state: &mut crate::app::WizardState,
+    actions: &mut Vec<Action>,
+) {
+    wizard_heading(
+        ui,
+        "Choose an installer",
+        "Give Entangled the ISO of the system you want. It recognises what is on it \
+         and sets everything up for you.",
+    );
+    ui.add_space(18.0);
+    match &state.installer {
+        Some(installer) if installer.from_iso => {
+            installer_card(ui, installer, Some(&state.machine.iso_path), actions);
+        }
+        Some(installer) => installer_card(ui, installer, None, actions),
+        None => {
+            if drop_zone(ui).clicked() {
+                actions.push(Action::PickPath(PickTarget::WizardIso));
+            }
+        }
+    }
+    if let Some(note) = state.installer.as_ref().and_then(|i| i.note) {
+        ui.add_space(8.0);
+        ui.label(RichText::new(note).size(12.5).color(theme::TEXT_DIM));
+    }
+
+    ui.add_space(26.0);
+    ui.horizontal(|ui| {
+        let width = ui.available_width();
+        let label = "No ISO yet?";
+        let galley = ui.painter().layout_no_wrap(
+            label.to_string(),
+            egui::FontId::proportional(12.0),
+            theme::TEXT_FAINT,
+        );
+        let side = ((width - galley.size().x - 24.0) / 2.0).max(0.0);
+        let (left, _) = ui.allocate_exact_size(Vec2::new(side, 16.0), egui::Sense::hover());
+        ui.painter().hline(
+            left.x_range(),
+            left.center().y,
+            egui::Stroke::new(1.0_f32, theme::DIVIDER),
+        );
+        ui.label(RichText::new(label).size(12.0).color(theme::TEXT_FAINT));
+        let (right, _) = ui.allocate_exact_size(Vec2::new(side, 16.0), egui::Sense::hover());
+        ui.painter().hline(
+            right.x_range(),
+            right.center().y,
+            egui::Stroke::new(1.0_f32, theme::DIVIDER),
+        );
+    });
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Install").size(13.0).color(theme::TEXT_DIM));
+        let debian = state
+            .installer
+            .as_ref()
+            .is_some_and(|i| i.family == launcher::GuestFamily::Debian);
+        if choice_chip(ui, "Debian", debian)
+            .on_hover_text(
+                "Debian's verified network installer: nothing to download first, the \
+                 system comes over the internet while it installs.",
+            )
+            .clicked()
+        {
+            actions.push(Action::WizardInstaller(
+                launcher::Installer::debian_download(),
+            ));
+        }
+        ui.label(
+            RichText::new("from the internet — Entangled downloads and checks it.")
+                .size(13.0)
+                .color(theme::TEXT_DIM),
+        );
+    });
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(
+            RichText::new("Windows can't be downloaded for you —")
+                .size(12.0)
+                .color(theme::TEXT_FAINT),
+        );
+        ui.hyperlink_to(
+            RichText::new("get the ISO from Microsoft")
+                .size(12.0)
+                .color(theme::ACCENT),
+            "https://www.microsoft.com/software-download/windows11",
+        );
+        ui.label(
+            RichText::new("(it is free).")
+                .size(12.0)
+                .color(theme::TEXT_FAINT),
+        );
+    });
+}
+
+/// The big target an ISO is dropped on or chosen through.
+fn drop_zone(ui: &mut egui::Ui) -> egui::Response {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 180.0), egui::Sense::click());
+    let hover = theme::animate_bool(
+        ui.ctx(),
+        response.id.with("hover"),
+        response.hovered(),
+        0.12,
+    );
+    let painter = ui.painter();
+    let radius = egui::CornerRadius::same(theme::CARD_RADIUS);
+    painter.rect_filled(rect, radius, theme::INSET);
+    painter.rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(
+            1.5_f32,
+            theme::mix(theme::STROKE_STRONG, theme::ACCENT_DEEP, hover),
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let disc = egui::pos2(rect.center().x, rect.top() + 48.0);
+    painter.circle_stroke(disc, 17.0, egui::Stroke::new(1.5_f32, theme::ACCENT));
+    painter.circle_stroke(disc, 4.5, egui::Stroke::new(1.5_f32, theme::ACCENT));
+    let line = |y: f32, text: &str, size: f32, color: egui::Color32| {
+        painter.text(
+            egui::pos2(rect.center().x, rect.top() + y),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::proportional(size),
+            color,
+        );
+    };
+    line(92.0, "Drop an ISO file here", 16.0, theme::TEXT);
+    line(
+        118.0,
+        "or click to choose one from this computer",
+        13.0,
+        theme::ACCENT,
+    );
+    line(
+        146.0,
+        "Ubuntu, Fedora, Windows 10 / 11, or any x86-64 Linux installer",
+        12.0,
+        theme::TEXT_FAINT,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// The colour and letter that stand for a system, on the cards and the setup
+/// header. Painted, never a logo: no other project's mark is ours to draw.
+fn family_mark(family: launcher::GuestFamily) -> (egui::Color32, &'static str) {
+    use launcher::GuestFamily;
+    match family {
+        GuestFamily::Ubuntu => (theme::WARN, "U"),
+        GuestFamily::Debian => (theme::ERR, "D"),
+        GuestFamily::Fedora => (theme::ACCENT, "F"),
+        GuestFamily::Windows => (theme::OK, "W"),
+        GuestFamily::OtherLinux => (theme::IDLE, "?"),
+    }
+}
+
+fn paint_family_mark(ui: &mut egui::Ui, family: launcher::GuestFamily, size: f32) {
+    let (tint, letter) = family_mark(family);
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(10), tint);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        letter,
+        egui::FontId::proportional(size * 0.42),
+        theme::BG_DEEP,
+    );
+}
+
+/// A small rounded label: "Installs automatically", "Experimental".
+fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    let font = egui::FontId::proportional(11.0);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
+    let (rect, _) =
+        ui.allocate_exact_size(galley.size() + Vec2::new(14.0, 6.0), egui::Sense::hover());
+    ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::same(255),
+        color.gamma_multiply(0.16),
+    );
+    ui.painter().galley(
+        rect.center() - galley.size() * 0.5,
+        galley,
+        egui::Color32::TRANSPARENT,
+    );
+}
+
+/// What step 0 settled, with a way to change it.
+fn installer_card(
+    ui: &mut egui::Ui,
+    installer: &launcher::Installer,
+    iso: Option<&str>,
+    actions: &mut Vec<Action>,
+) {
+    egui::Frame::new()
+        .fill(theme::SELECTED)
+        .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT))
+        .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
+        .inner_margin(egui::Margin::same(16))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                paint_family_mark(ui, installer.family, 44.0);
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(&installer.title)
+                                .size(15.0)
+                                .color(theme::TEXT)
+                                .strong(),
+                        );
+                        if installer.automatic() {
+                            badge(ui, "Installs automatically", theme::ACCENT);
+                        } else {
+                            badge(ui, "Manual install", theme::WARN);
+                        }
+                    });
+                    let detail = match iso {
+                        Some(path) => std::path::Path::new(path)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.to_string()),
+                        None => "Downloaded and verified by Entangled while it installs".into(),
+                    };
+                    ui.label(RichText::new(detail).size(12.0).color(theme::TEXT_FAINT));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let change = if iso.is_some() {
+                        "Change"
+                    } else {
+                        "Use an ISO instead"
+                    };
+                    if ui::text_button(ui, change, theme::ACCENT).clicked() {
+                        actions.push(Action::PickPath(PickTarget::WizardIso));
+                    }
+                });
+            });
+        });
+}
+
+/// An on/off switch, the size of the line beside it.
+fn switch(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(44.0, 24.0), egui::Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let value = *on;
+    response
+        .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, value, label));
+    let t = theme::animate_bool(ui.ctx(), response.id.with("switch"), value, 0.12);
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(12),
+        theme::mix(theme::STROKE_STRONG, theme::ACCENT_DEEP, t),
+    );
+    let x = egui::lerp(rect.left() + 12.0..=rect.right() - 12.0, t);
+    painter.circle_filled(egui::pos2(x, rect.center().y), 9.0, theme::TEXT);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// The 3D switch in its card: a title, a line of what it does, and — once it
+/// is on — what it costs, said plainly.
+fn gpu_switch_card(
+    ui: &mut egui::Ui,
+    on: &mut bool,
+    experimental: bool,
+    detail: &str,
+    when_on: Option<&str>,
+) {
+    egui::Frame::new()
+        .fill(theme::CARD)
+        .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+        .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
+        .inner_margin(egui::Margin::same(16))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("3D graphics")
+                                .size(14.0)
+                                .color(theme::TEXT)
+                                .strong(),
+                        );
+                        if experimental {
+                            badge(ui, "Experimental", theme::WARN);
+                        }
+                    });
+                    ui.label(RichText::new(detail).size(12.5).color(theme::TEXT_DIM));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    switch(ui, on, "3D graphics");
+                });
+            });
+            if let (true, Some(text)) = (*on, when_on) {
+                ui.add_space(10.0);
+                theme::rule(ui.painter(), ui.max_rect().x_range(), ui.cursor().top());
+                ui.add_space(10.0);
+                ui.label(RichText::new(text).size(12.5).color(theme::TEXT_DIM));
+            }
+        });
+}
+
+/// The footer's one line about the machine about to be made.
+fn machine_summary(state: &crate::app::WizardState) -> String {
+    let machine = &state.machine;
+    let mut text = format!(
+        "{} · {} cores · {}",
+        state
+            .installer
+            .as_ref()
+            .map_or(machine.family.label(), |i| i.family.label()),
+        machine.vcpus,
+        format_bytes(machine.memory_mib * 1024 * 1024)
+    );
+    if machine.disk_mode == launcher::DiskMode::CreateNew {
+        text.push_str(&format!(" · {} GiB disk", machine.disk_gib));
+    }
+    if gpu_chosen(machine) {
+        text.push_str(" · 3D");
+    }
+    text
+}
+
+/// Whether the machine will be made with 3D: the Windows package, or the
+/// Ubuntu GPU desktop (which needs the automatic install).
+fn gpu_chosen(machine: &launcher::NewMachine) -> bool {
+    match machine.family {
+        launcher::GuestFamily::Windows => machine.gpu3d_download || !machine.gpu3d_path.is_empty(),
+        launcher::GuestFamily::Ubuntu => machine.venus && machine.automated,
+        _ => false,
+    }
+}
+
+/// Step 1: what the machine is called, how big it is, 3D, and everything
+/// else under "Advanced options".
+#[allow(clippy::too_many_arguments)]
+fn setup_step(
+    ui: &mut egui::Ui,
+    state: &mut crate::app::WizardState,
+    settings: &crate::settings::Settings,
+    scan: &crate::discovery::Scan,
+    wsl_engine: &wslengine::Status,
+    wsl_install_running: bool,
+    native_arm: bool,
+    cli_label: &str,
+    actions: &mut Vec<Action>,
+) {
+    let family = state.machine.family;
+    let (title, subtitle) = match &state.installer {
+        Some(installer) => {
+            let how = if installer.automatic() {
+                "installs automatically"
+            } else {
+                "you install it in the machine's window"
+            };
+            let from = if installer.from_iso {
+                std::path::Path::new(state.machine.iso_path.trim())
+                    .file_name()
+                    .map(|n| format!("From {}", n.to_string_lossy()))
+                    .unwrap_or_default()
+            } else {
+                "Downloaded and verified by Entangled".to_string()
+            };
+            (installer.title.clone(), format!("{from} · {how}"))
+        }
+        None => (family.label().to_string(), String::new()),
+    };
+    ui.horizontal(|ui| {
+        paint_family_mark(ui, family, 44.0);
+        ui.add_space(6.0);
+        ui.vertical(|ui| {
+            ui.set_max_width(ui.available_width() - 240.0);
+            ui.add(
+                egui::Label::new(RichText::new(title).size(17.0).color(theme::TEXT).strong())
+                    .truncate(),
+            );
+            ui.add(
+                egui::Label::new(RichText::new(subtitle).size(12.5).color(theme::TEXT_DIM))
+                    .truncate(),
+            );
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Name").size(12.0).color(theme::TEXT_DIM));
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut state.machine.name)
+                        .desired_width(220.0)
+                        .min_size(Vec2::new(220.0, 30.0))
+                        .vertical_align(Align::Center)
+                        .hint_text("my-machine"),
+                );
+                if response.changed() {
+                    state.name_suggested = false;
+                }
+                response.on_hover_text(
+                    "Names the machine, its disk file and the guest's own hostname.",
+                );
+            });
+        });
+    });
+
+    ui.add_space(22.0);
+    ui.label(
+        RichText::new("How powerful?")
+            .size(14.0)
+            .color(theme::TEXT)
+            .strong(),
+    );
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        let gap = ui.spacing().item_spacing.x;
+        let card_width = ((ui.available_width() - 2.0 * gap) / 3.0).floor();
+        for preset in POWER_PRESETS {
+            let selected = state.machine.vcpus == preset.vcpus
+                && state.machine.memory_mib == preset.memory_mib;
+            if option_card(
+                ui,
+                card_width,
+                preset.name,
+                &format!(
+                    "{} cores · {} GiB · {}",
+                    preset.vcpus,
+                    preset.memory_mib / 1024,
+                    preset.hint
+                ),
+                selected,
+                true,
+                theme::ACCENT,
+            )
+            .clicked()
+            {
+                state.machine.vcpus = preset.vcpus;
+                state.machine.memory_mib = preset.memory_mib;
+            }
+        }
+    });
+    if !POWER_PRESETS
+        .iter()
+        .any(|p| p.vcpus == state.machine.vcpus && p.memory_mib == state.machine.memory_mib)
+    {
+        ui.add_space(6.0);
+        ui.label(ui::faint(format!(
+            "Custom: {} cores · {} — set under Advanced options",
+            state.machine.vcpus,
+            format_bytes(state.machine.memory_mib * 1024 * 1024)
+        )));
+    }
+    if state.machine.disk_mode == launcher::DiskMode::CreateNew {
+        ui.add_space(20.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Disk size")
+                    .size(14.0)
+                    .color(theme::TEXT)
+                    .strong(),
+            );
+            ui.add_space(12.0);
+            // Windows refuses less than 64 GiB to be comfortable in
+            // (`install windows`' own default), so it is not offered less.
+            let floor = if family == launcher::GuestFamily::Windows {
+                64
+            } else {
+                0
+            };
+            for gib in DISK_CHOICES_GIB.into_iter().filter(|&g| g >= floor) {
+                if choice_chip(ui, &format!("{gib} GiB"), state.machine.disk_gib == gib).clicked() {
+                    state.machine.disk_gib = gib;
+                }
+            }
+            ui.add_space(8.0);
+            ui.label(ui::faint("Only grows as files are saved."));
+        });
+    }
+
+    ui.add_space(20.0);
+    let ubuntu_desktop = family == launcher::GuestFamily::Ubuntu
+        && state.installer.as_ref().is_some_and(|i| i.desktop)
+        && state.machine.automated
+        && !native_arm;
+    if family == launcher::GuestFamily::Windows {
+        gpu_switch_card(
+            ui,
+            &mut state.machine.gpu3d_download,
+            true,
+            "Games, Vulkan, Direct3D and WebGL on this computer's graphics card. You can \
+             also add it later from the machine's page.",
+            Some(
+                "Entangled downloads its graphics driver during setup and checks it for \
+                 you. Windows then shows a small \"Test Mode\" label in the corner, and \
+                 games with anti-cheat may refuse to start.",
+            ),
+        );
+    } else if ubuntu_desktop {
+        gpu_switch_card(
+            ui,
+            &mut state.machine.venus,
+            false,
+            "A smoother desktop and apps, drawn by this computer's graphics card. Nothing \
+             extra to download. You can also add it later.",
+            Some(
+                "Needs an up-to-date graphics driver on this computer; Health checks it. \
+                 The machine gets at least 4 GiB of memory.",
+            ),
+        );
+    } else if !native_arm {
+        ui.label(ui::faint(
+            "3D graphics can be added after the install, from the machine's page.",
+        ));
+    }
+
+    ui.add_space(14.0);
+    let toggle = if state.more {
+        "Hide advanced options"
+    } else {
+        "Advanced options — exact cores and memory, disk file, installer, where it runs"
+    };
+    if ui::text_button(ui, toggle, theme::ACCENT).clicked() {
+        state.more = !state.more;
+    }
+    if state.more {
+        ui.add_space(10.0);
+        advanced_options(
+            ui,
+            state,
+            settings,
+            scan,
+            wsl_engine,
+            wsl_install_running,
+            native_arm,
+            actions,
+        );
+    }
+
+    // A machine whose files the chosen backend cannot see is refused here,
+    // before the button is pressed, with the fix.
+    let runner = launcher::Runner::new(
+        state.machine.backend,
+        std::path::PathBuf::from(&cli_label),
+        settings,
+    );
+    if let Err(message) = launcher::install_spec(
+        &runner,
+        &settings.vm_dir,
+        settings.child_cwd(),
+        &state.machine,
+    ) {
+        ui.add_space(10.0);
+        ui.label(RichText::new(message).color(theme::ERR).size(12.5));
+    }
+    // …and neither is a backend whose engine is not there: the same refusal
+    // `ManagerApp::backend_block` gives the Start button, with the install
+    // offer attached.
+    if state.machine.backend == Backend::Wsl && wsl_engine.refusal().is_some() && !state.more {
+        ui.add_space(6.0);
+        wsl_setup_note(ui, wsl_engine, wsl_install_running, 0.0, actions);
     }
 }
 
