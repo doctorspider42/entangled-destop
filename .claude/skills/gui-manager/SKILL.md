@@ -583,11 +583,10 @@ Health, Activity, Settings — with one line of host numbers, the version and th
   tiles. A tile opens the editor on its own section through
   `Action::AskEditVmAt(name, section)`; tiles are disabled (with the reason on
   hover) unless the machine is Stopped or Suspended.
-- **The editor is a drawer** (`dialogs::edit_vm_drawer`): a `Modal` whose area
-  is anchored `RIGHT_TOP`, full window height, section tabs (`ui::page_tab`)
-  along the top, a fixed footer with Save. Processor & memory opens with the
-  Light / Balanced / Performance presets (`POWER_PRESETS`, shared with the
-  wizard) above the sliders.
+- **The editor is a drawer** (`ui/machine_settings.rs`, `edit_vm_drawer`): a
+  `Modal` anchored `RIGHT_TOP`, full window height, 880 px wide, the sections
+  in a side list (`rows::nav_item`) and a fixed footer with Save. See
+  "Machine settings" below for how its sections are built.
 - **The wizard** is two steps — Installer (an ISO, recognised; or Debian from
   the internet) and Name & size: the presets, disk-size chips, the 3D switch
   and an "Advanced options" toggle (`WizardState::more`) that reveals every
@@ -599,6 +598,57 @@ Health, Activity, Settings — with one line of host numbers, the version and th
 - A machine page whose name has gone (deleted, renamed, moved) says so with a
   way back rather than falling over; a pending install has its own page until
   its profile exists.
+
+## Machine settings (2026-11-03)
+
+The editor drawer was rebuilt because it read like a config file: upper-case
+labels, a `?` on every row, a screen size as two bare numbers. The rule now is
+**the common choice is one click; the rare one is still there, never the main
+course.** Its building blocks are in `ui/rows.rs`, and new editor settings use
+them rather than `form_row`:
+
+- `rows::section_title` + `rows::group`: titled groups of rows, hairlines
+  between them. `Group::row(title, detail, tooltip, control)` is a title, **one
+  short visible line** of what it is for, the long explanation on hover of the
+  text, and the control right-aligned. This is the editor's exception to
+  "explanation is a tooltip": one plain sentence is visible, the mechanism is
+  still the tooltip. `sub_row` indents a dependent row ("Size" under
+  "Resolution"), `choice` is a radio row with the reason as its detail when
+  disabled, `body` holds free content, `action` is a "+ Add …" foot.
+- `rows::segmented` (two to four choices), `rows::switch` (on/off instead of a
+  checkbox), `rows::stepper`, `rows::status` ("● Ready"), `rows::callout`, and
+  `rows::disclosure` — the collapsible **Advanced** with a summary of what is
+  inside. Its open state is egui memory, not the form.
+- Row text wraps against the control's width *from the previous frame*
+  (`row_at` keeps it in egui memory and asks for a repaint when it changes),
+  because the text has to be laid out before the control.
+- `option_card` (from `dialogs.rs`) is the big pick-one card: the power
+  presets plus **Custom** (which reveals the sliders), the network (Internet /
+  On my network / Offline), the start mode (UEFI / Direct Linux).
+
+What each section does:
+
+- **Display**: Resolution is *Follow window | Fixed size*; fixed shows a named
+  size (`SCREEN_SIZES`) with **Custom…** last, which reveals W × H. Refresh is
+  *Match monitor · N Hz*, 60/75/120/144, or **Custom…**. "Picked Custom" is a
+  flag in egui memory keyed by the machine name, because values that happen to
+  match a preset cannot say it. 3D is a radio list. Boost is a switch. Video
+  memory is *Automatic* or *A limit I set* (a GB slider).
+- **Processor & memory**: preset cards; usage bars against this computer's
+  cores and RAM (`EditForm::host_cpus` / `host_memory_mib`, filled when the
+  editor opens, presentation only; `--mock` is 8 threads). Engine and device
+  wiring are under Advanced.
+- **Network & devices**: network cards, port forwards, Sound and Gamepads
+  switches, a players stepper, and the **device slots** bar. The bar uses
+  `VmConfig::virtio_devices()` and `control_api::max_devices(transport)` — the
+  numbers validation itself uses — so it cannot disagree with the refusal. MAC
+  and audio output are under Advanced.
+- **Storage**: disks and shared folders as rows with a read-only switch and a
+  remove button. A path the picker returns into `add_disk` / `add_share` is
+  attached straight away. There is no "Attach it" step.
+- **Startup**: Firmware and NVRAM show a *state* ("Ready", "Saved", "New",
+  "Not kept" with a fix button), not a path. The path fields are under
+  Advanced. Direct Linux keeps its path rows inside a group.
 
 ## Dependency notes
 
@@ -696,13 +746,15 @@ did not start, with an explanation on hover. The engine retains diagnostic
 pause/resume commands and its internal quiesce barrier for snapshot correctness;
 removing a product option must not remove that mechanism.
 
-**Port forwards** (2026-10-12) live under Network & devices for a usernet
-machine: one text field per `[network] forward` rule, a Remove button each,
-"+ Add a forward", and under every rule either what it means ("127.0.0.1:2222
-on this computer reaches port 22 in the guest", from
-`control_api::PortForwardRule::parse`) or why it does not parse. A TAP machine
-writes no forwards (control-api refuses them there). egui's bundled font has
-no `✕` or `→`: write words.
+**Port forwards** (2026-10-12, redrawn 2026-11-03) live under Network &
+devices for a usernet machine. Each rule that parses
+(`control_api::PortForwardRule::parse`) is a sentence — TCP/UDP chip, "port
+2222 on this computer to port 22 in the guest", a remove button. One that
+does not parse stays a text field with the reason under it. *Add port
+forward* opens a small form (`ForwardDraft`: protocol, two ports, "open to my
+network") that writes the profile syntax itself. A TAP machine writes no
+forwards (control-api refuses them there). egui's bundled font has no `✕` or
+`→`: write words, or use an `Icon`.
 
 **Shut down** (2026-10-12) is the first button for a running machine:
 `Task::shutdown` writes `shutdown` (`control_api::control::CMD_SHUTDOWN`), the

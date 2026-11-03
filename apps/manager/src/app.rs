@@ -2734,6 +2734,15 @@ impl ManagerApp {
                 } else {
                     control_api::refresh::host_default_refresh_hz().0
                 };
+                // A mock session is an 8-thread host, like the wizard's.
+                form.host_cpus = if self.mock_mode {
+                    8
+                } else {
+                    std::thread::available_parallelism()
+                        .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
+                        .unwrap_or(0)
+                };
+                form.host_memory_mib = self.stats.host.mem_total.map(|bytes| bytes >> 20);
                 self.modal = Modal::EditVm(EditVmState {
                     form,
                     section: EditVmSection::Hardware,

@@ -25,22 +25,6 @@ pub enum NetworkChoice {
     Usernet,
 }
 
-impl NetworkChoice {
-    pub const ALL: [NetworkChoice; 3] = [
-        NetworkChoice::None,
-        NetworkChoice::Tap,
-        NetworkChoice::Usernet,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            NetworkChoice::None => "none",
-            NetworkChoice::Tap => "tap",
-            NetworkChoice::Usernet => "usernet",
-        }
-    }
-}
-
 /// Everything the editor can change, plus the profile it came from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EditForm {
@@ -85,6 +69,11 @@ pub struct EditForm {
     /// `entangled install` uses. Filled in by the app when the editor opens;
     /// presentation only, never written.
     pub monitor_refresh_hz: u32,
+    /// This computer's logical processors and memory, so the editor can say
+    /// what share of it the machine takes. Filled in by the app when the
+    /// editor opens; presentation only, never written.
+    pub host_cpus: u32,
+    pub host_memory_mib: Option<u64>,
     /// `[display] gpu_boost`, as the checkbox shows it: on unless the profile
     /// says `false`. Only offered with the GPU desktop, the one renderer the
     /// boost has anything to raise the clocks for.
@@ -276,6 +265,8 @@ enabled = true
             gaming_mouse: cfg.display.relative_mouse == Some(true),
             typing_layout: cfg.display.typing_layout.clone().unwrap_or_default(),
             monitor_refresh_hz: control_api::DEFAULT_REFRESH_HZ,
+            host_cpus: 0,
+            host_memory_mib: None,
             gpu_boost: cfg.display.gpu_boost != Some(false),
             gpu_memory_limit: cfg.display.gpu_memory_mib.is_some(),
             gpu_memory_mib: cfg

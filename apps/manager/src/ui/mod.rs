@@ -8,6 +8,8 @@ pub mod disks;
 pub mod lifecycle;
 pub mod logpane;
 pub mod machine;
+mod machine_settings;
+pub mod rows;
 pub mod sidebar;
 pub mod snapshots;
 pub mod toasts;
@@ -244,6 +246,10 @@ pub fn card<R>(
 //    whether or not the row has one, so the text boxes form a straight edge and
 //    the Browse buttons line up under each other. Alignment is a property of
 //    the helper; a call site cannot drift out of it by adding a space.
+//
+// The machine editor is the exception: it is a list of choices, not a form to
+// type into, and is built from `rows` instead (one short visible line per
+// setting, the explanation still on hover).
 
 /// Width of the label column shared by every stacked form row.
 pub const FORM_LABEL_W: f32 = 112.0;
