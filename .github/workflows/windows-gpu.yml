@@ -148,7 +148,7 @@ jobs:
           # The release tarball holds the DLLs alone; the licence is the tag's.
           Invoke-WebRequest -Uri "https://raw.githubusercontent.com/doitsujin/dxvk/v$env:DXVK_VERSION/LICENSE" -OutFile "$pkg\LICENSE-dxvk.txt"
           Copy-Item C:\mesa\docs\license.rst "$pkg\LICENSE-mesa.txt"
-          Get-Pinned "https://sdk.lunarg.com/sdk/download/$env:VULKANRT_VERSION/windows/VulkanRT-$env:VULKANRT_VERSION-Installer.exe" $env:VULKANRT_SHA256 "$pkg\VulkanRT-Installer.exe"
+          Get-Pinned "https://sdk.lunarg.com/sdk/download/$env:VULKANRT_VERSION/windows/VulkanRT-X64-$env:VULKANRT_VERSION-Installer.exe" $env:VULKANRT_SHA256 "$pkg\VulkanRT-Installer.exe"
           Get-ChildItem $pkg | Format-Table Name, Length
 
       - name: Publish the release and print the pin
