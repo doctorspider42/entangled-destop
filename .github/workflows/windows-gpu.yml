@@ -64,11 +64,24 @@ jobs:
           # One kit root laid out like an installed kit, which is what the
           # build scripts expect.
           New-Item -ItemType Directory -Force C:\kit | Out-Null
+          # The runner's own Windows SDK first: the NuGet SDK lacks some
+          # user-mode import libraries (uuid.lib). The WDK goes on top.
+          $sdk = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          foreach ($part in 'Include', 'Lib') {
+            if (Test-Path "$sdk\$part\10.0.26100.0") {
+              robocopy "$sdk\$part\10.0.26100.0" "C:\kit\$part\10.0.26100.0" /E /NFL /NDL /NJH /NJS /NP | Out-Null
+            }
+          }
           foreach ($d in Get-ChildItem C:\nuget -Directory) {
             $c = Join-Path $d.FullName 'c'
             if (Test-Path $c) { robocopy $c C:\kit /E /NFL /NDL /NJH /NJS /NP | Out-Null }
           }
           Get-ChildItem C:\kit\Include, C:\kit\Lib, C:\kit\bin -Directory | Select-Object FullName
+          foreach ($f in 'Lib\10.0.26100.0\um\x64\uuid.lib', 'Lib\10.0.26100.0\km\x64\ntoskrnl.lib',
+                         'bin\10.0.26100.0\x64\stampinf.exe', 'bin\10.0.26100.0\x86\Inf2Cat.exe',
+                         'bin\10.0.26100.0\x64\signtool.exe') {
+            if (-not (Test-Path "C:\kit\$f")) { Write-Output "::warning::the kit has no $f" }
+          }
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           $msvc = (Get-ChildItem "$vs\VC\Tools\MSVC" -Directory | Sort-Object Name | Select-Object -Last 1).FullName
           "VCVARS=$vs\VC\Auxiliary\Build\vcvarsall.bat" >> $env:GITHUB_ENV

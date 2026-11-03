@@ -54,6 +54,9 @@ mod seed;
 mod snapshot;
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), test))]
 mod ubuntu_arm64_image;
+/// Fetchable everywhere (`entangled fetch virtio-win`); only `install windows`,
+/// which macOS does not build, uses all of it.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod windows_media;
 // The renderer is a Linux `.so` that only the Linux engine can `dlopen`, so the
 // module that finds and fetches it is Linux-only too. `fetch virglrenderer` on
