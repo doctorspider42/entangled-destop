@@ -840,6 +840,7 @@ mod tests {
             product_key: None,
             gpu3d: None,
             winfsp: None,
+            no_shared_folders: false,
         }
     }
 

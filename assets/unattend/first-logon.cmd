@@ -13,18 +13,11 @@ rem and a headless conhost were both tried, and neither stayed up at logon.
 setlocal
 set "disc=%~1"
 set "dir=%ProgramFiles%\Entangled"
-if not exist "%disc%\$WinPEDriver$\viogpudo\viogpuap.exe" exit /b 1
+rem Not our disc: nothing to do. A virtio-win without viogpuap only costs the
+rem resolution following; the agent, 3D and shared folders still install.
+if not exist "%disc%\entangled\first-logon.cmd" exit /b 1
 mkdir "%dir%" 2>nul
-copy /y "%disc%\$WinPEDriver$\viogpudo\viogpuap.exe" "%dir%\" >nul
-> "%dir%\resolution.cmd" (
-  echo @echo off
-  echo :again
-  echo "%dir%\viogpuap.exe"
-  echo ping -n 11 127.0.0.1 ^>nul
-  echo goto again
-)
-> "%dir%\resolution.vbs" echo CreateObject("WScript.Shell").Run """%dir%\resolution.cmd""", 0, False
-reg add "HKLM\Software\Microsoft\Windows\CurrentVersion\Run" /v "Entangled display resolution" /t REG_SZ /d "\"%SystemRoot%\System32\wscript.exe\" \"%dir%\resolution.vbs\"" /f >nul
+if exist "%disc%\$WinPEDriver$\viogpudo\viogpuap.exe" call :resolution
 rem The guest agent (the shared clipboard), when the installer had one to
 rem put on this disc. It has no window and reconnects by itself. vioserial's
 rem ports admit administrators only, so it starts at this user's logon with
@@ -51,6 +44,19 @@ rem Shared folders over virtio-fs, when the installer was given WinFsp: WinFsp,
 rem then virtio-win's virtiofs service, which mounts the share as a drive.
 if exist "%disc%\entangled\winfsp.msi" call :virtiofs
 endlocal
+exit /b 0
+
+:resolution
+copy /y "%disc%\$WinPEDriver$\viogpudo\viogpuap.exe" "%dir%\" >nul
+> "%dir%\resolution.cmd" (
+  echo @echo off
+  echo :again
+  echo "%dir%\viogpuap.exe"
+  echo ping -n 11 127.0.0.1 ^>nul
+  echo goto again
+)
+> "%dir%\resolution.vbs" echo CreateObject("WScript.Shell").Run """%dir%\resolution.cmd""", 0, False
+reg add "HKLM\Software\Microsoft\Windows\CurrentVersion\Run" /v "Entangled display resolution" /t REG_SZ /d "\"%SystemRoot%\System32\wscript.exe\" \"%dir%\resolution.vbs\"" /f >nul
 exit /b 0
 
 :virtiofs

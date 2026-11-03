@@ -185,15 +185,37 @@ fn absolute(path: &Path) -> Result<PathBuf, String> {
     std::path::absolute(path).map_err(|e| e.to_string())
 }
 
+/// One of the downloads a Windows guest needs, from the verified cache or
+/// its publisher, said aloud because the first one is ~840 MiB.
+fn media(media: crate::windows_media::Media) -> Result<PathBuf, String> {
+    if let Ok(path) = crate::windows_media::cached_path(media) {
+        if !path.is_file() {
+            eprintln!(
+                "downloading {} (verified against the pinned digest)...",
+                media.label()
+            );
+        }
+    }
+    crate::windows_media::fetch(media, crate::artifact::FetchOptions::default())
+        .map_err(|e| format!("cannot get {}: {e}", media.label()))
+}
+
 fn prepare(args: &InstallArgs) -> Result<Plan, String> {
     let iso = absolute(args.iso.as_deref().ok_or(
         "install windows requires --iso with a Windows 10 or 11 x64 installation ISO \
          (Microsoft's own, untouched)",
     )?)?;
-    let drivers = absolute(args.drivers.as_deref().ok_or(
-        "install windows requires --drivers with the virtio-win ISO \
-         (https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/)",
-    )?)?;
+    // The drivers and WinFsp come from their publishers, verified against
+    // the digests compiled in (`guest/windows/pinned.toml`), unless given.
+    let drivers = match args.drivers.as_deref() {
+        Some(path) => absolute(path)?,
+        None => media(crate::windows_media::Media::VirtioWin)?,
+    };
+    let winfsp = match (args.winfsp.as_deref(), args.no_shared_folders) {
+        (Some(path), _) => Some(absolute(path)?),
+        (None, true) => None,
+        (None, false) => Some(media(crate::windows_media::Media::WinFsp)?),
+    };
     for (what, path) in [("Windows ISO", &iso), ("virtio-win ISO", &drivers)] {
         if !path.is_file() {
             return Err(format!("the {what} {} was not found", path.display()));
@@ -258,7 +280,7 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
             .as_deref(),
         Extras {
             gpu3d: args.gpu3d.as_deref(),
-            winfsp: args.winfsp.as_deref(),
+            winfsp: winfsp.as_deref(),
         },
     )?;
     let firmware = crate::firmware::resolve(args.firmware.as_deref()).map_err(|e| e.to_string())?;

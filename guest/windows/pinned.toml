@@ -1,0 +1,45 @@
+# What `entangled install windows` downloads for a Windows guest (ADR-0008,
+# ADR-0009), so that installing one needs nothing but Microsoft's own ISO.
+#
+# This file is COMPILED INTO the `entangled` binary
+# (apps/entangled/src/windows_media.rs, `include_str!`) and is the trust anchor
+# for those downloads, exactly as guest/firmware/pinned.toml is for the
+# firmware: bytes that do not hash to the `sha256` below are deleted, not used.
+# No signature is checked — as strong as this repository's history.
+#
+# All of it is GUEST-side content: none of it is linked into a host binary,
+# so the copyleft gate (`cargo deny`) does not apply. It is downloaded from its
+# own publisher, never redistributed by us.
+#
+# HOW TO UPDATE
+#   Point `tag`/`name` at the new upstream release, download it once, write its
+#   size and SHA-256 here (`sha256sum`), and install a Windows guest with it.
+
+# The virtio-win drivers (Red Hat / Fedora): without them Windows Setup sees
+# neither this machine's disk nor its network. Mostly BSD-3-Clause; the ISO
+# also carries GPL-2.0 pieces (the QEMU guest agent) that only ever run in the
+# guest. From the archive, whose per-version directories never change.
+[virtio_win]
+version = "0.1.302"
+base_url = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio"
+tag = "virtio-win-0.1.302-1"
+source = "https://github.com/virtio-win/kvm-guest-drivers-windows"
+
+[[virtio_win.assets]]
+name = "virtio-win-0.1.302.iso"
+sha256 = "303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d"
+bytes = 877373440
+
+# WinFsp, which virtio-win's virtiofs service needs to show a shared folder
+# as a drive (`[[share]] virtiofs = true`). GPL-3.0 with a FLOSS exception;
+# guest-side only.
+[winfsp]
+version = "2.1.25156"
+base_url = "https://github.com/winfsp/winfsp/releases/download"
+tag = "v2.1"
+source = "https://github.com/winfsp/winfsp"
+
+[[winfsp.assets]]
+name = "winfsp-2.1.25156.msi"
+sha256 = "073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a"
+bytes = 2191360

@@ -66,10 +66,12 @@ pub struct PinnedAsset {
     pub bytes: u64,
 }
 
-/// Nothing we publish is remotely this big; a server that streams forever is a
+/// Nothing pinned is remotely this big; a server that streams forever is a
 /// bug or an attack, and either way it must not fill the disk. The kernel is
-/// ~13 MiB and the firmware is exactly 4 MiB.
-const MAX_ASSET_LEN: u64 = 256 * 1024 * 1024;
+/// ~13 MiB, the firmware exactly 4 MiB, and the largest pin, virtio-win's
+/// driver ISO (ADR-0008), ~840 MiB. A download stops at the asset's own
+/// pinned size, below this.
+const MAX_ASSET_LEN: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The GitHub API answer is a release object with an `assets` array; a megabyte
 /// is generous for it.
@@ -339,7 +341,9 @@ fn download_verified(
     let mut hasher = DigestAlgo::Sha256.hasher();
     let mut file = std::fs::File::create(&partial)
         .map_err(|e| format!("cannot create {}: {e}", partial.display()))?;
-    let mut reader = download.body.take(MAX_ASSET_LEN + 1);
+    // The pinned size is exact: one byte more is already the wrong file.
+    let limit = asset.bytes.min(MAX_ASSET_LEN);
+    let mut reader = download.body.take(limit + 1);
     let mut buf = vec![0u8; 64 * 1024];
     let mut written: u64 = 0;
     loop {
@@ -352,10 +356,13 @@ fn download_verified(
             }
         };
         written += read as u64;
-        if written > MAX_ASSET_LEN {
+        if written > limit {
             let _ = std::fs::remove_file(&partial);
             return Err(format!(
-                "{url} is larger than the {MAX_ASSET_LEN} byte limit for a guest artifact"
+                "{url} does not match the digest pinned in {}: expected sha256 {expected} \
+                 over {limit} bytes, and it is larger. The file has been deleted; nothing \
+                 unverified is kept",
+                release.pin_path
             ));
         }
         hasher.update(&buf[..read]);

@@ -58,6 +58,24 @@ pub fn run(args: &FetchArgs) -> Result<(), String> {
     {
         return run_bootstrap(args);
     }
+    if let Some(media) = crate::windows_media::Media::from_target(&args.distro) {
+        let path = crate::windows_media::fetch(
+            media,
+            crate::artifact::FetchOptions {
+                refresh: args.refresh,
+                offline: args.offline,
+            },
+        )?;
+        let pin = crate::windows_media::pin(media)?;
+        println!("{} {} [verified]", media.target(), pin.version);
+        println!(
+            "  sha256    : {} (pinned in this binary; no signature)",
+            pin.assets[0].sha256
+        );
+        println!("  source    : {}", pin.source);
+        println!("  file      : {}", path.display());
+        return Ok(());
+    }
     if args.distro.eq_ignore_ascii_case(VIRGL_TARGET) || args.distro.eq_ignore_ascii_case("virgl") {
         return run_virglrenderer(args);
     }

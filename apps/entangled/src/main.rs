@@ -54,6 +54,7 @@ mod seed;
 mod snapshot;
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), test))]
 mod ubuntu_arm64_image;
+mod windows_media;
 // The renderer is a Linux `.so` that only the Linux engine can `dlopen`, so the
 // module that finds and fetches it is Linux-only too. `fetch virglrenderer` on
 // Windows says where the artifact belongs rather than downloading bytes that
@@ -424,10 +425,10 @@ pub struct InstallArgs {
     /// --autoinstall; `entangled doctor` says whether this host can serve it.
     #[arg(long)]
     pub venus: bool,
-    /// Windows only: the virtio-win driver ISO
-    /// (https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/).
-    /// The disk, network, input, balloon, serial and RNG drivers for the
-    /// installed version are copied off it onto the answer disc.
+    /// Windows only: the virtio-win driver ISO. The disk, network, input,
+    /// balloon, serial and RNG drivers for the installed version are copied
+    /// off it onto the answer disc. Absent, the pinned release is downloaded
+    /// from fedorapeople.org and verified (`entangled fetch virtio-win`).
     #[arg(long)]
     pub drivers: Option<PathBuf>,
     /// Windows only: the edition to install — its index in install.wim, its
@@ -454,8 +455,14 @@ pub struct InstallArgs {
     /// for shared folders over virtio-fs (`[[share]] virtiofs = true`). With
     /// it the guest installs WinFsp and virtio-win's virtiofs service at the
     /// first logon, and a share mounts as a drive.
+    /// Absent, the pinned release is downloaded and verified (`entangled
+    /// fetch winfsp`), unless `--no-shared-folders`.
     #[arg(long, value_name = "MSI")]
     pub winfsp: Option<PathBuf>,
+    /// Windows only: install no WinFsp, so a shared folder never shows as a
+    /// drive in this guest.
+    #[arg(long, conflicts_with = "winfsp")]
+    pub no_shared_folders: bool,
 }
 
 fn main() -> ExitCode {
