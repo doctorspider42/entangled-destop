@@ -225,6 +225,26 @@ it as a choice kept an upgraded manager stamping 2 vCPUs over the CLI's 8.
 identical everywhere. While the install runs the VM has no profile
 yet, so `PendingInstall` gives it a card with the Installing badge.
 
+### Windows in the wizard (ADR-0008, ADR-0009)
+
+A Windows machine needs **nothing but Microsoft's ISO** from the user. Keep
+it that way:
+
+- *Drivers* is optional. Empty means the engine downloads the virtio-win
+  release pinned in `guest/windows/pinned.toml` and verifies it; the row's
+  hint says so. Never make the spec refuse an empty driver path again.
+- *Shared folders* (on by default) installs WinFsp, also downloaded; off
+  passes `--no-shared-folders`. Only the "off" case adds a flag, so an
+  older engine is never handed one it does not know by default.
+- *3D* is a switch: on with an empty *3D package* passes `--gpu3d auto` (the
+  CI-built, per-run test-signed package); a folder overrides it. Its tooltip
+  must keep saying what test mode costs (watermark, anti-cheat).
+- A profile with `hyperv_enlightenments` is how the editor knows a Windows
+  guest (`EditForm::windows_guest`): its shares are written `virtiofs =
+  true` and the hint names drive `Z:`, never a `mount -t 9p` line.
+- `--screenshot-view wizard-windows` shows the defaults: drivers and 3D
+  downloaded.
+
 ## Form conventions — read before adding any field
 
 The GUI is the product; the CLI is the engine underneath it. Two rules follow,
