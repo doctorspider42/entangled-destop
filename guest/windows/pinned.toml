@@ -43,3 +43,89 @@ source = "https://github.com/winfsp/winfsp"
 name = "winfsp-2.1.25156.msi"
 sha256 = "073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a"
 bytes = 2191360
+
+# Our 3D package for Windows guests (ADR-0009), built, test-signed under a
+# per-run certificate whose private key was deleted, and published by
+# .github/workflows/windows-gpu.yml; paste the block its job summary prints.
+# Mesa (MIT), DXVK (zlib) and the LunarG Vulkan runtime ride along with
+# their licences. `install windows --gpu3d auto`.
+[gpu3d]
+version = "gpu3d-5"
+base_url = "https://github.com/doctorspider42/entangled-destop/releases/download"
+tag = "gpu3d-5"
+source = "https://github.com/doctorspider42/entangled-destop/tree/92438a184707c5db53b1bc7e0151a4a8d3287f78/guest/windows-gpu"
+
+[[gpu3d.assets]]
+name = "LICENSE-dxvk.txt"
+sha256 = "a5cb1a6ded7d2d7e92d550ba28edd21be2d1d4044662b399887351023e30ce64"
+bytes = 1074
+
+[[gpu3d.assets]]
+name = "LICENSE-mesa.txt"
+sha256 = "e272a136f6ce1b855afeef2fbe44f94f17d3b4d91cef29f8364af5800c5838a8"
+bytes = 1866
+
+[[gpu3d.assets]]
+name = "VulkanRT-Installer.exe"
+sha256 = "3f03bda2522d1d10d05461ce8a47364f9af6f5dc8642b7c45e43943dba164303"
+bytes = 25699768
+
+[[gpu3d.assets]]
+name = "d3d10core.dll"
+sha256 = "beffdd081dce91c2bccdc87845b88cbbb7848d39d4642143462d2556d69bd5d9"
+bytes = 122894
+
+[[gpu3d.assets]]
+name = "d3d11.dll"
+sha256 = "0a203b6255c893430f0a8461c618962df04e62aa41538d5a875b21868317cf9f"
+bytes = 7483406
+
+[[gpu3d.assets]]
+name = "d3d9.dll"
+sha256 = "c126316f7478eaff1ad8087702eda5930f2400187b9c8b3592219c34f6632780"
+bytes = 7286798
+
+[[gpu3d.assets]]
+name = "dxgi.dll"
+sha256 = "e3c1178eb7f0dd59f91bcfcc257549e5b9cfdb5e8508719293de7f8704f53160"
+bytes = 5414926
+
+[[gpu3d.assets]]
+name = "entangled-gpu.cat"
+sha256 = "0e09242512f4244e15be5d92e9b0ab6e93a2303588d39032a0d2dbe758647a4e"
+bytes = 2478
+
+[[gpu3d.assets]]
+name = "entangled-gpu.cer"
+sha256 = "3b1a54a5ff761440eb6efe74437da70bdd3e8874bb4c65671df2f987757d2e98"
+bytes = 782
+
+[[gpu3d.assets]]
+name = "entangled-gpu.inf"
+sha256 = "fc576aec93a4770202ae4cbc25285ffc0bdd440f61eb31513c25cda34486dcbe"
+bytes = 1846
+
+[[gpu3d.assets]]
+name = "entangled-gpu.sys"
+sha256 = "bf2f3dd7233108db9f5ba920a537b4bc063d111ad53f5039974fb9abf26514b5"
+bytes = 22408
+
+[[gpu3d.assets]]
+name = "gpu-test.exe"
+sha256 = "4271e22668b36505c6a02bd200b99d0c1dd040d9664987a4c4065f1e8eeb2a19"
+bytes = 139776
+
+[[gpu3d.assets]]
+name = "libgallium_wgl.dll"
+sha256 = "83e5936afbda8360baf741cff1e404b0580a83b9d820039c35ae1a6f9b5e9601"
+bytes = 18369536
+
+[[gpu3d.assets]]
+name = "opengl32.dll"
+sha256 = "2a01fc5cefceed81c2fa7e5163b8c648efa05a11c58a3801360f16cc41799547"
+bytes = 138240
+
+[[gpu3d.assets]]
+name = "vulkan_virtio.dll"
+sha256 = "83b8647a60d59975f0dac05920473685ae73782767969abab4d6dac4182ad8a9"
+bytes = 1549312

@@ -175,5 +175,14 @@ mod tests {
             .ends_with(".iso"));
         assert!(pin(Media::WinFsp).unwrap().assets[0].name.ends_with(".msi"));
         assert_eq!(Media::from_target("virgl"), None);
+        // The 3D package is many files, and holds what `--gpu3d` checks for.
+        let gpu3d = pin(Media::Gpu3d).expect("a 3D package is pinned");
+        for name in [
+            "entangled-gpu.inf",
+            "entangled-gpu.sys",
+            "vulkan_virtio.dll",
+        ] {
+            assert!(gpu3d.assets.iter().any(|a| a.name == name), "{name}");
+        }
     }
 }
