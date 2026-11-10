@@ -38,7 +38,7 @@
 //! which is what a guest that reads register C in its handler expects. `AIE`
 //! is accepted and never fires; nothing has asked for the alarm.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -175,7 +175,17 @@ pub struct RtcInterrupts {
     line: OnceLock<Arc<dyn IrqLine>>,
     /// How many times the line was raised, for tests and `doctor`.
     raised: AtomicU64,
+    /// Periodic events that came due and have not reached the guest yet: the
+    /// host thread woke late, or the guest had not acknowledged the one
+    /// before. Bounded by [`MAX_OWED`].
+    owed: AtomicU32,
 }
+
+/// The most periodic events kept owed: 16 ms of a 1024 Hz clock, 8 ms of the
+/// 2048 Hz one Windows runs. A stall longer than that (a paused VM, a host
+/// that stopped this process) is time the guest finds out about from its
+/// clock source, not from a burst of interrupts.
+pub const MAX_OWED: u32 = 16;
 
 impl std::fmt::Debug for RtcInterrupts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -213,7 +223,80 @@ impl RtcInterrupts {
 
     /// One periodic event.
     pub fn periodic_tick(&self) {
-        self.event(REG_C_PF, REG_B_PIE);
+        self.periodic_ticks(1);
+    }
+
+    /// `count` periodic events came due at once: the host thread slept
+    /// through all but the last. One is raised now, if the guest has
+    /// acknowledged the one before; the rest stay owed, and each register C
+    /// read raises the next ([`MAX_OWED`] at most).
+    ///
+    /// A guest that takes this interrupt as its clock counts on the *rate*:
+    /// Windows runs it at 2048 Hz, and a host thread cannot sleep for 488 µs.
+    /// Measured on a Windows host, it delivered 1050 a second, and the
+    /// guest's 15.6 ms timer tick took 30 (ADR-0008, the frame-clock
+    /// amendment). This is the 8254's policy too ([`crate::irqchip::pit`]).
+    pub fn periodic_ticks(&self, count: u32) {
+        if self.reg_b.load(Ordering::Acquire) & REG_B_PIE == 0 {
+            self.owed.store(0, Ordering::Release);
+            self.flags.fetch_or(REG_C_PF, Ordering::AcqRel);
+            return;
+        }
+        let mut owed = self.owed.load(Ordering::Acquire);
+        loop {
+            let more = owed.saturating_add(count).min(MAX_OWED);
+            match self
+                .owed
+                .compare_exchange_weak(owed, more, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(now) => owed = now,
+            }
+        }
+        self.raise_owed();
+    }
+
+    /// Raises one owed periodic event, unless an interrupt is still pending
+    /// (its acknowledgement will come back here). Called by the timer thread
+    /// and by the vCPU that read register C; the `IRQF` bit decides which of
+    /// two racing callers raises.
+    fn raise_owed(&self) {
+        if self.owed.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let before = self.flags.fetch_or(REG_C_PF | REG_C_IRQF, Ordering::AcqRel);
+        if before & REG_C_IRQF != 0 {
+            return;
+        }
+        // Only the caller that found `IRQF` clear gets here, so the count
+        // cannot go below zero under it; a rate change may have cleared it.
+        let mut owed = self.owed.load(Ordering::Acquire);
+        while owed > 0 {
+            match self.owed.compare_exchange_weak(
+                owed,
+                owed - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => owed = now,
+            }
+        }
+        self.raise();
+    }
+
+    fn raise(&self) {
+        if let Some(line) = self.line.get() {
+            self.raised.fetch_add(1, Ordering::AcqRel);
+            if let Err(error) = line.trigger() {
+                tracing::warn!(%error, "could not raise the RTC interrupt");
+            }
+        }
+    }
+
+    /// Periodic events due and not yet raised.
+    pub fn owed(&self) -> u32 {
+        self.owed.load(Ordering::Acquire)
     }
 
     /// The once-a-second update cycle finished.
@@ -232,23 +315,31 @@ impl RtcInterrupts {
         if before & REG_C_IRQF != 0 {
             return;
         }
-        if let Some(line) = self.line.get() {
-            self.raised.fetch_add(1, Ordering::AcqRel);
-            if let Err(error) = line.trigger() {
-                tracing::warn!(%error, "could not raise the RTC interrupt");
-            }
-        }
+        self.raise();
     }
 
-    /// Register C read: the flags, cleared.
+    /// Register C read: the flags, cleared. It is also the acknowledgement
+    /// the next owed periodic event was waiting for.
     fn take_flags(&self) -> u8 {
-        self.flags.swap(0, Ordering::AcqRel)
+        let flags = self.flags.swap(0, Ordering::AcqRel);
+        self.raise_owed();
+        flags
     }
 
-    /// Follows the register file after a write, a reset or a restore.
+    /// Power-on, or a restored machine: nothing pending and nothing owed.
+    fn clear(&self) {
+        self.owed.store(0, Ordering::Release);
+        self.flags.store(0, Ordering::Release);
+    }
+
+    /// Follows the register file after a write, a reset or a restore. What
+    /// was owed at the old rate is not owed at the new one.
     fn sync(&self, reg_a: u8, reg_b: u8) {
-        self.reg_a.store(reg_a, Ordering::Release);
-        self.reg_b.store(reg_b, Ordering::Release);
+        let changed = self.reg_a.swap(reg_a, Ordering::AcqRel) != reg_a;
+        let was = self.reg_b.swap(reg_b, Ordering::AcqRel);
+        if changed || (was ^ reg_b) & REG_B_PIE != 0 {
+            self.owed.store(0, Ordering::Release);
+        }
     }
 }
 
@@ -287,7 +378,7 @@ impl Rtc {
         cmos[REG_B as usize] = DEFAULT_REG_B;
         cmos[REG_D as usize] = REG_D_VRT;
         interrupts.sync(cmos[REG_A as usize], cmos[REG_B as usize]);
-        interrupts.take_flags();
+        interrupts.clear();
         Self {
             index: 0,
             cmos,
@@ -407,7 +498,7 @@ impl Rtc {
         // an interrupt gets the next one.
         self.interrupts
             .sync(self.cmos[REG_A as usize], self.cmos[REG_B as usize]);
-        self.interrupts.take_flags();
+        self.interrupts.clear();
         Ok(())
     }
 
@@ -477,13 +568,86 @@ const IDLE_POLL: Duration = Duration::from_millis(10);
 /// Shortest sleep, so a guest asking for 8 kHz cannot make the thread spin.
 const MIN_SLEEP: Duration = Duration::from_micros(100);
 
+/// How often the timer thread reports what its periodic interrupt did.
+const TICK_REPORT: Duration = Duration::from_secs(5);
+
+/// What the periodic interrupt did over one report: a Windows guest's clock
+/// *is* this interrupt, so a tick that is late or never taken is time its
+/// scheduler, its timers and its compositor's frame clock did not get
+/// (`RUST_LOG=machine_x86::rtc=debug`).
+struct TickStats {
+    since: Instant,
+    period: Duration,
+    wakes: u64,
+    due: u64,
+    owed_max: u32,
+    late_sum: Duration,
+    late_max: Duration,
+}
+
+impl TickStats {
+    fn new(now: Instant) -> Self {
+        Self {
+            since: now,
+            period: Duration::ZERO,
+            wakes: 0,
+            due: 0,
+            owed_max: 0,
+            late_sum: Duration::ZERO,
+            late_max: Duration::ZERO,
+        }
+    }
+
+    /// One wake-up of the thread: how many periodic events came due in it,
+    /// how late it was for the first, and how many the guest is still owed.
+    fn tick(&mut self, period: Duration, count: u32, late: Duration, owed: u32, now: Instant) {
+        if period != self.period {
+            tracing::debug!(
+                hz = 1_000_000_000 / period.as_nanos().max(1),
+                "the guest set the RTC's periodic rate"
+            );
+            self.report(now);
+            self.period = period;
+        }
+        self.wakes += 1;
+        self.due += u64::from(count);
+        self.owed_max = self.owed_max.max(owed);
+        self.late_sum += late;
+        self.late_max = self.late_max.max(late);
+        if now.saturating_duration_since(self.since) >= TICK_REPORT {
+            self.report(now);
+        }
+    }
+
+    fn report(&mut self, now: Instant) {
+        if self.wakes > 0 {
+            let secs = now.saturating_duration_since(self.since).as_secs_f64();
+            tracing::debug!(
+                hz = 1_000_000_000 / self.period.as_nanos().max(1),
+                due_per_s = format_args!("{:.1}", self.due as f64 / secs.max(1e-9)),
+                wakes_per_s = format_args!("{:.1}", self.wakes as f64 / secs.max(1e-9)),
+                owed_max = self.owed_max,
+                late_mean_us = (self.late_sum.as_micros() / u128::from(self.wakes)) as u64,
+                late_max_us = self.late_max.as_micros() as u64,
+                "RTC periodic interrupt"
+            );
+        }
+        *self = Self {
+            period: self.period,
+            ..Self::new(now)
+        };
+    }
+}
+
 /// The host thread that makes the RTC's events happen: the periodic
 /// interrupt at the rate register A selects, and the update-ended event once
 /// a second. Joined on drop, so it cannot outlive the line it raises.
 ///
-/// Late wake-ups coalesce rather than burst: an interrupt the guest has not
-/// acknowledged yet (`IRQF` still set) is not raised twice, and a timer that
-/// fell behind restarts from now. That is a real RTC's behaviour too.
+/// The thread sleeps, and a sleep is a millisecond long at best while the
+/// guest may ask for 2048 or 8192 events a second: every period that ended
+/// during a sleep is handed over at once ([`RtcInterrupts::periodic_ticks`]),
+/// and the guest's acknowledgements pull the owed ones in. An interrupt the
+/// guest has not acknowledged yet (`IRQF` still set) is never raised twice.
 pub struct RtcTimer {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -499,6 +663,7 @@ impl RtcTimer {
                 crate::irqchip::raise_timer_thread_priority();
                 let mut second = now();
                 let mut due: Option<Instant> = None;
+                let mut stats = TickStats::new(Instant::now());
                 while !flag.load(Ordering::Acquire) {
                     let current = now();
                     if current != second {
@@ -513,8 +678,15 @@ impl RtcTimer {
                     let at = Instant::now();
                     let next = *due.get_or_insert(at + period);
                     if at >= next {
-                        interrupts.periodic_tick();
-                        let after = next + period;
+                        // Every period that ended while this thread slept,
+                        // not only the last: the guest counts on the rate.
+                        let late = at - next;
+                        let missed = (late.as_nanos() / period.as_nanos().max(1))
+                            .min(u128::from(MAX_OWED)) as u32;
+                        let count = missed + 1;
+                        interrupts.periodic_ticks(count);
+                        stats.tick(period, count, late, interrupts.owed(), at);
+                        let after = next + period * count;
                         due = Some(if after < at { at + period } else { after });
                         continue;
                     }
@@ -738,12 +910,94 @@ mod tests {
             Some(Duration::from_nanos(1_000_000_000 / 2048))
         );
         rtc.interrupts().periodic_tick();
-        rtc.interrupts().periodic_tick();
-        assert_eq!(line.0.load(Ordering::Acquire), 1, "IRQF still pending");
+        assert_eq!(line.0.load(Ordering::Acquire), 1);
         assert_eq!(read_reg(&mut rtc, REG_C), REG_C_IRQF | REG_C_PF);
         assert_eq!(read_reg(&mut rtc, REG_C), 0, "reading clears it");
         rtc.interrupts().periodic_tick();
         assert_eq!(line.0.load(Ordering::Acquire), 2);
+    }
+
+    /// The guest counts on the rate: an event that comes due while the one
+    /// before is unacknowledged is owed, not lost, and the acknowledgement
+    /// (the register C read) is what raises it.
+    #[test]
+    fn an_unacknowledged_interrupt_leaves_the_next_one_owed() {
+        let mut rtc = rtc();
+        let line = Arc::new(Line::default());
+        rtc.interrupts().connect(line.clone());
+        write_reg(&mut rtc, REG_A, 0x25);
+        write_reg(&mut rtc, REG_B, REG_B_24H | REG_B_PIE);
+        rtc.interrupts().periodic_tick();
+        rtc.interrupts().periodic_tick();
+        assert_eq!(line.0.load(Ordering::Acquire), 1, "IRQF still pending");
+        assert_eq!(rtc.interrupts().owed(), 1);
+        assert_eq!(read_reg(&mut rtc, REG_C), REG_C_IRQF | REG_C_PF);
+        assert_eq!(line.0.load(Ordering::Acquire), 2, "the read raised it");
+        assert_eq!(rtc.interrupts().owed(), 0);
+        assert_eq!(read_reg(&mut rtc, REG_C), REG_C_IRQF | REG_C_PF);
+        assert_eq!(read_reg(&mut rtc, REG_C), 0, "nothing more is owed");
+        assert_eq!(line.0.load(Ordering::Acquire), 2);
+    }
+
+    /// A host thread that slept through several periods hands them all over,
+    /// and the guest's acknowledgements pull them in one by one.
+    #[test]
+    fn a_late_wake_up_delivers_every_period_it_slept_through() {
+        let mut rtc = rtc();
+        let line = Arc::new(Line::default());
+        rtc.interrupts().connect(line.clone());
+        write_reg(&mut rtc, REG_A, 0x25);
+        write_reg(&mut rtc, REG_B, REG_B_24H | REG_B_PIE);
+        rtc.interrupts().periodic_ticks(3);
+        assert_eq!(line.0.load(Ordering::Acquire), 1);
+        let mut taken = 0;
+        while read_reg(&mut rtc, REG_C) & REG_C_PF != 0 {
+            taken += 1;
+            assert!(taken <= 3, "more interrupts than periods");
+        }
+        assert_eq!(taken, 3);
+        assert_eq!(line.0.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn what_is_owed_is_bounded_and_dropped_with_the_rate() {
+        let mut rtc = rtc();
+        let line = Arc::new(Line::default());
+        rtc.interrupts().connect(line.clone());
+        write_reg(&mut rtc, REG_A, 0x25);
+        write_reg(&mut rtc, REG_B, REG_B_24H | REG_B_PIE);
+        // A stalled guest: a second's worth of periods, none acknowledged.
+        rtc.interrupts().periodic_ticks(2048);
+        rtc.interrupts().periodic_ticks(2048);
+        assert_eq!(rtc.interrupts().owed(), MAX_OWED);
+        assert_eq!(line.0.load(Ordering::Acquire), 1);
+        // A new rate owes nothing from the old one.
+        write_reg(&mut rtc, REG_A, 0x26);
+        assert_eq!(rtc.interrupts().owed(), 0);
+        rtc.interrupts().periodic_ticks(4);
+        // Turning the interrupt off drops the rest, and the read that follows
+        // raises nothing.
+        write_reg(&mut rtc, REG_B, REG_B_24H);
+        assert_eq!(rtc.interrupts().owed(), 0);
+        let raised = line.0.load(Ordering::Acquire);
+        read_reg(&mut rtc, REG_C);
+        rtc.interrupts().periodic_ticks(4);
+        assert_eq!(line.0.load(Ordering::Acquire), raised);
+        assert_eq!(rtc.interrupts().owed(), 0);
+    }
+
+    #[test]
+    fn a_reset_owes_nothing() {
+        let mut rtc = rtc();
+        let line = Arc::new(Line::default());
+        rtc.interrupts().connect(line.clone());
+        write_reg(&mut rtc, REG_A, 0x25);
+        write_reg(&mut rtc, REG_B, REG_B_24H | REG_B_PIE);
+        rtc.interrupts().periodic_ticks(5);
+        rtc.reset();
+        assert_eq!(rtc.interrupts().owed(), 0);
+        assert_eq!(read_reg(&mut rtc, REG_C), 0);
+        assert_eq!(line.0.load(Ordering::Acquire), 1);
     }
 
     #[test]

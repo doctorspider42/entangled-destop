@@ -328,6 +328,7 @@ impl DisplayHost {
             fullscreen: false,
             mode: ScaleMode::default(),
             reporter: StatsReporter::default(),
+            fps: crate::fps::FpsBadge::new(crate::fps::shown_by_env()),
             fatal: None,
             guest_refresh_hz,
             seen_frames: 0,
@@ -443,6 +444,8 @@ struct App {
     /// Fit or 1:1 (WIN-1503/1504).
     mode: ScaleMode,
     reporter: StatsReporter,
+    /// The frame-rate badge (`Ctrl+Alt+F`, [`crate::fps`]).
+    fps: crate::fps::FpsBadge,
     fatal: Option<DisplayError>,
     /// The guest's advertised refresh, for the one sentence at window
     /// creation.
@@ -703,6 +706,7 @@ impl App {
                 .window
                 .as_ref()
                 .map_or(1.0, |window| window.scale_factor());
+            renderer.set_fps(self.fps.overlay(win_w, scale));
             renderer.set_loading(self.loading.overlay((win_w, win_h), scale, Instant::now()));
         }
         if let Some(renderer) = self.renderer.as_mut() {
@@ -766,6 +770,13 @@ impl App {
             WindowAction::ToggleFullscreen => self.toggle_fullscreen(),
             WindowAction::ToggleScaleMode => self.toggle_scale_mode(),
             WindowAction::TypeClipboard => self.type_clipboard(),
+            WindowAction::ToggleFps => {
+                self.fps.toggle();
+                tracing::info!(shown = self.fps.shown(), "frame-rate badge toggled");
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
         }
     }
 
@@ -1334,6 +1345,23 @@ impl ApplicationHandler<HostEvent> for App {
             if !matches!(event_loop.control_flow(), ControlFlow::WaitUntil(at) if at > now && at < next)
             {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+            }
+        }
+        // The frame-rate badge counts by the clock, not by the frames: an
+        // idle guest sends none to carry the number down to zero.
+        if !self.occluded {
+            let now = Instant::now();
+            if self.fps.sample(self.waker.frames(), now) {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            if let Some(next) = self.fps.next_sample(now) {
+                let next = next.max(now + Duration::from_millis(1));
+                if !matches!(event_loop.control_flow(), ControlFlow::WaitUntil(at) if at > now && at < next)
+                {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                }
             }
         }
         // A finished/occluded operation or an expired notice must not leave

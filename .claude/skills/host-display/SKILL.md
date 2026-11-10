@@ -293,6 +293,7 @@ window on the desktop.
 | `Ctrl+Alt+Q` | `ControlEvent::QuitRequested` — the supervisor decides |
 | `Ctrl+Alt+O` | 1:1 pixel mode toggle (`ScaleMode`) |
 | `Ctrl+Alt+V` | type the host clipboard into the guest (`virtio_input::typing`); modifiers handed back first |
+| `Ctrl+Alt+F` | show or hide the frame-rate badge (`display::fps`): the guest's flushes over the last second, top-right corner; `ENTANGLED_SHOW_FPS=1` starts with it on |
 | `F11` | borderless fullscreen toggle; reserved even without modifiers |
 | `Ctrl+Alt+<anything else>` | forwarded to the guest verbatim (`Ctrl+Alt+F2` must reach Weston) |
 | focus loss | grab released, every guest-held key released |
@@ -321,8 +322,20 @@ Rules to keep when extending this:
 - `entangled` screenshot support (MVP-707): copy the scanout texture to a
   buffer and encode PNG — this is also how graphical acceptance tests
   compare against golden images (see vm-testing skill).
-- FPS/copy statistics behind a debug overlay or periodic `tracing` event
-  (MVP-708, P1).
+- FPS/copy statistics: the periodic `display statistics` event (MVP-708),
+  and for a person at the window the frame-rate badge (`Ctrl+Alt+F`,
+  `fps.rs`). The badge counts `Waker::frames` by the clock in
+  `about_to_wait`, not per draw, so an idle guest reads 0 instead of the
+  last busy second; it is a third `CursorOverlay` drawn under the bar.
+- **A Windows desktop that sits at 32 or ~40 fps is not the window.**
+  `viogpudo` gives DWM no vsync, so DWM composes on the guest's 15.6 ms
+  timer tick: every tick or every second one. Until 2026-11-10 the host
+  delivered half the guest's RTC clock interrupts and the tick itself took
+  30 ms (ADR-0008, the frame-clock amendment; `RUST_LOG=machine_x86::rtc=debug`
+  shows the delivered rate). To see the cadence, histogram the timestamps of
+  `virtio-gpu flush` (`RUST_LOG=virtio_gpu::device=trace`) under a steady
+  guest workload such as a scrolling console: peaks at multiples of 15.6 ms
+  are the guest's frame clock, not a cost on the host.
 - **Frame pacing is measured by the GPU device, not by this crate**
   (`virtio_gpu::pacing`, GAME-2105): the window presents asynchronously —
   `update_scanout` is a `memcpy` plus a wake, and the guest never waits for it
