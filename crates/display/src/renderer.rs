@@ -172,6 +172,8 @@ pub(crate) struct Renderer {
     /// The window's quick-actions bar (`crate::toolbar`), drawn over the
     /// whole surface after the frame; armed only while it is visible.
     toolbar: CursorOverlay,
+    /// The frame-rate badge (`crate::fps`), in window space like the bar.
+    fps: CursorOverlay,
     loading: CursorOverlay,
     loading_scrim: CursorOverlay,
     texture: wgpu::Texture,
@@ -297,6 +299,7 @@ impl Renderer {
         let image = ImagePipeline::new(&device, format, wgpu::FilterMode::Linear);
         let cursor = CursorOverlay::new(&device, format);
         let toolbar = CursorOverlay::new(&device, format);
+        let fps = CursorOverlay::new(&device, format);
         let loading = CursorOverlay::new(&device, format);
         let loading_scrim = CursorOverlay::new(&device, format);
 
@@ -316,6 +319,7 @@ impl Renderer {
             image,
             cursor,
             toolbar,
+            fps,
             loading,
             loading_scrim,
             texture,
@@ -724,6 +728,17 @@ impl Renderer {
         );
     }
 
+    /// The frame-rate badge's picture, or nothing.
+    pub(crate) fn set_fps(&mut self, overlay: Option<&crate::toolbar::Overlay>) {
+        place_overlay(
+            &self.device,
+            &self.queue,
+            &mut self.fps,
+            overlay,
+            (self.config.width, self.config.height),
+        );
+    }
+
     pub(crate) fn set_loading(&mut self, overlay: Option<&crate::toolbar::Overlay>) {
         place_overlay(
             &self.device,
@@ -847,6 +862,7 @@ impl Renderer {
                 pass.set_scissor_rect(0, 0, max_w, max_h);
                 self.loading_scrim.draw(&mut pass);
                 self.loading.draw(&mut pass);
+                self.fps.draw(&mut pass);
                 self.toolbar.draw(&mut pass);
             }
         }

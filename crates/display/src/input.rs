@@ -28,6 +28,7 @@
 //! | `F11` | toggle borderless fullscreen ([`WindowAction::ToggleFullscreen`]) |
 //! | `Ctrl+Alt+O` | toggle 1:1 pixel mode ([`WindowAction::ToggleScaleMode`]) |
 //! | `Ctrl+Alt+V` | type the host clipboard into the guest ([`WindowAction::TypeClipboard`]) |
+//! | `Ctrl+Alt+F` | show or hide the frame-rate badge ([`WindowAction::ToggleFps`]) |
 //!
 //! Every *other* `Ctrl+Alt+<key>` combination is forwarded verbatim, so the
 //! guest still gets `Ctrl+Alt+F2` (VT switch) and friends. The bare-modifier
@@ -142,6 +143,8 @@ pub enum WindowAction {
     ToggleScaleMode,
     /// `Ctrl+Alt+V`: type the host clipboard's text (`virtio_input::typing`).
     TypeClipboard,
+    /// `Ctrl+Alt+F`: show or hide the frame-rate badge ([`crate::fps`]).
+    ToggleFps,
 }
 
 /// What happened to one key press/release or button event.
@@ -854,6 +857,7 @@ impl InputCapture {
                 Some(WindowAction::Quit)
             }
             KeyCode::KeyO => Some(WindowAction::ToggleScaleMode),
+            KeyCode::KeyF => Some(WindowAction::ToggleFps),
             // The modifiers go back first: typed text under a held Ctrl+Alt
             // would be a string of shortcuts.
             KeyCode::KeyV => {
@@ -1411,7 +1415,7 @@ mod tests {
     fn a_reserved_third_key_also_keeps_the_grab() {
         // Regression (found under WSLg): `Ctrl+Alt+O` toggled the scale mode and
         // then the modifier release dropped the grab as a side effect.
-        for third in [KeyCode::KeyO, KeyCode::F11] {
+        for third in [KeyCode::KeyO, KeyCode::KeyF, KeyCode::F11] {
             let mut c = grabbed_capture();
             hold_ctrl_alt(&mut c);
             assert!(matches!(press(&mut c, third), KeyOutcome::Reserved(_)));

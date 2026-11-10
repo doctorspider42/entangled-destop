@@ -82,6 +82,7 @@
 
 pub mod boost;
 mod error;
+pub mod fps;
 #[cfg(windows)]
 mod gpu_scanout;
 mod handle;

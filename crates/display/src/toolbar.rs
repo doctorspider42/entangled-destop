@@ -994,6 +994,41 @@ fn render(
     }
 }
 
+/// A small panel with `text` in it, hung in the top-right corner of a window
+/// `window_w` physical pixels wide: the frame-rate badge ([`crate::fps`]).
+/// Drawn with the bar's font and colours so the two read as one interface.
+pub(crate) fn render_badge(text: &str, window_w: u32, scale: f64, serial: u64) -> Overlay {
+    let s = scale.clamp(0.5, 8.0);
+    let k = font_scale(s);
+    let pad = (6.0 * s).round();
+    let margin = (8.0 * s).round();
+    let (text_w, text_h) = text_size(text, k);
+    let width = (text_w + 2.0 * pad).ceil();
+    let height = (text_h + 2.0 * pad).ceil();
+    let mut canvas = Canvas::new(width as usize, height as usize);
+    let panel = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: width,
+        h: height,
+    };
+    let radius = 6.0 * s;
+    canvas.fill(panel, PANEL, |x, y| sd_round_rect(x, y, panel, radius));
+    canvas.fill(panel, STROKE, |x, y| {
+        sd_round_rect(x, y, panel, radius).abs() - 0.5 * s.max(1.0)
+    });
+    draw_text(&mut canvas, text, pad, pad, k, CYAN);
+    let x = (f64::from(window_w) - width - margin).max(0.0);
+    Overlay {
+        serial,
+        x: x as u32,
+        y: margin as u32,
+        width: width as u32,
+        height: height as u32,
+        pixels: canvas.into_bgra(),
+    }
+}
+
 fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
     [
         a[0] + (b[0] - a[0]) * t,

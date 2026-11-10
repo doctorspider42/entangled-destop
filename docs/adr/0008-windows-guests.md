@@ -756,3 +756,76 @@ storm guard then ends the VM). Never seen without the console. The WHP exit
 now logs its reason and the code bytes at RIP for the next occurrence, and
 `install windows` no longer mistakes a storm-stopped VM for a finished
 install (`Lifecycle::stormed_out`).
+
+### Amendment, 2026-11-10: the desktop's frame clock, and the RTC ticks the host lost
+
+The Windows desktop looked like "about 15 fps". The window was not the
+cause: `display statistics` showed it drawing every frame it was given
+(`fps` = `guest_fps`, `unshown_per_s` 0), and the device's pacing report
+showed the guest asking for nothing for ~30 ms of every frame (`quiet_ms`),
+with the transfer and the flush taking 1–2 ms.
+
+Measured with a steady workload (a console scrolling at full speed) and the
+host's timestamp of every `RESOURCE_FLUSH`
+(`RUST_LOG=virtio_gpu::device=trace`), the intervals between the desktop's
+frames are not spread at all. They sit on multiples of **15.625 ms**,
+Windows' default timer tick:
+
+| host | 15.6 ms frames | 31.25 ms frames | mean |
+|---|---|---|---|
+| as shipped (the RTC thread sleeping per tick) | none | all | 31.0 ms, **32 fps** |
+| every tick delivered (below) | ~42 % | ~55 % | 24.9 ms, **40 fps** |
+| the same, a guest process holding `timeBeginPeriod(1)` | ~60 % | ~35 % | 21.7–22.4 ms, 45 fps |
+
+Why: `viogpudo` is a display-only driver that reports no vsync and no
+refresh rate (`VSyncFreq` is `D3DKMDT_FREQUENCY_NOTSPECIFIED`, and it never
+raises `DXGK_INTERRUPT_DISPLAYONLY_VSYNC`). DWM then paces its frames with a
+wait of its own, of about one 60 Hz period, and that wait ends on the
+guest's 15.6 ms timer grid: on the next tick when it can, on the one after
+when it cannot.
+
+**What the host got wrong.** Windows takes the RTC's periodic interrupt as
+its clock (§3) and runs it at **2048 Hz** the whole time. The `RtcTimer`
+thread slept one period at a time, and a host thread cannot sleep for
+488 µs: `RUST_LOG=machine_x86::rtc=debug` (new) showed ~1050 interrupts a
+second reaching the guest, 480 µs late on average. Windows keeps the time
+right from its clock source, but its 15.6 ms tick came every ~30 ms, which is
+what dividing the interrupts into ticks by counting them would give (32 of
+1050 a second; inferred from the cadence, not read out of the guest). Every timer in the
+guest was twice as coarse as Windows meant, and DWM composed once per tick:
+32 fps.
+
+`RtcInterrupts::periodic_ticks` now takes every period that ended while the
+thread slept, raises one, and keeps the rest **owed** (at most
+`rtc::MAX_OWED`, 16); the guest's acknowledgement, the register C read, raises
+the next one straight from the vCPU thread. That is the 8254's policy
+(`irqchip::pit`, lost-tick re-injection) for the same reason. Measured:
+2044–2048 interrupts a second with the thread waking 1100–1600 times, at
+most 3 owed, no core spent spinning. A spinning thread (tried, not kept)
+delivered them 0 µs late and gave the same 40 fps.
+
+**What did not help**, each measured on the fixed host and none kept:
+
+- `GlobalTimerResolutionRequests = 1` in the guest's registry: no change
+  (this Windows 10 guest ignores it; a process's `timeBeginPeriod` stays its own
+  since 2004, verified with `Sleep(1)` in a second process).
+- The EDID's refresh rate (`refresh_hz` 75 against 120): no change. The
+  driver does not pass it on, so DWM assumes 60 Hz.
+- Stretching the RTC's period by 8 % so a tick outlasts DWM's wait: no
+  change. The 15.6 ms grid is the guest's time, not a count of interrupts.
+- `timeBeginPeriod(1)` held by the guest agent: 40 → 45 fps, at the price of
+  a 1 ms tick for the whole guest. Not worth shipping by itself.
+
+**What is left** is the driver. 60 fps and more on the desktop needs a
+display driver that gives DWM a vsync to wait for: a `viogpudo` (BSD-3-Clause)
+built by us that reports the EDID's rate and raises
+`DXGK_INTERRUPT_DISPLAYONLY_VSYNC`, from a timer of its own or from an
+interrupt the host raises per refresh. ADR-0009 already builds, signs and
+installs a driver for the render-only function; this would be its sibling
+for the display. Applications that present through the overlay plane
+(ADR-0009 phase E) are not on this clock and are unaffected.
+
+**The window can say what the guest sends.** `Ctrl+Alt+F` (or
+`ENTANGLED_SHOW_FPS=1`) puts a badge in the window's top-right corner:
+the guest's flushes over the last second (`display::fps`), counted by the
+clock so an idle desktop reads 0.
