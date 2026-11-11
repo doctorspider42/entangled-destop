@@ -378,3 +378,24 @@ build A; E is performance; F is distribution.
 - virglrenderer MR !1185, its host side: https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1185
 - Mesa drops `d3d10umd` (Mesa 26.3): https://www.phoronix.com/news/Mesa-Drops-Direct3D-10-UMD
 - Venus in Mesa: https://docs.mesa3d.org/drivers/venus
+
+## Amendment (2026-11-11): the Venus backend never released a buffer object
+
+Found while putting DWM on this stack (ADR-0010). `vn_renderer_bo_unref`
+drops the last reference and only then calls the backend's `destroy`;
+`entangled_bo_destroy` dropped it a second time, saw a count that was not
+one, and returned without releasing. So no mapped `VkDeviceMemory` of any
+Vulkan program in a Windows guest gave its host pages back before the process
+ended: the host log shows `vkFreeMemory` arriving in step with the
+allocations and the blobs unmapped only at teardown. A program that allocates
+its memory once and keeps it (DXVK does, mostly) never reached the context's
+host-visible budget; one that frees a frame-sized staging buffer per frame
+reaches it in seconds. Fixed in `guest/windows-gpu/mesa/vn_renderer_entangled.c`
+(the destroy releases unconditionally). Packages up to `gpu3d-5` have the
+bug; the next build of the 3D package carries the fix.
+
+The same work added an export to `vulkan_virtio.dll`,
+`entangled_present_overlay` (the phase E overlay hook by name, for a
+compositor with no window to present to), and a rule for the one plane: a
+window's swapchain leaves it alone while the desktop is shown on it
+(ADR-0010).
