@@ -41,3 +41,18 @@ foreach ($class in 'MSEdgeHTM', 'MSEdgePDF') {
         Set-ItemProperty -Path $key -Name '(default)' -Value $fixed
     }
 }
+
+# None of that reaches an Edge that is already running. "Startup boost" starts
+# Edge in the background at logon, and background mode keeps it alive after its
+# last window closes - both without any switch - and a window opened later joins
+# that process, whatever its shortcut says. Edge then draws with Windows'
+# software Direct3D: measured on a full-screen 1080p60 video, 17.5 frames a
+# second, every one rendered and copied by the CPU, against 60-75 through the
+# overlay plane once Edge starts from a shortcut (ADR-0008, the vsync
+# amendment's follow-up). Both are policies; Edge then says it is "managed by
+# your organization", which is the price.
+$policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
+New-Item -Path $policy -Force | Out-Null
+foreach ($name in 'StartupBoostEnabled', 'BackgroundModeEnabled') {
+    New-ItemProperty -Path $policy -Name $name -PropertyType DWord -Value 0 -Force | Out-Null
+}

@@ -1,0 +1,185 @@
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index e87cbb2..7b55eee 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -474,9 +474,8 @@ NTSTATUS VioGpuAllocation::DescribeAllocation(DXGKARG_DESCRIBEALLOCATION *pDescr
+     pDescribeAllocation->MultisampleMethod.NumQualityLevels = 2;
+     pDescribeAllocation->MultisampleMethod.NumSamples = 2;
+ 
+-    pDescribeAllocation->RefreshRate.Numerator = 148500000;
+-    pDescribeAllocation->RefreshRate.Denominator = 2475000;
+-
++    pDescribeAllocation->RefreshRate.Numerator = m_adapter->vidpn.RefreshMilliHz();
++    pDescribeAllocation->RefreshRate.Denominator = 1000;
+     return STATUS_SUCCESS;
+ };
+ 
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.cpp b/viogpu/viogpu3d/viogpu_vidpn.cpp
+index f4c5aca..5c08bee 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.cpp
++++ b/viogpu/viogpu3d/viogpu_vidpn.cpp
+@@ -109,6 +109,12 @@ NTSTATUS VioGpuVidPN::Start(ULONG *pNumberOfViews, ULONG *pNumberOfChildren)
+     DbgPrint(TRACE_LEVEL_INFORMATION,
+              ("<--- %s ColorFormat = %d\n", __FUNCTION__, m_CurrentModes[0].DispInfo.ColorFormat));
+ 
++    m_refreshMilliHz = RefreshMilliHz();
++    KeInitializeEvent(&m_vsyncEvent, SynchronizationEvent, FALSE);
++    // High resolution: an ordinary wait ends on the system clock tick
++    // (15.6 ms by default), the very grid a vsync has to get the desktop off.
++    m_vsyncTimer = ExAllocateTimer(VSyncTimerCallback, this, EX_TIMER_HIGH_RESOLUTION);
++
+     HANDLE threadHandle = 0;
+     m_shouldFlipStop = false;
+     Status = PsCreateSystemThread(&threadHandle, (ACCESS_MASK)0, NULL, (HANDLE)0, NULL, VioGpuVidPN::FlipThread, this);
+@@ -154,6 +160,12 @@ void VioGpuVidPN::ReleasePostDisplayOwnership(D3DDDI_VIDEO_PRESENT_TARGET_ID Tar
+     }
+ 
+     ObDereferenceObject(m_pFlipThread);
++    if (m_vsyncTimer != NULL)
++    {
++        // Cancels, and waits for a callback that is running to return.
++        ExDeleteTimer(m_vsyncTimer, TRUE, TRUE, NULL);
++        m_vsyncTimer = NULL;
++    }
+ 
+     BlackOutScreen(&m_CurrentModes[SourceId]);
+     DestroyFrameBufferObj(TRUE);
+@@ -948,6 +960,33 @@ NTSTATUS VioGpuVidPN::AddSingleSourceMode(_In_ CONST DXGK_VIDPNSOURCEMODESET_INT
+     return STATUS_SUCCESS;
+ }
+ 
++ULONG VioGpuVidPN::RefreshMilliHz(void)
++{
++    PAGED_CODE();
++
++    PBYTE edid = GetEdidData(0);
++    if (edid == NULL)
++    {
++        return 60000;
++    }
++    // The first detailed timing descriptor: pixel clock over total pixels.
++    PBYTE dtd = edid + 54;
++    ULONG clock = ((ULONG)dtd[0] | ((ULONG)dtd[1] << 8)) * 10000;
++    ULONG htotal = (dtd[2] | ((dtd[4] & 0xF0) << 4)) + (dtd[3] | ((dtd[4] & 0x0F) << 8));
++    ULONG vtotal = (dtd[5] | ((dtd[7] & 0xF0) << 4)) + (dtd[6] | ((dtd[7] & 0x0F) << 8));
++    if (clock == 0 || htotal == 0 || vtotal == 0)
++    {
++        return 60000;
++    }
++    ULONGLONG total = (ULONGLONG)htotal * vtotal;
++    ULONG mhz = (ULONG)(((ULONGLONG)clock * 1000 + total / 2) / total);
++    if (mhz < 24000 || mhz > 240000)
++    {
++        return 60000;
++    }
++    return mhz;
++}
++
+ VOID VioGpuVidPN::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo, PVIDEO_MODE_INFORMATION pModeInfo)
+ {
+     PAGED_CODE();
+@@ -957,13 +996,15 @@ VOID VioGpuVidPN::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalIn
+     pVideoSignalInfo->TotalSize.cy = pModeInfo->VisScreenHeight;
+ 
+ #if 1
+-    pVideoSignalInfo->VSyncFreq.Numerator = 148500000;
+-    pVideoSignalInfo->VSyncFreq.Denominator = 2475000;
+-    pVideoSignalInfo->HSyncFreq.Numerator = 67500;
++    // Entangled: every mode runs at the display's rate, the EDID's (upstream
++    // said 60 Hz whatever the display advertised).
++    ULONG mhz = RefreshMilliHz();
++    pVideoSignalInfo->VSyncFreq.Numerator = mhz;
++    pVideoSignalInfo->VSyncFreq.Denominator = 1000;
++    pVideoSignalInfo->HSyncFreq.Numerator = (UINT)(((ULONGLONG)mhz * pModeInfo->VisScreenHeight) / 1000);
+     pVideoSignalInfo->HSyncFreq.Denominator = 1;
+-    pVideoSignalInfo->PixelRate = 148500000;
++    pVideoSignalInfo->PixelRate = (ULONGLONG)pModeInfo->VisScreenWidth * pModeInfo->VisScreenHeight * mhz / 1000;
+ #else
+-
+     pVideoSignalInfo->VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+     pVideoSignalInfo->VSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+     pVideoSignalInfo->HSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+@@ -1988,11 +2029,37 @@ void VioGpuVidPN::FlipThread(void *ctx)
+     PAGED_CODE();
+ 
+     VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(ctx);
+-    LARGE_INTEGER interval;
+-    interval.QuadPart = -166666LL;
++    // Entangled: one vsync per refresh period of the display, at the points
++    // of a grid, so a late one does not make the next one late. (Upstream
++    // slept 16.67 ms between flips, which a default system clock rounds up
++    // to its tick.)
++    LARGE_INTEGER freq;
++    LONGLONG period = 10000000000LL / vidpn->m_refreshMilliHz;
++    LARGE_INTEGER counter = KeQueryPerformanceCounter(&freq);
++    LONGLONG next = (counter.QuadPart / freq.QuadPart) * 10000000LL +
++                    (counter.QuadPart % freq.QuadPart) * 10000000LL / freq.QuadPart;
+     while (true)
+     {
+-        KeDelayExecutionThread(KernelMode, false, &interval);
++        counter = KeQueryPerformanceCounter(NULL);
++        LONGLONG now = (counter.QuadPart / freq.QuadPart) * 10000000LL +
++                       (counter.QuadPart % freq.QuadPart) * 10000000LL / freq.QuadPart;
++        next += period;
++        if (next <= now)
++        {
++            // A whole period behind (a stalled vCPU): skip the missed ones.
++            next += ((now - next) / period + 1) * period;
++        }
++        if (vidpn->m_vsyncTimer != NULL)
++        {
++            ExSetTimer(vidpn->m_vsyncTimer, now - next, 0, NULL);
++            KeWaitForSingleObject(&vidpn->m_vsyncEvent, Executive, KernelMode, FALSE, NULL);
++        }
++        else
++        {
++            LARGE_INTEGER interval;
++            interval.QuadPart = now - next;
++            KeDelayExecutionThread(KernelMode, false, &interval);
++        }
+         if (vidpn->m_shouldFlipStop)
+         {
+             return;
+@@ -2009,6 +2076,16 @@ PAGED_CODE_SEG_END
+ #pragma code_seg(push)
+ #pragma code_seg()
+ 
++VOID VioGpuVidPN::VSyncTimerCallback(_In_ PEX_TIMER Timer, _In_opt_ PVOID Context)
++{
++    UNREFERENCED_PARAMETER(Timer);
++    VioGpuVidPN *vidpn = reinterpret_cast<VioGpuVidPN *>(Context);
++    if (vidpn != NULL)
++    {
++        KeSetEvent(&vidpn->m_vsyncEvent, IO_NO_INCREMENT, FALSE);
++    }
++}
++
+ NTSTATUS VioGpuVidPN::SetVidPnSourceAddress(const DXGKARG_SETVIDPNSOURCEADDRESS *pSetVidPnSourceAddress)
+ {
+     m_sourceAddress = pSetVidPnSourceAddress->PrimaryAddress;
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.h b/viogpu/viogpu3d/viogpu_vidpn.h
+index cf8b1d4..f2a9dc9 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.h
++++ b/viogpu/viogpu3d/viogpu_vidpn.h
+@@ -65,6 +65,9 @@ class VioGpuVidPN
+ 
+     BOOLEAN GpuObjectAttach(UINT res_id, VioGpuObj *obj);
+     PBYTE GetEdidData(UINT Idx);
++    // Entangled: the refresh rate of the EDID's preferred timing, in
++    // millihertz (60 Hz when there is none or it is not credible).
++    ULONG RefreshMilliHz(void);
+     BOOLEAN IsSource(const VioGpuAllocation *allocation) const
+     {
+         return m_sourceRes == allocation;
+@@ -144,4 +147,11 @@ class VioGpuVidPN
+ 
+     PETHREAD m_pFlipThread;
+     BOOL m_shouldFlipStop = false;
++
++    // Entangled: the flip thread's clock. A high-resolution timer sets the
++    // event at the next point of a grid one refresh period apart.
++    static EXT_CALLBACK VSyncTimerCallback;
++    PEX_TIMER m_vsyncTimer = NULL;
++    KEVENT m_vsyncEvent;
++    ULONG m_refreshMilliHz = 60000;
+ };

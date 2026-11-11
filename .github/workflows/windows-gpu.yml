@@ -2,7 +2,8 @@ name: Windows GPU package
 
 # Builds the 3D package for Windows guests (ADR-0009) — our KMDF driver, Mesa's
 # Venus ICD with our renderer backend, Mesa's OpenGL over Zink, DXVK and the
-# Vulkan runtime installer — and publishes it as an immutable GitHub Release
+# Vulkan runtime installer, and our build of virtio-win's display-only driver
+# with a vsync (ADR-0008) — and publishes it as an immutable GitHub Release
 # that `entangled fetch gpu3d` downloads and `install windows --gpu3d auto`
 # puts on the answer disc. Without it a user had to build all of that by hand.
 #
@@ -115,6 +116,38 @@ jobs:
         shell: cmd
         run: call guest\windows-gpu\driver\build.cmd C:\drv
 
+      # virtio-win's viogpudo at the commit prepare.ps1 pins, with our patch:
+      # into the same directory, so one certificate signs both drivers.
+      - name: The display driver (viogpudo with a vsync)
+        shell: pwsh
+        run: |
+          powershell -File guest/windows-gpu/display/prepare.ps1 C:\viogpu
+          if ($LASTEXITCODE -ne 0) { throw 'preparing the viogpudo source failed' }
+          cmd /c "guest\windows-gpu\display\build.cmd C:\viogpu C:\drv"
+          if ($LASTEXITCODE -ne 0) { throw 'building entangled-display.sys failed' }
+
+      # ADR-0010, opt-in inside the guest: the WDDM driver for the display
+      # function (viogpu3d of virtio-win PR 943 at the commit prepare.ps1
+      # pins, with our patches) and its Direct3D user-mode driver (Mesa's
+      # d3d10umd over Zink). The DLL goes beside the driver before signing:
+      # the catalogue names it.
+      - name: The WDDM driver and its Direct3D driver (opt-in)
+        shell: pwsh
+        env:
+          MESA_SRC: C:\mesa-d3d10
+          MESA_BUILD: C:\mesa-d3d10-build
+          WDK_UM: C:\kit\Include\10.0.26100.0\um
+        run: |
+          powershell -File guest/windows-gpu/mesa/prepare-d3d10.ps1 C:\mesa-d3d10
+          if ($LASTEXITCODE -ne 0) { throw 'preparing the d3d10umd source failed' }
+          cmd /c "guest\windows-gpu\mesa\build-d3d10.cmd"
+          if ($LASTEXITCODE -ne 0) { throw 'building entangled_d3d10.dll failed' }
+          powershell -File guest/windows-gpu/wddm/prepare.ps1 C:\viogpu3d
+          if ($LASTEXITCODE -ne 0) { throw 'preparing the viogpu3d source failed' }
+          cmd /c "guest\windows-gpu\wddm\build.cmd C:\viogpu3d C:\drv"
+          if ($LASTEXITCODE -ne 0) { throw 'building entangled-wddm.sys failed' }
+          Copy-Item C:\mesa-d3d10-build\src\gallium\targets\d3d10umd\entangled_d3d10.dll C:\drv
+
       - name: Test-sign under a certificate whose key is then destroyed
         shell: pwsh
         run: |
@@ -128,7 +161,10 @@ jobs:
         run: |
           $pkg = 'C:\gpu3d'
           New-Item -ItemType Directory -Force $pkg | Out-Null
-          foreach ($f in 'entangled-gpu.inf', 'entangled-gpu.sys', 'entangled-gpu.cat', 'gpu-test.exe') {
+          foreach ($f in 'entangled-gpu.inf', 'entangled-gpu.sys', 'entangled-gpu.cat', 'gpu-test.exe',
+                         'entangled-display.inf', 'entangled-display.sys', 'entangled-display.cat',
+                         'entangled-wddm.inf', 'entangled-wddm.sys', 'entangled-wddm.cat', 'entangled_d3d10.dll',
+                         'LICENSE-viogpudo.txt') {
             Copy-Item "C:\drv\$f" $pkg
           }
           Copy-Item C:\drv\entangled-gpu-test.cer "$pkg\entangled-gpu.cer"
@@ -163,7 +199,8 @@ jobs:
           $files = Get-ChildItem C:\gpu3d -File | Sort-Object Name
           $notes = "The 3D package for Windows guests (ADR-0009), built by $env:GITHUB_WORKFLOW run $env:GITHUB_RUN_ID from $env:GITHUB_SHA. " +
             "The driver is test-signed under a certificate made for this run whose private key was deleted before publishing; a guest needs test-signing mode. " +
-            "Mesa 26.2.6 (MIT), DXVK $env:DXVK_VERSION (zlib), LunarG Vulkan runtime $env:VULKANRT_VERSION."
+            "Mesa 26.2.6 (MIT), DXVK $env:DXVK_VERSION (zlib), LunarG Vulkan runtime $env:VULKANRT_VERSION, " +
+            "and entangled-display: virtio-win's viogpudo (BSD-3-Clause) with a refresh rate and a vsync."
           # GITHUB_TOKEN may not create a tag on a commit that changes a
           # workflow (403), so the tag goes on the newest commit that does
           # not; guest/windows-gpu is the same there or the run would differ.

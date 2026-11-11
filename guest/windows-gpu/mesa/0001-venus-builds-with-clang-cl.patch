@@ -126,7 +126,7 @@ index ea224ea..46aa89a 100644
     return vn_renderer_create_vtest(instance, alloc, renderer);
  #endif
 diff --git a/src/virtio/vulkan/vn_wsi.c b/src/virtio/vulkan/vn_wsi.c
-index e73ab48..742314b 100644
+index e73ab48..655b669 100644
 --- a/src/virtio/vulkan/vn_wsi.c
 +++ b/src/virtio/vulkan/vn_wsi.c
 @@ -14,11 +14,23 @@
@@ -196,6 +196,28 @@ index e73ab48..742314b 100644
  void
  vn_wsi_fini(struct vn_physical_device *physical_dev)
  {
+@@ -1011,3 +1052,21 @@ vn_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
+    return wsi_common_queue_present(
+       queue_vk->base.device->physical->wsi_device, queue_vk, pPresentInfo);
+ }
++
++#ifdef VK_USE_PLATFORM_WIN32_KHR
++/* The overlay, by name (ADR-0010): for a client that composes a whole screen
++ * with this driver and has no window to present to - the Direct3D user-mode
++ * driver inside DWM. `memory` is a mapped allocation of `device` holding
++ * width x height BGRX pixels in rows of `stride` bytes; 0 hides the plane. */
++__declspec(dllexport) bool
++entangled_present_overlay(VkDevice device,
++                          VkDeviceMemory memory,
++                          uint32_t width,
++                          uint32_t height,
++                          uint32_t stride,
++                          int32_t x,
++                          int32_t y)
++{
++   return vn_wsi_present_overlay(device, memory, width, height, stride, x, y);
++}
++#endif
 diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
 index 803d140..7ad6a09 100644
 --- a/src/vulkan/wsi/wsi_common.h
@@ -217,7 +239,7 @@ index 803d140..7ad6a09 100644
  
     struct {
 diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
-index 6929684..fcbf129 100644
+index 6929684..763d505 100644
 --- a/src/vulkan/wsi/wsi_common_win32.cpp
 +++ b/src/vulkan/wsi/wsi_common_win32.cpp
 @@ -109,6 +109,8 @@ struct wsi_win32_swapchain {
@@ -240,7 +262,7 @@ index 6929684..fcbf129 100644
     if (chain->surface->current_swapchain == chain)
        chain->surface->current_swapchain = NULL;
  
-@@ -805,6 +811,36 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
+@@ -805,6 +811,45 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
     return VK_SUCCESS;
  }
  
@@ -253,6 +275,15 @@ index 6929684..fcbf129 100644
 +   HWND root = GetAncestor(chain->wnd, GA_ROOT);
 +   if (!root || GetForegroundWindow() != root || IsIconic(root))
 +      return false;
++   /* The plane is the desktop's while a compositor using this driver shows
++    * the whole screen on it (the Direct3D user-mode driver in DWM, which
++    * holds this event): the window is then presented the ordinary way, and
++    * composed on the GPU like everything else. */
++   HANDLE desktop = OpenEventA(SYNCHRONIZE, FALSE, "Local\\EntangledDesktopOverlay");
++   if (desktop) {
++      CloseHandle(desktop);
++      return false;
++   }
 +   DPI_AWARENESS_CONTEXT old =
 +      SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 +   RECT client;
@@ -277,7 +308,7 @@ index 6929684..fcbf129 100644
  static VkResult
  wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
                          uint32_t image_index,
-@@ -820,6 +856,29 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
+@@ -820,6 +865,29 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
     if (chain->dxgi)
        return wsi_win32_queue_present_dxgi(chain, image, damage);
  

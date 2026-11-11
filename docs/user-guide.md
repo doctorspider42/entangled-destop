@@ -766,6 +766,14 @@ Measured on an RTX 2070:
 These numbers come from tests chosen by the project. They do not promise that
 any particular game will run, or how fast.
 
+**A smoother desktop comes with it.** A package built after 2026-11-10 (the
+pinned one may be older: it has the display driver if it lists
+`entangled-display.sys`) also replaces the display driver with our build of it, which gives Windows a
+vsync at the rate `[display] refresh_hz` advertises. Without it the Windows
+desktop composes on the guest's timer tick, about 40 frames a second whatever
+the rate; with it a scrolling window measured 58 of 60 and 72-94 of 120
+([ADR-0008](adr/0008-windows-guests.md), the vsync amendment).
+
 **The catch: the driver is test-signed.** Windows loads a third-party kernel
 driver only if it is signed by Microsoft (attestation signing needs an EV
 certificate and a Partner Center account) or if Windows is in **test mode**. So

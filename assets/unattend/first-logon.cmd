@@ -93,6 +93,19 @@ if exist "%g%\entangled-gpu.cer" (
 "%g%\VulkanRT-Installer.exe" /S
 mkdir "%dir%\owngpu" 2>nul
 copy /y "%g%\entangled-gpu.*" "%dir%\owngpu\" >nul
+rem Our display driver, when the package has it (ADR-0008, the vsync
+rem amendment): viogpudo with a refresh rate and a vsync, so the desktop
+rem composes at the display's rate. owngpu-bind.ps1 puts it on the display.
+if exist "%g%\entangled-display.inf" copy /y "%g%\entangled-display.*" "%dir%\owngpu\" >nul
+rem Opt-in (ADR-0010): the WDDM driver that has DWM compose on the host GPU.
+rem Only copied here; wddm-on.cmd installs it, wddm-off.cmd goes back.
+if exist "%g%\entangled-wddm.inf" (
+  mkdir "%dir%\wddm" 2>nul
+  copy /y "%g%\entangled-wddm.*" "%dir%\wddm\" >nul
+  copy /y "%g%\entangled_d3d10.dll" "%dir%\wddm\" >nul
+  copy /y "%disc%\entangled\wddm-on.cmd" "%dir%\" >nul
+  copy /y "%disc%\entangled\wddm-off.cmd" "%dir%\" >nul
+)
 copy /y "%g%\gpu-test.exe" "%dir%\" >nul
 copy /y "%disc%\entangled\owngpu-bind.ps1" "%dir%\" >nul
 rem owngpu-bind.ps1 says why it runs at every startup and logon.

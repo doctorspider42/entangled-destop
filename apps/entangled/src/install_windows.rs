@@ -43,6 +43,8 @@ const GPU3D_EDGE: &str = include_str!("../../../assets/unattend/gpu3d-edge.ps1")
 /// Keeps our own render-only driver bound to every instance of its function
 /// (ADR-0009).
 const OWNGPU_BIND: &str = include_str!("../../../assets/unattend/owngpu-bind.ps1");
+const WDDM_ON: &str = include_str!("../../../assets/unattend/wddm-on.cmd");
+const WDDM_OFF: &str = include_str!("../../../assets/unattend/wddm-off.cmd");
 
 /// `--gpu3d auto`: download the pinned package instead of naming a folder.
 pub const GPU3D_AUTO: &str = "auto";
@@ -472,6 +474,11 @@ fn add_gpu3d(disc: &mut IsoBuilder, dir: &Path) -> Result<(), String> {
     let (at, files) = if is_own_gpu_package(dir) {
         disc.add_file("entangled/owngpu-bind.ps1", crlf(OWNGPU_BIND))
             .map_err(|e| e.to_string())?;
+        // Opt-in (ADR-0010): how a guest turns the WDDM driver on and off.
+        disc.add_file("entangled/wddm-on.cmd", crlf(WDDM_ON))
+            .map_err(|e| e.to_string())?;
+        disc.add_file("entangled/wddm-off.cmd", crlf(WDDM_OFF))
+            .map_err(|e| e.to_string())?;
         ("owngpu", own_gpu_files(dir)?)
     } else {
         ("gpu3d", gpu3d_files(dir)?)
@@ -619,6 +626,35 @@ fn own_gpu_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
         }
         files.push((name.to_owned(), read(&path)?));
     }
+    // Optional: our build of the display-only driver, with a vsync (ADR-0008,
+    // the vsync amendment). A package from before it has none of the three
+    // and the display stays viogpudo's; one with only some is broken.
+    let display: Vec<_> = DISPLAY_DRIVER_FILES
+        .iter()
+        .map(|name| (name, dir.join(name)))
+        .collect();
+    if display.iter().any(|(_, path)| path.is_file()) {
+        for (name, path) in display {
+            if !path.is_file() {
+                return Err(missing(name));
+            }
+            files.push(((*name).to_owned(), read(&path)?));
+        }
+    }
+    // Optional, and opt-in inside the guest: the WDDM driver for the display
+    // function and its Direct3D user-mode driver (ADR-0010). All four or none.
+    let wddm: Vec<_> = WDDM_DRIVER_FILES
+        .iter()
+        .map(|name| (name, dir.join(name)))
+        .collect();
+    if wddm.iter().any(|(_, path)| path.is_file()) {
+        for (name, path) in wddm {
+            if !path.is_file() {
+                return Err(missing(name));
+            }
+            files.push(((*name).to_owned(), read(&path)?));
+        }
+    }
     // Optional: Mesa's OpenGL over Vulkan (Zink) and DXVK's Direct3D 9-11,
     // each a folder of DLLs an application takes from beside itself. The
     // published package (windows-gpu.yml) is flat, a release being a list of
@@ -646,6 +682,24 @@ fn own_gpu_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     files.sort();
     Ok(files)
 }
+
+/// The display driver in our own package (`guest/windows-gpu/display`): all
+/// three or none.
+const DISPLAY_DRIVER_FILES: &[&str] = &[
+    "entangled-display.inf",
+    "entangled-display.sys",
+    "entangled-display.cat",
+];
+
+/// The WDDM driver for the display function and its Direct3D user-mode driver
+/// (`guest/windows-gpu/wddm`, `guest/windows-gpu/mesa/build-d3d10.cmd`): all
+/// four or none. Copied into the guest, installed there only on request.
+const WDDM_DRIVER_FILES: &[&str] = &[
+    "entangled-wddm.inf",
+    "entangled-wddm.sys",
+    "entangled-wddm.cat",
+    "entangled_d3d10.dll",
+];
 
 /// The optional folders of our own package and the DLLs each must hold:
 /// `opengl` from `guest/windows-gpu/mesa/build-zink.cmd`, `dxvk` from a DXVK
@@ -1308,6 +1362,43 @@ mod tests {
             names.contains(&"opengl/libgallium_wgl.dll".to_owned()),
             "{names:?}"
         );
+        // The display driver is all three files or none: a package from
+        // before it (above) is fine, half of one is refused.
+        assert!(!names.iter().any(|n| n.starts_with("entangled-display")));
+        std::fs::write(dir.join("entangled-display.sys"), b"sys").unwrap();
+        let refused = own_gpu_files(&dir).unwrap_err();
+        assert!(refused.contains("entangled-display.inf"), "{refused}");
+        for name in ["entangled-display.inf", "entangled-display.cat"] {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+        let names: Vec<String> = own_gpu_files(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for name in DISPLAY_DRIVER_FILES {
+            assert!(names.contains(&(*name).to_owned()), "{names:?}");
+        }
+        // The WDDM driver likewise: none so far, half refused, all carried.
+        assert!(!names.iter().any(|n| n.starts_with("entangled-wddm")));
+        std::fs::write(dir.join("entangled_d3d10.dll"), b"dll").unwrap();
+        let refused = own_gpu_files(&dir).unwrap_err();
+        assert!(refused.contains("entangled-wddm.inf"), "{refused}");
+        for name in [
+            "entangled-wddm.inf",
+            "entangled-wddm.sys",
+            "entangled-wddm.cat",
+        ] {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+        let names: Vec<String> = own_gpu_files(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for name in WDDM_DRIVER_FILES {
+            assert!(names.contains(&(*name).to_owned()), "{names:?}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

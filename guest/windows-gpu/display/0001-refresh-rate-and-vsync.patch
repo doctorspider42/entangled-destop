@@ -1,0 +1,409 @@
+diff --git a/viogpu/viogpudo/driver.cpp b/viogpu/viogpudo/driver.cpp
+index 33f18c78..4b5b71c2 100644
+--- a/viogpu/viogpudo/driver.cpp
++++ b/viogpu/viogpudo/driver.cpp
+@@ -109,6 +109,10 @@ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_
+     InitialData.DxgkDdiStopDeviceAndReleasePostDisplayOwnership = VioGpuDodStopDeviceAndReleasePostDisplayOwnership;
+     InitialData.DxgkDdiSystemDisplayEnable = VioGpuDodSystemDisplayEnable;
+     InitialData.DxgkDdiSystemDisplayWrite = VioGpuDodSystemDisplayWrite;
++    // Entangled: with both of these dxgkrnl stops simulating a vsync from the
++    // system clock tick and waits for the driver's DXGK_INTERRUPT_DISPLAYONLY_VSYNC.
++    InitialData.DxgkDdiControlInterrupt = VioGpuDodControlInterrupt;
++    InitialData.DxgkDdiGetScanLine = VioGpuDodGetScanLine;
+ 
+     NTSTATUS Status = DxgkInitializeDisplayOnlyDriver(pDriverObject, pRegistryPath, &InitialData);
+     if (!NT_SUCCESS(Status))
+@@ -581,6 +585,26 @@ VioGpuDodInterruptRoutine(_In_ VOID *pDeviceContext, _In_ ULONG MessageNumber)
+     return pVioGpuDod->InterruptRoutine(MessageNumber);
+ }
+ 
++NTSTATUS
++APIENTRY
++VioGpuDodControlInterrupt(_In_ CONST HANDLE hAdapter,
++                          _In_ CONST DXGK_INTERRUPT_TYPE InterruptType,
++                          _In_ BOOLEAN EnableInterrupt)
++{
++    VIOGPU_ASSERT_CHK(hAdapter != NULL);
++    VioGpuDod *pVioGpuDod = reinterpret_cast<VioGpuDod *>(hAdapter);
++    return pVioGpuDod->ControlInterrupt(InterruptType, EnableInterrupt);
++}
++
++NTSTATUS
++APIENTRY
++VioGpuDodGetScanLine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_GETSCANLINE *pGetScanLine)
++{
++    VIOGPU_ASSERT_CHK(hAdapter != NULL);
++    VioGpuDod *pVioGpuDod = reinterpret_cast<VioGpuDod *>(hAdapter);
++    return pVioGpuDod->GetScanLine(pGetScanLine);
++}
++
+ VOID VioGpuDodResetDevice(_In_ VOID *pDeviceContext)
+ {
+     VIOGPU_ASSERT_CHK(pDeviceContext != NULL);
+diff --git a/viogpu/viogpudo/driver.h b/viogpu/viogpudo/driver.h
+index 361f4768..71922326 100644
+--- a/viogpu/viogpudo/driver.h
++++ b/viogpu/viogpudo/driver.h
+@@ -148,6 +148,17 @@ NTSTATUS
+ APIENTRY
+ VioGpuDodQueryVidPnHWCapability(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYVIDPNHWCAPABILITY *pVidPnHWCaps);
+ 
++// Entangled: a display-only driver that has a vsync supplies both of these (or neither).
++NTSTATUS
++APIENTRY
++VioGpuDodControlInterrupt(_In_ CONST HANDLE hAdapter,
++                          _In_ CONST DXGK_INTERRUPT_TYPE InterruptType,
++                          _In_ BOOLEAN EnableInterrupt);
++
++NTSTATUS
++APIENTRY
++VioGpuDodGetScanLine(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_GETSCANLINE *pGetScanLine);
++
+ NTSTATUS
+ APIENTRY
+ VioGpuDodStopDeviceAndReleasePostDisplayOwnership(_In_ VOID *pDeviceContext,
+diff --git a/viogpu/viogpudo/trace.h b/viogpu/viogpudo/trace.h
+index 6772eda6..4084b372 100755
+--- a/viogpu/viogpudo/trace.h
++++ b/viogpu/viogpudo/trace.h
+@@ -33,6 +33,12 @@
+ 
+ #define WPP_INIT_TRACING(driver, regpath)  InitializeDebugPrints(driver, regpath);
+ #define WPP_CLEANUP(driver)
++#elif defined(ENTANGLED_NO_WPP)
++// Entangled: built without the WDK's MSBuild integration, so without WPP.
++#define DbgPrint(Level, MSG)
++#define VioGpuDbgBreak()
++#define WPP_INIT_TRACING(driver, regpath)
++#define WPP_CLEANUP(driver)
+ #else
+ //#define DbgPrint(level, line) {};
+ 
+diff --git a/viogpu/viogpudo/viogpudo.cpp b/viogpu/viogpudo/viogpudo.cpp
+index f9508143..6d27148c 100644
+--- a/viogpu/viogpudo/viogpudo.cpp
++++ b/viogpu/viogpudo/viogpudo.cpp
+@@ -57,6 +57,12 @@ VioGpuDod::VioGpuDod(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
+     RtlZeroMemory(&m_PointerShape, sizeof(m_PointerShape));
+     m_PersistentDispMode0Width = 0;
+     m_PersistentDispMode0Height = 0;
++    m_RefreshNumerator = 60;
++    m_RefreshDenominator = 1;
++    m_VSyncTimer = NULL;
++    m_VSyncEnabled = 0;
++    m_LastVSync = 0;
++    m_NextVSync = 0;
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+ }
+ 
+@@ -64,6 +70,7 @@ VioGpuDod::~VioGpuDod(void)
+ {
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s 0x%p\n", __FUNCTION__, m_pHWDevice));
++    StopVSync();
+     delete m_pHWDevice;
+     m_pHWDevice = NULL;
+ }
+@@ -168,6 +175,10 @@ NTSTATUS VioGpuDod::StartDevice(_In_ DXGK_START_INFO *pDxgkStartInfo,
+         return Status;
+     }
+ 
++    // Entangled: the mode list was built from the EDID in HWInit, so the rate is known.
++    m_pHWDevice->GetRefreshRate(&m_RefreshNumerator, &m_RefreshDenominator);
++    StartVSync();
++
+     m_CurrentMode.RamFrameBuffer = m_pHWDevice->GetPciResources()[0].GetMappedAddress(0, 0);
+     if (!m_CurrentMode.RamFrameBuffer)
+     {
+@@ -241,9 +252,38 @@ NTSTATUS VioGpuDod::StopDevice(VOID)
+     PAGED_CODE();
+ 
+     m_Flags.DriverStarted = FALSE;
++    StopVSync();
+     return STATUS_SUCCESS;
+ }
+ 
++// Entangled: the vsync timer exists from StartDevice to StopDevice and runs
++// only while dxgkrnl has the interrupt enabled (ControlInterrupt).
++VOID VioGpuDod::StartVSync(VOID)
++{
++    PAGED_CODE();
++
++    if (m_VSyncTimer == NULL)
++    {
++        // High resolution: an ordinary kernel timer expires on the system
++        // clock tick (15.6 ms by default), which is the very grid a vsync
++        // has to get the desktop off.
++        m_VSyncTimer = ExAllocateTimer(VSyncTimerCallback, this, EX_TIMER_HIGH_RESOLUTION);
++    }
++}
++
++VOID VioGpuDod::StopVSync(VOID)
++{
++    PAGED_CODE();
++
++    InterlockedExchange(&m_VSyncEnabled, 0);
++    if (m_VSyncTimer != NULL)
++    {
++        // Cancels, and waits for a callback that is running to return.
++        ExDeleteTimer(m_VSyncTimer, TRUE, TRUE, NULL);
++        m_VSyncTimer = NULL;
++    }
++}
++
+ NTSTATUS VioGpuDod::DispatchIoRequest(_In_ ULONG VidPnSourceId, _In_ VIDEO_REQUEST_PACKET *pVideoRequestPacket)
+ {
+     PAGED_CODE();
+@@ -891,11 +931,15 @@ VOID VioGpuDod::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo
+     pVideoSignalInfo->TotalSize.cx = pModeInfo->VisScreenWidth;
+     pVideoSignalInfo->TotalSize.cy = pModeInfo->VisScreenHeight;
+ 
+-    pVideoSignalInfo->VSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+-    pVideoSignalInfo->VSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+-    pVideoSignalInfo->HSyncFreq.Numerator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+-    pVideoSignalInfo->HSyncFreq.Denominator = D3DKMDT_FREQUENCY_NOTSPECIFIED;
+-    pVideoSignalInfo->PixelRate = D3DKMDT_FREQUENCY_NOTSPECIFIED;
++    // Entangled: the display has a refresh rate, the EDID's, and every mode
++    // runs at it: the host presents whatever size the guest sets at that rate.
++    // Without it DWM assumes 60 Hz.
++    pVideoSignalInfo->VSyncFreq.Numerator = m_RefreshNumerator;
++    pVideoSignalInfo->VSyncFreq.Denominator = m_RefreshDenominator;
++    pVideoSignalInfo->HSyncFreq.Numerator = (UINT)((ULONGLONG)m_RefreshNumerator * pModeInfo->VisScreenHeight);
++    pVideoSignalInfo->HSyncFreq.Denominator = m_RefreshDenominator;
++    pVideoSignalInfo->PixelRate = (ULONGLONG)pModeInfo->VisScreenWidth * pModeInfo->VisScreenHeight *
++                                  m_RefreshNumerator / m_RefreshDenominator;
+     pVideoSignalInfo->ScanLineOrdering = D3DDDI_VSSLO_PROGRESSIVE;
+ }
+ 
+@@ -1931,6 +1975,137 @@ VOID VioGpuDod::ResetDevice(VOID)
+     m_pHWDevice->ResetDevice();
+ }
+ 
++// Entangled: the vsync.
++//
++// A display-only driver without DxgkDdiControlInterrupt and DxgkDdiGetScanLine
++// gets a vsync dxgkrnl simulates, and that one ends on the system clock tick:
++// DWM then composes every 15.6 ms or every 31.25 ms, never at the display's
++// rate. This driver has no display hardware to interrupt it either (virtio-gpu
++// has no vblank), so the vsync is a high-resolution timer at the EDID's rate,
++// reported the way a vblank interrupt would be: DxgkCbNotifyInterrupt under
++// the interrupt's lock, then the DPC.
++
++LONGLONG VioGpuDod::VSyncPeriod100ns(VOID) const
++{
++    return (10000000LL * m_RefreshDenominator + m_RefreshNumerator / 2) / m_RefreshNumerator;
++}
++
++LONGLONG VioGpuDod::Now100ns(VOID) const
++{
++    LARGE_INTEGER freq;
++    LARGE_INTEGER now = KeQueryPerformanceCounter(&freq);
++    return (now.QuadPart / freq.QuadPart) * 10000000LL + (now.QuadPart % freq.QuadPart) * 10000000LL / freq.QuadPart;
++}
++
++// One shot at the next point of a grid one period apart, not a periodic timer:
++// a periodic one is re-armed from the clock interrupt that expired it, so every
++// period comes out up to a clock interrupt long (measured: 17.6 ms for 60 Hz,
++// 36 interrupts of 488 us where 34.1 were asked for). Against a grid the
++// lateness of one vsync is not carried into the next. Only the timer's callback
++// and the enable that starts it call this, never both at once.
++VOID VioGpuDod::ArmVSync(LONGLONG Now)
++{
++    LONGLONG period = VSyncPeriod100ns();
++    m_NextVSync += period;
++    if (m_NextVSync <= Now)
++    {
++        // Fell a whole period behind (a stalled vCPU): skip the missed ones.
++        m_NextVSync += ((Now - m_NextVSync) / period + 1) * period;
++    }
++    ExSetTimer(m_VSyncTimer, Now - m_NextVSync, 0, NULL);
++}
++
++NTSTATUS VioGpuDod::ControlInterrupt(_In_ CONST DXGK_INTERRUPT_TYPE InterruptType, _In_ BOOLEAN EnableInterrupt)
++{
++    if (InterruptType != DXGK_INTERRUPT_DISPLAYONLY_VSYNC)
++    {
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (m_VSyncTimer == NULL)
++    {
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
++    if (EnableInterrupt)
++    {
++        if (InterlockedExchange(&m_VSyncEnabled, 1) == 0)
++        {
++            LONGLONG now = Now100ns();
++            m_NextVSync = now;
++            ArmVSync(now);
++        }
++    }
++    else
++    {
++        if (InterlockedExchange(&m_VSyncEnabled, 0) != 0)
++        {
++            ExCancelTimer(m_VSyncTimer, NULL);
++        }
++    }
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS VioGpuDod::GetScanLine(_Inout_ DXGKARG_GETSCANLINE *pGetScanLine)
++{
++    // There is no raster. The answer is where one would be, this far after
++    // the last vsync: the blank first (a twentieth of the frame), then the
++    // lines in order.
++    LONGLONG period = VSyncPeriod100ns();
++    LONGLONG last = m_LastVSync;
++    LONGLONG since = last ? (Now100ns() - last) % period : 0;
++    LONGLONG blank = period / 20;
++    UINT height = m_CurrentMode.DispInfo.Height ? m_CurrentMode.DispInfo.Height : NOM_HEIGHT_SIZE;
++
++    if (since < blank)
++    {
++        pGetScanLine->InVerticalBlank = TRUE;
++        pGetScanLine->ScanLine = 0;
++    }
++    else
++    {
++        pGetScanLine->InVerticalBlank = FALSE;
++        pGetScanLine->ScanLine = (UINT)((since - blank) * height / (period - blank));
++    }
++    return STATUS_SUCCESS;
++}
++
++BOOLEAN VioGpuDod::VSyncNotify(_In_opt_ PVOID Context)
++{
++    VioGpuDod *pVioGpuDod = reinterpret_cast<VioGpuDod *>(Context);
++    DXGKARGCB_NOTIFY_INTERRUPT_DATA NotifyInterrupt = {};
++    NotifyInterrupt.InterruptType = DXGK_INTERRUPT_DISPLAYONLY_VSYNC;
++    NotifyInterrupt.DisplayOnlyVsync.VidPnTargetId = 0;
++    pVioGpuDod->m_DxgkInterface.DxgkCbNotifyInterrupt(pVioGpuDod->m_DxgkInterface.DeviceHandle, &NotifyInterrupt);
++    pVioGpuDod->m_DxgkInterface.DxgkCbQueueDpc(pVioGpuDod->m_DxgkInterface.DeviceHandle);
++    return TRUE;
++}
++
++VOID VioGpuDod::VSyncTick(VOID)
++{
++    if (!m_VSyncEnabled || !IsDriverActive())
++    {
++        return;
++    }
++    LONGLONG now = Now100ns();
++    InterlockedExchange64(&m_LastVSync, now);
++    ArmVSync(now);
++
++    if (IsHardwareInit())
++    {
++        BOOLEAN ret = FALSE;
++        m_DxgkInterface.DxgkCbSynchronizeExecution(m_DxgkInterface.DeviceHandle, VSyncNotify, this, 0, &ret);
++    }
++}
++
++VOID VioGpuDod::VSyncTimerCallback(_In_ PEX_TIMER Timer, _In_opt_ PVOID Context)
++{
++    UNREFERENCED_PARAMETER(Timer);
++    VioGpuDod *pVioGpuDod = reinterpret_cast<VioGpuDod *>(Context);
++    if (pVioGpuDod)
++    {
++        pVioGpuDod->VSyncTick();
++    }
++}
++
+ NTSTATUS VioGpuDod::SystemDisplayEnable(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
+                                         _In_ PDXGKARG_SYSTEM_DISPLAY_ENABLE_FLAGS Flags,
+                                         _Out_ UINT *pWidth,
+@@ -3231,6 +3406,41 @@ BOOLEAN VioGpuAdapter::GetDisplayInfo(void)
+     return FALSE;
+ }
+ 
++// Entangled: the refresh rate of the EDID's preferred (first) detailed
++// timing, pixel clock over total pixels. 60 Hz when there is none or it is
++// not credible.
++VOID VioGpuAdapter::GetRefreshRate(_Out_ ULONG *pNumerator, _Out_ ULONG *pDenominator)
++{
++    PAGED_CODE();
++
++    *pNumerator = 60;
++    *pDenominator = 1;
++
++    PBYTE edid = GetEdidData();
++    if (edid == NULL)
++    {
++        return;
++    }
++    PBYTE dtd = edid + 54;
++    ULONG clock = ((ULONG)dtd[0] | ((ULONG)dtd[1] << 8)) * 10000;
++    ULONG htotal = (dtd[2] | ((dtd[4] & 0xF0) << 4)) + (dtd[3] | ((dtd[4] & 0x0F) << 8));
++    ULONG vtotal = (dtd[5] | ((dtd[7] & 0xF0) << 4)) + (dtd[6] | ((dtd[7] & 0x0F) << 8));
++    if (clock == 0 || htotal == 0 || vtotal == 0)
++    {
++        return;
++    }
++    // In millihertz: the exact ratio does not fit the 32-bit rationals a
++    // video signal carries once it is multiplied by a mode's height.
++    ULONGLONG total = (ULONGLONG)htotal * vtotal;
++    ULONG mhz = (ULONG)(((ULONGLONG)clock * 1000 + total / 2) / total);
++    if (mhz < 24000 || mhz > 240000)
++    {
++        return;
++    }
++    *pNumerator = mhz;
++    *pDenominator = 1000;
++}
++
+ int VioGpuAdapter::ProcessEdid(void)
+ {
+     PAGED_CODE();
+diff --git a/viogpu/viogpudo/viogpudo.h b/viogpu/viogpudo/viogpudo.h
+index 41533c73..49d755de 100644
+--- a/viogpu/viogpudo/viogpudo.h
++++ b/viogpu/viogpudo/viogpudo.h
+@@ -151,6 +151,7 @@ class VioGpuAdapter : IVioGpuPCI
+     }
+     PBYTE GetEdidData(void);
+     PBYTE GetCTA861Data(void);
++    VOID GetRefreshRate(_Out_ ULONG *pNumerator, _Out_ ULONG *pDenominator);
+ 
+   protected:
+   private:
+@@ -247,6 +248,17 @@ class VioGpuDod
+     USHORT m_PersistentDispMode0Width;
+     USHORT m_PersistentDispMode0Height;
+ 
++    // Entangled: the vsync. The display's refresh rate as the EDID's preferred
++    // timing states it, a high-resolution timer running at that rate while
++    // dxgkrnl has the vsync interrupt enabled, the time of the last one and
++    // the grid point the next is due at (100 ns units of the performance counter).
++    ULONG m_RefreshNumerator;
++    ULONG m_RefreshDenominator;
++    PEX_TIMER m_VSyncTimer;
++    volatile LONG m_VSyncEnabled;
++    volatile LONGLONG m_LastVSync;
++    LONGLONG m_NextVSync;
++
+   public:
+     VioGpuDod(_In_ DEVICE_OBJECT *pPhysicalDeviceObject);
+     ~VioGpuDod(void);
+@@ -358,6 +370,8 @@ class VioGpuDod
+     NTSTATUS
+     UpdateActiveVidPnPresentPath(_In_ CONST DXGKARG_UPDATEACTIVEVIDPNPRESENTPATH *CONST pUpdateActiveVidPnPresentPath);
+     NTSTATUS QueryVidPnHWCapability(_Inout_ DXGKARG_QUERYVIDPNHWCAPABILITY *pVidPnHWCaps);
++    NTSTATUS ControlInterrupt(_In_ CONST DXGK_INTERRUPT_TYPE InterruptType, _In_ BOOLEAN EnableInterrupt);
++    NTSTATUS GetScanLine(_Inout_ DXGKARG_GETSCANLINE *pGetScanLine);
+     NTSTATUS StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
+                                                       _Out_ DXGK_DISPLAY_INFORMATION *pDisplayInfo);
+     NTSTATUS SystemDisplayEnable(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
+@@ -398,4 +412,12 @@ class VioGpuDod
+     NTSTATUS SetRegisterInfo(_In_ ULONG Id, _In_ DWORD MemSize);
+     NTSTATUS GetRegisterInfo(void);
+     VOID BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo, PVIDEO_MODE_INFORMATION pModeInfo);
++    VOID StartVSync(VOID);
++    VOID StopVSync(VOID);
++    LONGLONG VSyncPeriod100ns(VOID) const;
++    LONGLONG Now100ns(VOID) const;
++    VOID ArmVSync(LONGLONG Now);
++    VOID VSyncTick(VOID);
++    static EXT_CALLBACK VSyncTimerCallback;
++    static KSYNCHRONIZE_ROUTINE VSyncNotify;
+ };

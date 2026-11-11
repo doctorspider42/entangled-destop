@@ -1,0 +1,98 @@
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index 68f9e63..9b20262 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -60,6 +60,9 @@ void InitializeDebugPrints(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING Re
+     virtioDebugLevel = 0x5;
+     bBreakAlways = 1;
+     nDebugLevel = TRACE_LEVEL_WARNING;
++#if defined(ENTANGLED_SERIAL_TRACE)
++    nDebugLevel = ENTANGLED_SERIAL_TRACE;
++#endif
+ #if defined(COM_DEBUG)
+     VirtioDebugPrintProc = DebugPrintFuncSerial;
+ #elif defined(PRINT_DEBUG)
+diff --git a/viogpu/viogpu3d/trace.h b/viogpu/viogpu3d/trace.h
+index 3f3925f..e47262b 100644
+--- a/viogpu/viogpu3d/trace.h
++++ b/viogpu/viogpu3d/trace.h
+@@ -1,7 +1,15 @@
+ #pragma once
+ #include "kdebugprint.h"
+ 
++// Entangled: upstream forces its debug mode on (DBG 1, messages to a kernel
++// debugger). Ours is off, and on only in a diagnostic build:
++// ENTANGLED_SERIAL_TRACE=<level> sends the driver's messages up to that level
++// to COM1, which a VM's log carries - the only view into a kernel driver in a
++// guest with no debugger attached.
++#if defined(ENTANGLED_SERIAL_TRACE)
+ #define DBG 1
++#define COM_DEBUG 1
++#endif
+ 
+ #ifndef TRACE_LEVEL_INFORMATION
+ #define TRACE_LEVEL_NONE        0   // Tracing is not on
+@@ -33,6 +41,12 @@
+ 
+ #define WPP_INIT_TRACING(driver, regpath)  InitializeDebugPrints(driver, regpath);
+ #define WPP_CLEANUP(driver)
++#elif defined(ENTANGLED_NO_WPP)
++// Entangled: built without the WDK's MSBuild integration, so without WPP.
++#define DbgPrint(Level, MSG)
++#define VioGpuDbgBreak()
++#define WPP_INIT_TRACING(driver, regpath)
++#define WPP_CLEANUP(driver)
+ #else
+ //#define DbgPrint(level, line) {};
+ 
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 8d3512a..78aa512 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -208,6 +208,26 @@ NTSTATUS VioGpuAdapter::StartDevice(_In_ DXGK_START_INFO *pDxgkStartInfo,
+         return STATUS_UNSUCCESSFUL;
+     }
+ 
++    {
++        HANDLE key;
++        if (NT_SUCCESS(IoOpenDeviceRegistryKey(m_pPhysicalDevice, PLUGPLAY_REGKEY_DRIVER, KEY_READ | KEY_WRITE, &key)))
++        {
++            DWORD once = 0;
++            if (NT_SUCCESS(ReadRegistryDWORD(key, L"StartOnce", &once)))
++            {
++                DWORD spent = 0;
++                WriteRegistryDWORD(key, L"StartOnce", &spent);
++                if (once == 0)
++                {
++                    ZwClose(key);
++                    DbgPrint(TRACE_LEVEL_ERROR, ("StartOnce is spent: not starting until the package is installed again\n"));
++                    return STATUS_UNSUCCESSFUL;
++                }
++            }
++            ZwClose(key);
++        }
++    }
++
+     Status = SetRegisterInfo(GetInstanceId(), 0);
+     if (!NT_SUCCESS(Status))
+     {
+@@ -598,6 +618,19 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+         return STATUS_INVALID_BUFFER_SIZE;
+     }
+ 
++#if defined(ENTANGLED_SERIAL_TRACE)
++    if (size > 4 && pVioGpuEscape->Type == 0x900)
++    {
++        // Type and DataLength (two bytes each), then the text.
++        char text[240];
++        UINT length = min(size - 4, (UINT)sizeof(text) - 1);
++        RtlCopyMemory(text, (PUCHAR)pVioGpuEscape + 4, length);
++        text[length] = 0;
++        VirtioDebugPrintProc("[umd] %s\n", text);
++        return STATUS_SUCCESS;
++    }
++#endif
++
+     switch (pVioGpuEscape->Type)
+     {
+         case VIOGPU_GET_DEVICE_ID:

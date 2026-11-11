@@ -32,6 +32,9 @@ read before adding a guest-family switch or a legacy platform device).
 [docs/adr/0009-own-windows-gpu-driver.md](docs/adr/0009-own-windows-gpu-driver.md)
 (proposed: replacing the third-party viogpu3d with our own KMDF driver, a Mesa
 Venus winsys for Windows, and DXVK/Zink on top).
+[docs/adr/0010-wddm-desktop-on-the-gpu.md](docs/adr/0010-wddm-desktop-on-the-gpu.md)
+(proposed: a WDDM driver for the display function after all, so DWM composes
+on the GPU — `viogpu3d` carrying Venus, `d3d10umd` on Zink; phases W0–W5).
 
 ## Build and test
 

@@ -26,8 +26,11 @@ if (-not (Test-Path $pfx)) {
 }
 & "$kit\x86\Inf2Cat.exe" "/driver:$Out" /os:10_X64 /uselocaltime | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Inf2Cat failed ($LASTEXITCODE)" }
-foreach ($file in 'entangled-gpu.sys', 'entangled-gpu.cat') {
-    & "$kit\x64\signtool.exe" sign /fd sha256 /f $pfx /p 'entangled-test' (Join-Path $Out $file) | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "signtool failed on $file ($LASTEXITCODE)" }
+# Every driver built into this directory: entangled-gpu, and entangled-display
+# (guest/windows-gpu/display) when its build.cmd wrote here too. One
+# certificate for both, so a guest trusts one.
+foreach ($file in Get-ChildItem -Path $Out -File | Where-Object { $_.Extension -in '.sys', '.cat' }) {
+    & "$kit\x64\signtool.exe" sign /fd sha256 /f $pfx /p 'entangled-test' $file.FullName | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "signtool failed on $($file.Name) ($LASTEXITCODE)" }
 }
 Write-Output "signed $Out"

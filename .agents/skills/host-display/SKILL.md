@@ -336,6 +336,19 @@ Rules to keep when extending this:
   `virtio-gpu flush` (`RUST_LOG=virtio_gpu::device=trace`) under a steady
   guest workload such as a scrolling console: peaks at multiples of 15.6 ms
   are the guest's frame clock, not a cost on the host.
+- **The cure is the display driver, and it rides in the 3D package.**
+  `entangled-display.sys` (`guest/windows-gpu/display`: viogpudo at a pinned
+  commit plus our patch) reports the EDID's refresh rate and raises a vsync
+  from a high-resolution guest timer; measured 41.5 fps before, 58 of 60 and
+  73-94 of 120 after (ADR-0008, the vsync amendment). To tell whether a
+  guest's frames follow it, fit a period to the flush timestamps instead of
+  reading intervals: at 120 Hz small and large presents land in two groups
+  inside one period, so the interval histogram shows 5 and 12 ms while the
+  frames sit on an 8.333 ms grid. A desktop pacing at 17.6 ms for 60 Hz is a
+  *periodic* kernel timer gaining a clock interrupt per period - the driver
+  re-arms a one-shot against a grid for that reason. A guest back at ~40 fps
+  has viogpudo on the display again (`Get-PnpDevice -Class Display`);
+  `owngpu-bind.ps1` puts ours back at startup.
 - **Frame pacing is measured by the GPU device, not by this crate**
   (`virtio_gpu::pacing`, GAME-2105): the window presents asynchronously —
   `update_scanout` is a `memcpy` plus a wake, and the guest never waits for it

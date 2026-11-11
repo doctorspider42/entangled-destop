@@ -829,3 +829,117 @@ for the display. Applications that present through the overlay plane
 `ENTANGLED_SHOW_FPS=1`) puts a badge in the window's top-right corner:
 the guest's flushes over the last second (`display::fps`), counted by the
 clock so an idle desktop reads 0.
+
+### Amendment, 2026-11-10: a vsync for the desktop (`entangled-display`)
+
+The amendment above ended at the driver. This is the driver:
+`guest/windows-gpu/display` builds **`entangled-display.sys`**, virtio-win's
+display-only `viogpudo` (BSD-3-Clause) at a pinned commit with one patch of
+ours, and the Windows desktop now composes on the display's refresh rate.
+
+Measured the same way (a console scrolling at full speed, the host's
+timestamp of every `RESOURCE_FLUSH`), in one Windows 10 guest, 1920×1016,
+8 vCPUs, on the host with every RTC tick delivered:
+
+| driver | `refresh_hz` | frames | where the intervals sit |
+|---|---|---|---|
+| `viogpudo` 0.1.302 | 120 | 24.1 ms mean, **41.5 fps** | two peaks: 15–17 ms (46 %) and 29–32 ms (42 %) |
+| `entangled-display` | 60 | 17.2 ms mean, **58.1 fps** (the device's pacing report: 57.9–60.0) | one peak at 16–17 ms; on a 16.667 ms grid, 1219 of 1260 vsyncs (97 %) carry a frame, 2 carry two |
+| `entangled-display` | 120 | 10.7 ms mean, **93.9 fps** (two later runs: 72.8 and 74.4) | on an 8.333 ms grid, 78 % of vsyncs carry a frame (60–62 % in the later runs), none two |
+
+At 60 Hz that is the single peak asked for. At 120 Hz the frames are on the
+vsync grid (the period that fits the flushes best is 8.3334–8.3336 ms in
+every run) but not every vsync gets one, and inside a period they arrive in
+two groups about 3.5 ms apart: the trace alternates between flushes of an
+8×4 rectangle (the caret) and of the 960×503 console, and the small ones
+come early (which group is which is read off the trace, not measured). So the *intervals* at
+120 Hz show peaks at 5 and 11–12 ms, and 25 ms where two vsyncs went by,
+rather than one at 8.3. That is DWM composing 1920×1016 on the CPU inside an
+8.3 ms budget, not the clock: the same driver fills 97 % at 60 Hz.
+
+**What the patch does** (`0001-refresh-rate-and-vsync.patch`, 409 lines):
+
+- `BuildVideoSignalInfo` reports the rate of the EDID's preferred timing, in
+  millihertz, for every mode (it was `D3DKMDT_FREQUENCY_NOTSPECIFIED`).
+- The driver supplies `DxgkDdiControlInterrupt` and `DxgkDdiGetScanLine`
+  (a display-only driver supplies both or neither; with neither, dxgkrnl
+  simulates the vsync, which is the clock-tick pacing measured above). While
+  Windows has the vsync enabled a timer raises
+  `DXGK_INTERRUPT_DISPLAYONLY_VSYNC`: `DxgkCbNotifyInterrupt` under
+  `DxgkCbSynchronizeExecution`, then the DPC. Red Hat's `qxl-wddm-dod` does
+  the same, from memory of its source; that Windows accepts a vsync from a
+  display-only driver is what the table shows.
+
+**Why a timer in the guest and not an interrupt from the host.** virtio-gpu
+has no vblank. A host interrupt per refresh would need a feature bit outside
+the spec, a vector or a config event Linux's driver would also take 120
+times a second, a host thread per display that can sleep to a fraction of a
+millisecond (the RTC amendment is about a host thread that could not), and
+the reset, quiesce and save/load every device state owes. A guest timer needs
+none of it and works on any host. Its precision is the guest's clock
+interrupt: `ExAllocateTimer` with `EX_TIMER_HIGH_RESOLUTION` expires on the
+RTC's 2048 Hz interrupt (488 µs), not on the 15.6 ms tick an ordinary
+`KeSetTimerEx` waits for. The host route stays open if a guest ever needs a
+vsync tied to the host monitor's; nothing here does, the window presents with
+`Mailbox`.
+
+**The periodic timer was wrong, and the measurement said so.** The first
+build set a periodic `ExSetTimer`. At 60 Hz the desktop came out at one clean
+peak — at 17.6 ms, 56.8 fps: each period is re-armed from the clock interrupt
+that expired the last, so it lasted 36 interrupts where 34.1 were asked for.
+The timer is now one shot, re-armed in its callback against a grid one period
+apart, so a late vsync does not make the next one late; a callback a whole
+period behind (a stalled vCPU) skips the vsyncs it missed.
+
+**Installing it.** It rides in the 3D package (`windows-gpu.yml` builds it
+into the same directory as `entangled-gpu.sys`, and `sign.ps1` signs every
+driver there under the run's one certificate): `own_gpu_files` takes
+`entangled-display.inf/.sys/.cat` when the package has all three, and
+`owngpu-bind.ps1` puts it on the display function
+(`SUBSYS_11001AF4`) wherever viogpudo runs it — a Microsoft-signed viogpudo
+outranks a test-signed package, so `gpu-test install <inf> <hardware id>`
+forces it, as for the render-only function. The swap is live: the desktop
+carried on, on the new driver, with no restart, and stayed bound across the
+reboots that followed, with and without an `[[optical]]` drive on the bus. It needs
+test-signing mode like the rest of the package, so a 2D-only Windows guest
+keeps viogpudo and its ~40 fps.
+
+**Not verified.** The workflow has not run with the new step (it runs on a
+push to main; the kit it assembles from NuGet has to hold `displib.lib`), so
+`guest/windows/pinned.toml` still pins `gpu3d-5`, which has no display
+driver. `owngpu-bind.ps1`'s display branch was installed in the guest and ran
+at startup, but never met a display on viogpudo: the first install was the
+same `gpu-test` command by hand. A fresh `install windows --gpu3d` with the
+new package, Windows 11, sleep and resume, and the window's `Ctrl+Alt+F`
+badge by eye (the test window was minimised; the badge and `guest_fps` count
+the same flushes) are untried.
+
+### Amendment, 2026-11-11: full-screen video at 17 fps was Edge, started without its switches
+
+With the vsync in, a full-screen YouTube video still ran at about 17 fps. The
+device's pacing report put it in the guest (the host served a frame in 2–3 ms)
+and made it look like a slow copy: the time per frame grew with the pixels
+changed, about 30 ms per megapixel, with no vCPU saturated. Three tests in the
+same guest took the suspects apart:
+
+| workload | path | frames |
+|---|---|---|
+| a maximised console scrolling, 1.1–1.2 Mpx a frame | DWM → `entangled-display` | 79–92 fps |
+| a full-window animation in Edge started with its switches, 1.95 Mpx | the overlay plane (ADR-0009 phase E) | 118–120 fps |
+| YouTube 1080p60 full screen, Edge started with its switches | the overlay plane | 60–75 fps |
+| the same, Edge opened from the taskbar after a fresh boot | 2D, every frame through the CPU | **17.5 fps** |
+| the same after `taskkill /im msedge.exe` and the same taskbar icon | the overlay plane | 68–75 fps |
+
+So neither DWM, the display driver nor the overlay was slow. Edge's **Startup
+boost** starts it in the background at logon without `--use-angle=vulkan
+--ignore-gpu-blocklist` (`gpu3d-edge.ps1` puts them on the shortcuts and the
+link handlers, which a running Edge ignores), and the window opened later
+joins that process: Edge renders with the software Direct3D of the Basic
+Render Driver, and the host sees whole-window 2D frames and no new Venus
+context. `gpu3d-edge.ps1` now also sets the Edge policies
+`StartupBoostEnabled = 0` and `BackgroundModeEnabled = 0`. **Verified** in
+the test guest (set by hand, then a restart): Edge from the taskbar presents
+through the overlay at once, 60–75 fps full screen, 130 of 133 flushes 3D.
+Not verified: the script's own lines (the same two values were set with
+`reg add`), and Edge started by typing `msedge` into the Run box, which takes
+no shortcut and stays on the software path.
