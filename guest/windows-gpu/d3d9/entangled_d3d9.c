@@ -9,6 +9,7 @@
  * Nothing is drawn yet.
  */
 #include "ddi.h"
+#include "d3d9_nine.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -437,6 +438,9 @@ d3d9_get_caps(HANDLE adapter, const D3DDDIARG_GETCAPS *arg)
 struct d3d9_device {
    HANDLE runtime;
    D3DDDI_DEVICECALLBACKS callbacks;
+   /* Nine on a Gallium screen (d3d9_nine.c), or NULL where there is none:
+    * the device then only answers, as in phase N0. */
+   struct entangled_nine *nine;
 };
 
 /* Phase N0's resources: a handle and what was asked for, nothing behind it.
@@ -497,8 +501,11 @@ d3d9_destroy_resource(HANDLE device, HANDLE resource)
 static HRESULT APIENTRY
 d3d9_destroy_device(HANDLE handle)
 {
+   struct d3d9_device *device = handle;
+
+   entangled_nine_close(device->nine);
    d3d9_log("device %p destroyed", handle);
-   free(handle);
+   free(device);
    return S_OK;
 }
 
@@ -530,6 +537,18 @@ d3d9_create_device(HANDLE adapter, D3DDDIARG_CREATEDEVICE *arg)
    arg->hDevice = device;
    d3d9_log("device %p: interface %u, version 0x%x, flags 0x%x", (void *)device,
             arg->Interface, arg->Version, arg->Flags.Value);
+   {
+      struct entangled_nine_info info;
+      long result;
+
+      device->nine = entangled_nine_open(&info, &result);
+      if (device->nine)
+         d3d9_log("nine: %s, vs 0x%x, ps 0x%x, textures to %u, %u render targets",
+                  info.renderer, info.vertex_shader, info.pixel_shader, info.max_texture_width,
+                  info.simultaneous_rts);
+      else
+         d3d9_log("nine: no adapter (0x%08lx)", (unsigned long)result);
+   }
    return S_OK;
 }
 

@@ -11,6 +11,7 @@
 #endif
 
 #include <windows.h>
+#include <winternl.h> /* NTSTATUS, which a lean windows.h leaves out */
 
 #include <d3d9types.h>
 #include <d3d9caps.h>

@@ -1,0 +1,983 @@
+diff --git a/include/D3D9/d3d9types.h b/include/D3D9/d3d9types.h
+index 88f22b97..3b38d70b 100644
+--- a/include/D3D9/d3d9types.h
++++ b/include/D3D9/d3d9types.h
+@@ -24,7 +24,13 @@
+ #define _D3D9TYPES_H_
+ 
+ #ifdef _WIN32
++/* IUnknown and its C macros: Mesa builds with WIN32_LEAN_AND_MEAN, which
++ * leaves COM out of windows.h. */
++#ifndef COBJMACROS
++#define COBJMACROS
++#endif
+ #include <windows.h>
++#include <unknwn.h>
+ #else /* _WIN32 */
+ #include <stdint.h>
+ 
+diff --git a/include/meson.build b/include/meson.build
+index 397d4b42..71d93e30 100644
+--- a/include/meson.build
++++ b/include/meson.build
+@@ -3,6 +3,7 @@
+ 
+ inc_include = [include_directories('.')]
+ inc_winddk = include_directories('winddk')
++inc_d3d9 = include_directories('D3D9')
+ 
+ # Most things assume that Android headers are in the default include
+ # path when compiling for Android so add the stub headers to
+diff --git a/meson.build b/meson.build
+index 37f2fd47..8549b901 100644
+--- a/meson.build
++++ b/meson.build
+@@ -830,6 +830,8 @@ if with_gallium_st_d3d10umd
+   endif
+ endif
+ 
++with_gallium_st_d3d9umd = get_option('gallium-d3d9umd')
++
+ if host_machine.cpu_family() == 'ppc64' and host_machine.endian() == 'little'
+   if cc.compiles('''
+       #include <altivec.h>
+diff --git a/meson.options b/meson.options
+index 93a60e30..2507f734 100644
+--- a/meson.options
++++ b/meson.options
+@@ -136,6 +136,13 @@ option(
+   description : 'build gallium D3D10 WDDM UMD frontend.',
+ )
+ 
++option(
++  'gallium-d3d9umd',
++  type : 'boolean',
++  value : false,
++  description : 'build the gallium D3D9 WDDM UMD (Nine behind the DDI).',
++)
++
+ option(
+   'gallium-rusticl',
+   type : 'boolean',
+diff --git a/src/gallium/frontends/nine/adapter9.c b/src/gallium/frontends/nine/adapter9.c
+index 4119c9fc..d3ea9617 100644
+--- a/src/gallium/frontends/nine/adapter9.c
++++ b/src/gallium/frontends/nine/adapter9.c
+@@ -40,7 +40,7 @@ NineAdapter9_ctor( struct NineAdapter9 *This,
+     This->ctx = pCTX;
+     if (!hal->caps.clip_halfz) {
+         WARN_ONCE("Driver doesn't natively support d3d9 coordinates\n");
+-        const nir_shader_compiler_options *options = hal->get_compiler_options(hal, PIPE_SHADER_IR_NIR, PIPE_SHADER_VERTEX);
++        const nir_shader_compiler_options *options = hal->nir_options[MESA_SHADER_VERTEX];
+         if(!options->compact_arrays){
+             ERR("Driver doesn't support emulating d3d9 coordinates\n");
+             return D3DERR_DRIVERINTERNALERROR;
+@@ -57,22 +57,22 @@ NineAdapter9_ctor( struct NineAdapter9 *This,
+ 
+     /* checks minimum requirements, most are vs3/ps3 strict requirements */
+     if (!has_sm3(hal) ||
+-        hal->shader_caps[PIPE_SHADER_VERTEX].max_const_buffer0_size < 256 * sizeof(float[4]) ||
+-        hal->shader_caps[PIPE_SHADER_FRAGMENT].max_const_buffer0_size < 244 * sizeof(float[4]) ||
+-        hal->shader_caps[PIPE_SHADER_VERTEX].max_temps < 32 ||
+-        hal->shader_caps[PIPE_SHADER_FRAGMENT].max_temps < 32 ||
+-        hal->shader_caps[PIPE_SHADER_VERTEX].max_inputs < 16 ||
+-        hal->shader_caps[PIPE_SHADER_FRAGMENT].max_inputs < 10 ||
+-        hal->shader_caps[PIPE_SHADER_FRAGMENT].max_texture_samplers < 16) {
++        hal->shader_caps[MESA_SHADER_VERTEX].max_const_buffer0_size < 256 * sizeof(float[4]) ||
++        hal->shader_caps[MESA_SHADER_FRAGMENT].max_const_buffer0_size < 244 * sizeof(float[4]) ||
++        hal->shader_caps[MESA_SHADER_VERTEX].max_temps < 32 ||
++        hal->shader_caps[MESA_SHADER_FRAGMENT].max_temps < 32 ||
++        hal->shader_caps[MESA_SHADER_VERTEX].max_inputs < 16 ||
++        hal->shader_caps[MESA_SHADER_FRAGMENT].max_inputs < 10 ||
++        hal->shader_caps[MESA_SHADER_FRAGMENT].max_texture_samplers < 16) {
+         ERR("Your device is not supported by Gallium Nine. Minimum requirement "
+             "is >= r500, >= nv50, >= i965\n");
+         return D3DERR_DRIVERINTERNALERROR;
+     }
+     /* for r500 */
+-    if (hal->shader_caps[PIPE_SHADER_VERTEX].max_const_buffer0_size < 276 * sizeof(float[4]) || /* we put bool and int constants with float constants */
+-        hal->shader_caps[PIPE_SHADER_VERTEX].max_temps < 40 || /* we use some more temp registers */
+-        hal->shader_caps[PIPE_SHADER_FRAGMENT].max_temps < 40 ||
+-        hal->shader_caps[PIPE_SHADER_FRAGMENT].max_inputs < 20) /* we don't pack inputs as much as we could */
++    if (hal->shader_caps[MESA_SHADER_VERTEX].max_const_buffer0_size < 276 * sizeof(float[4]) || /* we put bool and int constants with float constants */
++        hal->shader_caps[MESA_SHADER_VERTEX].max_temps < 40 || /* we use some more temp registers */
++        hal->shader_caps[MESA_SHADER_FRAGMENT].max_temps < 40 ||
++        hal->shader_caps[MESA_SHADER_FRAGMENT].max_inputs < 20) /* we don't pack inputs as much as we could */
+         WARN_ONCE("Your device is at the limit of Gallium Nine requirements. Some games "
+             "may run into issues because requirements are too tight\n");
+     return D3D_OK;
+@@ -312,7 +312,7 @@ NineAdapter9_CheckDeviceFormat( struct NineAdapter9 *This,
+     }
+ 
+     if ((Usage & D3DUSAGE_QUERY_VERTEXTEXTURE) &&
+-        !screen->shader_caps[PIPE_SHADER_VERTEX].max_texture_samplers)
++        !screen->shader_caps[MESA_SHADER_VERTEX].max_texture_samplers)
+         return D3DERR_NOTAVAILABLE;
+ 
+     /* API hack because setting RT[0] to NULL is forbidden */
+@@ -825,7 +825,7 @@ NineAdapter9_GetDeviceCaps( struct NineAdapter9 *This,
+     pCaps->MaxPrimitiveCount = 0x555555; /* <- wine, really 0xFFFFFFFF; */
+     pCaps->MaxVertexIndex = 0xFFFFFF; /* <- wine, really 0xFFFFFFFF */
+     pCaps->MaxStreams =
+-        _min(screen->shader_caps[PIPE_SHADER_VERTEX].max_inputs,
++        _min(screen->shader_caps[MESA_SHADER_VERTEX].max_inputs,
+              16);
+ 
+     pCaps->MaxStreamStride = screen->caps.max_vertex_attrib_stride;
+@@ -884,11 +884,11 @@ NineAdapter9_GetDeviceCaps( struct NineAdapter9 *This,
+ 
+     pCaps->VS20Caps.Caps = D3DVS20CAPS_PREDICATION;
+     pCaps->VS20Caps.DynamicFlowControlDepth = /* XXX is this dynamic ? */
+-        screen->shader_caps[PIPE_SHADER_VERTEX].max_control_flow_depth;
++        screen->shader_caps[MESA_SHADER_VERTEX].max_control_flow_depth;
+     pCaps->VS20Caps.NumTemps =
+-        screen->shader_caps[PIPE_SHADER_VERTEX].max_temps;
++        screen->shader_caps[MESA_SHADER_VERTEX].max_temps;
+     pCaps->VS20Caps.StaticFlowControlDepth = /* XXX is this static ? */
+-        screen->shader_caps[PIPE_SHADER_VERTEX].max_control_flow_depth;
++        screen->shader_caps[MESA_SHADER_VERTEX].max_control_flow_depth;
+ 
+     /* also check for values < 0, because get_shader_param may return unsigned */
+     if (pCaps->VS20Caps.DynamicFlowControlDepth > D3DVS20_MAX_DYNAMICFLOWCONTROLDEPTH
+@@ -907,20 +907,20 @@ NineAdapter9_GetDeviceCaps( struct NineAdapter9 *This,
+     pCaps->PS20Caps.Caps = D3DPS20CAPS_ARBITRARYSWIZZLE |
+                            D3DPS20CAPS_GRADIENTINSTRUCTIONS |
+                            D3DPS20CAPS_PREDICATION;
+-    if (screen->shader_caps[PIPE_SHADER_FRAGMENT].max_tex_instructions ==
+-        screen->shader_caps[PIPE_SHADER_FRAGMENT].max_instructions)
++    if (screen->shader_caps[MESA_SHADER_FRAGMENT].max_tex_instructions ==
++        screen->shader_caps[MESA_SHADER_FRAGMENT].max_instructions)
+         pCaps->PS20Caps.Caps |= D3DPS20CAPS_NOTEXINSTRUCTIONLIMIT;
+-    if (screen->shader_caps[PIPE_SHADER_FRAGMENT].max_tex_instructions ==
+-        screen->shader_caps[PIPE_SHADER_FRAGMENT].max_tex_indirections)
++    if (screen->shader_caps[MESA_SHADER_FRAGMENT].max_tex_instructions ==
++        screen->shader_caps[MESA_SHADER_FRAGMENT].max_tex_indirections)
+         pCaps->PS20Caps.Caps |= D3DPS20CAPS_NODEPENDENTREADLIMIT;
+     pCaps->PS20Caps.DynamicFlowControlDepth = /* XXX is this dynamic ? */
+-        screen->shader_caps[PIPE_SHADER_FRAGMENT].max_control_flow_depth;
++        screen->shader_caps[MESA_SHADER_FRAGMENT].max_control_flow_depth;
+     pCaps->PS20Caps.NumTemps =
+-        screen->shader_caps[PIPE_SHADER_FRAGMENT].max_temps;
++        screen->shader_caps[MESA_SHADER_FRAGMENT].max_temps;
+     pCaps->PS20Caps.StaticFlowControlDepth =  /* XXX is this static ? */
+-        screen->shader_caps[PIPE_SHADER_FRAGMENT].max_control_flow_depth;
++        screen->shader_caps[MESA_SHADER_FRAGMENT].max_control_flow_depth;
+     pCaps->PS20Caps.NumInstructionSlots =
+-        screen->shader_caps[PIPE_SHADER_FRAGMENT].max_instructions;
++        screen->shader_caps[MESA_SHADER_FRAGMENT].max_instructions;
+ 
+     if (pCaps->PS20Caps.DynamicFlowControlDepth > D3DPS20_MAX_DYNAMICFLOWCONTROLDEPTH
+         || pCaps->PS20Caps.DynamicFlowControlDepth < 0)
+@@ -938,7 +938,7 @@ NineAdapter9_GetDeviceCaps( struct NineAdapter9 *This,
+     assert(pCaps->PS20Caps.NumInstructionSlots >= D3DPS20_MIN_NUMINSTRUCTIONSLOTS);
+ 
+ 
+-    if (screen->shader_caps[PIPE_SHADER_VERTEX].max_texture_samplers)
++    if (screen->shader_caps[MESA_SHADER_VERTEX].max_texture_samplers)
+         pCaps->VertexTextureFilterCaps = pCaps->TextureFilterCaps &
+             ~(D3DPTFILTERCAPS_MIPFPOINT |
+               D3DPTFILTERCAPS_MIPFPOINT); /* XXX */
+@@ -946,9 +946,9 @@ NineAdapter9_GetDeviceCaps( struct NineAdapter9 *This,
+         pCaps->VertexTextureFilterCaps = 0;
+ 
+     pCaps->MaxVertexShader30InstructionSlots =
+-        screen->shader_caps[PIPE_SHADER_VERTEX].max_instructions;
++        screen->shader_caps[MESA_SHADER_VERTEX].max_instructions;
+     pCaps->MaxPixelShader30InstructionSlots =
+-        screen->shader_caps[PIPE_SHADER_FRAGMENT].max_instructions;
++        screen->shader_caps[MESA_SHADER_FRAGMENT].max_instructions;
+     if (pCaps->MaxVertexShader30InstructionSlots > D3DMAX30SHADERINSTRUCTIONS)
+         pCaps->MaxVertexShader30InstructionSlots = D3DMAX30SHADERINSTRUCTIONS;
+     if (pCaps->MaxPixelShader30InstructionSlots > D3DMAX30SHADERINSTRUCTIONS)
+diff --git a/src/gallium/frontends/nine/buffer9.c b/src/gallium/frontends/nine/buffer9.c
+index 965f29db..e3cbe89a 100644
+--- a/src/gallium/frontends/nine/buffer9.c
++++ b/src/gallium/frontends/nine/buffer9.c
+@@ -641,7 +641,7 @@ NineBuffer9_Upload( struct NineBuffer9 *This )
+                 unsigned buffer_offset = 0;
+                 struct pipe_resource *resource = NULL;
+                 This->managed.can_unsynchronized = false;
+-                u_upload_data(device->vertex_uploader,
++                u_upload_data_ref(device->vertex_uploader,
+                     required_valid_region->x,
+                     required_valid_region->width,
+                     64,
+diff --git a/src/gallium/frontends/nine/device9.c b/src/gallium/frontends/nine/device9.c
+index 4fe9c07c..90063ad1 100644
+--- a/src/gallium/frontends/nine/device9.c
++++ b/src/gallium/frontends/nine/device9.c
+@@ -223,9 +223,9 @@ NineDevice9_ctor( struct NineDevice9 *This,
+     /* TODO: check if swvp is reset by device Resets */
+ 
+     if (This->may_swvp &&
+-        (This->screen->shader_caps[PIPE_SHADER_VERTEX].max_const_buffer0_size
++        (This->screen->shader_caps[MESA_SHADER_VERTEX].max_const_buffer0_size
+                                      < (NINE_MAX_CONST_F_SWVP/2) * sizeof(float[4]) ||
+-         This->screen->shader_caps[PIPE_SHADER_VERTEX].max_const_buffers < 5)) {
++         This->screen->shader_caps[MESA_SHADER_VERTEX].max_const_buffers < 5)) {
+         /* Note: We just go on, some apps never use the abilities of
+          * swvp, and just set more constants than allowed at init.
+          * Only cards we support that are affected are the r500 */
+@@ -445,7 +445,7 @@ NineDevice9_ctor( struct NineDevice9 *This,
+ 
+         /* vs 3.0: >= 256 float constants, but for cards with exactly 256 slots,
+          * we have to take in some more slots for int and bool*/
+-        max_const_vs = _min(pScreen->shader_caps[PIPE_SHADER_VERTEX].max_const_buffer0_size /
++        max_const_vs = _min(pScreen->shader_caps[MESA_SHADER_VERTEX].max_const_buffer0_size /
+                                 sizeof(float[4]),
+                             NINE_MAX_CONST_ALL_VS);
+         /* ps 3.0: 224 float constants. All cards supported support at least
+@@ -556,9 +556,9 @@ NineDevice9_ctor( struct NineDevice9 *This,
+     This->vertex_uploader = This->csmt_active ? This->pipe_secondary->stream_uploader : This->context.pipe->stream_uploader;
+     This->driver_caps.window_space_position_support = GET_PCAP(vs_window_space_position);
+     This->driver_caps.disabling_depth_clipping_support = GET_PCAP(depth_clip_disable);
+-    This->driver_caps.vs_integer = pScreen->shader_caps[PIPE_SHADER_VERTEX].integers;
+-    This->driver_caps.ps_integer = pScreen->shader_caps[PIPE_SHADER_FRAGMENT].integers;
+-    This->driver_caps.offset_units_unscaled = GET_PCAP(polygon_offset_units_unscaled);
++    This->driver_caps.vs_integer = pScreen->shader_caps[MESA_SHADER_VERTEX].integers;
++    This->driver_caps.ps_integer = pScreen->shader_caps[MESA_SHADER_FRAGMENT].integers;
++    This->driver_caps.offset_units_unscaled = true;
+     This->driver_caps.alpha_test_emulation = !GET_PCAP(alpha_test);
+     /* Always write pointsize output when the driver doesn't support point_size_per_vertex = 0.
+      * TODO: Only generate pointsize for draw calls that need it */
+@@ -3116,7 +3116,7 @@ NineDevice9_DrawPrimitiveUP( struct NineDevice9 *This,
+                 D3DERR_INVALIDCALL);
+     user_assert(PrimitiveCount, D3D_OK);
+ 
+-    u_upload_data(This->vertex_uploader,
++    u_upload_data_ref(This->vertex_uploader,
+                   0,
+                   (prim_count_to_vertex_count(PrimitiveType, PrimitiveCount)) * VertexStreamZeroStride,
+                   1,
+@@ -3179,7 +3179,7 @@ NineDevice9_DrawIndexedPrimitiveUP( struct NineDevice9 *This,
+     base = MinVertexIndex * VertexStreamZeroStride;
+     vbuf.is_user_buffer = false;
+     vbuf.buffer.resource = NULL;
+-    u_upload_data(This->vertex_uploader,
++    u_upload_data_ref(This->vertex_uploader,
+                   base,
+                   NumVertices * VertexStreamZeroStride, /* XXX */
+                   64,
+@@ -3191,7 +3191,7 @@ NineDevice9_DrawIndexedPrimitiveUP( struct NineDevice9 *This,
+     vbuf.buffer_offset -= base;
+ 
+     unsigned index_offset = 0;
+-    u_upload_data(This->pipe_secondary->stream_uploader,
++    u_upload_data_ref(This->pipe_secondary->stream_uploader,
+                   0,
+                   (prim_count_to_vertex_count(PrimitiveType, PrimitiveCount)) * index_size,
+                   64,
+diff --git a/src/gallium/frontends/nine/meson.build b/src/gallium/frontends/nine/meson.build
+index 8352a2e7..14c3ea4a 100644
+--- a/src/gallium/frontends/nine/meson.build
++++ b/src/gallium/frontends/nine/meson.build
+@@ -51,9 +51,6 @@ libnine_st = static_library(
+     inc_d3d9, inc_gallium, inc_include, inc_src, inc_gallium_aux,
+   ],
+   dependencies : [
+-    dep_thread, idep_nir, idep_nir_headers
++    dep_thread, idep_nir, idep_nir_headers, idep_mesautil,
+   ],
+-  link_with : [
+-    libmesa
+-  ]
+ )
+diff --git a/src/gallium/frontends/nine/nine_ff.c b/src/gallium/frontends/nine/nine_ff.c
+index 2a9fd461..06beeb27 100644
+--- a/src/gallium/frontends/nine/nine_ff.c
++++ b/src/gallium/frontends/nine/nine_ff.c
+@@ -336,7 +336,7 @@ static void *
+ nine_ff_build_vs(struct NineDevice9 *device, struct vs_build_ctx *vs)
+ {
+     const struct nine_ff_vs_key *key = vs->key;
+-    struct ureg_program *ureg = ureg_create(PIPE_SHADER_VERTEX);
++    struct ureg_program *ureg = ureg_create(MESA_SHADER_VERTEX);
+     struct ureg_dst oPos, oCol[2], oPsz, oFog;
+     struct ureg_dst AR;
+     unsigned i, c;
+@@ -1348,7 +1348,7 @@ static void *
+ nine_ff_build_ps(struct NineDevice9 *device, struct nine_ff_ps_key *key)
+ {
+     struct ps_build_ctx ps;
+-    struct ureg_program *ureg = ureg_create(PIPE_SHADER_FRAGMENT);
++    struct ureg_program *ureg = ureg_create(MESA_SHADER_FRAGMENT);
+     struct ureg_dst oCol;
+     unsigned s;
+     const unsigned texcoord_sn = get_texcoord_sn(device->screen);
+diff --git a/src/gallium/frontends/nine/nine_memory_helper.c b/src/gallium/frontends/nine/nine_memory_helper.c
+index 67febdda..cb78df9f 100644
+--- a/src/gallium/frontends/nine/nine_memory_helper.c
++++ b/src/gallium/frontends/nine/nine_memory_helper.c
+@@ -67,14 +67,16 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <limits.h>
+-#include <linux/memfd.h>
+-#include <pthread.h>
+ #include <stdio.h>
++#ifndef _WIN32
++#include <linux/memfd.h>
+ #include <sys/mman.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <ulimit.h>
+ #include <unistd.h>
++#endif
++#include "nine_win32.h"
+ 
+ #include "util/list.h"
+ #include "util/u_memory.h"
+@@ -93,7 +95,7 @@
+ #define DBG_CHANNEL (DBG_BASETEXTURE|DBG_SURFACE|DBG_VOLUME|DBG_TEXTURE|DBG_CUBETEXTURE)
+ 
+ /* Use memfd only for 32 bits. Check for memfd_create support */
+-#if DETECT_ARCH_X86 && defined(HAVE_MEMFD_CREATE)
++#if DETECT_ARCH_X86 && defined(HAVE_MEMFD_CREATE) && !defined(_WIN32)
+ #define NINE_ENABLE_MEMFD
+ #endif
+ 
+diff --git a/src/gallium/frontends/nine/nine_pipe.c b/src/gallium/frontends/nine/nine_pipe.c
+index 45c96244..559b4e07 100644
+--- a/src/gallium/frontends/nine/nine_pipe.c
++++ b/src/gallium/frontends/nine/nine_pipe.c
+@@ -248,9 +248,9 @@ nine_convert_sampler_state(struct cso_context *ctx, int idx, const DWORD *ss)
+ 
+     /* see nine_state.h */
+     if (idx < NINE_MAX_SAMPLERS_PS)
+-        cso_single_sampler(ctx, PIPE_SHADER_FRAGMENT, idx - NINE_SAMPLER_PS(0), &samp);
++        cso_single_sampler(ctx, MESA_SHADER_FRAGMENT, idx - NINE_SAMPLER_PS(0), &samp);
+     else
+-        cso_single_sampler(ctx, PIPE_SHADER_VERTEX, idx - NINE_SAMPLER_VS(0), &samp);
++        cso_single_sampler(ctx, MESA_SHADER_VERTEX, idx - NINE_SAMPLER_VS(0), &samp);
+ }
+ 
+ const enum pipe_format nine_d3d9_to_pipe_format_map[120] =
+diff --git a/src/gallium/frontends/nine/nine_pipe.h b/src/gallium/frontends/nine/nine_pipe.h
+index 01dd49d5..740e5595 100644
+--- a/src/gallium/frontends/nine/nine_pipe.h
++++ b/src/gallium/frontends/nine/nine_pipe.h
+@@ -249,7 +249,7 @@ d3d9_get_pipe_depth_format_bindings(D3DFORMAT format)
+     case D3DFMT_DF24:
+     case D3DFMT_INTZ:
+         return PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SAMPLER_VIEW;
+-    default: unreachable("Unexpected format");
++    default: UNREACHABLE("Unexpected format");
+     }
+ }
+ 
+diff --git a/src/gallium/frontends/nine/nine_shader.c b/src/gallium/frontends/nine/nine_shader.c
+index cc70f6fd..a15a8b2d 100644
+--- a/src/gallium/frontends/nine/nine_shader.c
++++ b/src/gallium/frontends/nine/nine_shader.c
+@@ -429,7 +429,7 @@ struct shader_translator
+         BYTE major;
+         BYTE minor;
+     } version;
+-    unsigned processor; /* PIPE_SHADER_VERTEX/FRAMGENT */
++    unsigned processor; /* MESA_SHADER_VERTEX/FRAMGENT */
+     unsigned num_constf_allowed;
+     unsigned num_consti_allowed;
+     unsigned num_constb_allowed;
+@@ -512,8 +512,8 @@ struct shader_translator
+     int16_t op_info_map[D3DSIO_BREAKP + 1];
+ };
+ 
+-#define IS_VS (tx->processor == PIPE_SHADER_VERTEX)
+-#define IS_PS (tx->processor == PIPE_SHADER_FRAGMENT)
++#define IS_VS (tx->processor == MESA_SHADER_VERTEX)
++#define IS_PS (tx->processor == MESA_SHADER_FRAGMENT)
+ 
+ #define FAILURE_VOID(cond) if ((cond)) {tx->failure=1;return;}
+ 
+@@ -844,7 +844,7 @@ TEX_if_fetch4(struct shader_translator *tx, struct ureg_dst dst,
+     /* TODO: needs more tests, but this feature is not much used at all */
+ 
+     tmp = tx_scratch(tx);
+-    ureg_tex_insn(tx->ureg, TGSI_OPCODE_TG4, &tmp, 1, target, TGSI_RETURN_TYPE_FLOAT,
++    ureg_tex_insn(tx->ureg, TGSI_OPCODE_TG4, &tmp, 1, target,
+                   NULL, 0, src_tg4, 3);
+     ureg_MOV(tx->ureg, dst, ureg_swizzle(ureg_src(tmp), NINE_SWIZZLE4(Z, X, Y, W)));
+     return true;
+@@ -2169,7 +2169,7 @@ sm1_declusage_to_tgsi(struct tgsi_declaration_semantic *sem,
+         sem->Index = 0;
+         break;
+     default:
+-        unreachable("Invalid DECLUSAGE.");
++        UNREACHABLE("Invalid DECLUSAGE.");
+         break;
+     }
+ }
+@@ -3244,7 +3244,7 @@ create_op_info_map(struct shader_translator *tx)
+     for (i = 0; i < ARRAY_SIZE(tx->op_info_map); ++i)
+         tx->op_info_map[i] = -1;
+ 
+-    if (tx->processor == PIPE_SHADER_VERTEX) {
++    if (tx->processor == MESA_SHADER_VERTEX) {
+         for (i = 0; i < ARRAY_SIZE(inst_table); ++i) {
+             assert(inst_table[i].sio < ARRAY_SIZE(tx->op_info_map));
+             if (inst_table[i].vert_version.min <= version &&
+@@ -3315,8 +3315,8 @@ sm1_read_version(struct shader_translator *tx)
+     tx->version.minor = D3DSHADER_VERSION_MINOR(tok);
+ 
+     switch (tok >> 16) {
+-    case NINED3D_SM1_VS: tx->processor = PIPE_SHADER_VERTEX; break;
+-    case NINED3D_SM1_PS: tx->processor = PIPE_SHADER_FRAGMENT; break;
++    case NINED3D_SM1_VS: tx->processor = MESA_SHADER_VERTEX; break;
++    case NINED3D_SM1_PS: tx->processor = MESA_SHADER_FRAGMENT; break;
+     default:
+        DBG("Invalid shader type: %x\n", tok);
+        tx->processor = ~0;
+@@ -4000,13 +4000,13 @@ nine_ureg_create_shader(struct ureg_program                  *ureg,
+     bool use_nir = true;
+ 
+     /* Allow user to override preferred IR, this is very useful for debugging */
+-    if (unlikely(shader_type == PIPE_SHADER_VERTEX && nine_shader_get_debug_flag(NINE_SHADER_DEBUG_OPTION_NO_NIR_VS)))
++    if (unlikely(shader_type == MESA_SHADER_VERTEX && nine_shader_get_debug_flag(NINE_SHADER_DEBUG_OPTION_NO_NIR_VS)))
+         use_nir = false;
+-    if (unlikely(shader_type == PIPE_SHADER_FRAGMENT && nine_shader_get_debug_flag(NINE_SHADER_DEBUG_OPTION_NO_NIR_PS)))
++    if (unlikely(shader_type == MESA_SHADER_FRAGMENT && nine_shader_get_debug_flag(NINE_SHADER_DEBUG_OPTION_NO_NIR_PS)))
+         use_nir = false;
+ 
+     DUMP("shader type: %s, selected IR: %s\n",
+-         shader_type == PIPE_SHADER_VERTEX ? "VS" : "PS",
++         shader_type == MESA_SHADER_VERTEX ? "VS" : "PS",
+          use_nir ? "NIR" : "TGSI");
+ 
+     if (use_nir) {
+@@ -4023,12 +4023,12 @@ nine_ureg_create_shader(struct ureg_program                  *ureg,
+     state.report_compile_error = false;
+ 
+     switch (shader_type) {
+-    case PIPE_SHADER_VERTEX:
++    case MESA_SHADER_VERTEX:
+         return pipe->create_vs_state(pipe, &state);
+-    case PIPE_SHADER_FRAGMENT:
++    case MESA_SHADER_FRAGMENT:
+         return pipe->create_fs_state(pipe, &state);
+     default:
+-        unreachable("unsupported shader type");
++        UNREACHABLE("unsupported shader type");
+     }
+ }
+ 
+@@ -4079,7 +4079,7 @@ nine_translate_shader(struct NineDevice9 *device, struct nine_shader_info *info,
+         DBG("Shader type mismatch: %u / %u !\n", tx->processor, processor);
+         goto out;
+     }
+-    DUMP("%s%u.%u\n", processor == PIPE_SHADER_VERTEX ? "VS" : "PS",
++    DUMP("%s%u.%u\n", processor == MESA_SHADER_VERTEX ? "VS" : "PS",
+          tx->version.major, tx->version.minor);
+ 
+     parse_shader(tx);
+diff --git a/src/gallium/frontends/nine/nine_state.c b/src/gallium/frontends/nine/nine_state.c
+index 623f1dc3..ab663bfb 100644
+--- a/src/gallium/frontends/nine/nine_state.c
++++ b/src/gallium/frontends/nine/nine_state.c
+@@ -519,7 +519,7 @@ prepare_vs_constants_userbuf(struct NineDevice9 *device)
+      * to have efficient WC. Thus for this case we really want
+      * that intermediate buffer. */
+ 
+-    u_upload_alloc(context->pipe->const_uploader,
++    u_upload_alloc_ref(context->pipe->const_uploader,
+                   0,
+                   cb.buffer_size,
+                   256, /* Be conservative about alignment */
+@@ -601,7 +601,7 @@ prepare_ps_constants_userbuf(struct NineDevice9 *device)
+     if (!cb.buffer_size)
+         return;
+ 
+-    u_upload_alloc(context->pipe->const_uploader,
++    u_upload_alloc_ref(context->pipe->const_uploader,
+                   0,
+                   cb.buffer_size,
+                   256, /* Be conservative about alignment */
+@@ -758,23 +758,23 @@ update_framebuffer(struct NineDevice9 *device, bool is_clear)
+         if (rt && rt->desc.Format != D3DFMT_NULL && (mask & (1 << i)) &&
+             rt->desc.Width == w && rt->desc.Height == h &&
+             rt->base.info.nr_samples == nr_samples) {
+-            fb->cbufs[i] = NineSurface9_GetSurface(rt, sRGB);
++            fb->cbufs[i] = *NineSurface9_GetSurface(rt, sRGB);
+             context->rt_mask |= 1 << i;
+             fb->nr_cbufs = i + 1;
+         } else {
+             /* Color outputs must match RT slot,
+              * drivers will have to handle NULL entries for GL, too.
+              */
+-            fb->cbufs[i] = NULL;
++            memset(&fb->cbufs[i], 0, sizeof(fb->cbufs[i]));
+         }
+     }
+ 
+     if (context->ds && context->ds->desc.Width >= w &&
+         context->ds->desc.Height >= h &&
+         context->ds->base.info.nr_samples == nr_samples) {
+-        fb->zsbuf = NineSurface9_GetSurface(context->ds, 0);
++        fb->zsbuf = *NineSurface9_GetSurface(context->ds, 0);
+     } else {
+-        fb->zsbuf = NULL;
++        memset(&fb->zsbuf, 0, sizeof(fb->zsbuf));
+     }
+ 
+     fb->width = w;
+@@ -969,7 +969,7 @@ update_vertex_buffers(struct NineDevice9 *device)
+        memset(&vbuffer[i], 0, sizeof(vbuffer[i]) * (num_vertex_buffers - i));
+ 
+     if (num_vertex_buffers)
+-        util_set_vertex_buffers(pipe, num_vertex_buffers, false, vbuffer);
++        pipe->set_vertex_buffers(pipe, num_vertex_buffers, vbuffer);
+     else
+         pipe->set_vertex_buffers(pipe, 0, NULL);
+ 
+@@ -1048,7 +1048,7 @@ update_textures_and_samplers(struct NineDevice9 *device)
+          * or sampler states are changed. */
+         view[i] = device->dummy_sampler_view;
+ 
+-        cso_single_sampler(context->cso, PIPE_SHADER_FRAGMENT,
++        cso_single_sampler(context->cso, MESA_SHADER_FRAGMENT,
+                            s - NINE_SAMPLER_PS(0), &device->dummy_sampler_state);
+ 
+         commit_samplers = true;
+@@ -1058,13 +1058,13 @@ update_textures_and_samplers(struct NineDevice9 *device)
+     u_foreach_bit(i, BITFIELD_MASK(num_textures) & ~ps_mask)
+        view[i] = NULL;
+ 
+-    pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, num_textures,
++    pipe->set_sampler_views(pipe, MESA_SHADER_FRAGMENT, 0, num_textures,
+                             num_textures < context->enabled_sampler_count_ps ? context->enabled_sampler_count_ps - num_textures : 0,
+                             view);
+     context->enabled_sampler_count_ps = num_textures;
+ 
+     if (commit_samplers)
+-        cso_single_sampler_done(context->cso, PIPE_SHADER_FRAGMENT);
++        cso_single_sampler_done(context->cso, MESA_SHADER_FRAGMENT);
+ 
+     commit_samplers = false;
+     sampler_mask = context->programmable_vs ? context->vs->sampler_mask : 0;
+@@ -1093,7 +1093,7 @@ update_textures_and_samplers(struct NineDevice9 *device)
+          * or sampler states are changed. */
+         view[i] = device->dummy_sampler_view;
+ 
+-        cso_single_sampler(context->cso, PIPE_SHADER_VERTEX,
++        cso_single_sampler(context->cso, MESA_SHADER_VERTEX,
+                            s - NINE_SAMPLER_VS(0), &device->dummy_sampler_state);
+ 
+         commit_samplers = true;
+@@ -1103,13 +1103,13 @@ update_textures_and_samplers(struct NineDevice9 *device)
+     u_foreach_bit(i, BITFIELD_MASK(num_textures) & ~vs_mask)
+        view[i] = NULL;
+ 
+-    pipe->set_sampler_views(pipe, PIPE_SHADER_VERTEX, 0, num_textures,
++    pipe->set_sampler_views(pipe, MESA_SHADER_VERTEX, 0, num_textures,
+                             num_textures < context->enabled_sampler_count_vs ? context->enabled_sampler_count_vs - num_textures : 0,
+                             view);
+     context->enabled_sampler_count_vs = num_textures;
+ 
+     if (commit_samplers)
+-        cso_single_sampler_done(context->cso, PIPE_SHADER_VERTEX);
++        cso_single_sampler_done(context->cso, MESA_SHADER_VERTEX);
+ }
+ 
+ /* State commit only */
+@@ -1154,15 +1154,15 @@ commit_vs_constants(struct NineDevice9 *device)
+     struct pipe_context *pipe = context->pipe;
+ 
+     if (unlikely(!context->programmable_vs))
+-        pipe->set_constant_buffer(pipe, PIPE_SHADER_VERTEX, 0, false, &context->pipe_data.cb_vs_ff);
++        pipe->set_constant_buffer(pipe, MESA_SHADER_VERTEX, 0, &context->pipe_data.cb_vs_ff);
+     else {
+         if (context->swvp) {
+-            pipe->set_constant_buffer(pipe, PIPE_SHADER_VERTEX, 0, false, &context->pipe_data.cb0_swvp);
+-            pipe->set_constant_buffer(pipe, PIPE_SHADER_VERTEX, 1, false, &context->pipe_data.cb1_swvp);
+-            pipe->set_constant_buffer(pipe, PIPE_SHADER_VERTEX, 2, false, &context->pipe_data.cb2_swvp);
+-            pipe->set_constant_buffer(pipe, PIPE_SHADER_VERTEX, 3, false, &context->pipe_data.cb3_swvp);
++            pipe->set_constant_buffer(pipe, MESA_SHADER_VERTEX, 0, &context->pipe_data.cb0_swvp);
++            pipe->set_constant_buffer(pipe, MESA_SHADER_VERTEX, 1, &context->pipe_data.cb1_swvp);
++            pipe->set_constant_buffer(pipe, MESA_SHADER_VERTEX, 2, &context->pipe_data.cb2_swvp);
++            pipe->set_constant_buffer(pipe, MESA_SHADER_VERTEX, 3, &context->pipe_data.cb3_swvp);
+         } else {
+-            pipe->set_constant_buffer(pipe, PIPE_SHADER_VERTEX, 0, false, &context->pipe_data.cb_vs);
++            pipe->set_constant_buffer(pipe, MESA_SHADER_VERTEX, 0, &context->pipe_data.cb_vs);
+         }
+     }
+ }
+@@ -1174,9 +1174,9 @@ commit_ps_constants(struct NineDevice9 *device)
+     struct pipe_context *pipe = context->pipe;
+ 
+     if (unlikely(!context->ps))
+-        pipe->set_constant_buffer(pipe, PIPE_SHADER_FRAGMENT, 0, false, &context->pipe_data.cb_ps_ff);
++        pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, &context->pipe_data.cb_ps_ff);
+     else
+-        pipe->set_constant_buffer(pipe, PIPE_SHADER_FRAGMENT, 0, false, &context->pipe_data.cb_ps);
++        pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, &context->pipe_data.cb_ps);
+ }
+ 
+ static inline void
+@@ -2297,7 +2297,7 @@ CSMT_ITEM_NO_WAIT(nine_context_clear_fb,
+ 
+     if (Flags & D3DCLEAR_TARGET) bufs |= PIPE_CLEAR_COLOR;
+     /* Ignore Z buffer if not bound */
+-    if (context->pipe_data.fb.zsbuf != NULL) {
++    if (context->pipe_data.fb.zsbuf.texture != NULL) {
+         if (Flags & D3DCLEAR_ZBUFFER) bufs |= PIPE_CLEAR_DEPTH;
+         if (Flags & D3DCLEAR_STENCIL) bufs |= PIPE_CLEAR_STENCIL;
+     }
+@@ -2350,7 +2350,7 @@ CSMT_ITEM_NO_WAIT(nine_context_clear_fb,
+          rect.x2 >= zsbuf_surf->desc.Width &&
+          rect.y2 >= zsbuf_surf->desc.Height))) {
+         DBG("Clear fast path\n");
+-        pipe->clear(pipe, bufs, NULL, &rgba, Z, Stencil);
++        pipe->clear(pipe, bufs, ~0u, 0xff, NULL, &rgba, Z, Stencil);
+         return;
+     }
+ 
+@@ -2430,7 +2430,6 @@ init_draw_info(struct pipe_draw_info *info,
+         info->instance_count = MAX2(dev->context.stream_freq[0] & 0x7FFFFF, 1);
+     info->primitive_restart = false;
+     info->has_user_indices = false;
+-    info->take_index_buffer_ownership = false;
+     info->index_bias_varies = false;
+     info->increment_draw_id = false;
+     info->was_line_loop = false;
+@@ -2534,7 +2533,7 @@ CSMT_ITEM_NO_WAIT(nine_context_draw_indexed_primitive_from_vtxbuf_idxbuf,
+     else
+         info.index.user = user_ibuf;
+ 
+-    util_set_vertex_buffers(context->pipe, 1, false, vbuf);
++    context->pipe->set_vertex_buffers(context->pipe, 1, vbuf);
+     context->changed.vtxbuf_dirty = true;
+ 
+     context->pipe->draw_vbo(context->pipe, &info, 0, NULL, &draw, 1);
+@@ -3045,14 +3044,14 @@ nine_context_clear(struct NineDevice9 *device)
+      * do not change on Reset.
+      */
+ 
+-    cso_set_samplers(cso, PIPE_SHADER_VERTEX, 0, NULL);
+-    cso_set_samplers(cso, PIPE_SHADER_FRAGMENT, 0, NULL);
++    cso_set_samplers(cso, MESA_SHADER_VERTEX, 0, NULL);
++    cso_set_samplers(cso, MESA_SHADER_FRAGMENT, 0, NULL);
+     context->enabled_sampler_count_vs = 0;
+     context->enabled_sampler_count_ps = 0;
+ 
+-    pipe->set_sampler_views(pipe, PIPE_SHADER_VERTEX, 0, 0,
++    pipe->set_sampler_views(pipe, MESA_SHADER_VERTEX, 0, 0,
+                             NINE_MAX_SAMPLERS_VS, NULL);
+-    pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, 0,
++    pipe->set_sampler_views(pipe, MESA_SHADER_FRAGMENT, 0, 0,
+                             NINE_MAX_SAMPLERS_PS, NULL);
+ 
+     pipe->set_vertex_buffers(pipe, 0, NULL);
+@@ -3244,7 +3243,7 @@ update_vertex_buffers_sw(struct NineDevice9 *device, int dummy_vbo_stream,
+             if (!device->driver_caps.user_sw_vbufs) {
+                 vbuffer[j].buffer.resource = NULL;
+                 vbuffer[j].is_user_buffer = false;
+-                u_upload_data(device->pipe_sw->stream_uploader,
++                u_upload_data_ref(device->pipe_sw->stream_uploader,
+                               0,
+                               box.width,
+                               16,
+@@ -3299,13 +3298,13 @@ update_vs_constants_sw(struct NineDevice9 *device)
+ 
+         buf = cb.user_buffer;
+ 
+-        pipe_sw->set_constant_buffer(pipe_sw, PIPE_SHADER_VERTEX, 0, false, &cb);
++        pipe_sw->set_constant_buffer(pipe_sw, MESA_SHADER_VERTEX, 0, &cb);
+         if (cb.buffer)
+             pipe_resource_reference(&cb.buffer, NULL);
+ 
+         cb.user_buffer = (int8_t *)buf + 4096 * sizeof(float[4]);
+ 
+-        pipe_sw->set_constant_buffer(pipe_sw, PIPE_SHADER_VERTEX, 1, false, &cb);
++        pipe_sw->set_constant_buffer(pipe_sw, MESA_SHADER_VERTEX, 1, &cb);
+         if (cb.buffer)
+             pipe_resource_reference(&cb.buffer, NULL);
+     }
+@@ -3318,7 +3317,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
+         cb.buffer_size = 2048 * sizeof(float[4]);
+         cb.user_buffer = state->vs_const_i;
+ 
+-        pipe_sw->set_constant_buffer(pipe_sw, PIPE_SHADER_VERTEX, 2, false, &cb);
++        pipe_sw->set_constant_buffer(pipe_sw, MESA_SHADER_VERTEX, 2, &cb);
+         if (cb.buffer)
+             pipe_resource_reference(&cb.buffer, NULL);
+     }
+@@ -3331,7 +3330,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
+         cb.buffer_size = 512 * sizeof(float[4]);
+         cb.user_buffer = state->vs_const_b;
+ 
+-        pipe_sw->set_constant_buffer(pipe_sw, PIPE_SHADER_VERTEX, 3, false, &cb);
++        pipe_sw->set_constant_buffer(pipe_sw, MESA_SHADER_VERTEX, 3, &cb);
+         if (cb.buffer)
+             pipe_resource_reference(&cb.buffer, NULL);
+     }
+@@ -3351,7 +3350,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
+         cb.user_buffer = viewport_data;
+ 
+         {
+-            u_upload_data(device->pipe_sw->const_uploader,
++            u_upload_data_ref(device->pipe_sw->const_uploader,
+                           0,
+                           cb.buffer_size,
+                           16,
+@@ -3362,7 +3361,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
+             cb.user_buffer = NULL;
+         }
+ 
+-        pipe_sw->set_constant_buffer(pipe_sw, PIPE_SHADER_VERTEX, 4, false, &cb);
++        pipe_sw->set_constant_buffer(pipe_sw, MESA_SHADER_VERTEX, 4, &cb);
+         if (cb.buffer)
+             pipe_resource_reference(&cb.buffer, NULL);
+     }
+diff --git a/src/gallium/frontends/nine/nine_win32.h b/src/gallium/frontends/nine/nine_win32.h
+new file mode 100644
+index 00000000..d6c6ad35
+--- /dev/null
++++ b/src/gallium/frontends/nine/nine_win32.h
+@@ -0,0 +1,71 @@
++/*
++ * Copyright © 2026 Entangled Desktop contributors
++ * SPDX-License-Identifier: MIT
++ *
++ * Nine was written for Linux (under wine) and uses pthreads for its few
++ * locks and its one worker thread. On Windows the same calls are spelled
++ * with Mesa's C11 threads, which is all this header does.
++ */
++#ifndef _NINE_WIN32_H_
++#define _NINE_WIN32_H_
++
++#ifdef _WIN32
++
++#include "c11/threads.h"
++
++typedef mtx_t pthread_mutex_t;
++typedef cnd_t pthread_cond_t;
++typedef thrd_t pthread_t;
++
++#define pthread_mutex_init(m, attr) mtx_init((m), mtx_plain)
++#define pthread_mutex_destroy(m) mtx_destroy(m)
++#define pthread_mutex_lock(m) mtx_lock(m)
++#define pthread_mutex_unlock(m) mtx_unlock(m)
++#define pthread_cond_init(c, attr) cnd_init(c)
++#define pthread_cond_destroy(c) cnd_destroy(c)
++#define pthread_cond_wait(c, m) cnd_wait((c), (m))
++#define pthread_cond_signal(c) cnd_signal(c)
++#define pthread_cond_broadcast(c) cnd_broadcast(c)
++#define pthread_join(t, result) thrd_join((t), NULL)
++
++/* A pthread's function returns a pointer and a C11 thread's an int: the one
++ * place Nine starts a thread (threadpool.c) goes through this. */
++struct nine_win32_thread_start {
++   void *(*function)(void *);
++   void *data;
++};
++
++static inline int
++nine_win32_thread_entry(void *arg)
++{
++   struct nine_win32_thread_start start = *(struct nine_win32_thread_start *)arg;
++
++   free(arg);
++   start.function(start.data);
++   return 0;
++}
++
++static inline int
++pthread_create(pthread_t *thread, void *attr, void *(*function)(void *), void *data)
++{
++   struct nine_win32_thread_start *start = malloc(sizeof *start);
++
++   (void)attr;
++   if (!start)
++      return -1;
++   start->function = function;
++   start->data = data;
++   if (thrd_create(thread, nine_win32_thread_entry, start) != thrd_success) {
++      free(start);
++      return -1;
++   }
++   return 0;
++}
++
++#else
++
++#include <pthread.h>
++
++#endif
++
++#endif /* _NINE_WIN32_H_ */
+diff --git a/src/gallium/frontends/nine/pixelshader9.c b/src/gallium/frontends/nine/pixelshader9.c
+index b0b49dad..1a7a2b62 100644
+--- a/src/gallium/frontends/nine/pixelshader9.c
++++ b/src/gallium/frontends/nine/pixelshader9.c
+@@ -35,7 +35,7 @@ NinePixelShader9_ctor( struct NinePixelShader9 *This,
+     }
+     device = This->base.device;
+ 
+-    info.type = PIPE_SHADER_FRAGMENT;
++    info.type = MESA_SHADER_FRAGMENT;
+     info.byte_code = pFunction;
+     info.const_i_base = NINE_CONST_I_BASE(NINE_MAX_CONST_F_PS3) / 16;
+     info.const_b_base = NINE_CONST_B_BASE(NINE_MAX_CONST_F_PS3) / 16;
+@@ -177,7 +177,7 @@ NinePixelShader9_GetVariant( struct NinePixelShader9 *This,
+         struct nine_shader_info info;
+         HRESULT hr;
+ 
+-        info.type = PIPE_SHADER_FRAGMENT;
++        info.type = MESA_SHADER_FRAGMENT;
+         info.const_i_base = NINE_CONST_I_BASE(NINE_MAX_CONST_F_PS3) / 16;
+         info.const_b_base = NINE_CONST_B_BASE(NINE_MAX_CONST_F_PS3) / 16;
+         info.byte_code = This->byte_code.tokens;
+diff --git a/src/gallium/frontends/nine/surface9.c b/src/gallium/frontends/nine/surface9.c
+index e5f2d013..b666cd7f 100644
+--- a/src/gallium/frontends/nine/surface9.c
++++ b/src/gallium/frontends/nine/surface9.c
+@@ -210,8 +210,7 @@ NineSurface9_dtor( struct NineSurface9 *This )
+     if (p_atomic_read(&This->pending_uploads_counter))
+         nine_csmt_process(This->base.base.device);
+ 
+-    pipe_surface_reference(&This->surface[0], NULL);
+-    pipe_surface_reference(&This->surface[1], NULL);
++    memset(This->surface, 0, sizeof(This->surface));
+ 
+     if (!is_worker && This->lock_count && (This->data_internal || This->data)) {
+         /* For is_worker nine_free_worker will handle it */
+@@ -253,27 +252,16 @@ NineSurface9_CreatePipeSurfaces( struct NineSurface9 *This )
+                                      resource->target, 0, 0, resource->bind))
+         srgb_format = resource->format;
+ 
++    /* A surface is a description now, not an object of the driver's. */
+     memset(&templ, 0, sizeof(templ));
+     templ.format = resource->format;
+-    templ.u.tex.level = This->level;
+-    templ.u.tex.first_layer = This->layer;
+-    templ.u.tex.last_layer = This->layer;
+-
+-    pipe = nine_context_get_pipe_acquire(This->base.base.device);
+-
+-    This->surface[0] = pipe->create_surface(pipe, resource, &templ);
+-
+-    memset(&templ, 0, sizeof(templ));
++    templ.level = This->level;
++    templ.first_layer = This->layer;
++    templ.last_layer = This->layer;
++    templ.texture = resource;
++    This->surface[0] = templ;
+     templ.format = srgb_format;
+-    templ.u.tex.level = This->level;
+-    templ.u.tex.first_layer = This->layer;
+-    templ.u.tex.last_layer = This->layer;
+-
+-    This->surface[1] = pipe->create_surface(pipe, resource, &templ);
+-
+-    nine_context_get_pipe_release(This->base.base.device);
+-
+-    assert(This->surface[0]); /* TODO: Handle failure */
++    This->surface[1] = templ;
+     assert(This->surface[1]);
+ }
+ 
+@@ -841,8 +829,7 @@ NineSurface9_SetResourceResize( struct NineSurface9 *This,
+     This->stride = nine_format_get_stride(This->base.info.format,
+                                           This->desc.Width);
+ 
+-    pipe_surface_reference(&This->surface[0], NULL);
+-    pipe_surface_reference(&This->surface[1], NULL);
++    memset(This->surface, 0, sizeof(This->surface));
+     NineSurface9_CreatePipeSurfaces(This);
+ }
+ 
+diff --git a/src/gallium/frontends/nine/surface9.h b/src/gallium/frontends/nine/surface9.h
+index 374860a4..5473f6d4 100644
+--- a/src/gallium/frontends/nine/surface9.h
++++ b/src/gallium/frontends/nine/surface9.h
+@@ -20,7 +20,7 @@ struct NineSurface9
+ 
+     /* G3D state */
+     struct pipe_transfer *transfer;
+-    struct pipe_surface *surface[2]; /* created on-demand (linear, sRGB) */
++    struct pipe_surface surface[2]; /* linear, sRGB: by value since Mesa 25.2 */
+     int lock_count;
+     uint8_t texture; /* rtype of container BaseTex or 0 */
+ 
+@@ -77,8 +77,8 @@ NineSurface9_MarkContainerDirty( struct NineSurface9 *This );
+ static inline struct pipe_surface *
+ NineSurface9_GetSurface( struct NineSurface9 *This, int sRGB )
+ {
+-    assert(This->surface[sRGB]);
+-    return This->surface[sRGB];
++    assert(This->surface[sRGB].texture);
++    return &This->surface[sRGB];
+ }
+ 
+ static inline struct pipe_resource *
+diff --git a/src/gallium/frontends/nine/swapchain9.c b/src/gallium/frontends/nine/swapchain9.c
+index de505c11..53bf1a41 100644
+--- a/src/gallium/frontends/nine/swapchain9.c
++++ b/src/gallium/frontends/nine/swapchain9.c
+@@ -96,7 +96,7 @@ D3DWindowBuffer_create(struct NineSwapChain9 *This,
+     }
+     nine_context_get_pipe_release(This->base.device);
+     stride = whandle.stride;
+-    dmaBufFd = whandle.handle;
++    dmaBufFd = (int)(intptr_t)whandle.handle;
+     hr = ID3DPresent_NewD3DWindowBufferFromDmaBuf(This->present,
+                                                   dmaBufFd,
+                                                   resource->width0,
+diff --git a/src/gallium/frontends/nine/threadpool.h b/src/gallium/frontends/nine/threadpool.h
+index 57d37691..f0f8ae1c 100644
+--- a/src/gallium/frontends/nine/threadpool.h
++++ b/src/gallium/frontends/nine/threadpool.h
+@@ -6,7 +6,7 @@
+ #ifndef _THREADPOOL_H_
+ #define _THREADPOOL_H_
+ 
+-#include <pthread.h>
++#include "nine_win32.h"
+ 
+ struct NineSwapChain9;
+ 
+diff --git a/src/gallium/frontends/nine/vertexshader9.c b/src/gallium/frontends/nine/vertexshader9.c
+index 4bc11c7c..3ff31ef9 100644
+--- a/src/gallium/frontends/nine/vertexshader9.c
++++ b/src/gallium/frontends/nine/vertexshader9.c
+@@ -40,7 +40,7 @@ NineVertexShader9_ctor( struct NineVertexShader9 *This,
+ 
+     device = This->base.device;
+ 
+-    info.type = PIPE_SHADER_VERTEX;
++    info.type = MESA_SHADER_VERTEX;
+     info.byte_code = pFunction;
+     info.const_i_base = NINE_CONST_I_BASE(device->max_vs_const_f) / 16;
+     info.const_b_base = NINE_CONST_B_BASE(device->max_vs_const_f) / 16;
+@@ -201,7 +201,7 @@ NineVertexShader9_GetVariant( struct NineVertexShader9 *This,
+         struct nine_shader_info info;
+         HRESULT hr;
+ 
+-        info.type = PIPE_SHADER_VERTEX;
++        info.type = MESA_SHADER_VERTEX;
+         info.const_i_base = NINE_CONST_I_BASE(device->max_vs_const_f) / 16;
+         info.const_b_base = NINE_CONST_B_BASE(device->max_vs_const_f) / 16;
+         info.byte_code = This->byte_code.tokens;
+@@ -249,7 +249,7 @@ NineVertexShader9_GetVariantProcessVertices( struct NineVertexShader9 *This,
+     if (cso)
+         return cso;
+ 
+-    info.type = PIPE_SHADER_VERTEX;
++    info.type = MESA_SHADER_VERTEX;
+     info.const_i_base = 0;
+     info.const_b_base = 0;
+     info.byte_code = This->byte_code.tokens;
+diff --git a/src/gallium/meson.build b/src/gallium/meson.build
+index 980c297a..84adcc8c 100644
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -242,6 +242,10 @@ if with_gallium_st_d3d10umd
+   subdir('frontends/d3d10umd')
+   subdir('targets/d3d10umd')
+ endif
++if with_gallium_st_d3d9umd
++  subdir('frontends/nine')
++  subdir('targets/d3d9umd')
++endif
+ if with_platform_windows
+   if with_opengl
+     subdir('frontends/wgl')

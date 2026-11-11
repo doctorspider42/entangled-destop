@@ -178,3 +178,50 @@ process with `ENTANGLED_D3D9=1`: everyone else is answered `E_FAIL` from
 
 VirtualBox's driver answers the same six caps queries (two query types, a
 zero gamma answer); read for what it answers, not copied (it is GPL).
+
+### N1 (2026-11-11): Nine in the tree, and in the driver
+
+`entangled_d3d9.dll` is now Nine and Zink behind the DDI front, about 12 MB
+for each of x64 and x86, built by Mesa from the tree `prepare-d3d10.ps1`
+makes (`build-d3d9.cmd`; `guest/windows-gpu/d3d9/build.cmd` builds only the
+test program now).
+
+- **Carrying Nine forward** was smaller than feared: `0003-nine-on-mesa-26.2.patch`
+  is under a thousand lines over 25.1.9's sources. What had moved in Gallium
+  between the two: the shader stage names (`MESA_SHADER_*`), `UNREACHABLE`,
+  surfaces (a description held by value in the framebuffer state, no
+  `create_surface`), vertex buffers (set without a reference), the uploader's
+  `_ref` forms, `set_constant_buffer` and `clear` (a colour mask per draw
+  buffer), the NIR options (a table of the screen's), and a cap that is now
+  every driver's (unscaled polygon offset).
+- **On Windows** Nine needed three things: its few pthread calls spelled
+  with Mesa's C11 threads (`nine_win32.h`), `IUnknown` (Mesa builds with a
+  lean `windows.h`), and its Linux-only allocator (memfd) left out.
+- **Two sets of headers.** The front sees the WDK's Direct3D 9 headers and
+  Nine sees Mesa's own; they declare the same types and cannot meet in one
+  translation unit. So the DLL is two sides with a plain-C seam between
+  them (`d3d9_nine.h`), and each side translates. Every DDI function that
+  becomes real in N2 crosses that seam.
+- **x86.** Gallium, Zink and Nine built for x86 at the first attempt, with
+  the cross file and `CL=-m32` of the Venus ICD's x86 build. The Direct3D 10
+  driver's x86 build stops only in our own crash reporter (`d3d10_wddm.c`
+  walks the stack the x64 way) — N4's 32-bit Direct3D 10 driver is that one
+  function away from compiling.
+
+In the test guest, on creating a device, the driver now makes a Gallium
+screen and a Nine adapter on it and logs what Nine says, in the 64-bit and
+the 32-bit test program alike:
+
+    nine: zink Vulkan 1.3(Virtio-GPU Venus (NVIDIA GeForce RTX 2070)
+    (MESA_VENUS)), vs 0xfffe0300, ps 0xffff0300, textures to 16384, 4 render
+    targets
+
+That is past "the DLL links": Nine, Zink and the 32-bit Venus ICD load and
+agree inside a Direct3D 9 program of either width. The device still draws
+nothing — its functions are N0's placeholders, and the adapter is closed
+with the device. The caps the runtime is given are still the hand-written
+table of N0, not Nine's; N2 has to take Nine's and keep them inside the
+runtime's minimum list.
+
+Not done here: a run of the workflow (the build step is rewritten and has
+not run), and the 12 MB DLLs through `install windows`.

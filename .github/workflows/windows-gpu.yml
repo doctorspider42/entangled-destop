@@ -142,6 +142,7 @@ jobs:
         env:
           MESA_SRC: C:\mesa-d3d10
           MESA_BUILD: C:\mesa-d3d10-build
+          MESA_BUILD32: C:\mesa-d3d-x86
           WDK_UM: C:\kit\Include\10.0.26100.0\um
         run: |
           powershell -File guest/windows-gpu/mesa/prepare-d3d10.ps1 C:\mesa-d3d10
@@ -153,11 +154,13 @@ jobs:
           cmd /c "guest\windows-gpu\wddm\build.cmd C:\viogpu3d C:\drv"
           if ($LASTEXITCODE -ne 0) { throw 'building entangled-wddm.sys failed' }
           Copy-Item C:\mesa-d3d10-build\src\gallium\targets\d3d10umd\entangled_d3d10.dll C:\drv
-          # ADR-0011: the Direct3D 9 driver, x64 and x86, which the INF names too.
-          cmd /c "guest\windows-gpu\d3d9\build.cmd C:\d3d9"
+          # ADR-0011: the Direct3D 9 driver, which the INF names too - Nine and
+          # Zink from the same tree, for 64-bit programs (the build directory
+          # above) and for 32-bit ones (a build of its own).
+          cmd /c "guest\windows-gpu\mesa\build-d3d9.cmd"
           if ($LASTEXITCODE -ne 0) { throw 'building entangled_d3d9.dll failed' }
-          Copy-Item C:\d3d9\entangled_d3d9.dll C:\drv
-          Copy-Item C:\d3d9\x86\entangled_d3d9.dll C:\drv\entangled_d3d9_x86.dll
+          Copy-Item C:\mesa-d3d10-build\src\gallium\targets\d3d9umd\entangled_d3d9.dll C:\drv
+          Copy-Item C:\mesa-d3d-x86\src\gallium\targets\d3d9umd\entangled_d3d9.dll C:\drv\entangled_d3d9_x86.dll
 
       - name: Test-sign under a certificate whose key is then destroyed
         shell: pwsh
