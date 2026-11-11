@@ -11,6 +11,9 @@
 #include "ddi.h"
 #include "d3d9_nine.h"
 
+/* The kernel driver's contract for an allocation's private data. */
+#include "wddm/viogpu_wddm_driver.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,34 +25,9 @@
  * (a diagnostic build of it; a quiet one drops it). */
 #define ESCAPE_PRINT 0x900
 
-/* gdi32's thunks, as d3dkmthk.h has them: only what the log needs, so that
- * the adapter-level code needs no device. */
-typedef struct {
-   HDC hDc;
-   UINT hAdapter;
-   LUID AdapterLuid;
-   UINT VidPnSourceId;
-} KMT_OPENADAPTERFROMHDC;
-
-typedef struct {
-   UINT hAdapter;
-   UINT hDevice;
-   UINT Type; /* D3DKMT_ESCAPE_DRIVERPRIVATE = 0 */
-   UINT Flags;
-   VOID *pPrivateDriverData;
-   UINT PrivateDriverDataSize;
-   UINT hContext;
-} KMT_ESCAPE;
-
-typedef struct {
-   UINT hAdapter;
-} KMT_CLOSEADAPTER;
-
-extern NTSTATUS APIENTRY D3DKMTOpenAdapterFromHdc(KMT_OPENADAPTERFROMHDC *);
-extern NTSTATUS APIENTRY D3DKMTEscape(const KMT_ESCAPE *);
-extern NTSTATUS APIENTRY D3DKMTCloseAdapter(const KMT_CLOSEADAPTER *);
-
-static UINT log_adapter;
+/* The log goes through gdi32's thunks (d3dkmthk.h) and an adapter handle of
+ * its own, so that the adapter-level code can speak before there is a device. */
+static D3DKMT_HANDLE log_adapter;
 static CRITICAL_SECTION log_lock;
 static BOOL log_ready;
 
@@ -61,7 +39,7 @@ d3d9_log(const char *format, ...)
       unsigned short length;
       char text[236];
    } escape;
-   KMT_ESCAPE call;
+   D3DKMT_ESCAPE call;
    va_list args;
    int at;
 
@@ -76,7 +54,7 @@ d3d9_log(const char *format, ...)
    line[sizeof line - 1] = 0;
    EnterCriticalSection(&log_lock);
    if (!log_adapter) {
-      KMT_OPENADAPTERFROMHDC open;
+      D3DKMT_OPENADAPTERFROMHDC open;
 
       memset(&open, 0, sizeof open);
       open.hDc = GetDC(NULL);
@@ -116,6 +94,64 @@ d3d9_log(const char *format, ...)
       }
    }
    LeaveCriticalSection(&log_lock);
+}
+
+/* ---------------------------------------------------------------- crash */
+
+/* A fault in the process this DLL is loaded into: say where, once, and let
+ * it take its course. A program that dies inside its Direct3D driver says
+ * nothing itself, and there is no debugger in the guest. The report is the
+ * faulting address and every word of the stack above it that points into
+ * this DLL, as offsets its linker map (/MAP) turns into function names:
+ * cruder than an unwind, the same for x64 and x86, and enough. */
+static HMODULE crash_module;
+static PVOID crash_handler;
+
+static LONG CALLBACK
+d3d9_crash(EXCEPTION_POINTERS *info)
+{
+   static volatile LONG reported;
+   DWORD code = info->ExceptionRecord->ExceptionCode;
+   ULONG_PTR base = (ULONG_PTR)crash_module, top, *word, *limit;
+   IMAGE_NT_HEADERS *nt;
+   char line[220];
+   int at = 0;
+   unsigned found = 0;
+
+   /* Errors only (not C++ throws, debug strings or breakpoints). */
+   if (code < 0xC0000000u || code == 0xE06D7363u)
+      return EXCEPTION_CONTINUE_SEARCH;
+   if (InterlockedExchange(&reported, 1) != 0)
+      return EXCEPTION_CONTINUE_SEARCH;
+   nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+   top = base + nt->OptionalHeader.SizeOfImage;
+   d3d9_log("exception 0x%08lx at %p (this DLL is %p), access %p", (unsigned long)code,
+            info->ExceptionRecord->ExceptionAddress, (void *)base,
+            info->ExceptionRecord->NumberParameters > 1
+               ? (void *)info->ExceptionRecord->ExceptionInformation[1]
+               : NULL);
+#if defined(_WIN64)
+   word = (ULONG_PTR *)info->ContextRecord->Rsp;
+#else
+   word = (ULONG_PTR *)info->ContextRecord->Esp;
+#endif
+   limit = (ULONG_PTR *)((NT_TIB *)NtCurrentTeb())->StackBase;
+   for (; word < limit && found < 40; word++) {
+      if (*word < base || *word >= top)
+         continue;
+      at += _snprintf(line + at, sizeof line - 1 - at, " 0x%lx", (unsigned long)(*word - base));
+      found++;
+      if (at > 150) {
+         line[at] = 0;
+         d3d9_log("  stack:%s", line);
+         at = 0;
+      }
+   }
+   if (at) {
+      line[at] = 0;
+      d3d9_log("  stack:%s", line);
+   }
+   return EXCEPTION_CONTINUE_SEARCH;
 }
 
 /* ---------------------------------------------------------------- stubs */
@@ -435,44 +471,146 @@ d3d9_get_caps(HANDLE adapter, const D3DDDIARG_GETCAPS *arg)
 
 /* --------------------------------------------------------------- device */
 
+struct d3d9_adapter;
+
 struct d3d9_device {
    HANDLE runtime;
+   struct d3d9_adapter *adapter;
    D3DDDI_DEVICECALLBACKS callbacks;
+   /* The kernel context presents are submitted on. */
+   HANDLE context;
    /* Nine on a Gallium screen (d3d9_nine.c), or NULL where there is none:
     * the device then only answers, as in phase N0. */
    struct entangled_nine *nine;
 };
 
-/* Phase N0's resources: a handle and what was asked for, nothing behind it.
- * The runtime will not have a device whose resources have no handle. */
+/* What the runtime calls a resource: one or more surfaces of one kind. */
 struct d3d9_resource {
    HANDLE runtime;
    D3DDDIFORMAT format;
+   D3DDDI_RESOURCEFLAGS flags;
    UINT surfaces;
    UINT width, height;
+   /* Nine's object for it (a surface, for a render target or depth buffer),
+    * or NULL for a kind this phase does not make yet. */
+   void *nine;
+   /* A render target the runtime may present has an allocation of the kernel
+    * driver's: a present is a copy from it, and it is what DWM is shown. */
+   D3DKMT_HANDLE allocation;
+   /* The frame on its way from the GPU to that allocation. */
+   void *pixels;
 };
 
+/* The kernel driver's escape that takes a frame for a present to copy on (0x904;
+ * ADR-0010, the second pass): type and length, the allocation, a buffer of
+ * ours and its size. */
+struct d3d9_escape_write {
+   unsigned short type;
+   unsigned short length;
+   UINT handle;
+   unsigned long long buffer;
+   unsigned long long size;
+   char rest[216];
+};
+
+static NTSTATUS
+d3d9_escape(struct d3d9_device *device, void *data, UINT size);
+
+/* An allocation the kernel driver will copy from at a present. Its private
+ * data is the kernel driver's contract (viogpu_wddm_driver.h). */
+static D3DKMT_HANDLE
+d3d9_allocate(struct d3d9_device *device, HANDLE runtime_resource, UINT width, UINT height,
+              BOOL alpha)
+{
+   VIOGPU_CREATE_RESOURCE_EXCHANGE resource_exchange;
+   VIOGPU_CREATE_ALLOCATION_EXCHANGE allocation_exchange;
+   D3DDDI_ALLOCATIONINFO info;
+   D3DDDICB_ALLOCATE allocate;
+   HRESULT hr;
+
+   memset(&resource_exchange, 0, sizeof resource_exchange);
+   memset(&allocation_exchange, 0, sizeof allocation_exchange);
+   allocation_exchange.ResourceOptions.target = 2; /* PIPE_TEXTURE_2D */
+   allocation_exchange.ResourceOptions.format = alpha ? 1 : 2; /* B8G8R8A8, B8G8R8X8 */
+   allocation_exchange.ResourceOptions.width = width;
+   allocation_exchange.ResourceOptions.height = height;
+   allocation_exchange.ResourceOptions.depth = 1;
+   allocation_exchange.ResourceOptions.array_size = 1;
+   allocation_exchange.Size = (ULONGLONG)width * 4 * height;
+
+   memset(&info, 0, sizeof info);
+   info.pPrivateDriverData = &allocation_exchange;
+   info.PrivateDriverDataSize = sizeof allocation_exchange;
+
+   memset(&allocate, 0, sizeof allocate);
+   allocate.pPrivateDriverData = &resource_exchange;
+   allocate.PrivateDriverDataSize = sizeof resource_exchange;
+   allocate.hResource = runtime_resource;
+   allocate.NumAllocations = 1;
+   allocate.pAllocationInfo = &info;
+   hr = device->callbacks.pfnAllocateCb(device->runtime, &allocate);
+   if (FAILED(hr) || !info.hAllocation) {
+      d3d9_log("allocation %ux%u failed: 0x%08lx", width, height, (unsigned long)hr);
+      return 0;
+   }
+   return info.hAllocation;
+}
+
 static HRESULT APIENTRY
-d3d9_create_resource2(HANDLE device, D3DDDIARG_CREATERESOURCE2 *arg)
+d3d9_create_resource2(HANDLE handle, D3DDDIARG_CREATERESOURCE2 *arg)
 {
    static volatile LONG said;
+   struct d3d9_device *device = handle;
    struct d3d9_resource *resource = calloc(1, sizeof *resource);
+   long result = S_OK;
 
-   (void)device;
    if (!resource)
       return E_OUTOFMEMORY;
    resource->runtime = arg->hResource;
    resource->format = arg->Format;
+   resource->flags = arg->Flags;
    resource->surfaces = arg->SurfCount;
    if (arg->SurfCount && arg->pSurfList) {
       resource->width = arg->pSurfList[0].Width;
       resource->height = arg->pSurfList[0].Height;
    }
+
+   if (device->nine && arg->SurfCount == 1 && !arg->Flags.Texture && !arg->Flags.CubeMap &&
+       (arg->Flags.RenderTarget || arg->Flags.ZBuffer)) {
+      struct entangled_nine_surface desc;
+
+      memset(&desc, 0, sizeof desc);
+      desc.width = resource->width;
+      desc.height = resource->height;
+      desc.format = (unsigned)arg->Format;
+      desc.multisample = (unsigned)arg->MultisampleType;
+      desc.quality = arg->MultisampleQuality;
+      desc.depth_stencil = arg->Flags.ZBuffer;
+      /* Lockable whatever the runtime says: a present reads it back. */
+      desc.lockable = 1;
+      resource->nine = entangled_nine_surface_create(device->nine, &desc, &result);
+      if (!resource->nine) {
+         d3d9_log("surface %ux%u format %u failed: 0x%08lx", resource->width, resource->height,
+                  (unsigned)arg->Format, (unsigned long)result);
+         free(resource);
+         return (HRESULT)result;
+      }
+      if (arg->Flags.RenderTarget &&
+          (arg->Format == D3DDDIFMT_X8R8G8B8 || arg->Format == D3DDDIFMT_A8R8G8B8)) {
+         resource->allocation = d3d9_allocate(device, arg->hResource, resource->width,
+                                              resource->height,
+                                              arg->Format == D3DDDIFMT_A8R8G8B8);
+         if (resource->allocation)
+            resource->pixels = malloc((size_t)resource->width * 4 * resource->height);
+      }
+   }
+
    arg->hResource = resource;
    if (InterlockedIncrement(&said) <= 24)
-      d3d9_log("resource %p: format %u, %ux%u, %u surfaces, pool %u, flags 0x%x", (void *)resource,
-               (unsigned)arg->Format, resource->width, resource->height, arg->SurfCount,
-               (unsigned)arg->Pool, arg->Flags.Value);
+      d3d9_log("resource %p: format %u, %ux%u, %u surfaces, pool %u, flags 0x%x%s%s",
+               (void *)resource, (unsigned)arg->Format, resource->width, resource->height,
+               arg->SurfCount, (unsigned)arg->Pool, arg->Flags.Value,
+               resource->nine ? ", nine" : "", resource->allocation ? ", allocation" : "");
    return S_OK;
 }
 
@@ -491,11 +629,127 @@ d3d9_open_resource(HANDLE device, D3DDDIARG_OPENRESOURCE *arg)
 }
 
 static HRESULT APIENTRY
-d3d9_destroy_resource(HANDLE device, HANDLE resource)
+d3d9_destroy_resource(HANDLE handle, HANDLE resource_handle)
 {
-   (void)device;
+   struct d3d9_device *device = handle;
+   struct d3d9_resource *resource = resource_handle;
+
+   if (!resource)
+      return S_OK;
+   entangled_nine_release(resource->nine);
+   if (resource->allocation) {
+      D3DDDICB_DEALLOCATE deallocate;
+
+      memset(&deallocate, 0, sizeof deallocate);
+      deallocate.hResource = resource->runtime;
+      device->callbacks.pfnDeallocateCb(device->runtime, &deallocate);
+   }
+   free(resource->pixels);
    free(resource);
    return S_OK;
+}
+
+static HRESULT APIENTRY
+d3d9_set_render_target(HANDLE handle, const D3DDDIARG_SETRENDERTARGET *arg)
+{
+   struct d3d9_device *device = handle;
+   struct d3d9_resource *resource = arg->hRenderTarget;
+
+   if (!device->nine)
+      return S_OK;
+   return (HRESULT)entangled_nine_set_render_target(device->nine, arg->RenderTargetIndex,
+                                                    resource ? resource->nine : NULL);
+}
+
+static HRESULT APIENTRY
+d3d9_set_depth_stencil(HANDLE handle, const D3DDDIARG_SETDEPTHSTENCIL *arg)
+{
+   struct d3d9_device *device = handle;
+   struct d3d9_resource *resource = arg->hZBuffer;
+
+   if (!device->nine)
+      return S_OK;
+   return (HRESULT)entangled_nine_set_depth_stencil(device->nine,
+                                                    resource ? resource->nine : NULL);
+}
+
+static HRESULT APIENTRY
+d3d9_clear(HANDLE handle, const D3DDDIARG_CLEAR *arg, UINT count, const RECT *rects)
+{
+   struct d3d9_device *device = handle;
+
+   if (!device->nine)
+      return S_OK;
+   /* RECT and D3DRECT are the same four LONGs. The low three flags are the
+    * API's; the fourth (D3DCLEAR_COMPUTERECTS) is the runtime's own. */
+   return (HRESULT)entangled_nine_clear(device->nine, count, (const long *)rects,
+                                        arg->Flags & 7, arg->FillColor, arg->FillDepth,
+                                        arg->FillStencil);
+}
+
+static HRESULT APIENTRY
+d3d9_flush1(HANDLE handle, UINT flags)
+{
+   struct d3d9_device *device = handle;
+
+   (void)flags;
+   if (device->nine)
+      entangled_nine_flush(device->nine);
+   return S_OK;
+}
+
+/* A present: the frame leaves the GPU for the back buffer's allocation, and
+ * the kernel driver copies it on to wherever Windows shows this window (the
+ * surface DWM composes from, or the screen). Through the guest's CPU, like
+ * every window under this driver so far (ADR-0010); the plane is N4's. */
+static HRESULT APIENTRY
+d3d9_present1(HANDLE handle, const D3DDDIARG_PRESENT1 *arg)
+{
+   static volatile LONG said;
+   struct d3d9_device *device = handle;
+   struct d3d9_resource *resource;
+   struct d3d9_escape_write write;
+   D3DDDICB_PRESENT present;
+   long result;
+   HRESULT hr;
+
+   if (!device->nine || !arg->SrcResources || !arg->phSrcResources)
+      return S_OK;
+   resource = arg->phSrcResources[0].hResource;
+   if (!resource || !resource->nine || !resource->allocation || !resource->pixels) {
+      if (InterlockedIncrement(&said) <= 4)
+         d3d9_log("present of %p: nothing to present from", (void *)resource);
+      return S_OK;
+   }
+
+   result = entangled_nine_read_surface(device->nine, resource->nine, resource->pixels,
+                                        resource->width, resource->height);
+   if (result < 0) {
+      if (InterlockedIncrement(&said) <= 4)
+         d3d9_log("present: reading the frame failed 0x%08lx", (unsigned long)result);
+      return (HRESULT)result;
+   }
+   memset(&write, 0, sizeof write);
+   write.type = 0x904;
+   write.length = 20;
+   write.handle = resource->allocation;
+   write.buffer = (unsigned long long)(uintptr_t)resource->pixels;
+   write.size = (unsigned long long)resource->width * 4 * resource->height;
+   {
+      NTSTATUS status = d3d9_escape(device, &write, sizeof write);
+
+      if (status < 0 && InterlockedIncrement(&said) <= 4)
+         d3d9_log("present: handing the frame to the kernel driver failed 0x%08lx",
+                  (unsigned long)status);
+   }
+
+   memset(&present, 0, sizeof present);
+   present.hSrcAllocation = resource->allocation;
+   present.hContext = device->context;
+   hr = device->callbacks.pfnPresentCb(device->runtime, &present);
+   if (InterlockedIncrement(&said) <= 4 || FAILED(hr))
+      d3d9_log("present %ux%u: 0x%08lx", resource->width, resource->height, (unsigned long)hr);
+   return hr;
 }
 
 static HRESULT APIENTRY
@@ -504,6 +758,12 @@ d3d9_destroy_device(HANDLE handle)
    struct d3d9_device *device = handle;
 
    entangled_nine_close(device->nine);
+   if (device->context) {
+      D3DDDICB_DESTROYCONTEXT destroy;
+
+      destroy.hContext = device->context;
+      device->callbacks.pfnDestroyContextCb(device->runtime, &destroy);
+   }
    d3d9_log("device %p destroyed", handle);
    free(device);
    return S_OK;
@@ -514,20 +774,25 @@ d3d9_create_device(HANDLE adapter, D3DDDIARG_CREATEDEVICE *arg)
 {
    struct d3d9_device *device = calloc(1, sizeof *device);
 
-   (void)adapter;
    if (!device)
       return E_OUTOFMEMORY;
    device->runtime = arg->hDevice;
+   device->adapter = adapter;
    device->callbacks = *arg->pCallbacks;
    d3d9_fill_stubs(arg->pDeviceFuncs);
    arg->pDeviceFuncs->pfnDestroyDevice = d3d9_destroy_device;
+   arg->pDeviceFuncs->pfnCreateResource2 = d3d9_create_resource2;
+   arg->pDeviceFuncs->pfnOpenResource = d3d9_open_resource;
+   arg->pDeviceFuncs->pfnDestroyResource = d3d9_destroy_resource;
+   arg->pDeviceFuncs->pfnSetRenderTarget = d3d9_set_render_target;
+   arg->pDeviceFuncs->pfnSetDepthStencil = d3d9_set_depth_stencil;
+   arg->pDeviceFuncs->pfnClear = d3d9_clear;
+   arg->pDeviceFuncs->pfnFlush1 = d3d9_flush1;
+   arg->pDeviceFuncs->pfnPresent1 = d3d9_present1;
    /* A driver of this interface version has the newer form of six functions
     * and must leave the older one NULL: the runtime fails CreateDevice
     * otherwise ("UMD did not provide non-null pfnPresent1, and null
     * pfnPresent", and so on down the list). */
-   arg->pDeviceFuncs->pfnCreateResource2 = d3d9_create_resource2;
-   arg->pDeviceFuncs->pfnOpenResource = d3d9_open_resource;
-   arg->pDeviceFuncs->pfnDestroyResource = d3d9_destroy_resource;
    arg->pDeviceFuncs->pfnPresent = NULL;
    arg->pDeviceFuncs->pfnFlush = NULL;
    arg->pDeviceFuncs->pfnCreateResource = NULL;
@@ -538,6 +803,17 @@ d3d9_create_device(HANDLE adapter, D3DDDIARG_CREATEDEVICE *arg)
    d3d9_log("device %p: interface %u, version 0x%x, flags 0x%x", (void *)device,
             arg->Interface, arg->Version, arg->Flags.Value);
    {
+      D3DDDICB_CREATECONTEXT create;
+      HRESULT hr;
+
+      memset(&create, 0, sizeof create);
+      hr = device->callbacks.pfnCreateContextCb(device->runtime, &create);
+      if (SUCCEEDED(hr))
+         device->context = create.hContext;
+      else
+         d3d9_log("no kernel context (0x%08lx): nothing will be presented", (unsigned long)hr);
+   }
+   {
       struct entangled_nine_info info;
       long result;
 
@@ -547,7 +823,7 @@ d3d9_create_device(HANDLE adapter, D3DDDIARG_CREATEDEVICE *arg)
                   info.renderer, info.vertex_shader, info.pixel_shader, info.max_texture_width,
                   info.simultaneous_rts);
       else
-         d3d9_log("nine: no adapter (0x%08lx)", (unsigned long)result);
+         d3d9_log("nine: no device (0x%08lx)", (unsigned long)result);
    }
    return S_OK;
 }
@@ -558,6 +834,19 @@ struct d3d9_adapter {
    HANDLE runtime;
    D3DDDI_ADAPTERCALLBACKS callbacks;
 };
+
+static NTSTATUS
+d3d9_escape(struct d3d9_device *device, void *data, UINT size)
+{
+   D3DDDICB_ESCAPE escape;
+
+   memset(&escape, 0, sizeof escape);
+   escape.hDevice = device->runtime;
+   escape.pPrivateDriverData = data;
+   escape.PrivateDriverDataSize = size;
+   escape.hContext = device->context;
+   return device->callbacks.pfnEscapeCb(device->adapter->runtime, &escape);
+}
 
 static HRESULT APIENTRY
 d3d9_close_adapter(HANDLE handle)
@@ -616,6 +905,12 @@ DllMain(HINSTANCE instance, DWORD reason, void *reserved)
       DisableThreadLibraryCalls(instance);
       InitializeCriticalSection(&log_lock);
       log_ready = TRUE;
+      crash_module = instance;
+      crash_handler = AddVectoredExceptionHandler(0, d3d9_crash);
+   } else if (reason == DLL_PROCESS_DETACH) {
+      /* A handler left behind would be a jump into a DLL that is gone. */
+      if (crash_handler)
+         RemoveVectoredExceptionHandler(crash_handler);
    }
    return TRUE;
 }

@@ -203,10 +203,62 @@ index 965f29db..e3cbe89a 100644
                      required_valid_region->width,
                      64,
 diff --git a/src/gallium/frontends/nine/device9.c b/src/gallium/frontends/nine/device9.c
-index 4fe9c07c..90063ad1 100644
+index 4fe9c07c..cc1a5562 100644
 --- a/src/gallium/frontends/nine/device9.c
 +++ b/src/gallium/frontends/nine/device9.c
-@@ -223,9 +223,9 @@ NineDevice9_ctor( struct NineDevice9 *This,
+@@ -125,20 +125,23 @@ NineDevice9_SetDefaultState( struct NineDevice9 *This, bool is_reset )
+ 
+     nine_state_set_defaults(This, &This->caps, is_reset);
+ 
+-    refSurf = This->swapchains[0]->buffers[0];
+-    assert(refSurf);
++    /* No swap chain (a device under the WDDM DDI): nothing to size the
++     * viewport by and no depth buffer of its own; the runtime sets both. */
++    if (This->nswapchains)
++        refSurf = This->swapchains[0]->buffers[0];
++    assert(refSurf || !This->nswapchains);
+ 
+     This->state.viewport.X = 0;
+     This->state.viewport.Y = 0;
+-    This->state.viewport.Width = refSurf->desc.Width;
+-    This->state.viewport.Height = refSurf->desc.Height;
++    This->state.viewport.Width = refSurf ? refSurf->desc.Width : 1;
++    This->state.viewport.Height = refSurf ? refSurf->desc.Height : 1;
+ 
+     nine_context_set_viewport(This, &This->state.viewport);
+ 
+     This->state.scissor.minx = 0;
+     This->state.scissor.miny = 0;
+-    This->state.scissor.maxx = refSurf->desc.Width;
+-    This->state.scissor.maxy = refSurf->desc.Height;
++    This->state.scissor.maxx = refSurf ? refSurf->desc.Width : 1;
++    This->state.scissor.maxy = refSurf ? refSurf->desc.Height : 1;
+ 
+     nine_context_set_scissor(This, &This->state.scissor);
+ 
+@@ -146,7 +149,7 @@ NineDevice9_SetDefaultState( struct NineDevice9 *This, bool is_reset )
+         nine_context_set_render_state(This, D3DRS_ZENABLE, true);
+         This->state.rs_advertised[D3DRS_ZENABLE] = true;
+     }
+-    if (This->state.rs_advertised[D3DRS_ZENABLE])
++    if (This->nswapchains && This->state.rs_advertised[D3DRS_ZENABLE])
+         NineDevice9_SetDepthStencilSurface(
+             This, (IDirect3DSurface9 *)This->swapchains[0]->zsbuf);
+ }
+@@ -198,8 +201,10 @@ NineDevice9_ctor( struct NineDevice9 *This,
+     This->gpu_priority = 0;
+     This->max_frame_latency = 3;
+ 
+-    IDirect3D9_AddRef(This->d3d9);
+-    ID3DPresentGroup_AddRef(This->present);
++    if (This->d3d9)
++        IDirect3D9_AddRef(This->d3d9);
++    if (This->present)
++        ID3DPresentGroup_AddRef(This->present);
+ 
+     if (!(This->params.BehaviorFlags & D3DCREATE_FPU_PRESERVE)) {
+         nine_setup_fpu();
+@@ -223,9 +228,9 @@ NineDevice9_ctor( struct NineDevice9 *This,
      /* TODO: check if swvp is reset by device Resets */
  
      if (This->may_swvp &&
@@ -218,7 +270,29 @@ index 4fe9c07c..90063ad1 100644
          /* Note: We just go on, some apps never use the abilities of
           * swvp, and just set more constants than allowed at init.
           * Only cards we support that are affected are the r500 */
-@@ -445,7 +445,7 @@ NineDevice9_ctor( struct NineDevice9 *This,
+@@ -270,8 +275,9 @@ NineDevice9_ctor( struct NineDevice9 *This,
+     This->frame_count = 0; /* Used to check if events occur the same frame */
+ 
+     /* create implicit swapchains */
+-    This->nswapchains = ID3DPresentGroup_GetMultiheadCount(This->present);
+-    This->swapchains = CALLOC(This->nswapchains,
++    This->nswapchains = This->present ?
++        ID3DPresentGroup_GetMultiheadCount(This->present) : 0;
++    This->swapchains = CALLOC(MAX2(This->nswapchains, 1),
+                               sizeof(struct NineSwapChain9 *));
+     if (!This->swapchains) { return E_OUTOFMEMORY; }
+ 
+@@ -409,7 +415,8 @@ NineDevice9_ctor( struct NineDevice9 *This,
+     This->cursor.hotspot.y = -1;
+     This->cursor.w = This->cursor.h = 0;
+     This->cursor.visible = false;
+-    if (ID3DPresent_GetCursorPos(This->swapchains[0]->present, &This->cursor.pos) != S_OK) {
++    if (!This->nswapchains ||
++        ID3DPresent_GetCursorPos(This->swapchains[0]->present, &This->cursor.pos) != S_OK) {
+         This->cursor.pos.x = 0;
+         This->cursor.pos.y = 0;
+     }
+@@ -445,7 +452,7 @@ NineDevice9_ctor( struct NineDevice9 *This,
  
          /* vs 3.0: >= 256 float constants, but for cards with exactly 256 slots,
           * we have to take in some more slots for int and bool*/
@@ -227,7 +301,7 @@ index 4fe9c07c..90063ad1 100644
                                  sizeof(float[4]),
                              NINE_MAX_CONST_ALL_VS);
          /* ps 3.0: 224 float constants. All cards supported support at least
-@@ -556,9 +556,9 @@ NineDevice9_ctor( struct NineDevice9 *This,
+@@ -556,9 +563,9 @@ NineDevice9_ctor( struct NineDevice9 *This,
      This->vertex_uploader = This->csmt_active ? This->pipe_secondary->stream_uploader : This->context.pipe->stream_uploader;
      This->driver_caps.window_space_position_support = GET_PCAP(vs_window_space_position);
      This->driver_caps.disabling_depth_clipping_support = GET_PCAP(depth_clip_disable);
@@ -240,7 +314,21 @@ index 4fe9c07c..90063ad1 100644
      This->driver_caps.alpha_test_emulation = !GET_PCAP(alpha_test);
      /* Always write pointsize output when the driver doesn't support point_size_per_vertex = 0.
       * TODO: Only generate pointsize for draw calls that need it */
-@@ -3116,7 +3116,7 @@ NineDevice9_DrawPrimitiveUP( struct NineDevice9 *This,
+@@ -599,8 +606,11 @@ NineDevice9_ctor( struct NineDevice9 *This,
+ 
+     nine_state_init_sw(This);
+ 
+-    ID3DPresentGroup_Release(This->present);
+-    nine_context_update_state(This); /* Some drivers needs states to be initialized */
++    if (This->present)
++        ID3DPresentGroup_Release(This->present);
++    /* Without a render target there is no framebuffer to set yet. */
++    if (This->nswapchains)
++        nine_context_update_state(This); /* Some drivers needs states to be initialized */
+     nine_csmt_process(This);
+ 
+     if (This->params.BehaviorFlags & D3DCREATE_FPU_PRESERVE)
+@@ -3116,7 +3126,7 @@ NineDevice9_DrawPrimitiveUP( struct NineDevice9 *This,
                  D3DERR_INVALIDCALL);
      user_assert(PrimitiveCount, D3D_OK);
  
@@ -249,7 +337,7 @@ index 4fe9c07c..90063ad1 100644
                    0,
                    (prim_count_to_vertex_count(PrimitiveType, PrimitiveCount)) * VertexStreamZeroStride,
                    1,
-@@ -3179,7 +3179,7 @@ NineDevice9_DrawIndexedPrimitiveUP( struct NineDevice9 *This,
+@@ -3179,7 +3189,7 @@ NineDevice9_DrawIndexedPrimitiveUP( struct NineDevice9 *This,
      base = MinVertexIndex * VertexStreamZeroStride;
      vbuf.is_user_buffer = false;
      vbuf.buffer.resource = NULL;
@@ -258,7 +346,7 @@ index 4fe9c07c..90063ad1 100644
                    base,
                    NumVertices * VertexStreamZeroStride, /* XXX */
                    64,
-@@ -3191,7 +3191,7 @@ NineDevice9_DrawIndexedPrimitiveUP( struct NineDevice9 *This,
+@@ -3191,7 +3201,7 @@ NineDevice9_DrawIndexedPrimitiveUP( struct NineDevice9 *This,
      vbuf.buffer_offset -= base;
  
      unsigned index_offset = 0;

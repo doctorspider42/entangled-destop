@@ -1,0 +1,138 @@
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 0b6f90f..56deffe 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -631,7 +631,7 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+     }
+ #endif
+ 
+-    if ((pVioGpuEscape->Type == 0x902 || pVioGpuEscape->Type == 0x903) && size >= 24)
++    if ((pVioGpuEscape->Type == 0x902 || pVioGpuEscape->Type == 0x903 || pVioGpuEscape->Type == 0x904) && size >= 24)
+     {
+         // Type and DataLength (two bytes each), the allocation's handle, a
+         // buffer of the caller's and its size, at offsets 4, 8 and 16; and
+@@ -648,9 +648,14 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+             DbgPrint(TRACE_LEVEL_ERROR, ("%s read: handle 0x%x is no allocation\n", __FUNCTION__, handle));
+             return STATUS_INVALID_HANDLE;
+         }
+-        if (pVioGpuEscape->Type == 0x903)
++        if (pVioGpuEscape->Type == 0x903 || pVioGpuEscape->Type == 0x904)
+         {
++            // 0x904 is 0x903 for a frame a present will copy on.
+             status = allocation->CopyIn((PVOID)(ULONG_PTR)buffer, (SIZE_T)bytes);
++            if (pVioGpuEscape->Type == 0x904 && NT_SUCCESS(status))
++            {
++                allocation->MarkPresentSource();
++            }
+         }
+         else if (size < 32)
+         {
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index a5e8018..a8afbdb 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -370,19 +370,73 @@ void VioGpuAllocation::CopyFrom(VioGpuAllocation *src, LONG dstX, LONG dstY, LON
+         ExAcquireFastMutex(&second->m_mapLock);
+         SIZE_T dstPitch = (SIZE_T)m_options.width * 4;
+         SIZE_T srcPitch = (SIZE_T)src->m_options.width * 4;
+-        if (m_pMapVa != NULL && src->m_pMapVa != NULL &&
+-            (SIZE_T)(dstY + height) * dstPitch <= m_pageCount * PAGE_SIZE &&
+-            (SIZE_T)(srcY + height) * srcPitch <= src->m_pageCount * PAGE_SIZE)
++        // Entangled: where each side's pixels are. A frame a user-mode driver
++        // handed over (CopyIn: a window's back buffer at a present, a surface
++        // shared with DWM) is the driver's own copy and the newest there is;
++        // otherwise the allocation's pages, where they are mapped. A
++        // destination with neither gets a copy of its own, for whoever opens
++        // it (CopyOut) - a window presented by a copy lands on the surface
++        // DWM composes that window from, which nothing ever maps.
++        PBYTE srcBase = NULL;
++        SIZE_T srcLimit = 0;
++        // Only for a source marked as one a present copies from (escape
++        // 0x904): any other copy stays as it was, pages to pages - DWM reads
++        // what it opens through the held copy first, and one made here for
++        // an allocation that has another way to its pixels would hide them.
++        if (src->m_presentSource && src->m_pShared != NULL)
+         {
+-            PBYTE to = (PBYTE)m_pMapVa + (SIZE_T)dstY * dstPitch + (SIZE_T)dstX * 4;
+-            PBYTE from = (PBYTE)src->m_pMapVa + (SIZE_T)srcY * srcPitch + (SIZE_T)srcX * 4;
++            srcBase = (PBYTE)src->m_pShared;
++            srcLimit = src->m_sharedSize;
++        }
++        else if (src->m_pMapVa != NULL)
++        {
++            srcBase = (PBYTE)src->m_pMapVa;
++            srcLimit = src->m_pageCount * PAGE_SIZE;
++        }
++        PBYTE dstBase = NULL;
++        SIZE_T dstLimit = 0;
++        BOOLEAN dstShared = FALSE;
++        if (m_pMapVa != NULL && (m_pShared == NULL || !src->m_presentSource))
++        {
++            dstBase = (PBYTE)m_pMapVa;
++            dstLimit = m_pageCount * PAGE_SIZE;
++        }
++        else if (srcBase != NULL && src->m_presentSource)
++        {
++            if (m_pShared == NULL)
++            {
++                m_sharedSize = (SIZE_T)m_options.width * m_options.height * 4;
++                m_pShared = new (PagedPool) BYTE[m_sharedSize];
++                if (m_pShared != NULL)
++                {
++                    RtlZeroMemory(m_pShared, m_sharedSize);
++                }
++            }
++            dstBase = (PBYTE)m_pShared;
++            dstLimit = m_sharedSize;
++            dstShared = TRUE;
++        }
++        if (dstBase != NULL && srcBase != NULL &&
++            (SIZE_T)(dstY + height - 1) * dstPitch + (SIZE_T)(dstX + width) * 4 <= dstLimit &&
++            (SIZE_T)(srcY + height - 1) * srcPitch + (SIZE_T)(srcX + width) * 4 <= srcLimit)
++        {
++            PBYTE to = dstBase + (SIZE_T)dstY * dstPitch + (SIZE_T)dstX * 4;
++            PBYTE from = srcBase + (SIZE_T)srcY * srcPitch + (SIZE_T)srcX * 4;
+             for (LONG row = 0; row < height; row++)
+             {
+                 RtlCopyMemory(to, from, (SIZE_T)width * 4);
+                 to += dstPitch;
+                 from += srcPitch;
+             }
+-            copied = TRUE;
++            if (dstShared)
++            {
++                // A reader is told by the count that there is a new frame.
++                m_sharedWrites++;
++            }
++            else
++            {
++                copied = TRUE;
++            }
+         }
+         ExReleaseFastMutex(&second->m_mapLock);
+         ExReleaseFastMutex(&first->m_mapLock);
+diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
+index 908d373..dbab43b 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.h
++++ b/viogpu/viogpu3d/viogpu_allocation.h
+@@ -53,6 +53,10 @@ class VioGpuAllocation
+     // the count now: equal, and nothing was copied.
+     NTSTATUS CopyOut(PVOID user, SIZE_T size, ULONGLONG *seen);
+     NTSTATUS CopyIn(PVOID user, SIZE_T size);
++    void MarkPresentSource()
++    {
++        m_presentSource = TRUE;
++    }
+     static NTSTATUS GetStandardAllocationDriverData(DXGKARG_GETSTANDARDALLOCATIONDRIVERDATA *pStandardAllocation);
+     static NTSTATUS DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_CREATEALLOCATION *pCreateAllocation);
+ 
+@@ -85,6 +89,9 @@ class VioGpuAllocation
+     SIZE_T m_sharedSize = 0;
+     // How many times it was written: never 0 once there is a frame.
+     ULONGLONG m_sharedWrites = 0;
++    // Entangled: the frames written here are what a present copies from (a
++    // window's back buffer; escape 0x904). See CopyFrom.
++    BOOLEAN m_presentSource = FALSE;
+     FAST_MUTEX m_mapLock;
+     KEVENT m_busyNotification;
+     volatile LONG m_busy;
