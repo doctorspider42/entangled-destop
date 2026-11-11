@@ -39,6 +39,10 @@ on the GPU — `viogpu3d` carrying Venus, `d3d10umd` on Zink; phases W0–W5).
 (proposed: a real Direct3D 9 user-mode driver, x64 and x86, from Gallium
 Nine's state machine behind the WDDM DDI — so a game needs no switch; phases
 N0–N4; N0 and N1 done, nothing drawn yet).
+[docs/adr/0012-windows-xp-guests.md](docs/adr/0012-windows-xp-guests.md)
+(proposed: Windows XP guests need the legacy PC this machine never was — a
+BIOS, real VGA, PCI IDE, level-triggered INTx, a PS/2 mouse; phases X0–X5,
+nothing implemented; branch `winxp-guests`).
 
 ## Build and test
 
