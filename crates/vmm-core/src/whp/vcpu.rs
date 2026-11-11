@@ -39,9 +39,9 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::System::Hypervisor::{
     WHvCancelRunVirtualProcessor, WHvDeleteVirtualProcessor, WHvGetVirtualProcessorRegisters,
-    WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
-    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonNone,
-    WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonX64ApicEoi,
+    WHvRegisterPendingInterruption, WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled,
+    WHvRunVpExitReasonInvalidVpRegisterValue, WHvRunVpExitReasonMemoryAccess,
+    WHvRunVpExitReasonNone, WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonX64ApicEoi,
     WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess,
     WHvRunVpExitReasonX64MsrAccess, WHvSetVirtualProcessorRegisters, WHvX64RegisterApicBase,
     WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
@@ -811,6 +811,9 @@ impl WhpVcpu {
 
     /// Completes an MMIO access through WHP's instruction emulator.
     ///
+    /// An access the emulator cannot decode becomes a #GP in the guest (see
+    /// the end of the function).
+    ///
     /// WHP's exit record carries the guest physical address, the access type and
     /// the raw instruction bytes — no width, no data, and RIP not advanced — so
     /// the only way to serve it is to decode the instruction. The emulator's
@@ -841,14 +844,36 @@ impl WhpVcpu {
                 access.Gpa, exit.VpContext.Rip
             )));
         }
-        self.emulator(emulator)?.emulate_mmio(
+        let emulated = self.emulator(emulator)?.emulate_mmio(
             self.partition.handle(),
             self.index,
             handler,
             self.partition.memory(),
             &exit.VpContext,
             &access,
-        )
+        )?;
+        if emulated {
+            return Ok(());
+        }
+        // An instruction the emulator cannot decode, on memory that is not
+        // RAM. The case that reaches here is a guest program still copying
+        // into a device's shared-memory window after the guest took the
+        // window away (a display driver stopping at shutdown, with a
+        // compositor still running): a vector move, on an address that now
+        // decodes nothing. Hardware would let the write vanish; there is no
+        // completing an instruction nobody can decode, so the guest gets the
+        // fault a bad access earns - #GP(0) at that instruction - and its
+        // own kernel decides what that costs: the program, usually. The
+        // alternative was ending the whole machine for one guest access.
+        tracing::warn!(
+            vcpu = self.index,
+            gpa = format_args!("{:#x}", access.Gpa),
+            rip = format_args!("{:#x}", exit.VpContext.Rip),
+            "the guest touched unmapped device memory with an instruction that cannot be emulated; \n             injecting #GP"
+        );
+        let mut values = Aligned16([zeroed_value(); 1]);
+        values.0[0].Reg64 = PENDING_GP_FAULT;
+        self.set_raw(&[WHvRegisterPendingInterruption], &values.0)
     }
 
     /// This VP's TSC, for the emulated reference counter.
@@ -1228,6 +1253,11 @@ fn trace_detail(exit: &WHV_RUN_VP_EXIT_CONTEXT) -> String {
         _ => String::new(),
     }
 }
+
+/// `WHvRegisterPendingInterruption` for a general-protection fault with error
+/// code 0: pending (bit 0), a hardware exception (type 3 in bits 1-3), with an
+/// error code (bit 4), vector 13 in bits 16-31, and the code in the high half.
+const PENDING_GP_FAULT: u64 = 1 | 3 << 1 | 1 << 4 | 13 << 16;
 
 /// `WHV_MEMORY_ACCESS_INFO::AccessType`: 0 read, 1 write, 2 execute.
 const MEMORY_ACCESS_EXECUTE: u32 = 2;

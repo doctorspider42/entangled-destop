@@ -368,6 +368,10 @@ impl Emulator {
 
     /// Decodes and completes the faulting MMIO instruction, dispatching the
     /// access to `handler` and letting the emulator advance RIP.
+    ///
+    /// `Ok(false)` when the emulator could not decode the instruction at all
+    /// ([`gave_up_decoding`]): nothing was read, written or advanced, and the
+    /// caller decides what the guest gets instead.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn emulate_mmio(
         &self,
@@ -377,7 +381,7 @@ impl Emulator {
         memory: &GuestMem,
         vp_context: &WHV_VP_EXIT_CONTEXT,
         access: &WHV_MEMORY_ACCESS_CONTEXT,
-    ) -> Result<(), VmmError> {
+    ) -> Result<bool, VmmError> {
         let mut ctx = EmulatorContext {
             partition,
             vp_index,
@@ -396,7 +400,11 @@ impl Emulator {
             )
         }
         .map_err(|e| whp_err("WHvEmulatorTryMmioEmulation", e))?;
-        check(status, "MMIO", access.Gpa, vp_context.Rip)
+        // SAFETY: as in `check`: `AsUINT32` reads the bitfield's storage.
+        if gave_up_decoding(unsafe { status.AsUINT32 }) {
+            return Ok(false);
+        }
+        check(status, "MMIO", access.Gpa, vp_context.Rip).map(|()| true)
     }
 
     /// Decodes and completes a string or `REP` port-I/O instruction.
@@ -462,6 +470,14 @@ const STATUS_REASONS: [(u32, &str); 9] = [
     (1 << 9, "the guest cannot be faulted"),
 ];
 
+/// Whether a status word says the emulator could not decode the instruction:
+/// not successful, and "internal emulation failure" the reason. WHP's emulator
+/// knows the integer instructions a driver uses on a register; a vector move
+/// (a `memcpy` running over memory that stopped being RAM) is beyond it.
+fn gave_up_decoding(raw: u32) -> bool {
+    raw & STATUS_SUCCESSFUL == 0 && raw & (1 << 1) != 0
+}
+
 fn check(status: WHV_EMULATOR_STATUS, what: &str, address: u64, rip: u64) -> Result<(), VmmError> {
     // SAFETY: `WHV_EMULATOR_STATUS` is a `repr(C)` union of a 32-bit bitfield
     // struct and `AsUINT32: u32`; reading `AsUINT32` reads the bitfield's
@@ -494,6 +510,17 @@ mod tests {
         assert!(CALLBACKS.WHvEmulatorGetVirtualProcessorRegisters.is_some());
         assert!(CALLBACKS.WHvEmulatorSetVirtualProcessorRegisters.is_some());
         assert!(CALLBACKS.WHvEmulatorTranslateGvaPage.is_some());
+    }
+
+    #[test]
+    fn only_an_undecodable_instruction_counts_as_giving_up() {
+        assert!(gave_up_decoding(1 << 1));
+        assert!(!gave_up_decoding(STATUS_SUCCESSFUL));
+        assert!(!gave_up_decoding(STATUS_SUCCESSFUL | 1 << 1));
+        assert!(
+            !gave_up_decoding(1 << 3),
+            "a callback failure is the machine's"
+        );
     }
 
     fn status(raw: u32) -> WHV_EMULATOR_STATUS {
