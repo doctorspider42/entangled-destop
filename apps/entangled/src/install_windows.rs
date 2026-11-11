@@ -661,14 +661,22 @@ fn own_gpu_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     // files: its DLLs sit beside the driver and go into their folders here.
     for (folder, wanted) in OPTIONAL_GPU_FOLDERS {
         let mut at = dir.join(folder);
-        if !at.is_dir() {
-            if !wanted.iter().all(|name| dir.join(name).is_file()) {
+        let flat = !at.is_dir();
+        if flat {
+            if !wanted
+                .iter()
+                .all(|name| dir.join(flat_name(folder, name)).is_file())
+            {
                 continue;
             }
             at = dir.to_path_buf();
         }
         for name in *wanted {
-            let path = at.join(name);
+            let path = if flat {
+                at.join(flat_name(folder, name))
+            } else {
+                at.join(name)
+            };
             if !path.is_file() {
                 return Err(format!(
                     "--gpu3d: {} has no {name}; it holds {}",
@@ -703,14 +711,32 @@ const WDDM_DRIVER_FILES: &[&str] = &[
 
 /// The optional folders of our own package and the DLLs each must hold:
 /// `opengl` from `guest/windows-gpu/mesa/build-zink.cmd`, `dxvk` from a DXVK
-/// release's `x64` (2.3 and 3.1 verified, ADR-0009).
+/// release's `x64` (2.3 and 3.1 verified, ADR-0009), and what a 32-bit
+/// program takes: `x86` from `guest/windows-gpu/mesa/build-x86.cmd` (the
+/// Venus ICD its Vulkan loader finds) and `dxvk/x86` from the DXVK release's
+/// `x32`. A 32-bit game otherwise has no graphics driver in the guest at all.
 const OPTIONAL_GPU_FOLDERS: &[(&str, &[&str])] = &[
     ("opengl", &["opengl32.dll", "libgallium_wgl.dll"]),
     (
         "dxvk",
         &["d3d9.dll", "d3d10core.dll", "d3d11.dll", "dxgi.dll"],
     ),
+    ("x86", &["vulkan_virtio.dll"]),
+    (
+        "dxvk/x86",
+        &["d3d9.dll", "d3d10core.dll", "d3d11.dll", "dxgi.dll"],
+    ),
 ];
+
+/// The name of an optional folder's DLL in the flat, published package: its
+/// own, except that a 32-bit one (a folder ending in `x86`) would collide
+/// with its 64-bit twin there and is `<stem>_x86.dll`.
+fn flat_name(folder: &str, name: &str) -> String {
+    match name.strip_suffix(".dll") {
+        Some(stem) if folder.ends_with("x86") => format!("{stem}_x86.dll"),
+        _ => name.to_owned(),
+    }
+}
 
 /// WinFsp's installer for the answer disc: an `.msi` of a sane size.
 fn winfsp_installer(msi: &Path) -> Result<Vec<u8>, String> {
@@ -1284,6 +1310,43 @@ mod tests {
                 "Win10/amd64/x64/opengl32_x64.dll",
             ]
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_flat_package_carries_32_bit_twins_into_their_own_folders() {
+        let dir = std::env::temp_dir().join(format!("entangled-x86gpu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "VulkanRT-1.4.363.0-Installer.exe",
+            "entangled-gpu.inf",
+            "entangled-gpu.sys",
+            "entangled-gpu.cat",
+            "gpu-test.exe",
+            "vulkan_virtio.dll",
+            "vulkan_virtio_x86.dll",
+            "d3d9_x86.dll",
+            "d3d10core_x86.dll",
+            "d3d11_x86.dll",
+        ] {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+        // Three of DXVK's four: not a set, so not carried (and not an error:
+        // a flat package's stray DLL is not a folder someone half filled).
+        let files = own_gpu_files(&dir).unwrap();
+        let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(names.contains(&"x86/vulkan_virtio.dll"), "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("dxvk/")), "{names:?}");
+        // The 32-bit driver is the 32-bit file, not its 64-bit twin.
+        let x86 = files.iter().find(|(n, _)| n == "x86/vulkan_virtio.dll");
+        assert_eq!(x86.unwrap().1, b"vulkan_virtio_x86.dll");
+        std::fs::write(dir.join("dxgi_x86.dll"), b"dll").unwrap();
+        let names: Vec<String> = own_gpu_files(&dir)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names.iter().any(|n| n == "dxvk/x86/d3d9.dll"), "{names:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

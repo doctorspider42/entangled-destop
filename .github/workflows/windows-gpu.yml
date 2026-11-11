@@ -106,6 +106,12 @@ jobs:
           MESA_BUILD: C:\mesa-venus
         run: call guest\windows-gpu\mesa\build.cmd
 
+      - name: Venus for 32-bit programs (vulkan_virtio_x86.dll)
+        shell: cmd
+        env:
+          MESA_BUILD32: C:\mesa-venus-x86
+        run: call guest\windows-gpu\mesa\build-x86.cmd
+
       - name: OpenGL over Zink (opengl32.dll, libgallium_wgl.dll)
         shell: cmd
         env:
@@ -169,6 +175,8 @@ jobs:
           }
           Copy-Item C:\drv\entangled-gpu-test.cer "$pkg\entangled-gpu.cer"
           Copy-Item C:\mesa-venus\src\virtio\vulkan\vulkan_virtio.dll $pkg
+          # A release is a flat list of files: the 32-bit twins are *_x86.dll.
+          Copy-Item C:\mesa-venus-x86\src\virtio\vulkan\vulkan_virtio.dll "$pkg\vulkan_virtio_x86.dll"
           foreach ($f in 'opengl32.dll', 'libgallium_wgl.dll') {
             $found = Get-ChildItem C:\mesa-zink -Recurse -Filter $f | Select-Object -First 1
             if (-not $found) { throw "the Zink build made no $f" }
@@ -183,6 +191,7 @@ jobs:
           tar -xzf C:\dxvk.tar.gz -C C:\
           foreach ($f in 'd3d9.dll', 'd3d10core.dll', 'd3d11.dll', 'dxgi.dll') {
             Copy-Item "C:\dxvk-$env:DXVK_VERSION\x64\$f" $pkg
+            Copy-Item "C:\dxvk-$env:DXVK_VERSION\x32\$f" "$pkg\$($f -replace '\.dll$', '_x86.dll')"
           }
           # The release tarball holds the DLLs alone; the licence is the tag's.
           Invoke-WebRequest -Uri "https://raw.githubusercontent.com/doitsujin/dxvk/v$env:DXVK_VERSION/LICENSE" -OutFile "$pkg\LICENSE-dxvk.txt"
