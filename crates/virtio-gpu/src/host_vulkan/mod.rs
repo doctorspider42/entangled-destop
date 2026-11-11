@@ -1468,11 +1468,24 @@ impl HostVulkan for AshVulkan {
         info: &VkBufferViewCreateInfo,
     ) -> Result<vk::BufferView, VkResult> {
         let _pool = macos_pool::Pool::new();
-        let create = vk::BufferViewCreateInfo::default()
+        // The view's own usage (`VK_KHR_maintenance5`), validated against
+        // the buffer's by the executor.
+        let mut usage = info.p_next.iter().map(|link| {
+            let crate::venus::protocol::VkBufferViewCreateInfoNext::VkBufferUsageFlags2CreateInfo(
+                usage,
+            ) = link;
+            vk::BufferUsageFlags2CreateInfoKHR::default()
+                .usage(vk::BufferUsageFlags2KHR::from_raw(usage.usage))
+        });
+        let mut usage = usage.next();
+        let mut create = vk::BufferViewCreateInfo::default()
             .buffer(buffer)
             .format(vk::Format::from_raw(info.format))
             .offset(info.offset)
             .range(info.range);
+        if let Some(usage) = usage.as_mut() {
+            create = create.push_next(usage);
+        }
         // SAFETY: `buffer` is a bound texel buffer of `device`; the format,
         // offset and range were checked against it; `create` is a local.
         unsafe { device.device.create_buffer_view(&create, None) }.map_err(result_code)
