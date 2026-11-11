@@ -153,6 +153,11 @@ jobs:
           cmd /c "guest\windows-gpu\wddm\build.cmd C:\viogpu3d C:\drv"
           if ($LASTEXITCODE -ne 0) { throw 'building entangled-wddm.sys failed' }
           Copy-Item C:\mesa-d3d10-build\src\gallium\targets\d3d10umd\entangled_d3d10.dll C:\drv
+          # ADR-0011: the Direct3D 9 driver, x64 and x86, which the INF names too.
+          cmd /c "guest\windows-gpu\d3d9\build.cmd C:\d3d9"
+          if ($LASTEXITCODE -ne 0) { throw 'building entangled_d3d9.dll failed' }
+          Copy-Item C:\d3d9\entangled_d3d9.dll C:\drv
+          Copy-Item C:\d3d9\x86\entangled_d3d9.dll C:\drv\entangled_d3d9_x86.dll
 
       - name: Test-sign under a certificate whose key is then destroyed
         shell: pwsh
@@ -170,6 +175,7 @@ jobs:
           foreach ($f in 'entangled-gpu.inf', 'entangled-gpu.sys', 'entangled-gpu.cat', 'gpu-test.exe',
                          'entangled-display.inf', 'entangled-display.sys', 'entangled-display.cat',
                          'entangled-wddm.inf', 'entangled-wddm.sys', 'entangled-wddm.cat', 'entangled_d3d10.dll',
+                         'entangled_d3d9.dll', 'entangled_d3d9_x86.dll',
                          'LICENSE-viogpudo.txt') {
             Copy-Item "C:\drv\$f" $pkg
           }

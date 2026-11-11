@@ -103,6 +103,7 @@ if exist "%g%\entangled-wddm.inf" (
   mkdir "%dir%\wddm" 2>nul
   copy /y "%g%\entangled-wddm.*" "%dir%\wddm\" >nul
   copy /y "%g%\entangled_d3d10.dll" "%dir%\wddm\" >nul
+  if exist "%g%\entangled_d3d9.dll" copy /y "%g%\entangled_d3d9*.dll" "%dir%\wddm\" >nul
   copy /y "%disc%\entangled\wddm-on.cmd" "%dir%\" >nul
   copy /y "%disc%\entangled\wddm-off.cmd" "%dir%\" >nul
 )

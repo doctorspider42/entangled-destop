@@ -35,6 +35,10 @@ Venus winsys for Windows, and DXVK/Zink on top).
 [docs/adr/0010-wddm-desktop-on-the-gpu.md](docs/adr/0010-wddm-desktop-on-the-gpu.md)
 (proposed: a WDDM driver for the display function after all, so DWM composes
 on the GPU — `viogpu3d` carrying Venus, `d3d10umd` on Zink; phases W0–W5).
+[docs/adr/0011-direct3d-9-driver.md](docs/adr/0011-direct3d-9-driver.md)
+(proposed: a real Direct3D 9 user-mode driver, x64 and x86, from Gallium
+Nine's state machine behind the WDDM DDI — so a game needs no switch; phases
+N0–N4, N0 open).
 
 ## Build and test
 

@@ -9,7 +9,7 @@ Class       = Display
 ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
 Provider    = %Entangled%
 CatalogFile = entangled-wddm.cat
-DriverVer   = 11/11/2026,0.1.0.0
+DriverVer   = 11/11/2026,0.2.0.0
 PnpLockdown = 1
 
 [Manufacturer]
@@ -29,6 +29,8 @@ DefaultDestDir = 13
 [SourceDisksFiles]
 entangled-wddm.sys  = 1
 entangled_d3d10.dll = 1
+entangled_d3d9.dll  = 1
+entangled_d3d9_x86.dll = 1
 
 [EntangledWddm.NT]
 Include      = msdv.inf
@@ -45,9 +47,12 @@ HKR,, StartOnce
 [EntangledWddm.CopyFiles]
 entangled-wddm.sys
 
-; The Direct3D 10 user-mode driver (Mesa's d3d10umd; ADR-0010 phase W3').
+; The Direct3D 10 user-mode driver (Mesa's d3d10umd; ADR-0010 phase W3') and
+; the Direct3D 9 one for 64-bit and for 32-bit programs (ADR-0011).
 [EntangledWddm.UserMode]
 entangled_d3d10.dll
+entangled_d3d9.dll
+entangled_d3d9_x86.dll
 
 ; Upstream's settings. The driver claims preemption and does none, so the
 ; scheduler's preemption is turned off for the whole guest, and a GPU timeout
@@ -58,10 +63,14 @@ HKR,, HWCursor,          0x00010001, 0
 HKR,, FlexResolution,    0x00010001, 1
 HKR,, UsePhysicalMemory, 0x00010001, 0
 ; The Direct3D user-mode driver, for every runtime that asks (Direct3D 9, 10,
-; 11 and 12 slots; only 10 is served). Without the entry Windows stops the
+; 11 and 12 slots; 9 and 10 are served, 11 through 10's). Without the entry Windows stops the
 ; adapter straight after it starts (code 43), and without a driver that loads
 ; DWM crashes and Windows takes the adapter away (ADR-0010, W0 and W0').
-HKR,, UserModeDriverName, 0x00010000, %13%\entangled_d3d10.dll, %13%\entangled_d3d10.dll, %13%\entangled_d3d10.dll, %13%\entangled_d3d10.dll
+HKR,, UserModeDriverName, 0x00010000, %13%\entangled_d3d9.dll, %13%\entangled_d3d10.dll, %13%\entangled_d3d10.dll, %13%\entangled_d3d10.dll
+; The same four slots for 32-bit programs. Only Direct3D 9 is served there
+; yet: the other three name a DLL that has no entry point of theirs, which
+; a runtime answers as it answers no driver at all.
+HKR,, UserModeDriverNameWow, 0x00010000, %13%\entangled_d3d9_x86.dll, %13%\entangled_d3d9_x86.dll, %13%\entangled_d3d9_x86.dll, %13%\entangled_d3d9_x86.dll
 HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler", EnablePreemption, 0x00010001, 0
 HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers", TdrDebugMode, 0x00010001, 1
 

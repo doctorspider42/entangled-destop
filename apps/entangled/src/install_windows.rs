@@ -654,6 +654,18 @@ fn own_gpu_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
             }
             files.push(((*name).to_owned(), read(&path)?));
         }
+        let d3d9: Vec<_> = WDDM_D3D9_FILES
+            .iter()
+            .map(|name| (name, dir.join(name)))
+            .collect();
+        if d3d9.iter().any(|(_, path)| path.is_file()) {
+            for (name, path) in d3d9 {
+                if !path.is_file() {
+                    return Err(missing(name));
+                }
+                files.push(((*name).to_owned(), read(&path)?));
+            }
+        }
     }
     // Optional: Mesa's OpenGL over Vulkan (Zink) and DXVK's Direct3D 9-11,
     // each a folder of DLLs an application takes from beside itself. The
@@ -702,12 +714,19 @@ const DISPLAY_DRIVER_FILES: &[&str] = &[
 /// The WDDM driver for the display function and its Direct3D user-mode driver
 /// (`guest/windows-gpu/wddm`, `guest/windows-gpu/mesa/build-d3d10.cmd`): all
 /// four or none. Copied into the guest, installed there only on request.
+/// The Direct3D 9 driver (`guest/windows-gpu/d3d9`, ADR-0011) rides with
+/// them once the INF names it: [`WDDM_D3D9_FILES`].
 const WDDM_DRIVER_FILES: &[&str] = &[
     "entangled-wddm.inf",
     "entangled-wddm.sys",
     "entangled-wddm.cat",
     "entangled_d3d10.dll",
 ];
+
+/// The Direct3D 9 user-mode driver of the WDDM driver, for 64-bit and 32-bit
+/// programs: both or neither, and only beside the WDDM driver. A package
+/// from before ADR-0011 has neither, and its INF names neither.
+const WDDM_D3D9_FILES: &[&str] = &["entangled_d3d9.dll", "entangled_d3d9_x86.dll"];
 
 /// The optional folders of our own package and the DLLs each must hold:
 /// `opengl` from `guest/windows-gpu/mesa/build-zink.cmd`, `dxvk` from a DXVK
