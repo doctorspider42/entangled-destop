@@ -1,9 +1,9 @@
 diff --git a/src/gallium/auxiliary/gdikmt/gdikmt.h b/src/gallium/auxiliary/gdikmt/gdikmt.h
 new file mode 100644
-index 0000000..5cf7690
+index 0000000..432f34f
 --- /dev/null
 +++ b/src/gallium/auxiliary/gdikmt/gdikmt.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,103 @@
 +// Helper to iteract with windows kernel-mode drivers
 +// Required because of difference between D3DKMT**** functions and callbacks used in umd
 +
@@ -94,6 +94,8 @@ index 0000000..5cf7690
 +   NTSTATUS (*createAllocation)(struct gdikmt_device* device, struct gdikmt_createallocation *options);
 +   NTSTATUS (*destroyAllocation)(struct gdikmt_device* device, HANDLE hResource, D3DKMT_HANDLE hAllocation);
 +   NTSTATUS (*lockAllocation)(struct gdikmt_device* device, D3DKMT_HANDLE hAllocation, D3DDDICB_LOCKFLAGS flags, void **out_ptr);
++   /* Entangled: the end of a lockAllocation. Optional (NULL where a lock is kept). */
++   NTSTATUS (*unlockAllocation)(struct gdikmt_device* device, D3DKMT_HANDLE hAllocation);
 +   NTSTATUS (*queryAllocation)(struct gdikmt_device* device, struct gdikmt_openallocation* options);
 +   NTSTATUS (*openAllocation)(struct gdikmt_device* device, struct gdikmt_openallocation* options);
 +
@@ -1213,7 +1215,7 @@ index 8e76023..e7c2a1c 100644
     }
  }
 diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
-index 65729f1..24131e5 100644
+index 65729f1..8785392 100644
 --- a/src/gallium/frontends/d3d10umd/Resource.cpp
 +++ b/src/gallium/frontends/d3d10umd/Resource.cpp
 @@ -38,6 +38,7 @@
@@ -1240,7 +1242,7 @@ index 65729f1..24131e5 100644
     Resource *pResource = CastResource(hResource);
  
     memset(pResource, 0, sizeof *pResource);
-@@ -293,6 +300,13 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+@@ -293,6 +300,18 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
     templat.bind       = translate_resource_flags(pCreateResource->BindFlags);
     templat.usage      = translate_resource_usage(pCreateResource->Usage);
  
@@ -1250,11 +1252,16 @@ index 65729f1..24131e5 100644
 +   if ((pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED)) {
 +      templat.bind |= PIPE_BIND_SHARED;
 +   }
++   /* Entangled: a primary - what a screen itself shows, not a window's
++    * buffer - says so, for a winsys that presents primaries its own way. */
++   if (pCreateResource->pPrimaryDesc) {
++      templat.bind |= PIPE_BIND_SCANOUT;
++   }
 +
     if (templat.target != PIPE_BUFFER) {
        if (!screen->is_format_supported(screen,
                                         templat.format,
-@@ -303,7 +317,7 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+@@ -303,7 +322,7 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
           debug_printf("%s: unsupported format %s\n",
                       __func__, util_format_name(templat.format));
           SetError(hDevice, E_OUTOFMEMORY);
@@ -1263,7 +1270,7 @@ index 65729f1..24131e5 100644
        }
     }
  
-@@ -311,7 +325,7 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+@@ -311,7 +330,7 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
     if (!pResource) {
        DebugPrintf("%s: failed to create resource\n", __func__);
        SetError(hDevice, E_OUTOFMEMORY);
@@ -1272,7 +1279,7 @@ index 65729f1..24131e5 100644
     }
  
     pResource->NumSubResources = pCreateResource->MipLevels * pCreateResource->ArraySize;
-@@ -378,6 +392,12 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+@@ -378,6 +397,12 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
           }
        }
     }
@@ -1285,7 +1292,7 @@ index 65729f1..24131e5 100644
  }
  
  
-@@ -418,8 +438,44 @@ OpenResource(D3D10DDI_HDEVICE hDevice,                            // IN
+@@ -418,8 +443,44 @@ OpenResource(D3D10DDI_HDEVICE hDevice,                            // IN
               D3D10DDI_HRESOURCE hResource,                        // IN
               D3D10DDI_HRTRESOURCE hRTResource)                    // IN
  {
@@ -1689,10 +1696,10 @@ index 7c7f2c2..fb8ba96 100644
  
 diff --git a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
 new file mode 100644
-index 0000000..df210f1
+index 0000000..843fdc2
 --- /dev/null
 +++ b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,324 @@
 +#include "gdikmt_d3dddi.h"
 +#include <string.h>
 +#include "gdikmt/gdikmt.h"
@@ -1914,6 +1921,19 @@ index 0000000..df210f1
 +}
 +
 +NTSTATUS
++gdikmt_d3dddi_unlockallocation(struct gdikmt_device *_device,
++                               D3DKMT_HANDLE hAllocation)
++{
++   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
++
++   D3DDDICB_UNLOCK unlock;
++   memset(&unlock, 0, sizeof(unlock));
++   unlock.NumAllocations = 1;
++   unlock.phAllocations = &hAllocation;
++   return device->KTCallbacks.pfnUnlockCb(device->hRTDevice, &unlock);
++}
++
++NTSTATUS
 +gdikmt_d3dddi_queryallocation(struct gdikmt_device *_device,
 +                              struct gdikmt_openallocation *options)
 +{
@@ -1997,6 +2017,7 @@ index 0000000..df210f1
 +   device->base.createAllocation = gdikmt_d3dddi_createallocation;
 +   device->base.destroyAllocation = gdikmt_d3dddi_destroyallocation;
 +   device->base.lockAllocation = gdikmt_d3dddi_lockallocation;
++   device->base.unlockAllocation = gdikmt_d3dddi_unlockallocation;
 +   device->base.queryAllocation = gdikmt_d3dddi_queryallocation;
 +   device->base.openAllocation = gdikmt_d3dddi_openallocation;
 +

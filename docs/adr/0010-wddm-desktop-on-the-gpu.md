@@ -350,7 +350,8 @@ but nothing installs them: `wddm-on.cmd` does, `wddm-off.cmd` goes back to
 the display-only driver. It stays opt-in until the list below is short. The
 workflow change has not run.
 
-**Still owed before this is a default:**
+**Still owed before this is a default** (as it stood; the second pass below
+replaces this list):
 
 1. the window path under the desktop's plane, measured (Edge video, a DXVK
    game), and a decision about who owns the plane in full screen;
@@ -362,6 +363,105 @@ workflow change has not run.
    message on every indexed draw;
 6. a soak: hours, a resolution change, sleep and resume, a snapshot restore;
 7. the comparison with the display-only driver at one resolution.
+
+### The second pass: programs other than DWM (2026-11-11)
+
+The record above ends with a list of what was owed. This is what working down
+it found; the list after it replaces that one.
+
+**A Direct3D program's window reaches DWM.** It did not: the Start menu was an
+empty panel. Three separate things were wrong.
+
+- *The overlay path ran in every process.* Any buffer with a present bind
+  counted as "presentable", so a windowed program's present took the host's
+  plane for itself and skipped the copy DWM was waiting for. Only a primary is
+  presentable now; the frontend marks one (`PIPE_BIND_SCANOUT` when the
+  runtime passes a primary description).
+- *DWM does not sample a window's surface, it copies from it.* The fetch of an
+  opened texture hung on `set_sampler_views` alone; it is on the source of a
+  blit and of a region copy too.
+- *An opened allocation cannot be read through WDDM here.* `pfnLockCb` on an
+  allocation the caller only opened answers `E_INVALIDARG`, read-only or not,
+  and the kernel driver has no mapping either: it maps an allocation's pages
+  when Windows puts it in the aperture, which never happens to one nothing
+  renders with. A named section would do between ordinary processes and not
+  for the ones that matter — the Start menu, Search and every Store app run in
+  an app container with a namespace of their own. So the kernel driver holds
+  the pixels: the producer writes its frame in at each flush (escape `0x903`),
+  whoever opened the allocation reads it out (`0x902`), into paged pool the
+  size of the surface, with a write count so that a reader that already has
+  the frame is told so and copies nothing (DWM binds every window every time
+  it draws). The Start menu, Search and the Calculator render.
+
+  This is two CPU copies per changed frame of each window, and it is the
+  honest state of "shared textures": correct, and not the GPU sharing the plan
+  wanted. The producer's lock is also held only for the length of a copy now.
+
+**App containers get the GPU.** `StartMenuExperienceHost.exe`, `SearchApp.exe`
+and the Store fell back to softpipe — it was they, not the secure desktop
+(`consent.exe` has had Zink all along): the render-only node answered
+"access denied". Its INF now gives every user and `ALL APPLICATION PACKAGES`
+read and write, with a low-integrity label, as a GPU's device object has.
+
+**A mode larger than 16 MiB took the guest down.** Resizing the window to
+3836×1952 was a bugcheck: upstream sizes its frame segment at 16 MiB ("FIXME")
+and the message for "too small" read the size through a pointer not yet set.
+The segment grows to the mode being set (`0005`); 1600×900, 2560×1440,
+1280×720 and 3840×2160 in a row, and a guest restart after them, are clean.
+
+**A guest access the host cannot emulate no longer ends the machine.** On one
+restart the VM died with "the WHP instruction emulator could not complete
+MMIO": the guest had switched the render node's memory decoding off and, 19 ms
+later, a program was still copying into a blob with a vector move — an address
+that decoded nothing, an instruction the emulator does not know. The WHP
+backend now injects `#GP(0)` at that instruction instead of failing the vCPU:
+the guest's own kernel ends the program, as hardware's master abort would have
+left it to. Not reproduced since, so the injection itself has run only in its
+unit test.
+
+**Who owns the plane: the desktop.** `vk-present` (300 frames, a small window,
+unthrottled) runs at 212 and 183 frames a second under this driver, presented
+through the window and composed by DWM, against 452 and 535 on the
+display-only driver with the plane to itself. Both are several times any
+display, so the rule stays as built — while the desktop is on the plane, a
+window is not. A window the size of the screen has not been measured.
+
+**The same resolution, both drivers** (2844×1406, 120 Hz advertised, text
+scrolling in a console):
+
+| | updates a second |
+|---|---|
+| display-only driver (`entangled-display`), flushing the rectangles that changed | 120 |
+| this driver, whole frames on the plane | 72–76 |
+
+So at 120 Hz the display-only driver is ahead on this load, and at 60 Hz the
+two are level. A present costs this driver about 2.5 ms (2.3 ms for the GPU's
+copy of the frame and the wait for it, 0.2 ms for the host to take it); the
+rest of a frame is DWM's own drawing through Zink and the Venus ring, which
+fits a 16.7 ms period and misses every other 8.3 ms one. That, not the
+present, is what there is to speed up.
+
+**Open, seen once or twice:** `SearchApp.exe` twice died of heap corruption
+found in `vn_DestroyPipeline` (the host having refused a `vkDestroyPipeline`
+of an id it never made, once), and not in the last runs. Not understood.
+
+**Still owed before this is a default:**
+
+1. the cost of a window the size of the screen under the desktop's plane
+   (a video, a DXVK game), and with it whether a full-screen window should
+   take the plane;
+2. shared surfaces on the GPU instead of through the kernel driver's copy,
+   and a blt-model present, which still copies between allocations that are
+   not mapped (so does nothing);
+3. the real sample opcodes in `tgsi_to_nir`, or DXBC straight to NIR;
+4. DWM's frame time on Zink over Venus, for displays faster than 60 Hz;
+5. the `SearchApp.exe` heap corruption;
+6. upstream's machine-wide settings the INF still carries (preemption off,
+   TDR debug mode), and its "restart_index … unsupported primitive topology"
+   message on every indexed draw;
+7. a soak of hours, sleep and resume, a snapshot restore;
+8. the workflow and `install windows` with the new package, neither of which
+   has run.
 
 ## Risks, in the order they are likely to bite
 

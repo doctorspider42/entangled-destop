@@ -63,6 +63,16 @@ checkout that still has it.
   (ADR-0010). Under it a flip refreshes the primary once a second instead of
   every frame.
 
+- `0005-a-mode-larger-than-the-frame-segment.patch` - the frame segment
+  (16 MiB upstream) grows to the mode being set, and the message for "too
+  small" no longer reads through a pointer that is not set yet: a mode past
+  2844x1406 was a bugcheck.
+
+- `0006-an-opened-allocation-read-through-the-driver.patch` - escapes `0x903`
+  and `0x902`: a surface's producer writes its pixels into the driver, whoever
+  opened the allocation reads them out, with a write count so an unchanged
+  frame is not copied. How a window's frame crosses to DWM (ADR-0010).
+
 ## The user-mode driver
 
 `entangled_d3d10.dll` is built from Mesa (MIT), not from virtio-win:

@@ -82,9 +82,15 @@ d3d10_wddm_log(const char *format, ...)
       return;
    memset(&escape, 0, sizeof escape);
    escape.type = D3D10_WDDM_ESCAPE_PRINT;
-   va_start(args, format);
-   vsnprintf(escape.text, sizeof escape.text, format, args);
-   va_end(args);
+   {
+      /* Which process says it: several load this driver at once. */
+      int at = snprintf(escape.text, sizeof escape.text, "%lu: ",
+                        (unsigned long)GetCurrentProcessId());
+
+      va_start(args, format);
+      vsnprintf(escape.text + at, sizeof escape.text - at, format, args);
+      va_end(args);
+   }
    escape.length = (unsigned short)strlen(escape.text);
    device->escape(device, &escape, sizeof escape);
 }
@@ -114,6 +120,12 @@ d3d10_wddm_exception(EXCEPTION_POINTERS *info)
    if (InterlockedExchange(&reported, 1) != 0)
       return EXCEPTION_CONTINUE_SEARCH;
 
+   {
+      char exe[MAX_PATH] = "?";
+
+      GetModuleFileNameA(NULL, exe, sizeof exe);
+      d3d10_wddm_log("in %.200s", exe);
+   }
    d3d10_wddm_log("exception 0x%08lx at %p, access %p", (unsigned long)code,
                   info->ExceptionRecord->ExceptionAddress,
                   info->ExceptionRecord->NumberParameters > 1
@@ -311,12 +323,6 @@ struct d3d10_wddm_context {
    void (*delete_shader[3])(struct pipe_context *, void *);
    /* In a flush of ours: the copies it makes flush again. */
    bool flushing;
-   void *(*buffer_map)(struct pipe_context *, struct pipe_resource *,
-                       unsigned, unsigned, const struct pipe_box *,
-                       struct pipe_transfer **);
-   void *(*texture_map)(struct pipe_context *, struct pipe_resource *,
-                        unsigned, unsigned, const struct pipe_box *,
-                        struct pipe_transfer **);
 };
 
 #define D3D10_WDDM_MAX_SCREENS 16
@@ -370,6 +376,21 @@ d3d10_wddm_lookup(struct d3d10_wddm_screen *ws, struct pipe_resource *res)
 static volatile LONG d3d10_wddm_readbacks, d3d10_wddm_uploads,
    d3d10_wddm_flushes, d3d10_wddm_overlays;
 static volatile LONG64 d3d10_wddm_copied;
+/* Microseconds a present spent waiting for the GPU's copy of the frame, and
+ * in the host showing it. */
+static volatile LONG64 d3d10_wddm_wait_us, d3d10_wddm_show_us;
+
+static LONG64
+d3d10_wddm_now_us(void)
+{
+   static LARGE_INTEGER frequency;
+   LARGE_INTEGER now;
+
+   if (!frequency.QuadPart)
+      QueryPerformanceFrequency(&frequency);
+   QueryPerformanceCounter(&now);
+   return now.QuadPart * 1000000 / frequency.QuadPart;
+}
 
 static void
 d3d10_wddm_stats(void)
@@ -381,6 +402,9 @@ d3d10_wddm_stats(void)
    if ((ULONG)(now - before) < 2000 ||
        InterlockedCompareExchange(&last, now, before) != before)
       return;
+   d3d10_wddm_log("overlay: %lld ms waiting for the copy, %lld ms shown by the host",
+                  (long long)(InterlockedExchange64(&d3d10_wddm_wait_us, 0) / 1000),
+                  (long long)(InterlockedExchange64(&d3d10_wddm_show_us, 0) / 1000));
    d3d10_wddm_log("copies in %lu ms: %ld overlaid, %ld flushes, %ld readbacks, %ld uploads, %lld MiB",
                   (unsigned long)(now - before),
                   InterlockedExchange(&d3d10_wddm_overlays, 0),
@@ -406,18 +430,46 @@ d3d10_wddm_readback(struct d3d10_wddm_screen *ws, struct pipe_context *pipe,
     * read (zink) flushes from inside the map, and that flush comes back
     * through d3d10_wddm_flush, which must find nothing left to read. */
    shared->dirty = false;
+   u_box_2d(0, 0, shared->width, shared->height, &box);
+   if (!shared->presentable) {
+      /* A surface for another process (a window's frame for DWM): the kernel
+       * driver carries the pixels across (wddm_sw_winsys_write says why). */
+      size_t row = (size_t)shared->width * 4;
+
+      src = pipe->texture_map(pipe, res, 0, PIPE_MAP_READ, &box, &transfer);
+      if (!src)
+         return;
+      if (transfer->stride == row) {
+         wddm_sw_winsys_write(ws->winsys, shared->dt, src, row * shared->height);
+      } else {
+         uint8_t *packed = MALLOC(row * shared->height);
+
+         if (packed) {
+            for (unsigned y = 0; y < shared->height; y++)
+               memcpy(packed + y * row, src + (size_t)y * transfer->stride, row);
+            wddm_sw_winsys_write(ws->winsys, shared->dt, packed, row * shared->height);
+            FREE(packed);
+         }
+      }
+      pipe->texture_unmap(pipe, transfer);
+      InterlockedIncrement(&d3d10_wddm_readbacks);
+      InterlockedAdd64(&d3d10_wddm_copied, (LONG64)row * shared->height);
+      return;
+   }
    dst = ws->winsys->displaytarget_map(ws->winsys, shared->dt, PIPE_MAP_WRITE);
    if (!dst)
       return;
-   u_box_2d(0, 0, shared->width, shared->height, &box);
    src = pipe->texture_map(pipe, res, 0, PIPE_MAP_READ, &box, &transfer);
-   if (!src)
+   if (!src) {
+      ws->winsys->displaytarget_unmap(ws->winsys, shared->dt);
       return;
+   }
    for (unsigned y = 0; y < shared->height; y++) {
       memcpy(dst + (size_t)y * shared->stride,
              src + (size_t)y * transfer->stride, (size_t)shared->width * 4);
    }
    pipe->texture_unmap(pipe, transfer);
+   ws->winsys->displaytarget_unmap(ws->winsys, shared->dt);
    InterlockedIncrement(&d3d10_wddm_readbacks);
    InterlockedAdd64(&d3d10_wddm_copied, (LONG64)shared->width * shared->height * 4);
 }
@@ -433,9 +485,14 @@ d3d10_wddm_upload(struct d3d10_wddm_screen *ws, struct pipe_context *pipe,
    src = ws->winsys->displaytarget_map(ws->winsys, shared->dt, PIPE_MAP_READ);
    if (!src)
       return;
+   /* The frame this texture already holds: nothing to do, which is the
+    * common case - a compositor binds every window every time it draws. */
+   if (!wddm_sw_winsys_changed(ws->winsys, shared->dt))
+      return;
    u_box_2d(0, 0, shared->width, shared->height, &box);
    pipe->texture_subdata(pipe, res, 0, PIPE_MAP_WRITE, &box, src,
                          shared->stride, 0);
+   ws->winsys->displaytarget_unmap(ws->winsys, shared->dt);
    InterlockedIncrement(&d3d10_wddm_uploads);
    InterlockedAdd64(&d3d10_wddm_copied, (LONG64)shared->width * shared->height * 4);
 }
@@ -490,9 +547,9 @@ d3d10_wddm_attach(struct d3d10_wddm_screen *ws,
    shared->height = templat->height0;
    shared->stride = stride;
    shared->opened = opened;
-   shared->presentable = !opened &&
-                         (templat->bind & PIPE_BIND_DISPLAY_TARGET) &&
-                         !(templat->bind & PIPE_BIND_SHARED);
+   /* A primary only (the frontend marks it PIPE_BIND_SCANOUT): a window's
+    * back buffer is presented too, and that goes to DWM, not to the screen. */
+   shared->presentable = !opened && (templat->bind & PIPE_BIND_SCANOUT);
 
    simple_mtx_lock(&ws->lock);
    _mesa_hash_table_insert(ws->shared, res, shared);
@@ -508,17 +565,17 @@ d3d10_wddm_resource_create(struct pipe_screen *screen,
    struct sw_displaytarget *dt;
    unsigned stride = 0;
 
-   {
+   if (ws->gpu && !d3d10_wddm_wants_allocation(templat) &&
+       (templat->bind & (PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SHARED |
+                         PIPE_BIND_SCANOUT))) {
       static volatile LONG said;
-      uint64_t bytes = templat->target == PIPE_BUFFER
-                          ? templat->width0
-                          : (uint64_t)templat->width0 * templat->height0 * 4;
 
-      if (bytes >= (4u << 20) && InterlockedIncrement(&said) <= 60)
-         d3d10_wddm_log("big resource: target %u format %u %ux%u bind 0x%x usage %u flags 0x%x",
+      /* Meant to leave this process, and not a kind this driver can share. */
+      if (InterlockedIncrement(&said) <= 40)
+         d3d10_wddm_log("not shared: target %u format %u %ux%u levels %u layers %u samples %u bind 0x%x",
                         templat->target, templat->format, templat->width0,
-                        templat->height0, templat->bind, templat->usage,
-                        templat->flags);
+                        templat->height0, templat->last_level + 1,
+                        templat->array_size, templat->nr_samples, templat->bind);
    }
    if (!ws->gpu || !d3d10_wddm_wants_allocation(templat))
       return ws->resource_create(screen, templat);
@@ -667,20 +724,29 @@ d3d10_wddm_overlay(struct d3d10_wddm_screen *ws, struct pipe_context *pipe,
       /* Mapped once: that is when the Venus driver makes the memory a
        * resource the host can be pointed at. */
       u_box_1d(0, templat.width0, &box);
-      if (wc->buffer_map(pipe, shared->frame, 0, PIPE_MAP_READ, &box, &transfer))
+      if (pipe->buffer_map(pipe, shared->frame, 0, PIPE_MAP_READ, &box, &transfer))
          pipe->buffer_unmap(pipe, transfer);
    }
    if (!zink_entangled_frame(pipe, shared->frame, res, &device, &memory))
       return false;
    /* The host reads the buffer when it is told to: the copy must have run. */
-   wc->flush(pipe, &fence, 0);
-   if (fence) {
-      ws->screen->fence_finish(ws->screen, NULL, fence, OS_TIMEOUT_INFINITE);
-      ws->screen->fence_reference(ws->screen, &fence, NULL);
+   {
+      LONG64 start = d3d10_wddm_now_us(), waited;
+      bool shown;
+
+      wc->flush(pipe, &fence, 0);
+      if (fence) {
+         ws->screen->fence_finish(ws->screen, NULL, fence, OS_TIMEOUT_INFINITE);
+         ws->screen->fence_reference(ws->screen, &fence, NULL);
+      }
+      waited = d3d10_wddm_now_us();
+      shown = present(device, memory, shared->width, shared->height,
+                      shared->width * 4, 0, 0);
+      InterlockedAdd64(&d3d10_wddm_wait_us, waited - start);
+      InterlockedAdd64(&d3d10_wddm_show_us, d3d10_wddm_now_us() - waited);
+      if (!shown)
+         return false;
    }
-   if (!present(device, memory, shared->width, shared->height,
-                shared->width * 4, 0, 0))
-      return false;
    ws->overlay_device = device;
    {
       /* Said once, for the life of this process: the plane is taken (see
@@ -768,6 +834,19 @@ d3d10_wddm_mark(struct d3d10_wddm_screen *ws, struct pipe_resource *res)
       shared->dirty = true;
 }
 
+/* A texture opened from another process is as old as its last upload: what
+ * is in the allocation now is fetched before it is read - sampled, or copied
+ * from, which is how a compositor takes a window's frame. */
+static void
+d3d10_wddm_fetch(struct d3d10_wddm_context *wc, struct pipe_context *pipe,
+                 struct pipe_resource *res)
+{
+   struct d3d10_wddm_shared *shared = d3d10_wddm_lookup(wc->ws, res);
+
+   if (shared && shared->opened && !shared->dirty)
+      d3d10_wddm_upload(wc->ws, pipe, res, shared);
+}
+
 static void
 d3d10_wddm_set_framebuffer_state(struct pipe_context *pipe,
                                  const struct pipe_framebuffer_state *state)
@@ -786,6 +865,7 @@ d3d10_wddm_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 {
    struct d3d10_wddm_context *wc = d3d10_wddm_context(pipe);
 
+   d3d10_wddm_fetch(wc, pipe, info->src.resource);
    d3d10_wddm_mark(wc->ws, info->dst.resource);
    wc->blit(pipe, info);
 }
@@ -799,6 +879,7 @@ d3d10_wddm_resource_copy_region(struct pipe_context *pipe,
 {
    struct d3d10_wddm_context *wc = d3d10_wddm_context(pipe);
 
+   d3d10_wddm_fetch(wc, pipe, src);
    d3d10_wddm_mark(wc->ws, dst);
    wc->resource_copy_region(pipe, dst, dst_level, dstx, dsty, dstz, src,
                             src_level, src_box);
@@ -817,13 +898,9 @@ d3d10_wddm_set_sampler_views(struct pipe_context *pipe,
 
    if (views) {
       for (unsigned i = 0; i < num_views; i++) {
-         struct d3d10_wddm_shared *shared;
-
          if (!views[i])
             continue;
-         shared = d3d10_wddm_lookup(wc->ws, views[i]->texture);
-         if (shared && shared->opened && !shared->dirty)
-            d3d10_wddm_upload(wc->ws, pipe, views[i]->texture, shared);
+         d3d10_wddm_fetch(wc, pipe, views[i]->texture);
       }
    }
    wc->set_sampler_views(pipe, shader, start_slot, num_views,
@@ -932,38 +1009,6 @@ d3d10_wddm_create_gs_state(struct pipe_context *pipe,
    return d3d10_wddm_create_shader(pipe, 2, state);
 }
 
-static void *
-d3d10_wddm_buffer_map(struct pipe_context *pipe, struct pipe_resource *res,
-                      unsigned level, unsigned usage,
-                      const struct pipe_box *box,
-                      struct pipe_transfer **transfer)
-{
-   struct d3d10_wddm_context *wc = d3d10_wddm_context(pipe);
-   static volatile LONG said;
-
-   if (res->width0 >= (4u << 20) && InterlockedIncrement(&said) <= 40)
-      d3d10_wddm_log("big buffer map: %u bytes, usage 0x%x, box %d+%d",
-                     res->width0, usage, box->x, box->width);
-   return wc->buffer_map(pipe, res, level, usage, box, transfer);
-}
-
-static void *
-d3d10_wddm_texture_map(struct pipe_context *pipe, struct pipe_resource *res,
-                       unsigned level, unsigned usage,
-                       const struct pipe_box *box,
-                       struct pipe_transfer **transfer)
-{
-   struct d3d10_wddm_context *wc = d3d10_wddm_context(pipe);
-   static volatile LONG said;
-
-   if ((uint64_t)box->width * box->height * 4 >= (4u << 20) &&
-       InterlockedIncrement(&said) <= 40)
-      d3d10_wddm_log("big texture map: %ux%u format %u, usage 0x%x, box %dx%d",
-                     res->width0, res->height0, res->format, usage,
-                     box->width, box->height);
-   return wc->texture_map(pipe, res, level, usage, box, transfer);
-}
-
 static void
 d3d10_wddm_bind_shader(struct pipe_context *pipe, unsigned stage, void *shader)
 {
@@ -1042,8 +1087,6 @@ d3d10_wddm_context_destroy(struct pipe_context *pipe)
    pipe->delete_vs_state = wc->delete_shader[0];
    pipe->delete_fs_state = wc->delete_shader[1];
    pipe->delete_gs_state = wc->delete_shader[2];
-   pipe->buffer_map = wc->buffer_map;
-   pipe->texture_map = wc->texture_map;
    simple_mtx_lock(&d3d10_wddm_tables);
    wc->pipe = NULL;
    simple_mtx_unlock(&d3d10_wddm_tables);
@@ -1084,10 +1127,6 @@ d3d10_wddm_context_create(struct pipe_screen *screen, void *priv,
    wc->create_shader[0] = pipe->create_vs_state;
    wc->create_shader[1] = pipe->create_fs_state;
    wc->create_shader[2] = pipe->create_gs_state;
-   wc->buffer_map = pipe->buffer_map;
-   wc->texture_map = pipe->texture_map;
-   pipe->buffer_map = d3d10_wddm_buffer_map;
-   pipe->texture_map = d3d10_wddm_texture_map;
    memset(wc->bound_shader, 0, sizeof wc->bound_shader);
    wc->bind_shader[0] = pipe->bind_vs_state;
    wc->bind_shader[1] = pipe->bind_fs_state;
@@ -1186,9 +1225,36 @@ d3d10_create_screen(struct gdikmt_device *device)
       return NULL;
    }
 
-   d3d10_wddm_log("screen %p: %s", (void *)screen, gpu ? "zink" : "softpipe");
+   {
+      char name[MAX_PATH] = "?";
+      const char *base = name;
+
+      GetModuleFileNameA(NULL, name, sizeof name);
+      for (const char *p = name; *p; p++) {
+         if (*p == '\\' || *p == '/')
+            base = p + 1;
+      }
+      d3d10_wddm_log("screen %p: %s, in %s (process %lu, session %lu)",
+                     (void *)screen, gpu ? "zink" : "softpipe", base,
+                     (unsigned long)GetCurrentProcessId(),
+                     (unsigned long)WTSGetActiveConsoleSessionId());
+      if (!gpu) {
+         /* Why there was no Vulkan: can this process open the render node? */
+         HANDLE node = CreateFileW(L"\\\\.\\EntangledGpu", GENERIC_READ | GENERIC_WRITE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                   OPEN_EXISTING, 0, NULL);
+
+         d3d10_wddm_log("render node: %s (error %lu)",
+                        node == INVALID_HANDLE_VALUE ? "cannot be opened" : "opens",
+                        (unsigned long)GetLastError());
+         if (node != INVALID_HANDLE_VALUE)
+            CloseHandle(node);
+      }
+   }
 
    ws->winsys = winsys;
+   if (gpu)
+      wddm_sw_winsys_lock_per_map(winsys);
    ws->device = device;
    ws->gpu = gpu;
    ws->destroy = screen->destroy;

@@ -7,7 +7,7 @@ Class       = System
 ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %Entangled%
 CatalogFile = entangled-gpu.cat
-DriverVer   = 11/02/2026,0.1.0.0
+DriverVer   = 11/11/2026,0.1.1.0
 PnpLockdown = 1
 
 [Manufacturer]
@@ -37,10 +37,18 @@ entangled-gpu.sys
 ; manager asks for a line interrupt, which this machine cannot route (no
 ; _PRT), and the function fails with code 12.
 [EntangledGpu.NT.HW]
-AddReg = EntangledGpu.MsiReg
+AddReg = EntangledGpu.MsiReg, EntangledGpu.Security
 
 [EntangledGpu.MsiReg]
 HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 1
+
+; Who may open the device: the system and administrators everything, every
+; user and every app container (AC) read and write, at low integrity too (the
+; label). A sandboxed program - the Start menu, a Store app - is a Vulkan
+; program like any other once the desktop itself is drawn through this device
+; (ADR-0010); without the last two it gets "access denied" and no GPU.
+[EntangledGpu.Security]
+HKR,, Security,, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)(A;;GRGW;;;AC)S:(ML;;NW;;;LW)"
 
 [EntangledGpu.NT.Services]
 AddService = EntangledGpu, 0x00000002, EntangledGpu.Service
