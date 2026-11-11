@@ -85,61 +85,96 @@ user without an opt-in; ADR-0010's "still owed" list is that work.
 
 ## Record
 
-### N0, first day (2026-11-11): taken, asked, and turned down
+### N0 (2026-11-11): the runtime takes the driver
 
 `guest/windows-gpu/d3d9/` is the skeleton: `OpenAdapter`, the caps, and a
 device whose 142 functions are placeholders generated from the WDK's header
-(`gen-stubs.py`; the shape of each matters on x86, where the callee pops its
-arguments). It builds for x64 and x86, the INF names both
+(`gen-stubs.py` reads it preprocessed; the shape of each matters on x86,
+where the callee pops its arguments), with real resource handles behind
+`pfnCreateResource2`. It builds for x64 and x86, the INF names both
 (`UserModeDriverName`, `UserModeDriverNameWow`), and the package, the
 installer and the workflow carry them.
 
-What works, in the test guest (Windows 10 19045, WDDM 2.7):
+In the test guest (Windows 10 19045, WDDM 2.7, d3d9.dll 10.0.19041.7802),
+`d3d9-test.exe` and its 32-bit build both get: the adapter named with our
+DLL, `CheckDeviceType` and `GetDeviceCaps` for `D3DDEVTYPE_HAL` (vertex and
+pixel shader 3.0), `CreateDevice` with hardware vertex processing, `Clear`
+and `Present`, all `S_OK`. Nothing is drawn: the device's functions answer
+and do nothing. What the runtime does to a new device, in order, is in the
+driver's log: `Flush1`, a back buffer (the window's client area, X8R8G8B8),
+a D24S8 depth buffer, six vertex and index buffers of its own, the render
+states, `Lock`, `SetRenderTarget`, `SetDepthStencil`, `Clear`, `Present1`.
 
-- `IDirect3D9::GetAdapterIdentifier` names `entangled_d3d9.dll` to a 64-bit
-  program and `entangled_d3d9_x86.dll` to a 32-bit one.
-- The runtime loads the DLL into both, calls `OpenAdapter` (interface 9,
-  runtime version 0xc001) and asks, every time a program asks it about the
-  adapter: `GETD3D9CAPS`, `GETFORMATCOUNT`, `GETD3DQUERYCOUNT`,
-  `GETGAMMARAMPCAPS`, then the same four again followed by `GETFORMATDATA`
-  and `GETD3DQUERYDATA`, and closes the adapter. Nothing else: no DirectDraw
-  caps, no Direct3D 3–8 caps.
-- The answers are used: without `D3DDEVCAPS_HWTRANSFORMANDLIGHT`,
-  `CreateDevice` with hardware vertex processing changes from
-  `D3DERR_NOTAVAILABLE` to `D3DERR_INVALIDCALL`.
+**What it took, which no document says.** For most of a day every call
+answered `D3DERR_NOTAVAILABLE` (0x8876086a), `pfnCreateDevice` was never
+called, and nothing said why. Three things were between the DLL and a device:
 
-What does not: `GetDeviceCaps`, `CheckDeviceType` and `CreateDevice` for
-`D3DDEVTYPE_HAL` all answer `D3DERR_NOTAVAILABLE` (0x8876086a), and
-`pfnCreateDevice` is never called. **N0 is not done.**
+1. *The interface version.* The WDK's default `D3D_UMD_INTERFACE_VERSION` is
+   its own newest (WDDM 3.2); the driver is built for and answers WDDM 2.0
+   (0x5002, `ddi.h`).
+2. *A list of minimum hardware.* d3d9.dll holds a driver that reports
+   shader model 2 or later to a fixed list of caps, and one that falls
+   short of any of them has its `DevCaps` zeroed and its format list cut
+   down to display modes — silently; the adapter then simply has no HAL.
+   Ours fell short by one bit, `D3DPMISCCAPS_FOGINFVF` (0x2000), which
+   exists only in the DDI's header (`d3dhal.h`), not in the SDK's. The list,
+   as the runtime checks it for a shader model 3 driver:
+   - `TextureCaps` and `FVFCaps` not zero; `MaxVertexIndex` ≥ 0xfffe;
+     `Caps2` has `DYNAMICTEXTURES`; `NumSimultaneousRTs` 1–4; `RasterCaps`
+     has `SCISSORTEST`;
+   - `PrimitiveMiscCaps` has `MASKZ`, the three `CULL` bits,
+     `COLORWRITEENABLE`, `BLENDOP` and `FOGINFVF`, and not `LINEPATTERNREP`;
+     with more than one render target also `INDEPENDENTWRITEMASKS` and
+     `MRTPOSTPIXELSHADERBLENDING`, and `MaxUserClipPlanes` ≥ 6;
+   - `MaxStreams` ≥ 8; no `D3DVTXPCAPS_NO_VSDT_UBYTE4`; `DevCaps2` has
+     `STREAMOFFSET` (a logged error without) and
+     `VERTEXELEMENTSCANSHARESTREAMOFFSET`; `DeclTypes` has `UBYTE4`,
+     `UBYTE4N`, `SHORT2N`, `SHORT4N`, `FLOAT16_2`, `FLOAT16_4`;
+   - vertex shader 3.0: `VS20Caps` predication, dynamic flow depth ≥ 24,
+     temps ≥ 32, static flow depth ≥ 4; 512–32768 instruction slots;
+     `MaxVertexShaderConst` ≥ 256; guard bands of at least ±8192;
+     `RasterCaps` has `FOGVERTEX`; `FVFCaps` has `PSIZE`;
+     `VertexTextureFilterCaps` has point min and mag;
+   - pixel shader 3.0: all five `PS20Caps` bits, dynamic flow depth ≥ 24,
+     temps ≥ 32, static flow depth ≥ 4, ≥ 512 slots; 512–32768 instruction
+     slots; textures ≥ 4096, `MaxTextureRepeat` ≥ 8192, anisotropy ≥ 16;
+     `RasterCaps` has `MIPMAPLODBIAS`, `ANISOTROPY`, `COLORPERSPECTIVE`,
+     `SCISSORTEST`, `SLOPESCALEDEPTHBIAS`, `DEPTHBIAS`; every Z and alpha
+     compare; every source blend, destination blends 0x23ff; point, linear
+     and anisotropic min, point and linear mip and mag (cube and volume:
+     point and linear); all six address modes; all nine stencil ops;
+     `TextureCaps` has `PERSPECTIVE`, `PROJECTED`, `CUBEMAP`, `VOLUMEMAP`,
+     the three `MIP*MAP` bits and `TEXREPEATNOTSCALEDBYSIZE`, and not
+     `SQUAREONLY`;
+   - in the format list: no `3DACCELERATION` without `DISPLAYMODE`, none on
+     A8R8G8B8 or A1R5G5B5 ("an alpha format"), `MEMBEROFGROUP_ARGB` only on
+     the RGB display formats — these three are logged errors and disable
+     the driver outright.
+3. *The newer six functions.* A driver of this interface version must give
+   `pfnPresent1`, `pfnFlush1`, `pfnCreateResource2`, `pfnVolBlt1`,
+   `pfnTexBlt1` and `pfnBufBlt1` and leave the older form of each NULL, or
+   `CreateDevice` fails — this one with a logged error.
 
-Ruled out, each by a run (`ENTANGLED_D3D9_TRY` is a set of bits that change
-one answer each, so a boot tries several):
+**How it was found**, because the next silent refusal will need the same.
+d3d9.dll keeps the sentences its debug build would have printed: a table of
+its last errors in its own data section, each with the text ("UMD did not
+provide non-null pfnPresent1, and null pfnPresent."). `d3d9-test.exe` prints
+every run of text in that section after a failure, which is that table. The
+caps list has no sentence: it came from reading the function in d3d9.dll
+that decides whether an adapter has a HAL, after the test program printed
+what the runtime's enumerator held for the adapter (ours, with `DevCaps` 0
+and one format). The test still carries both readers; the second is for that
+one build of the DLL and checks for it.
 
-- the interface version answered: WDDM 2.0 (0x5002), Windows 7 (0x2003) and
-  Vista (0x000c) are the same; the WDK's default, WDDM 3.2, was never right
-  (newer than the Windows it runs on) and is no longer what is built;
-- `D3DCAPS_READ_SCANLINE`, `DDCAPS2_CANRENDERWINDOWED`,
-  `D3DDEVCAPS_FLOATTLVERTEX`; shader model 2 instead of 3; `DeviceType` 0;
-- the format list: A8R8G8B8 as a display format beside X8R8G8B8 (the kernel
-  driver's source modes are A8R8G8B8, the mode Direct3D reports is
-  X8R8G8B8), the buffer formats (`VERTEXDATA`, `INDEX16`, `INDEX32`),
-  multisample type bits, a display format with only the plain operations.
+Ruled out along the way, and not it: the interface version among 2.0,
+Windows 7 and Vista; `D3DCAPS_READ_SCANLINE`, `DDCAPS2_CANRENDERWINDOWED`,
+`D3DDEVCAPS_FLOATTLVERTEX`; buffer formats in the list; multisample bits;
+the kernel driver (the runtime asks it nothing between the caps and the
+decision).
 
-So the caps are probably not it, and what is left is what the runtime asks
-the *kernel* driver between reading the caps and deciding — a display-mode
-list, a scan line, a device state — which `entangled-wddm.sys` has only ever
-been asked by Direct3D 10 and DWM. The attempt to listen
-(`kmt_trace.inc`: d3d9.dll's 64 `D3DKMT` imports pointed at logging
-wrappers) heard nothing, so those calls leave by another door (gdi32's
-exports looked up at run time, most likely); the next step is to listen
-there, or on the kernel driver's side, where a diagnostic build already
-prints every DDI it is called with.
-
-Until a device draws, the driver serves only its test program (and any
-process with `ENTANGLED_D3D9=1`): everyone else is answered `E_FAIL` from
+Until a device draws (N2), the driver serves only its test program and any
+process with `ENTANGLED_D3D9=1`: everyone else is answered `E_FAIL` from
 `OpenAdapter`, which is what they were told before the DLL existed.
 
-A reference that helped: VirtualBox's driver answers the same six queries
-the same way (two query types, a zero gamma answer, the caps of its
-backend), and `D3D_UMD_INTERFACE_VERSION_WIN7` for its version. Read for
-what it answers, not copied (it is GPL).
+VirtualBox's driver answers the same six caps queries (two query types, a
+zero gamma answer); read for what it answers, not copied (it is GPL).

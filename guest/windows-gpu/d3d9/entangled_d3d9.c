@@ -24,11 +24,11 @@
 /* gdi32's thunks, as d3dkmthk.h has them: only what the log needs, so that
  * the adapter-level code needs no device. */
 typedef struct {
-   WCHAR DeviceName[32];
+   HDC hDc;
    UINT hAdapter;
    LUID AdapterLuid;
    UINT VidPnSourceId;
-} KMT_OPENADAPTERFROMGDIDISPLAYNAME;
+} KMT_OPENADAPTERFROMHDC;
 
 typedef struct {
    UINT hAdapter;
@@ -44,7 +44,7 @@ typedef struct {
    UINT hAdapter;
 } KMT_CLOSEADAPTER;
 
-extern NTSTATUS APIENTRY D3DKMTOpenAdapterFromGdiDisplayName(KMT_OPENADAPTERFROMGDIDISPLAYNAME *);
+extern NTSTATUS APIENTRY D3DKMTOpenAdapterFromHdc(KMT_OPENADAPTERFROMHDC *);
 extern NTSTATUS APIENTRY D3DKMTEscape(const KMT_ESCAPE *);
 extern NTSTATUS APIENTRY D3DKMTCloseAdapter(const KMT_CLOSEADAPTER *);
 
@@ -75,11 +75,12 @@ d3d9_log(const char *format, ...)
    line[sizeof line - 1] = 0;
    EnterCriticalSection(&log_lock);
    if (!log_adapter) {
-      KMT_OPENADAPTERFROMGDIDISPLAYNAME open;
+      KMT_OPENADAPTERFROMHDC open;
 
       memset(&open, 0, sizeof open);
-      lstrcpyW(open.DeviceName, L"\\\\.\\DISPLAY1");
-      opened = D3DKMTOpenAdapterFromGdiDisplayName(&open);
+      open.hDc = GetDC(NULL);
+      opened = D3DKMTOpenAdapterFromHdc(&open);
+      ReleaseDC(NULL, open.hDc);
       if (opened >= 0)
          log_adapter = open.hAdapter;
    }
@@ -132,17 +133,6 @@ d3d9_stub(unsigned index, const char *name)
 
 /* ----------------------------------------------------------------- caps */
 
-/* Bring-up only: ENTANGLED_D3D9_TRY is a set of bits that each change one
- * answer, so that one boot of the guest tries several. */
-static unsigned
-d3d9_try(void)
-{
-   char text[16] = "";
-
-   GetEnvironmentVariableA("ENTANGLED_D3D9_TRY", text, sizeof text);
-   return (unsigned)strtoul(text, NULL, 0);
-}
-
 /* What the adapter says it can do with a format. Phase N0's list is the
  * handful a desktop program asks for; N1 takes it from the Gallium screen. */
 #define OPS_COLOR                                                            \
@@ -160,10 +150,9 @@ d3d9_try(void)
 
 static const FORMATOP d3d9_formats[] = {
    {D3DDDIFMT_X8R8G8B8, OPS_DISPLAY, 0, 0, 0},
-   /* A display mode too: the kernel driver's source modes are A8R8G8B8, and
-    * the adapter is "not available" to Direct3D 9 unless the format of the
-    * mode the desktop is in can be accelerated. */
-   {D3DDDIFMT_A8R8G8B8, OPS_DISPLAY | FORMATOP_SAME_FORMAT_UP_TO_ALPHA_RENDERTARGET, 0, 0, 0},
+   /* Never a display mode: d3d9.dll disables a driver that reports "an alpha
+    * format with D3DFORMAT_OP_3DACCELERATION" (its words). */
+   {D3DDDIFMT_A8R8G8B8, OPS_COLOR | FORMATOP_SAME_FORMAT_UP_TO_ALPHA_RENDERTARGET, 0, 0, 0},
    {D3DDDIFMT_R5G6B5, OPS_COLOR, 0, 0, 0},
    {D3DDDIFMT_A8, OPS_TEXTURE, 0, 0, 0},
    {D3DDDIFMT_L8, OPS_TEXTURE, 0, 0, 0},
@@ -175,39 +164,6 @@ static const FORMATOP d3d9_formats[] = {
    {D3DDDIFMT_D24X8, OPS_DEPTH, 0, 0, 0},
    {D3DDDIFMT_D24S8, OPS_DEPTH, 0, 0, 0},
 };
-
-/* The format list as answered: the table, and what ENTANGLED_D3D9_TRY adds. */
-static unsigned
-d3d9_format_list(FORMATOP *out)
-{
-   unsigned count = ARRAYSIZE(d3d9_formats);
-   unsigned t = d3d9_try();
-
-   memcpy(out, d3d9_formats, sizeof d3d9_formats);
-   if (t & 32) {
-      static const D3DDDIFORMAT buffers[] = {D3DDDIFMT_VERTEXDATA, D3DDDIFMT_INDEX16,
-                                             D3DDDIFMT_INDEX32};
-
-      for (unsigned i = 0; i < ARRAYSIZE(buffers); i++) {
-         memset(&out[count], 0, sizeof out[count]);
-         out[count++].Format = buffers[i];
-      }
-   }
-   if (t & 64) {
-      for (unsigned i = 0; i < count; i++) {
-         out[i].FlipMsTypes = 1;
-         out[i].BltMsTypes = 1;
-      }
-   }
-   if (t & 256) {
-      /* The display formats with nothing but what makes them one. */
-      for (unsigned i = 0; i < 2; i++)
-         out[i].Operations = FORMATOP_DISPLAYMODE | FORMATOP_3DACCELERATION |
-                             FORMATOP_TEXTURE | FORMATOP_OFFSCREEN_RENDERTARGET |
-                             FORMATOP_SAME_FORMAT_RENDERTARGET;
-   }
-   return count;
-}
 
 static const D3DDDIQUERYTYPE d3d9_queries[] = {
    D3DDDIQUERYTYPE_EVENT,
@@ -244,7 +200,14 @@ d3d9_caps9(D3DCAPS9 *caps)
                              D3DPMISCCAPS_PERSTAGECONSTANT | D3DPMISCCAPS_FOGANDSPECULARALPHA |
                              D3DPMISCCAPS_SEPARATEALPHABLEND |
                              D3DPMISCCAPS_MRTPOSTPIXELSHADERBLENDING |
-                             D3DPMISCCAPS_FOGVERTEXCLAMPED;
+                             D3DPMISCCAPS_FOGVERTEXCLAMPED |
+                             /* A DDI-only bit (d3dhal.h), and not optional: d3d9.dll
+                              * holds a shader model 2+ driver to a list of minimum
+                              * caps, this one among them, and one that falls short has
+                              * its DevCaps zeroed and its formats cut down to display
+                              * modes - without a word, as D3DERR_NOTAVAILABLE from
+                              * every call (ADR-0011 has the whole list). */
+                             D3DPMISCCAPS_FOGINFVF;
    caps->RasterCaps = D3DPRASTERCAPS_ANISOTROPY | D3DPRASTERCAPS_COLORPERSPECTIVE |
                       D3DPRASTERCAPS_DITHER | D3DPRASTERCAPS_DEPTHBIAS |
                       D3DPRASTERCAPS_FOGRANGE | D3DPRASTERCAPS_FOGTABLE |
@@ -385,23 +348,16 @@ d3d9_get_caps(HANDLE adapter, const D3DDDIARG_GETCAPS *arg)
       caps->Head = head;
       break;
    }
-   case D3DDDICAPS_GETFORMATCOUNT: {
-      FORMATOP list[ARRAYSIZE(d3d9_formats) + 4];
-
+   case D3DDDICAPS_GETFORMATCOUNT:
       if (arg->DataSize < sizeof(UINT))
          return E_INVALIDARG;
-      *(UINT *)arg->pData = d3d9_format_list(list);
+      *(UINT *)arg->pData = ARRAYSIZE(d3d9_formats);
       break;
-   }
-   case D3DDDICAPS_GETFORMATDATA: {
-      FORMATOP list[ARRAYSIZE(d3d9_formats) + 4];
-      unsigned count = d3d9_format_list(list);
-
-      if (arg->DataSize < count * sizeof list[0])
+   case D3DDDICAPS_GETFORMATDATA:
+      if (arg->DataSize < sizeof d3d9_formats)
          return E_INVALIDARG;
-      memcpy(arg->pData, list, count * sizeof list[0]);
+      memcpy(arg->pData, d3d9_formats, sizeof d3d9_formats);
       break;
-   }
    case D3DDDICAPS_GETMULTISAMPLEQUALITYLEVELS: {
       DDIMULTISAMPLEQUALITYLEVELSDATA *levels = arg->pData;
 
@@ -426,21 +382,6 @@ d3d9_get_caps(HANDLE adapter, const D3DDDIARG_GETCAPS *arg)
       D3DCAPS9 caps;
 
       d3d9_caps9(&caps);
-      if (d3d9_try() & 4) {
-         caps.Caps |= D3DCAPS_READ_SCANLINE;
-         caps.Caps2 |= 0x00080000; /* DDCAPS2_CANRENDERWINDOWED */
-         caps.DevCaps |= D3DDEVCAPS_FLOATTLVERTEX;
-      }
-      if (d3d9_try() & 128) {
-         caps.VertexShaderVersion = D3DVS_VERSION(2, 0);
-         caps.PixelShaderVersion = D3DPS_VERSION(2, 0);
-         caps.MaxVertexShader30InstructionSlots = 0;
-         caps.MaxPixelShader30InstructionSlots = 0;
-      }
-      if (d3d9_try() & 512)
-         caps.DeviceType = 0;
-      if (d3d9_try() & 8)
-         caps.DevCaps &= ~(D3DDEVCAPS_PUREDEVICE | D3DDEVCAPS_HWTRANSFORMANDLIGHT);
       memset(arg->pData, 0, arg->DataSize);
       memcpy(arg->pData, &caps, min(arg->DataSize, sizeof caps));
       break;
@@ -491,14 +432,67 @@ d3d9_get_caps(HANDLE adapter, const D3DDDIARG_GETCAPS *arg)
    return result;
 }
 
-#include "kmt_trace.inc"
-
 /* --------------------------------------------------------------- device */
 
 struct d3d9_device {
    HANDLE runtime;
    D3DDDI_DEVICECALLBACKS callbacks;
 };
+
+/* Phase N0's resources: a handle and what was asked for, nothing behind it.
+ * The runtime will not have a device whose resources have no handle. */
+struct d3d9_resource {
+   HANDLE runtime;
+   D3DDDIFORMAT format;
+   UINT surfaces;
+   UINT width, height;
+};
+
+static HRESULT APIENTRY
+d3d9_create_resource2(HANDLE device, D3DDDIARG_CREATERESOURCE2 *arg)
+{
+   static volatile LONG said;
+   struct d3d9_resource *resource = calloc(1, sizeof *resource);
+
+   (void)device;
+   if (!resource)
+      return E_OUTOFMEMORY;
+   resource->runtime = arg->hResource;
+   resource->format = arg->Format;
+   resource->surfaces = arg->SurfCount;
+   if (arg->SurfCount && arg->pSurfList) {
+      resource->width = arg->pSurfList[0].Width;
+      resource->height = arg->pSurfList[0].Height;
+   }
+   arg->hResource = resource;
+   if (InterlockedIncrement(&said) <= 24)
+      d3d9_log("resource %p: format %u, %ux%u, %u surfaces, pool %u, flags 0x%x", (void *)resource,
+               (unsigned)arg->Format, resource->width, resource->height, arg->SurfCount,
+               (unsigned)arg->Pool, arg->Flags.Value);
+   return S_OK;
+}
+
+static HRESULT APIENTRY
+d3d9_open_resource(HANDLE device, D3DDDIARG_OPENRESOURCE *arg)
+{
+   struct d3d9_resource *resource = calloc(1, sizeof *resource);
+
+   (void)device;
+   if (!resource)
+      return E_OUTOFMEMORY;
+   resource->runtime = arg->hResource;
+   arg->hResource = resource;
+   d3d9_log("resource %p: opened, %u allocations", (void *)resource, arg->NumAllocations);
+   return S_OK;
+}
+
+static HRESULT APIENTRY
+d3d9_destroy_resource(HANDLE device, HANDLE resource)
+{
+   (void)device;
+   free(resource);
+   return S_OK;
+}
 
 static HRESULT APIENTRY
 d3d9_destroy_device(HANDLE handle)
@@ -520,6 +514,19 @@ d3d9_create_device(HANDLE adapter, D3DDDIARG_CREATEDEVICE *arg)
    device->callbacks = *arg->pCallbacks;
    d3d9_fill_stubs(arg->pDeviceFuncs);
    arg->pDeviceFuncs->pfnDestroyDevice = d3d9_destroy_device;
+   /* A driver of this interface version has the newer form of six functions
+    * and must leave the older one NULL: the runtime fails CreateDevice
+    * otherwise ("UMD did not provide non-null pfnPresent1, and null
+    * pfnPresent", and so on down the list). */
+   arg->pDeviceFuncs->pfnCreateResource2 = d3d9_create_resource2;
+   arg->pDeviceFuncs->pfnOpenResource = d3d9_open_resource;
+   arg->pDeviceFuncs->pfnDestroyResource = d3d9_destroy_resource;
+   arg->pDeviceFuncs->pfnPresent = NULL;
+   arg->pDeviceFuncs->pfnFlush = NULL;
+   arg->pDeviceFuncs->pfnCreateResource = NULL;
+   arg->pDeviceFuncs->pfnVolBlt = NULL;
+   arg->pDeviceFuncs->pfnTexBlt = NULL;
+   arg->pDeviceFuncs->pfnBufBlt = NULL;
    arg->hDevice = device;
    d3d9_log("device %p: interface %u, version 0x%x, flags 0x%x", (void *)device,
             arg->Interface, arg->Version, arg->Flags.Value);
@@ -565,9 +572,6 @@ OpenAdapter(D3DDDIARG_OPENADAPTER *arg)
       return E_FAIL;
    }
 
-   if (d3d9_try() & 16)
-      kmt_trace_install();
-
    adapter = calloc(1, sizeof *adapter);
    if (!adapter)
       return E_OUTOFMEMORY;
@@ -578,14 +582,10 @@ OpenAdapter(D3DDDIARG_OPENADAPTER *arg)
    arg->pAdapterFuncs->pfnCreateDevice = d3d9_create_device;
    arg->pAdapterFuncs->pfnCloseAdapter = d3d9_close_adapter;
    arg->DriverVersion = D3D_UMD_INTERFACE_VERSION;
-   if (d3d9_try() & 1)
-      arg->DriverVersion = D3D_UMD_INTERFACE_VERSION_WIN7;
-   if (d3d9_try() & 2)
-      arg->DriverVersion = D3D_UMD_INTERFACE_VERSION_VISTA;
 
    d3d9_log("adapter %p in %.150s (%u-bit): interface %u, version 0x%x", (void *)adapter,
             exe, (unsigned)(8 * sizeof(void *)), arg->Interface, arg->Version);
-   d3d9_log("answering driver version 0x%x, try 0x%x", arg->DriverVersion, d3d9_try());
+   d3d9_log("answering driver version 0x%x", arg->DriverVersion);
    return S_OK;
 }
 

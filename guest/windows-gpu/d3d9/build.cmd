@@ -34,7 +34,7 @@ python "%HERE%gen-stubs.py" "%~2\ddi.i" "%~2\entangled_d3d9_stubs.inc"
 if errorlevel 1 exit /b 1
 clang-cl %~3 /nologo /W3 /O2 /MT /LD /I"%~2" "%HERE%entangled_d3d9.c" ^
   /Fo"%~2\entangled_d3d9.obj" /Fe"%~2\entangled_d3d9.dll" ^
-  /link /DEF:"%HERE%entangled_d3d9.def" /MAP gdi32.lib
+  /link /DEF:"%HERE%entangled_d3d9.def" /MAP gdi32.lib user32.lib
 if errorlevel 1 exit /b 1
 clang-cl %~3 /nologo /W3 /O2 /MT "%HERE%d3d9-test.c" /Fo"%~2\d3d9-test.obj" /Fe"%~2\d3d9-test.exe" ^
   /link d3d9.lib user32.lib

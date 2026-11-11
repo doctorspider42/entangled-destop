@@ -11,6 +11,84 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* Why not: d3d9.dll keeps its last errors, with the sentence it would have
+ * told a debugger, in a table in its own data ("HAL Disabled: ...", "UMD
+ * failed ..."). The table has no name to look up, but it is text in a
+ * section that is otherwise numbers: every run of printable characters in
+ * the DLL's writable data is printed, and the errors are among them. */
+static void
+print_runtime_errors(void)
+{
+   BYTE *base = (BYTE *)GetModuleHandleA("d3d9.dll");
+   IMAGE_NT_HEADERS *nt;
+   IMAGE_SECTION_HEADER *section;
+
+   if (!base)
+      return;
+   nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+   section = IMAGE_FIRST_SECTION(nt);
+   for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++, section++) {
+      const BYTE *at, *end;
+      unsigned printed = 0;
+
+      if (!(section->Characteristics & IMAGE_SCN_MEM_WRITE))
+         continue;
+      at = base + section->VirtualAddress;
+      end = at + section->Misc.VirtualSize;
+      while (at < end && printed < 40) {
+         const BYTE *run = at;
+
+         while (run < end && *run >= 0x20 && *run < 0x7f)
+            run++;
+         if (run - at >= 10) {
+            printf("  d3d9.dll says: %.*s\n", (int)(run - at), (const char *)at);
+            printed++;
+         }
+         at = run + 1;
+      }
+   }
+}
+
+/* Bring-up only, and only for the d3d9.dll it was read from (10.0.19041.7802,
+ * x64; checked by the bytes of one instruction before anything is trusted):
+ * what the runtime's enumerator holds for adapter 0 after it has read the
+ * driver's caps. IDirect3D9::GetDeviceCaps answers D3DERR_NOTAVAILABLE for a
+ * HAL when a "software only" flag is set, or when no format in the list it
+ * kept has D3DFORMAT_OP_3DACCELERATION; this prints both. */
+static void
+print_runtime_state(IDirect3D9 *d3d)
+{
+#if defined(_WIN64)
+   static const BYTE expected[] = {0x83, 0xb9, 0x68, 0x54, 0x00, 0x00, 0x00};
+   BYTE *base = (BYTE *)GetModuleHandleA("d3d9.dll");
+   BYTE *self = (BYTE *)d3d;
+   BYTE *caps, *formats;
+   unsigned count;
+
+   if (!base || memcmp(base + 0xf903, expected, sizeof expected) != 0) {
+      printf("  (another d3d9.dll build: its state is not read)\n");
+      return;
+   }
+   caps = self + 0x190;
+   count = *(unsigned *)(caps + 0x160);
+   formats = *(BYTE **)(caps + 0x168);
+   printf("  runtime: software-only %u, adapters %u, Caps 0x%08x, DevCaps 0x%08x, "
+          "DevCaps2 0x%08x, flags 0x%x, %u formats at %p\n",
+          *(unsigned *)(self + 0x5468), *(unsigned *)(self + 0x44), *(unsigned *)(caps + 0x8),
+          *(unsigned *)(caps + 0x1c), *(unsigned *)(caps + 0xd4), *(unsigned *)(caps + 0x15c),
+          count, (void *)formats);
+   printf("           Caps2 0x%08x, Caps3 0x%08x, max texture %u, streams %u, vs 0x%08x, "
+          "ps 0x%08x\n",
+          *(unsigned *)(caps + 0xc), *(unsigned *)(caps + 0x10), *(unsigned *)(caps + 0x58),
+          *(unsigned *)(caps + 0xbc), *(unsigned *)(caps + 0xc4), *(unsigned *)(caps + 0xcc));
+   for (unsigned i = 0; formats && i < count && i < 40; i++)
+      printf("    format %u ops 0x%08x\n", *(unsigned *)(formats + i * 0x78 + 0x58),
+             *(unsigned *)(formats + i * 0x78 + 0x60));
+#else
+   (void)d3d;
+#endif
+}
+
 int
 main(int argc, char **argv)
 {
@@ -29,6 +107,8 @@ main(int argc, char **argv)
       printf("Direct3DCreate9: nothing\n");
       return 2;
    }
+   if (argc > 2)
+      print_runtime_state(d3d);
    hr = IDirect3D9_GetAdapterIdentifier(d3d, D3DADAPTER_DEFAULT, 0, &id);
    printf("adapter: 0x%08lx \"%s\" driver \"%s\"\n", (unsigned long)hr,
           SUCCEEDED(hr) ? id.Description : "", SUCCEEDED(hr) ? id.Driver : "");
@@ -70,6 +150,8 @@ main(int argc, char **argv)
       printf("device (software vertex processing): 0x%08lx\n", (unsigned long)hr);
    }
    if (FAILED(hr)) {
+      print_runtime_errors();
+      print_runtime_state(d3d);
       IDirect3D9_Release(d3d);
       return 1;
    }
