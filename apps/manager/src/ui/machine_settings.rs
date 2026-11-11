@@ -1436,6 +1436,11 @@ fn edit_startup(ui: &mut egui::Ui, form: &mut EditForm, actions: &mut Vec<Action
     match form.boot_mode {
         BootMode::Uefi => startup_uefi(ui, form, actions),
         BootMode::DirectLinux => startup_direct(ui, form, actions),
+        // A BIOS machine has nothing to choose here: it boots its disc, then
+        // its disk. The profile is written by hand for now (ADR-0012).
+        BootMode::Bios => {
+            ui.label("This machine starts through a BIOS: it boots its disc, then its disk.");
+        }
     }
 }
 

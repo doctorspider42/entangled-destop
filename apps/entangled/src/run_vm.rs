@@ -32,6 +32,8 @@
 
 pub use crate::run_options::{RunOptions, ScreenshotRequest};
 
+#[path = "bios_text_present.rs"]
+mod bios_text_present;
 #[path = "clipboard_bridge.rs"]
 mod clipboard_bridge;
 #[path = "framebuffer_present.rs"]
@@ -1702,7 +1704,7 @@ pub fn run_with(
                 format!("cannot open the UEFI variable store: {e}")
             })?)))
         }
-        (control_api::BootMode::DirectLinux, _) | (_, None) => None,
+        (control_api::BootMode::DirectLinux | control_api::BootMode::Bios, _) | (_, None) => None,
     };
 
     // Everything hypervisor-shaped happens in here; see the module docs for
@@ -1730,10 +1732,30 @@ pub fn run_with(
                 display_handle.clone(),
                 Arc::clone(&quiesce),
                 cfg.display.refresh_hz,
-                gpu_scanout,
+                gpu_scanout.clone(),
             )
             .map_err(|e| format!("cannot start the framebuffer presenter: {e}"))?,
         ),
+        None => None,
+    };
+    // A BIOS machine starts in VGA text mode, which is guest RAM with no
+    // device behind it yet (ADR-0012): a thread draws it.
+    let _bios_text_presenter = match bus.bios() {
+        Some(bios) => {
+            let mem = match bios.lock() {
+                Ok(bios) => Arc::clone(bios.memory()),
+                Err(_) => return Err("the BIOS lock is poisoned".into()),
+            };
+            Some(
+                bios_text_present::Presenter::start(
+                    mem,
+                    display_handle.clone(),
+                    Arc::clone(&quiesce),
+                    gpu_scanout,
+                )
+                .map_err(|e| format!("cannot start the text screen presenter: {e}"))?,
+            )
+        }
         None => None,
     };
 
@@ -2045,6 +2067,11 @@ mod host_api {
         /// guest cannot have changed it, and the architectural reset state the
         /// vCPU is put back into already points its first fetch at it.
         ResetVector,
+        /// A BIOS served by the host (ADR-0012). Its ROM at the reset vector
+        /// is a host mapping like the one above; what it keeps in guest RAM
+        /// (the stubs at `F000:1000`, the interrupt vectors, the BIOS data
+        /// area, an empty text screen) is written again here.
+        Bios { bios: Arc<Mutex<pc_bios::Bios>> },
     }
 
     /// Where a vCPU starts, and in which of the three start-of-day states.
@@ -2092,6 +2119,17 @@ mod host_api {
                 argument: 0,
                 kind: BootEntryKind::ResetVector,
             }),
+            BootPlan::Bios { bios } => {
+                bios.lock()
+                    .map_err(|_| "the BIOS lock is poisoned".to_string())?
+                    .install()
+                    .map_err(|e| e.to_string())?;
+                Ok(BootEntry {
+                    entry: machine_x86::layout::RESET_VECTOR,
+                    argument: 0,
+                    kind: BootEntryKind::ResetVector,
+                })
+            }
         }
     }
 
@@ -2279,6 +2317,11 @@ mod host_api {
             // the file cannot carry (a Venus context's host Vulkan objects,
             // stage 5a.3) refuses the whole snapshot, by name, rather than
             // letting it be written without that state.
+            if self.cfg.boot.mode == control_api::BootMode::Bios {
+                return Err("cannot snapshot this VM: the BIOS of a mode = \"bios\" \
+                            machine has no saved state yet (ADR-0012)"
+                    .into());
+            }
             let refusals = self.bus.snapshot_refusals();
             if !refusals.is_empty() {
                 return Err(format!("cannot snapshot this VM: {}", refusals.join("; ")));
@@ -2697,9 +2740,18 @@ mod host {
         // anything else (EPIC 18); a direct-Linux guest must not suddenly find them
         // where there were none. The PCI configuration ports are the real bus's when
         // the pci transport is in use, and the firmware stub's otherwise.
+        let bios = match cfg.boot.mode {
+            BootMode::Bios => Some(super::build_bios(cfg, &mem, machine.memory_mib << 20)?),
+            BootMode::DirectLinux | BootMode::Uefi => None,
+        };
         let bus = match cfg.boot.mode {
             BootMode::DirectLinux => bus,
-            BootMode::Uefi => bus.with_firmware_platform(),
+            // A BIOS guest expects the same RTC and host bridge a firmware does.
+            BootMode::Uefi | BootMode::Bios => bus.with_firmware_platform(),
+        };
+        let bus = match &bios {
+            Some(bios) => bus.with_bios(Arc::clone(bios)),
+            None => bus,
         };
         let bus = match &pflash {
             Some(flash) => bus.with_pflash(Arc::clone(flash)),
@@ -2755,6 +2807,17 @@ mod host {
                 mem_size,
             },
             BootMode::Uefi => uefi_plan(&mut vm, cfg, mem_size)?,
+            BootMode::Bios => {
+                let bios = bios
+                    .clone()
+                    .ok_or_else(|| "mode = \"bios\" without a BIOS".to_string())?;
+                // The first instruction after reset is fetched through a CS
+                // base of 0xffff_0000: the ROM is mapped there, read-only,
+                // and copied into the F segment by `load_boot`.
+                vm.map_rom(pc_bios::rom::RESET_ALIAS, &pc_bios::rom::image())
+                    .map_err(|e| e.to_string())?;
+                BootPlan::Bios { bios }
+            }
         };
         // The pause gate goes in before anything can activate a device: a
         // restore re-activates every virtio slot, and a device that started a
@@ -3047,9 +3110,18 @@ mod host {
                 }
             }
         };
+        let bios = match cfg.boot.mode {
+            BootMode::Bios => Some(super::build_bios(cfg, &mem, machine.memory_mib << 20)?),
+            BootMode::DirectLinux | BootMode::Uefi => None,
+        };
         let bus = match cfg.boot.mode {
             BootMode::DirectLinux => bus,
-            BootMode::Uefi => bus.with_firmware_platform(),
+            // A BIOS guest expects the same RTC and host bridge a firmware does.
+            BootMode::Uefi | BootMode::Bios => bus.with_firmware_platform(),
+        };
+        let bus = match &bios {
+            Some(bios) => bus.with_bios(Arc::clone(bios)),
+            None => bus,
         };
         let bus = match &pflash {
             Some(flash) => bus.with_pflash(Arc::clone(flash)),
@@ -3073,6 +3145,17 @@ mod host {
                 mem_size,
             },
             BootMode::Uefi => uefi_plan(&mut vm, cfg, mem_size)?,
+            BootMode::Bios => {
+                let bios = bios
+                    .clone()
+                    .ok_or_else(|| "mode = \"bios\" without a BIOS".to_string())?;
+                // The first instruction after reset is fetched through a CS
+                // base of 0xffff_0000: the ROM is mapped there, read-only,
+                // and copied into the F segment by `load_boot`.
+                vm.map_rom(pc_bios::rom::RESET_ALIAS, &pc_bios::rom::image())
+                    .map_err(|e| e.to_string())?;
+                BootPlan::Bios { bios }
+            }
         };
         // Before anything can activate a device; see the KVM path.
         bus.set_quiesce(Arc::clone(&quiesce));
@@ -3181,6 +3264,52 @@ mod host {
             }
         }
     }
+}
+
+/// The BIOS of a `mode = "bios"` machine (ADR-0012).
+///
+/// Its drives are the profile's `[[disk]]`s and `[[optical]]` drives, opened
+/// here a second time: `int 13h` reads the image files directly and goes
+/// through no controller. A disk is writable to the BIOS exactly when it is to
+/// the guest.
+fn build_bios(
+    cfg: &VmConfig,
+    mem: &Arc<virtio_core::GuestMem>,
+    mem_size: u64,
+) -> Result<Arc<Mutex<pc_bios::Bios>>, String> {
+    let open = |path: &Path, kind, writable| {
+        pc_bios::Drive::open(path, kind, writable)
+            .map_err(|e| format!("the BIOS cannot open {}: {e}", path.display()))
+    };
+    let disks = cfg
+        .disks
+        .iter()
+        .map(|disk| open(&disk.path, pc_bios::DriveKind::Disk, disk.writable))
+        .collect::<Result<Vec<_>, _>>()?;
+    let opticals = cfg
+        .optical
+        .iter()
+        .map(|drive| open(&drive.path, pc_bios::DriveKind::Optical, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    let memory_map = machine_x86::e820_map(mem_size)
+        .into_iter()
+        .map(|entry| pc_bios::MemoryRange {
+            base: entry.addr,
+            len: entry.size,
+            kind: entry.kind as u32,
+        })
+        .collect();
+    tracing::info!(
+        disks = disks.len(),
+        opticals = opticals.len(),
+        "the machine boots through the built-in BIOS"
+    );
+    Ok(Arc::new(Mutex::new(pc_bios::Bios::new(
+        Arc::clone(mem),
+        memory_map,
+        disks,
+        opticals,
+    ))))
 }
 
 /// A reset-vector image *is* its own flash and is mapped over the same window

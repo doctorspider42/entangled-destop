@@ -21,6 +21,7 @@ members = [
     "crates/virtio-core",
     "crates/ahci",
     "crates/hda",
+    "crates/pc-bios",
     "crates/virtio-console",
     "crates/virtio-block",
     "crates/virtio-net",
@@ -62,6 +63,7 @@ virtio-core = { path = "crates/virtio-core", version = "0.2.0" }
 virtio-block = { path = "crates/virtio-block", version = "0.2.0" }
 ahci = { path = "crates/ahci", version = "0.2.0" }
 hda = { path = "crates/hda", version = "0.2.0" }
+pc-bios = { path = "crates/pc-bios", version = "0.2.0" }
 virtio-console = { path = "crates/virtio-console", version = "0.2.0" }
 virtio-net = { path = "crates/virtio-net", version = "0.2.0" }
 virtio-gpu = { path = "crates/virtio-gpu", version = "0.2.0" }

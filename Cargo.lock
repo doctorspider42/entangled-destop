@@ -1447,6 +1447,7 @@ dependencies = [
  "machine-x86",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
+ "pc-bios",
  "png",
  "serde",
  "serde_json",
@@ -1619,6 +1620,12 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
 
 [[package]]
 name = "foreign-types"
@@ -2478,6 +2485,7 @@ dependencies = [
  "hda",
  "kvm-bindings",
  "kvm-ioctls",
+ "pc-bios",
  "thiserror 2.0.20",
  "tracing",
  "virtio-core",
@@ -3203,6 +3211,17 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pc-bios"
+version = "0.2.0"
+dependencies = [
+ "font8x8",
+ "thiserror 2.0.20",
+ "tracing",
+ "virtio-core",
+ "vm-memory 0.17.2",
+]
 
 [[package]]
 name = "pem-rfc7468"

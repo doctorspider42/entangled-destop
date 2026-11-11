@@ -86,6 +86,9 @@ pub struct MachineBus {
     /// its interrupt ([`Self::with_keyboard`]). `None` leaves `0x60`/`0x64` as
     /// they were: reads float, and only the reset pulse is decoded.
     keyboard: Option<Arc<Mutex<crate::i8042::I8042>>>,
+    /// The BIOS behind the interrupt stubs of a `mode = "bios"` machine
+    /// (ADR-0012). `None` leaves its two ports undecoded, as they were.
+    bios: Option<Arc<Mutex<pc_bios::Bios>>>,
 }
 
 #[cfg(test)]
@@ -105,6 +108,7 @@ impl MachineBus {
             reset: Arc::new(ResetControl::new()),
             rtc_timer: None,
             keyboard: None,
+            bios: None,
         }
     }
 
@@ -122,6 +126,43 @@ impl MachineBus {
         Self {
             pci: Some(Arc::new(pci)),
             ..Self::new(serial)
+        }
+    }
+
+    /// Gives the machine a BIOS (ADR-0012): the two ports its interrupt stubs
+    /// write are answered by `bios`.
+    pub fn with_bios(mut self, bios: Arc<Mutex<pc_bios::Bios>>) -> Self {
+        self.bios = Some(bios);
+        self
+    }
+
+    /// The machine's BIOS, when it has one.
+    pub fn bios(&self) -> Option<&Arc<Mutex<pc_bios::Bios>>> {
+        self.bios.as_ref()
+    }
+
+    /// One BIOS port write. Before a call runs, the bytes waiting in the
+    /// keyboard controller go to the BIOS: it takes no interrupts, so this is
+    /// how `int 16h` gets its keys.
+    fn bios_write(&self, bios: &Mutex<pc_bios::Bios>, port: u16, data: &[u8]) {
+        let mut codes = [0u8; 16];
+        let mut count = 0;
+        if port == pc_bios::rom::PORT_CALL {
+            if let Some(Ok(mut keyboard)) = self.keyboard.as_ref().map(|k| k.lock()) {
+                while count < codes.len() && keyboard.io_read(crate::i8042::PORT_COMMAND) & 1 != 0 {
+                    codes[count] = keyboard.io_read(crate::i8042::PORT_DATA);
+                    count += 1;
+                }
+            }
+        }
+        match bios.lock() {
+            Ok(mut bios) => {
+                for &code in &codes[..count] {
+                    bios.scancode(code);
+                }
+                bios.io_out(port, data);
+            }
+            Err(_) => tracing::error!("the BIOS lock is poisoned; dropping a BIOS call"),
         }
     }
 
@@ -523,6 +564,12 @@ impl MachineBus {
 
 impl ExitHandler for MachineBus {
     fn io_out(&mut self, port: u16, data: &[u8]) {
+        if let Some(bios) = &self.bios {
+            if pc_bios::Bios::contains(port) {
+                self.bios_write(bios, port, data);
+                return;
+            }
+        }
         if let Some(keyboard) = &self.keyboard {
             if crate::i8042::I8042::contains(port) {
                 let pulse = match keyboard.lock() {
@@ -587,6 +634,15 @@ impl ExitHandler for MachineBus {
     }
 
     fn io_in(&mut self, port: u16, data: &mut [u8]) {
+        if let Some(bios) = &self.bios {
+            if pc_bios::Bios::contains(port) {
+                match bios.lock() {
+                    Ok(mut bios) => bios.io_in(port, data),
+                    Err(_) => data.fill(0xff),
+                }
+                return;
+            }
+        }
         if let Some(keyboard) = &self.keyboard {
             if crate::i8042::I8042::contains(port) {
                 if let Ok(mut keyboard) = keyboard.lock() {
