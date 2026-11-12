@@ -841,6 +841,10 @@ impl VirtioPciBus {
         let window =
             crate::shm::ShmWindow::new(pages, vram_bytes, placements, base, support.mem_bytes)
                 .map_err(|e| fail(e.to_string()))?;
+        let window = match config.low_vram_base {
+            Some(_) => window.allow_below_4g(),
+            None => window,
+        };
         let backing = window
             .backing_for(0)
             .ok_or_else(|| fail("the VRAM window has no region".into()))?;

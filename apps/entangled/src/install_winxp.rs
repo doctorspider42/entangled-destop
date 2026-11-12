@@ -361,6 +361,18 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
     })
 }
 
+/// `ENTANGLED_INSTALL_SCREENSHOT=<file.png>`: a numbered screenshot of the
+/// installer every minute, beside that file. An hour of Setup with no
+/// window is otherwise an hour of not knowing which screen it is on.
+fn progress_screenshots() -> Option<crate::run_options::ScreenshotRequest> {
+    let path = std::env::var_os("ENTANGLED_INSTALL_SCREENSHOT")?;
+    Some(crate::run_options::ScreenshotRequest {
+        after: std::time::Duration::from_secs(60),
+        path: PathBuf::from(path),
+        burst: Some(std::time::Duration::from_secs(60)),
+    })
+}
+
 pub(crate) fn run(args: &InstallArgs) -> Result<(), String> {
     let plan = prepare(args)?;
     tracing::info!(
@@ -373,6 +385,7 @@ pub(crate) fn run(args: &InstallArgs) -> Result<(), String> {
         None,
         run_vm::RunOptions {
             headless: args.headless,
+            screenshot: progress_screenshots(),
             ..Default::default()
         },
     )

@@ -956,6 +956,13 @@ fn build_devices(
         devices.push(Box::new(console));
     }
 
+    // A BIOS-era guest has a driver for no virtio device (ADR-0012), and to
+    // its Setup each would be one more unknown device to ask about. None is
+    // put on the bus; the handles made above stay valid and never become
+    // active, which is the state the PS/2 keyboard and mouse take over from.
+    if cfg.boot.mode == control_api::BootMode::Bios {
+        devices.clear();
+    }
     Ok(BuiltDevices {
         devices,
         net_cmdline,
