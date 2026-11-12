@@ -71,6 +71,12 @@ fn spread(bits: u8, plane: usize) -> u8 {
 }
 
 impl Planes {
+    /// Zeroes every plane and the latches: a mode set's clear.
+    pub fn clear(&mut self) {
+        self.data.fill(0);
+        self.latch = [0; 4];
+    }
+
     /// One plane's bytes.
     pub fn plane(&self, plane: usize) -> &[u8] {
         let at = (plane & 3) * PLANE;

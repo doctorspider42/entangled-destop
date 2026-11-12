@@ -323,6 +323,11 @@ pub struct BootSection {
     /// through this path (see `machine_x86::pflash`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvram: Option<PathBuf>,
+    /// `bios` only: a floppy image in drive A:, readable through the BIOS
+    /// and nothing else (ADR-0012). What Windows XP's Setup reads its answer
+    /// file, `WINNT.SIF`, from. The machine never boots from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floppy: Option<PathBuf>,
     /// Kernel command line. Meaningless in `uefi` mode — the firmware and the
     /// guest bootloader own the command line there.
     #[serde(default)]
@@ -358,6 +363,7 @@ impl Default for BootSection {
             initramfs: None,
             firmware: None,
             nvram: None,
+            floppy: None,
             cmdline: String::new(),
         }
     }
@@ -1280,6 +1286,13 @@ impl VmConfig {
                 "display.refresh_hz {} outside supported range {MIN_REFRESH_HZ}..={MAX_REFRESH_HZ}",
                 self.display.refresh_hz
             ));
+        }
+        if self.boot.floppy.is_some() && self.boot.mode != BootMode::Bios {
+            return err(
+                "boot.floppy is only valid for mode = \"bios\": only a BIOS \
+                 reads a floppy here"
+                    .into(),
+            );
         }
         if !self.optical.is_empty() {
             if self.optical.len() > MAX_OPTICAL {

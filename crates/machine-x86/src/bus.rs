@@ -105,6 +105,50 @@ pub struct MachineBus {
     mouse_line: Option<Arc<dyn virtio_core::interrupt::IrqLine>>,
 }
 
+/// Traps the VGA's memory window or hands it back, if that is a change.
+fn sync_vga_window(
+    trap: Option<&Arc<dyn vmm_core::hv::RamTrap>>,
+    trapped: &std::sync::atomic::AtomicBool,
+    wanted: bool,
+) {
+    use std::sync::atomic::Ordering;
+    let Some(trap) = trap else {
+        return;
+    };
+    if trapped.load(Ordering::Acquire) == wanted {
+        return;
+    }
+    match trap.set_trapped(wanted) {
+        Ok(()) => trapped.store(wanted, Ordering::Release),
+        Err(error) => tracing::warn!(%error, wanted, "cannot switch the VGA memory window"),
+    }
+}
+
+/// The VGA, for the BIOS's mode sets ([`MachineBus::vga_bios_modes`]): the
+/// registers come from the VGA's own mode tables, and the memory window is
+/// trapped or released to match, as it is when the guest programs them.
+pub struct VgaBiosModes {
+    vga: Arc<Mutex<crate::vga::Vga>>,
+    trap: Option<Arc<dyn vmm_core::hv::RamTrap>>,
+    trapped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl pc_bios::VideoModes for VgaBiosModes {
+    fn set_mode(&mut self, mode: u8, clear: bool) -> bool {
+        let wanted = match self.vga.lock() {
+            Ok(mut vga) => vga.set_bios_mode(mode, clear).then(|| vga.wants_trap()),
+            Err(_) => None,
+        };
+        match wanted {
+            Some(wanted) => {
+                sync_vga_window(self.trap.as_ref(), &self.trapped, wanted);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod stream_tests;
 
@@ -174,17 +218,17 @@ impl MachineBus {
     /// Makes the hypervisor's mapping of the VGA window agree with what the
     /// registers now ask for.
     fn sync_vga_trap(&self, wanted: bool) {
-        use std::sync::atomic::Ordering;
-        let Some(trap) = &self.vga_trap else {
-            return;
-        };
-        if self.vga_trapped.load(Ordering::Acquire) == wanted {
-            return;
-        }
-        match trap.set_trapped(wanted) {
-            Ok(()) => self.vga_trapped.store(wanted, Ordering::Release),
-            Err(error) => tracing::warn!(%error, wanted, "cannot switch the VGA memory window"),
-        }
+        sync_vga_window(self.vga_trap.as_ref(), &self.vga_trapped, wanted);
+    }
+
+    /// The machine's VGA as the BIOS sets modes on it (`int 10h, AH=00h`),
+    /// when the machine has one.
+    pub fn vga_bios_modes(&self) -> Option<VgaBiosModes> {
+        Some(VgaBiosModes {
+            vga: Arc::clone(self.vga.as_ref()?),
+            trap: self.vga_trap.clone(),
+            trapped: Arc::clone(&self.vga_trapped),
+        })
     }
 
     /// A guest access to `0xa0000..0xbffff` that exited: the window is
@@ -998,6 +1042,13 @@ impl ExitHandler for MachineBus {
         if let Some(irqchip) = &self.irqchip {
             irqchip.eoi(vector);
         }
+    }
+
+    /// The VGA's memory window, while a mode needs the planes.
+    fn ram_is_trapped(&self, gpa: u64) -> bool {
+        (0x000a_0000..0x000c_0000).contains(&gpa)
+            && self.vga.is_some()
+            && self.vga_trapped.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The userspace 8259 pair's `INTR` line (ADR-0012); never set on a

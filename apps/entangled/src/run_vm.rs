@@ -1814,6 +1814,12 @@ pub fn run_with(
     };
     // A BIOS machine starts in VGA text mode, which is guest RAM with no
     // device behind it yet (ADR-0012): a thread draws it.
+    // The BIOS sets the VGA's standard modes for a loader that asks it to.
+    if let (Some(bios), Some(modes)) = (bus.bios(), bus.vga_bios_modes()) {
+        if let Ok(mut bios) = bios.lock() {
+            bios.set_video_modes(Box::new(modes));
+        }
+    }
     // The BIOS offers the linear framebuffer through VBE, when the machine
     // has one beside its VGA.
     if let (Some(bios), Some(pci)) = (bus.bios(), bus.pci_shared()) {
@@ -3498,12 +3504,11 @@ fn build_bios(
         opticals = opticals.len(),
         "the machine boots through the built-in BIOS"
     );
-    Ok(Arc::new(Mutex::new(pc_bios::Bios::new(
-        Arc::clone(mem),
-        memory_map,
-        disks,
-        opticals,
-    ))))
+    let mut bios = pc_bios::Bios::new(Arc::clone(mem), memory_map, disks, opticals);
+    if let Some(floppy) = &cfg.boot.floppy {
+        bios.add_floppy(open(floppy, pc_bios::DriveKind::Floppy, false)?);
+    }
+    Ok(Arc::new(Mutex::new(bios)))
 }
 
 /// A reset-vector image *is* its own flash and is mapped over the same window

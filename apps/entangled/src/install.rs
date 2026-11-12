@@ -422,6 +422,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             initramfs: Some(initramfs.clone()),
             firmware: None,
             nvram: None,
+            floppy: None,
             cmdline,
         },
         disks: vec![DiskSection {
@@ -496,6 +497,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
             initramfs: Some(artifacts.initrd.clone()),
             firmware: None,
             nvram: None,
+            floppy: None,
             cmdline: format!("console=ttyS0 root=UUID={} rw", root.uuid),
         },
         disks: vec![DiskSection {

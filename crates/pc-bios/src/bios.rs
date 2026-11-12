@@ -39,6 +39,15 @@ pub struct Paging {
     pub pae: bool,
 }
 
+/// The VGA behind `int 10h, AH=00h`: the BIOS asks it for a standard mode,
+/// and it programs its own registers. Without one the BIOS has text mode 3
+/// only, which is memory and needs no registers.
+pub trait VideoModes: Send {
+    /// Sets VGA mode `mode` (03h, 12h, 13h…), clearing display memory
+    /// unless told not to. `false` for a mode the VGA has no table for.
+    fn set_mode(&mut self, mode: u8, clear: bool) -> bool;
+}
+
 /// The display behind the VESA BIOS Extensions (`int 10h, AH=4Fh`): a
 /// linear framebuffer whose mode the BIOS sets on a guest's behalf. An
 /// operating system with no driver for the machine's display — Windows XP's
@@ -293,6 +302,8 @@ pub struct Bios {
     paging: Option<Paging>,
     /// The linear-framebuffer display, when the machine has one.
     vbe: Option<Box<dyn Vbe>>,
+    /// The VGA, when the machine has one whose modes the BIOS can set.
+    modes: Option<Box<dyn VideoModes>>,
     /// The VBE mode in effect, as `4F03h` reports it; a VGA mode number
     /// while the VGA has the screen.
     vbe_mode: u16,
@@ -338,6 +349,7 @@ impl Bios {
             stack_segment: 0,
             paging: None,
             vbe: None,
+            modes: None,
             vbe_mode: 3,
             status: Status::Done,
             keys: VecDeque::new(),
@@ -345,6 +357,24 @@ impl Bios {
             console_line: String::new(),
             reported: Box::new([0; 1024]),
         }
+    }
+
+    /// Puts a floppy in the next drive, numbered from `0x00`. Call before
+    /// the machine boots.
+    pub fn add_floppy(&mut self, drive: Drive) {
+        let number = self
+            .drives
+            .iter()
+            .filter(|(_, d)| d.kind == DriveKind::Floppy)
+            .count() as u8;
+        if number < 2 {
+            self.drives.push((number, drive));
+        }
+    }
+
+    /// Gives the BIOS a VGA whose standard modes it can set.
+    pub fn set_video_modes(&mut self, modes: Box<dyn VideoModes>) {
+        self.modes = Some(modes);
     }
 
     /// Gives the BIOS a linear-framebuffer display to offer through VBE.
@@ -384,8 +414,18 @@ impl Bios {
             .count() as u8;
         self.put_word(BDA + bda::COM1, 0x3f8)?;
         self.put_word(BDA + bda::EBDA_SEGMENT, (EBDA >> 4) as u16)?;
-        // An x87, an 80x25 colour display, one serial port.
-        self.put_word(BDA + bda::EQUIPMENT, 0x0222)?;
+        // An x87, an 80x25 colour display, one serial port, and the floppy
+        // drives: bit 0 says there are any, bits 6-7 how many more than one.
+        let floppies = self
+            .drives
+            .iter()
+            .filter(|(_, d)| d.kind == DriveKind::Floppy)
+            .count() as u16;
+        let floppy_bits = match floppies {
+            0 => 0,
+            n => 1 | (n - 1) << 6,
+        };
+        self.put_word(BDA + bda::EQUIPMENT, 0x0222 | floppy_bits)?;
         self.put_word(BDA + bda::MEMORY_KB, CONVENTIONAL_KB)?;
         self.put_word(BDA + bda::KBD_HEAD, 0x1e)?;
         self.put_word(BDA + bda::KBD_TAIL, 0x1e)?;
@@ -694,7 +734,9 @@ impl Bios {
                     image.truncate(bytes);
                     Some((entry.load_segment, 0u16, image))
                 }),
-                DriveKind::Disk => {
+                // Reached only through the order above, which has no
+                // floppies: this BIOS does not boot from one.
+                DriveKind::Disk | DriveKind::Floppy => {
                     let mut sector = vec![0u8; 512];
                     drive
                         .read(0, &mut sector)
@@ -881,10 +923,18 @@ impl Bios {
                     vbe.disable();
                 }
                 self.vbe_mode = u16::from(mode);
-                if !matches!(mode, 0..=3 | 7) {
+                let clear = regs.al() & 0x80 == 0;
+                let text = matches!(mode, 0..=3 | 7);
+                // The VGA programs itself for the mode; text mode 3 needs
+                // nothing from a machine that has no VGA to program.
+                let set = match self.modes.as_mut() {
+                    Some(vga) => vga.set_mode(if text { 3 } else { mode }, clear),
+                    None => text,
+                };
+                if !set {
                     tracing::warn!(mode, "int 10h: a video mode this BIOS has no display for");
                 }
-                let _ = self.set_text_mode(regs.al() & 0x80 == 0);
+                let _ = self.set_text_mode(clear && text);
                 let _ = self.put(BDA + bda::VIDEO_MODE, &[mode]);
             }
             0x01 => {
@@ -1214,7 +1264,7 @@ impl Bios {
         };
         match function {
             0x02 | 0x03 => {
-                if kind != DriveKind::Disk {
+                if kind == DriveKind::Optical {
                     return Some(0x01);
                 }
                 let cylinder = u32::from(regs.ch()) | u32::from(regs.cl() & 0xc0) << 2;
@@ -1236,6 +1286,23 @@ impl Bios {
             }
             // Verify, seek, recalibrate, initialise, the media-lock calls.
             0x04 | 0x09 | 0x0c | 0x0d | 0x10 | 0x11 | 0x14 | 0x44 | 0x45 | 0x46 | 0x47 => Some(0),
+            0x08 if kind == DriveKind::Floppy => {
+                // Drive type 4 (1.44 MB), the geometry, the number of
+                // floppy drives, and a parameter table nobody steps by.
+                let floppies = self
+                    .drives
+                    .iter()
+                    .filter(|(_, d)| d.kind == DriveKind::Floppy)
+                    .count() as u16;
+                regs.set_ax(0);
+                regs.set_bx(0x0004);
+                regs.set_cx(((geometry.cylinders - 1) << 8 | geometry.sectors) as u16);
+                regs.set_dx(((geometry.heads - 1) << 8) as u16 | floppies);
+                regs.es = rom::SEGMENT;
+                regs.edi = (regs.edi & 0xffff_0000) | rom::CONFIG_TABLE as u32;
+                regs.set_carry(false);
+                None
+            }
             0x08 => {
                 if kind != DriveKind::Disk {
                     return Some(0x01);
@@ -1254,19 +1321,23 @@ impl Bios {
             }
             0x15 => {
                 // 3: a hard disk, with its size in CX:DX. 2: removable.
-                if kind == DriveKind::Disk {
-                    let total = sectors.min(u64::from(u32::MAX)) as u32;
-                    regs.set_cx((total >> 16) as u16);
-                    regs.set_dx(total as u16);
-                    regs.set_ah(3);
-                } else {
-                    regs.set_ah(2);
+                match kind {
+                    DriveKind::Disk => {
+                        let total = sectors.min(u64::from(u32::MAX)) as u32;
+                        regs.set_cx((total >> 16) as u16);
+                        regs.set_dx(total as u16);
+                        regs.set_ah(3);
+                    }
+                    // A floppy without change-line support.
+                    DriveKind::Floppy => regs.set_ah(1),
+                    DriveKind::Optical => regs.set_ah(2),
                 }
                 regs.set_carry(false);
                 None
             }
             0x41 => {
-                if regs.bx() != 0x55aa {
+                // A floppy has no extensions: CHS only.
+                if regs.bx() != 0x55aa || kind == DriveKind::Floppy {
                     return Some(0x01);
                 }
                 regs.set_bx(0xaa55);
@@ -1310,7 +1381,7 @@ impl Bios {
                 out[0..2].copy_from_slice(&0x1au16.to_le_bytes());
                 let (flags, c, h, s) = match kind {
                     // The geometry is valid.
-                    DriveKind::Disk => (
+                    DriveKind::Disk | DriveKind::Floppy => (
                         0x0002u16,
                         geometry.cylinders,
                         geometry.heads,
@@ -1940,6 +2011,57 @@ mod tests {
         );
         assert_eq!(params.dl(), 1);
         assert_eq!(params.cl() & 0x3f, 63);
+    }
+
+    #[test]
+    fn a_floppy_is_read_by_chs_reported_and_never_booted() {
+        // A 1.44 MB image with a boot signature and a marked second track.
+        let mut image = vec![0u8; 2880 * 512];
+        image[510] = 0x55;
+        image[511] = 0xaa;
+        image[36 * 512] = 0x77;
+        let mut bios = bios(vec![], vec![]);
+        bios.add_floppy(drive(&image, DriveKind::Floppy));
+        bios.install().expect("install");
+        // One floppy drive in the equipment word.
+        assert_eq!(bios.word(BDA + bda::EQUIPMENT) & 0x00c1, 0x0001);
+        // Cylinder 1, head 0, sector 1 is LBA 36.
+        let read = Regs {
+            eax: 0x0201,
+            ebx: 0x8000,
+            ecx: 0x0101,
+            edx: 0x0000,
+            ..Regs::default()
+        };
+        let (_, regs) = int(&mut bios, 0x13, read);
+        assert_eq!(regs.flags & FLAG_CARRY, 0);
+        assert_eq!(bios.byte(0x8000), 0x77);
+        let (_, params) = int(
+            &mut bios,
+            0x13,
+            Regs {
+                eax: 0x0800,
+                ..Regs::default()
+            },
+        );
+        assert_eq!(params.bl(), 4);
+        assert_eq!(params.cl() & 0x3f, 18);
+        assert_eq!(params.ch(), 79);
+        assert_eq!(params.dh(), 1);
+        assert_eq!(params.dl(), 1);
+        // No extensions, and it is not a boot device.
+        let (_, ext) = int(
+            &mut bios,
+            0x13,
+            Regs {
+                eax: 0x4100,
+                ebx: 0x55aa,
+                ..Regs::default()
+            },
+        );
+        assert_ne!(ext.flags & FLAG_CARRY, 0);
+        let (status, _) = int(&mut bios, 0x19, Regs::default());
+        assert_eq!(status, Status::Stop);
     }
 
     #[test]

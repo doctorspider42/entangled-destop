@@ -109,6 +109,73 @@ impl Default for Vga {
     }
 }
 
+/// The register values of one standard mode, as a video BIOS's mode table
+/// holds them: the miscellaneous output register, sequencer 0-4, CRT
+/// controller 0-24, graphics controller 0-8 and attribute controller 0-20.
+struct ModeTable {
+    misc: u8,
+    sequencer: [u8; 5],
+    crtc: [u8; 25],
+    graphics: [u8; 9],
+    attribute: [u8; 21],
+}
+
+/// The sixteen-colour attribute palette every standard mode starts with.
+const EGA_PALETTE: [u8; 16] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
+];
+
+const fn attributes(tail: [u8; 5], identity: bool) -> [u8; 21] {
+    let mut out = [0u8; 21];
+    let mut i = 0;
+    while i < 16 {
+        out[i] = if identity { i as u8 } else { EGA_PALETTE[i] };
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 5 {
+        out[16 + i] = tail[i];
+        i += 1;
+    }
+    out
+}
+
+/// Mode 03h: 80x25 text, 16-line cells.
+const MODE_03: ModeTable = ModeTable {
+    misc: 0x67,
+    sequencer: [0x03, 0x00, 0x03, 0x00, 0x02],
+    crtc: [
+        0x5f, 0x4f, 0x50, 0x82, 0x55, 0x81, 0xbf, 0x1f, 0x00, 0x4f, 0x0d, 0x0e, 0x00, 0x00, 0x00,
+        0x00, 0x9c, 0x8e, 0x8f, 0x28, 0x1f, 0x96, 0xb9, 0xa3, 0xff,
+    ],
+    graphics: [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0e, 0x00, 0xff],
+    attribute: attributes([0x0c, 0x00, 0x0f, 0x08, 0x00], false),
+};
+
+/// Mode 12h: 640x480, sixteen colours, planar.
+const MODE_12: ModeTable = ModeTable {
+    misc: 0xe3,
+    sequencer: [0x03, 0x01, 0x0f, 0x00, 0x06],
+    crtc: [
+        0x5f, 0x4f, 0x50, 0x82, 0x54, 0x80, 0x0b, 0x3e, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xea, 0x8c, 0xdf, 0x28, 0x00, 0xe7, 0x04, 0xe3, 0xff,
+    ],
+    graphics: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0f, 0xff],
+    attribute: attributes([0x01, 0x00, 0x0f, 0x00, 0x00], false),
+};
+
+/// Mode 13h: 320x200, 256 colours, one byte a pixel.
+const MODE_13: ModeTable = ModeTable {
+    misc: 0x63,
+    sequencer: [0x03, 0x01, 0x0f, 0x00, 0x0e],
+    crtc: [
+        0x5f, 0x4f, 0x50, 0x82, 0x54, 0x80, 0xbf, 0x1f, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x9c, 0x8e, 0x8f, 0x28, 0x40, 0x96, 0xb9, 0xa3, 0xff,
+    ],
+    graphics: [0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x05, 0x0f, 0xff],
+    attribute: attributes([0x41, 0x00, 0x0f, 0x00, 0x00], true),
+};
+
 /// 6-bit DAC component to 8 bits.
 fn expand(component: u8) -> u8 {
     let c = component & 0x3f;
@@ -287,6 +354,38 @@ impl Vga {
         }
     }
 
+    /// Sets a standard mode the way a video BIOS does, from its mode
+    /// table: every register of the mode, the default palette, and — unless
+    /// `clear` is off — empty display memory. `false` for a mode with no
+    /// table here (only 03h, 12h and 13h have one).
+    ///
+    /// A text mode set this way leaves the screen the BIOS's to describe
+    /// ([`Self::programmed`] is false again): the BIOS keeps its cursor in
+    /// its own data area, not in the CRT controller.
+    pub fn set_bios_mode(&mut self, mode: u8, clear: bool) -> bool {
+        let table = match mode {
+            0x03 => &MODE_03,
+            0x12 => &MODE_12,
+            0x13 => &MODE_13,
+            _ => return false,
+        };
+        self.misc = table.misc;
+        self.sequencer[..5].copy_from_slice(&table.sequencer);
+        self.crtc[..25].copy_from_slice(&table.crtc);
+        self.graphics[..9].copy_from_slice(&table.graphics);
+        self.attribute[..21].copy_from_slice(&table.attribute);
+        self.attribute_data_next = false;
+        self.dac_mask = 0xff;
+        let fresh = Self::new();
+        self.dac[..64].copy_from_slice(&fresh.dac[..64]);
+        if clear && mode != 0x03 {
+            self.planes.clear();
+        }
+        self.programmed = mode != 0x03;
+        self.dirty = true;
+        true
+    }
+
     /// Whether display memory needs its logic now: a graphics mode, or
     /// sequential addressing (a font load). In plain text mode — odd/even
     /// addressing, alphanumeric — the window is RAM.
@@ -347,6 +446,30 @@ impl Vga {
     pub fn font_plane(&self) -> Option<&[u8]> {
         let plane = &self.planes.plane(2)[..256 * 32];
         (self.font_loaded && plane.iter().any(|&b| b != 0)).then_some(plane)
+    }
+
+    /// The registers and how much of each plane is non-zero, on one line:
+    /// for a log, when a screen stays black and the question is which mode
+    /// the guest thinks it set.
+    pub fn summary(&self) -> String {
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let used: Vec<usize> = (0..4)
+            .map(|p| self.planes.plane(p).iter().filter(|&&b| b != 0).count())
+            .collect();
+        format!(
+            "misc={:02x} seq={} crtc={} gc={} ac={} mask={:02x} dac0-15={} planes-nonzero={used:?}",
+            self.misc,
+            hex(&self.sequencer[..5]),
+            hex(&self.crtc[..25]),
+            hex(&self.graphics[..9]),
+            hex(&self.attribute[..21]),
+            self.dac_mask,
+            self.dac[..16]
+                .iter()
+                .map(|c| hex(c))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
     }
 
     /// Whether anything changed since the last call, and forgets it.
@@ -631,6 +754,29 @@ mod tests {
         // display memory.
         assert_eq!(vga.mem_read(0xb0000), 0xff);
         assert!(!vga.take_dirty());
+    }
+
+    #[test]
+    fn the_bios_mode_tables_give_the_standard_modes() {
+        let mut vga = Vga::new();
+        assert!(vga.set_bios_mode(0x12, true));
+        assert!(vga.wants_trap() && vga.programmed());
+        assert_eq!(vga.render_graphics(&mut Vec::new()), Some((640, 480)));
+        // Something drawn survives a mode set that asks not to clear, and
+        // not one that does.
+        vga.mem_write(0xa0000, 0xff);
+        assert!(vga.set_bios_mode(0x12, false));
+        assert_eq!(vga.mem_read(0xa0000), 0xff);
+        assert!(vga.set_bios_mode(0x12, true));
+        assert_eq!(vga.mem_read(0xa0000), 0x00);
+        assert!(vga.set_bios_mode(0x13, true));
+        assert_eq!(vga.render_graphics(&mut Vec::new()), Some((320, 200)));
+        // Back to text: RAM again, and the BIOS's screen to describe.
+        assert!(vga.set_bios_mode(0x03, true));
+        assert!(!vga.wants_trap() && !vga.programmed());
+        let text = vga.text_mode().expect("text");
+        assert_eq!((text.columns, text.rows, text.cell_height), (80, 25, 16));
+        assert!(!vga.set_bios_mode(0x6a, true));
     }
 
     #[test]

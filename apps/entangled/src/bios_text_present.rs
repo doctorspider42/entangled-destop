@@ -174,6 +174,7 @@ fn run(
                 // something changed (or the last frame was text).
                 if let Some(Ok(mut vga)) = vga.map(|vga| vga.lock()) {
                     if vga.take_dirty() || shown.is_some() {
+                        tracing::debug!(vga = %vga.summary(), "drawing a VGA graphics frame");
                         if let Some((width, height)) = vga.render_graphics(&mut pixels) {
                             drop(vga);
                             match present(display, width, height, &pixels) {

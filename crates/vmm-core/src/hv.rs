@@ -293,6 +293,16 @@ pub trait ExitHandler: Send {
     fn mmio_write(&mut self, addr: u64, data: &[u8]);
     fn mmio_read(&mut self, addr: u64, data: &mut [u8]);
 
+    /// True when `gpa` is guest RAM the machine has taken from the guest
+    /// ([`RamTrap`]): an access there belongs to [`Self::mmio_read`] /
+    /// [`Self::mmio_write`] although the host still holds the pages. A
+    /// backend that emulates an instruction's memory operands itself asks
+    /// before it touches RAM. The default is `false`: no trapped RAM.
+    fn ram_is_trapped(&self, gpa: u64) -> bool {
+        let _ = gpa;
+        false
+    }
+
     /// True once a device has asked the machine to power off — today only the
     /// ACPI PM block (`machine_x86::acpi::pm`), when the guest writes
     /// `SLP_TYP = S5` with `SLP_EN`.

@@ -15,6 +15,11 @@ pub enum DriveKind {
     Disk,
     /// A CD-ROM: 2048-byte sectors, numbered from `0xE0`.
     Optical,
+    /// A floppy disk: 512-byte sectors, numbered from `0x00`. The BIOS reads
+    /// it for a loader (Windows Setup looks there for its answer file) and
+    /// never boots from it; the machine has no floppy controller, so an
+    /// operating system does not see it at all.
+    Floppy,
 }
 
 /// The first BIOS drive number of each kind.
@@ -32,6 +37,17 @@ pub struct Geometry {
 impl Geometry {
     /// The translation BIOSes call LBA-assisted: 63 sectors, the fewest
     /// heads that keep the cylinders within 1024, and 255 heads beyond that.
+    /// A floppy's geometry: two heads and 80 tracks, the sectors a track
+    /// the size implies (18 for 1.44 MB, 9 for 720 KB).
+    pub fn floppy(total: u64) -> Self {
+        let sectors = (total / 160).clamp(1, 63);
+        Self {
+            cylinders: 80,
+            heads: 2,
+            sectors: sectors as u32,
+        }
+    }
+
     pub fn for_sectors(total: u64) -> Self {
         let sectors = 63u64;
         let mut heads = 16u64;
@@ -86,7 +102,7 @@ pub struct Drive {
 impl Drive {
     /// Opens `path`. A disk opened writable is written by `int 13h`.
     pub fn open(path: &Path, kind: DriveKind, writable: bool) -> io::Result<Self> {
-        let writable = writable && kind == DriveKind::Disk;
+        let writable = writable && kind != DriveKind::Optical;
         let file = File::options().read(true).write(writable).open(path)?;
         let bytes = file.metadata()?.len();
         Ok(Self::from_file(file, bytes, kind, writable))
@@ -94,7 +110,7 @@ impl Drive {
 
     fn from_file(file: File, bytes: u64, kind: DriveKind, writable: bool) -> Self {
         let sector = match kind {
-            DriveKind::Disk => 512,
+            DriveKind::Disk | DriveKind::Floppy => 512,
             DriveKind::Optical => 2048,
         };
         let sectors = bytes / sector;
@@ -103,13 +119,16 @@ impl Drive {
             kind,
             writable,
             sectors,
-            geometry: Geometry::for_sectors(sectors),
+            geometry: match kind {
+                DriveKind::Floppy => Geometry::floppy(sectors),
+                _ => Geometry::for_sectors(sectors),
+            },
         }
     }
 
     pub fn sector_size(&self) -> u32 {
         match self.kind {
-            DriveKind::Disk => 512,
+            DriveKind::Disk | DriveKind::Floppy => 512,
             DriveKind::Optical => 2048,
         }
     }
