@@ -825,9 +825,12 @@ impl VirtioPciBus {
         let (support, aperture) =
             shm.ok_or_else(|| fail("this machine cannot back VRAM with host memory".into()))?;
         let vram_bytes = config.vram_bytes;
-        let base = aperture
-            .allocate(vram_bytes)
-            .ok_or_else(|| fail("the 64-bit MMIO aperture has no room for VRAM".into()))?;
+        let base = match config.low_vram_base {
+            Some(base) => base,
+            None => aperture
+                .allocate(vram_bytes)
+                .ok_or_else(|| fail("the 64-bit MMIO aperture has no room for VRAM".into()))?,
+        };
         let pages = (support.allocate)(vram_bytes, false)
             .map_err(|e| fail(format!("cannot allocate VRAM: {e}")))?;
         let placements = vec![vpci::ShmPlacement {
@@ -852,6 +855,40 @@ impl VirtioPciBus {
     /// The boot framebuffer, when the VM has one.
     pub fn framebuffer(&self) -> Option<&FramebufferSlot> {
         self.framebuffer.as_ref()
+    }
+
+    /// Where the framebuffer's VRAM is decoded in guest physical memory,
+    /// turning the function's memory decoding on first if it is off — what a
+    /// BIOS does at power-on, here done when the BIOS's VBE first needs the
+    /// address (ADR-0012). `None` without a framebuffer.
+    pub fn framebuffer_vram_base(&self) -> Option<u64> {
+        let fb = self.framebuffer.as_ref()?;
+        let window = |bus: &Self| {
+            bus.root
+                .lock()
+                .ok()?
+                .bar_window_of(fb.owner, crate::framebuffer::VRAM_BAR_INDEX)
+                .map(|(base, _)| base)
+        };
+        if let Some(base) = window(self) {
+            return Some(base);
+        }
+        // The command register through the configuration ports, the way a
+        // guest would write it, so every follow-up (the VRAM window mapping
+        // itself in) runs; the address latch is put back afterwards.
+        let address = 0x8000_0000u32 | u32::from(fb.device_number) << 11 | 0x04;
+        let mut latch = [0u8; 4];
+        self.io_read(crate::platform::PCI_CONFIG_ADDRESS, &mut latch);
+        self.io_write(crate::platform::PCI_CONFIG_ADDRESS, &address.to_le_bytes());
+        let mut command = [0u8; 2];
+        self.io_read(crate::platform::PCI_CONFIG_ADDRESS + 4, &mut command);
+        let enabled = u16::from_le_bytes(command) | crate::pci::command::MEMORY_SPACE;
+        self.io_write(
+            crate::platform::PCI_CONFIG_ADDRESS + 4,
+            &enabled.to_le_bytes(),
+        );
+        self.io_write(crate::platform::PCI_CONFIG_ADDRESS, &latch);
+        window(self)
     }
 
     /// Puts an AHCI controller with `drives` on the bus, after every other

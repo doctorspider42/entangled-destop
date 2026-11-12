@@ -1814,6 +1814,17 @@ pub fn run_with(
     };
     // A BIOS machine starts in VGA text mode, which is guest RAM with no
     // device behind it yet (ADR-0012): a thread draws it.
+    // The BIOS offers the linear framebuffer through VBE, when the machine
+    // has one beside its VGA.
+    if let (Some(bios), Some(pci)) = (bus.bios(), bus.pci_shared()) {
+        if pci.framebuffer().is_some() {
+            if let Ok(mut bios) = bios.lock() {
+                bios.set_vbe(Box::new(machine_x86::vbe::FramebufferVbe::new(Arc::clone(
+                    &pci,
+                ))));
+            }
+        }
+    }
     let _bios_text_presenter = match bus.bios() {
         Some(bios) => {
             let mem = match bios.lock() {
@@ -1824,6 +1835,9 @@ pub fn run_with(
                 bios_text_present::Presenter::start(
                     mem,
                     bus.vga().cloned(),
+                    bus.pci()
+                        .and_then(|pci| pci.framebuffer())
+                        .map(|fb| Arc::clone(&fb.device)),
                     display_handle.clone(),
                     Arc::clone(&quiesce),
                     gpu_scanout,

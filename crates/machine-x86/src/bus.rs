@@ -210,7 +210,13 @@ impl MachineBus {
     /// One BIOS port write. Before a call runs, the bytes waiting in the
     /// keyboard controller go to the BIOS: it takes no keyboard interrupt, so this is
     /// how `int 16h` gets its keys.
-    fn bios_write(&self, bios: &Mutex<pc_bios::Bios>, port: u16, data: &[u8]) {
+    fn bios_write(
+        &self,
+        bios: &Mutex<pc_bios::Bios>,
+        port: u16,
+        data: &[u8],
+        paging: Option<pc_bios::Paging>,
+    ) {
         let mut codes = [0u8; 16];
         let mut count = 0;
         if port == pc_bios::rom::PORT_CALL {
@@ -226,7 +232,7 @@ impl MachineBus {
                 for &code in &codes[..count] {
                     bios.scancode(code);
                 }
-                bios.io_out(port, data);
+                bios.io_out(port, data, paging);
             }
             Err(_) => tracing::error!("the BIOS lock is poisoned; dropping a BIOS call"),
         }
@@ -351,6 +357,12 @@ impl MachineBus {
     /// stops making progress.
     pub fn virtio(&self) -> &VirtioMmioBus {
         &self.virtio
+    }
+
+    /// The PCI bus, shared: for something that outlives a borrow of the
+    /// machine bus (the BIOS's VBE display).
+    pub fn pci_shared(&self) -> Option<Arc<VirtioPciBus>> {
+        self.pci.clone()
     }
 
     /// The PCI bus behind this machine, if the VM uses the pci transport.
@@ -686,7 +698,7 @@ impl ExitHandler for MachineBus {
         }
         if let Some(bios) = &self.bios {
             if pc_bios::Bios::contains(port) {
-                self.bios_write(bios, port, data);
+                self.bios_write(bios, port, data, None);
                 return;
             }
         }
@@ -751,6 +763,28 @@ impl ExitHandler for MachineBus {
                 }
             }
         }
+    }
+
+    /// A BIOS call needs to know how its caller translates addresses: one
+    /// made from virtual 8086 mode (Windows calling the video BIOS) names
+    /// its buffers by linear addresses under the guest's page tables.
+    fn io_out_from(&mut self, port: u16, data: &[u8], cpu: &dyn vmm_core::hv::GuestCpu) {
+        if let Some(bios) = &self.bios {
+            if port == pc_bios::rom::PORT_CALL {
+                const CR0_PG: u64 = 1 << 31;
+                const CR4_PAE: u64 = 1 << 5;
+                let paging =
+                    cpu.paging()
+                        .filter(|p| p.cr0 & CR0_PG != 0)
+                        .map(|p| pc_bios::Paging {
+                            cr3: p.cr3,
+                            pae: p.cr4 & CR4_PAE != 0,
+                        });
+                self.bios_write(bios, port, data, paging);
+                return;
+            }
+        }
+        self.io_out(port, data);
     }
 
     fn io_in(&mut self, port: u16, data: &mut [u8]) {

@@ -34,6 +34,6 @@ pub mod font;
 pub mod media;
 pub mod rom;
 
-pub use bios::{read_text_screen, Bios, BiosError, MemoryRange, TEXT_BASE};
+pub use bios::{read_text_screen, Bios, BiosError, MemoryRange, Paging, Vbe, TEXT_BASE};
 pub use media::{Drive, DriveKind};
 pub use rom::Status;

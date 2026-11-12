@@ -1306,10 +1306,17 @@ impl VmConfig {
                      renderers for the plain virtio-gpu adapter. Drop them, or use that one"
                 ));
             }
-            if self.transport != VirtioTransport::Pci || self.boot.mode != BootMode::Uefi {
+            // A BIOS machine takes the plain framebuffer: its BIOS offers it
+            // through VBE (ADR-0012). virtio-vga needs a virtio-gpu driver.
+            let bios_framebuffer =
+                self.boot.mode == BootMode::Bios && adapter == DisplayAdapter::Framebuffer;
+            if self.transport != VirtioTransport::Pci
+                || !(self.boot.mode == BootMode::Uefi || bios_framebuffer)
+            {
                 return err(format!(
-                    "display.adapter = \"{adapter}\" is a PCI device the UEFI firmware \
-                     drives: it needs transport = \"pci\" and boot.mode = \"uefi\""
+                    "display.adapter = \"{adapter}\" is a PCI device the firmware \
+                     drives: it needs transport = \"pci\" and boot.mode = \"uefi\" \
+                     (or, for \"framebuffer\", \"bios\")"
                 ));
             }
         }

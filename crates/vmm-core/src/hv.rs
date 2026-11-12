@@ -192,6 +192,24 @@ pub trait InterruptDelivery: Send + Sync {
     }
 }
 
+/// How the vCPU that took an exit translates addresses, for the one
+/// handler that has to follow a guest pointer: a BIOS called from virtual
+/// 8086 mode (`pc_bios`), whose `segment:offset` addresses are linear ones
+/// under the guest's page tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestPaging {
+    pub cr0: u64,
+    pub cr3: u64,
+    pub cr4: u64,
+}
+
+/// The vCPU behind an exit, as far as a handler may ask about it.
+pub trait GuestCpu {
+    /// The control registers that decide address translation, or `None` when
+    /// the backend cannot say.
+    fn paging(&self) -> Option<GuestPaging>;
+}
+
 /// A range of guest RAM the machine can take away from the guest and hand
 /// back.
 ///
@@ -263,6 +281,14 @@ pub enum RunOutcome {
 /// small recording handlers. Shared by both backends.
 pub trait ExitHandler: Send {
     fn io_out(&mut self, port: u16, data: &[u8]);
+
+    /// [`Self::io_out`] for a backend that can say which vCPU wrote and how
+    /// it translates addresses. The default ignores that, which is right
+    /// for every port whose handler follows no guest pointer.
+    fn io_out_from(&mut self, port: u16, data: &[u8], cpu: &dyn GuestCpu) {
+        let _ = cpu;
+        self.io_out(port, data);
+    }
     fn io_in(&mut self, port: u16, data: &mut [u8]);
     fn mmio_write(&mut self, addr: u64, data: &[u8]);
     fn mmio_read(&mut self, addr: u64, data: &mut [u8]);

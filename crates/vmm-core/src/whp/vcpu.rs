@@ -880,7 +880,7 @@ impl WhpVcpu {
 
         if info.is_write {
             let bytes = io.Rax.to_le_bytes();
-            handler.io_out(io.PortNumber, &bytes[..info.access_size]);
+            handler.io_out_from(io.PortNumber, &bytes[..info.access_size], self);
         } else {
             let mut data = [0u8; 4];
             handler.io_in(io.PortNumber, &mut data[..info.access_size]);
@@ -1268,6 +1268,21 @@ fn park(
             return Parked::GaveUp;
         }
         lifecycle.wait_for_attention(Duration::from_millis(20));
+    }
+}
+
+impl crate::hv::GuestCpu for WhpVcpu {
+    fn paging(&self) -> Option<crate::hv::GuestPaging> {
+        use windows::Win32::System::Hypervisor::{
+            WHvX64RegisterCr0, WHvX64RegisterCr3, WHvX64RegisterCr4,
+        };
+        let names = [WHvX64RegisterCr0, WHvX64RegisterCr3, WHvX64RegisterCr4];
+        let mut values = Aligned16([zeroed_value(); 3]);
+        self.get_raw(&names, &mut values.0).ok()?;
+        // SAFETY: the three control registers are 64-bit integers, which is
+        // the `Reg64` arm of the value union.
+        let (cr0, cr3, cr4) = unsafe { (values.0[0].Reg64, values.0[1].Reg64, values.0[2].Reg64) };
+        Some(crate::hv::GuestPaging { cr0, cr3, cr4 })
     }
 }
 

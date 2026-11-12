@@ -140,6 +140,10 @@ pub struct FramebufferConfig {
     /// Part of the virtio-gpu function rather than a function of its own
     /// (the module docs' "virtio-vga").
     pub on_virtio_gpu: bool,
+    /// Put VRAM at this address, below 4 GiB, instead of in the 64-bit
+    /// aperture: for a 32-bit guest that reaches it through the BIOS's VBE
+    /// (ADR-0012), which can name no address above.
+    pub low_vram_base: Option<u64>,
 }
 
 impl Default for FramebufferConfig {
@@ -148,6 +152,7 @@ impl Default for FramebufferConfig {
             vram_bytes: DEFAULT_VRAM_BYTES,
             edid: None,
             on_virtio_gpu: false,
+            low_vram_base: None,
         }
     }
 }
@@ -332,6 +337,31 @@ impl Framebuffer {
         if let Err(error) = self.vram.fill(0, self.vram_bytes, 0) {
             tracing::warn!(%error, "could not clear the framebuffer's VRAM");
         }
+    }
+
+    /// Sets a mode as the BIOS's VBE does on a guest's behalf: `width` x
+    /// `height` at `bpp`, with the linear framebuffer on.
+    pub fn set_mode(&self, width: u16, height: u16, bpp: u16, clear: bool) {
+        let register = |index: usize| regs::DISPI + 2 * index as u64;
+        let mut enable = dispi::ENABLED | dispi::LFB_ENABLED;
+        if !clear {
+            enable |= dispi::NOCLEARMEM;
+        }
+        for (index, value) in [
+            (dispi::ENABLE, 0),
+            (dispi::XRES, width),
+            (dispi::YRES, height),
+            (dispi::BPP, bpp),
+            (dispi::VIRT_WIDTH, width),
+            (dispi::ENABLE, enable),
+        ] {
+            self.mmio_write(register(index), &value.to_le_bytes());
+        }
+    }
+
+    /// Turns the framebuffer off: the VGA has the screen again.
+    pub fn disable(&self) {
+        self.mmio_write(regs::DISPI + 2 * dispi::ENABLE as u64, &0u16.to_le_bytes());
     }
 
     /// Guest read inside the register BAR. Unclaimed offsets read zero.

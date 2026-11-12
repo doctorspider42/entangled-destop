@@ -44,6 +44,7 @@ impl Presenter {
     pub(super) fn start(
         mem: Arc<GuestMem>,
         vga: Option<Arc<Mutex<Vga>>>,
+        framebuffer: Option<Arc<machine_x86::framebuffer::Framebuffer>>,
         display: display::DisplayHandle,
         quiesce: Arc<Quiesce>,
         virtio_scanout: Option<Arc<AtomicBool>>,
@@ -58,6 +59,7 @@ impl Presenter {
                     run(
                         &mem,
                         vga.as_deref(),
+                        framebuffer.as_deref(),
                         &display,
                         &quiesce,
                         &stop,
@@ -139,6 +141,7 @@ fn present(
 fn run(
     mem: &GuestMem,
     vga: Option<&Mutex<Vga>>,
+    framebuffer: Option<&machine_x86::framebuffer::Framebuffer>,
     display: &display::DisplayHandle,
     quiesce: &Quiesce,
     stop: &AtomicBool,
@@ -156,6 +159,11 @@ fn run(
         };
         if virtio_scanout.is_some_and(|bound| bound.load(Ordering::Acquire)) {
             // virtio-gpu has the display; when it lets go, draw afresh.
+            shown = None;
+            continue;
+        }
+        if framebuffer.is_some_and(|fb| fb.scanout().is_some()) {
+            // A VBE mode is up: the linear framebuffer's presenter draws.
             shown = None;
             continue;
         }

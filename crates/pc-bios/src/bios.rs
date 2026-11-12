@@ -27,6 +27,61 @@ pub struct MemoryRange {
     pub kind: u32,
 }
 
+/// How the caller of a BIOS service translates addresses, when it runs
+/// with paging on: an operating system calling the BIOS from virtual 8086
+/// mode. `segment:offset` is then a linear address under these page tables,
+/// not a physical one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Paging {
+    /// The page directory (or, with `pae`, the directory pointer table).
+    pub cr3: u64,
+    /// 64-bit entries in three levels, rather than 32-bit ones in two.
+    pub pae: bool,
+}
+
+/// The display behind the VESA BIOS Extensions (`int 10h, AH=4Fh`): a
+/// linear framebuffer whose mode the BIOS sets on a guest's behalf. An
+/// operating system with no driver for the machine's display — Windows XP's
+/// `vga.sys` — gets its true-colour modes this way.
+pub trait Vbe: Send {
+    /// Bytes of video memory.
+    fn memory_bytes(&self) -> u64;
+    /// Guest physical address of the framebuffer, below 4 GiB; `None` when
+    /// the display cannot be reached by a 32-bit guest.
+    fn framebuffer(&mut self) -> Option<u32>;
+    /// Shows `width` x `height` at 32 bits a pixel, clearing the screen
+    /// unless told not to. `false` when the display refuses the mode.
+    fn set_mode(&mut self, width: u16, height: u16, clear: bool) -> bool;
+    /// Back to the VGA.
+    fn disable(&mut self);
+}
+
+/// The resolutions the VBE mode list offers, all at 32 bits a pixel; mode
+/// number [`VBE_FIRST_MODE`] and up, in this order.
+const VBE_MODES: [(u16, u16); 16] = [
+    (640, 480),
+    (800, 600),
+    (1024, 768),
+    (1152, 864),
+    (1280, 720),
+    (1280, 768),
+    (1280, 800),
+    (1280, 960),
+    (1280, 1024),
+    (1366, 768),
+    (1440, 900),
+    (1600, 900),
+    (1600, 1200),
+    (1680, 1050),
+    (1920, 1080),
+    (1920, 1200),
+];
+const VBE_FIRST_MODE: u16 = 0x140;
+/// VBE return values in AX: done, failed, not supported.
+const VBE_OK: u16 = 0x004f;
+const VBE_FAILED: u16 = 0x014f;
+const VBE_UNSUPPORTED: u16 = 0x0100;
+
 /// Where text mode's memory is.
 pub const TEXT_BASE: u64 = 0x000b_8000;
 /// The BIOS data area.
@@ -234,6 +289,13 @@ pub struct Bios {
     memory_map: Vec<MemoryRange>,
     /// `SS`, latched by the first of the stub's two port writes.
     stack_segment: u16,
+    /// The page tables the call in progress was made under, if any.
+    paging: Option<Paging>,
+    /// The linear-framebuffer display, when the machine has one.
+    vbe: Option<Box<dyn Vbe>>,
+    /// The VBE mode in effect, as `4F03h` reports it; a VGA mode number
+    /// while the VGA has the screen.
+    vbe_mode: u16,
     status: Status,
     keys: VecDeque<u16>,
     modifiers: Modifiers,
@@ -274,12 +336,20 @@ impl Bios {
             drives,
             memory_map,
             stack_segment: 0,
+            paging: None,
+            vbe: None,
+            vbe_mode: 3,
             status: Status::Done,
             keys: VecDeque::new(),
             modifiers: Modifiers::default(),
             console_line: String::new(),
             reported: Box::new([0; 1024]),
         }
+    }
+
+    /// Gives the BIOS a linear-framebuffer display to offer through VBE.
+    pub fn set_vbe(&mut self, vbe: Box<dyn Vbe>) {
+        self.vbe = Some(vbe);
     }
 
     /// Whether `port` is one of the two the stub writes.
@@ -337,6 +407,11 @@ impl Bios {
     /// [`Self::install`]'s to restore.
     pub fn reset(&mut self) {
         self.stack_segment = 0;
+        self.paging = None;
+        self.vbe_mode = 3;
+        if let Some(vbe) = self.vbe.as_mut() {
+            vbe.disable();
+        }
         self.status = Status::Done;
         self.keys.clear();
         self.modifiers = Modifiers::default();
@@ -344,8 +419,9 @@ impl Bios {
         self.reported.fill(0);
     }
 
-    /// A port write from the stub.
-    pub fn io_out(&mut self, port: u16, data: &[u8]) {
+    /// A port write from the stub. `paging` is how the caller translates
+    /// addresses, when it runs with paging on.
+    pub fn io_out(&mut self, port: u16, data: &[u8], paging: Option<Paging>) {
         let value = match data {
             [lo, hi, ..] => u16::from_le_bytes([*lo, *hi]),
             _ => return,
@@ -353,7 +429,9 @@ impl Bios {
         match port {
             rom::PORT_STACK_SEGMENT => self.stack_segment = value,
             rom::PORT_CALL => {
+                self.paging = paging;
                 self.status = self.call(self.stack_segment, value);
+                self.paging = None;
                 if self.status == Status::Retry {
                     std::thread::sleep(RETRY_SLEEP);
                 }
@@ -398,7 +476,7 @@ impl Bios {
     pub fn call(&mut self, ss: u16, sp: u16) -> Status {
         let at = linear(ss, sp);
         let mut raw = [0u8; frame::LEN];
-        if self.mem.read_slice(&mut raw, GuestAddress(at)).is_err() {
+        if !self.read(at, &mut raw) {
             tracing::error!(
                 stack = format_args!("{ss:04x}:{sp:04x}"),
                 "BIOS call with a stack outside guest memory"
@@ -422,7 +500,7 @@ impl Bios {
         let status = self.dispatch(&mut regs);
         if status == Status::Done {
             regs.store(&mut raw);
-            if self.mem.write_slice(&raw, GuestAddress(at)).is_err() {
+            if !self.write(at, &raw) {
                 return Status::Stop;
             }
         }
@@ -459,9 +537,7 @@ impl Bios {
             _ => "general protection fault",
         };
         let mut code = [0u8; 8];
-        let _ = self
-            .mem
-            .read_slice(&mut code, GuestAddress(linear(regs.cs, regs.ip)));
+        let _ = self.read(linear(regs.cs, regs.ip), &mut code);
         tracing::error!(
             vector = regs.vector,
             at = format_args!("{:04x}:{:04x}", regs.cs, regs.ip),
@@ -491,10 +567,95 @@ impl Bios {
 
     // ---- guest memory -----------------------------------------------------
 
+    /// The guest physical address behind linear address `linear`: itself
+    /// in real mode, a walk of the caller's page tables otherwise. `None`
+    /// for an address that is not mapped.
+    fn physical(&self, linear: u64) -> Option<u64> {
+        let Some(paging) = self.paging else {
+            return Some(linear);
+        };
+        const PRESENT: u64 = 1;
+        const LARGE: u64 = 1 << 7;
+        const FRAME: u64 = 0x000f_ffff_ffff_f000;
+        let linear = linear & 0xffff_ffff;
+        let entry = |at: u64, wide: bool| -> Option<u64> {
+            let mut raw = [0u8; 8];
+            let len = if wide { 8 } else { 4 };
+            self.mem
+                .read_slice(&mut raw[..len], GuestAddress(at))
+                .ok()?;
+            Some(u64::from_le_bytes(raw)).filter(|entry| entry & PRESENT != 0)
+        };
+        if paging.pae {
+            let pointer = entry((paging.cr3 & 0xffff_ffe0) + (linear >> 30 & 3) * 8, true)?;
+            let directory = entry((pointer & FRAME) + (linear >> 21 & 0x1ff) * 8, true)?;
+            if directory & LARGE != 0 {
+                return Some((directory & FRAME & !0x1f_ffff) | (linear & 0x1f_ffff));
+            }
+            let table = entry((directory & FRAME) + (linear >> 12 & 0x1ff) * 8, true)?;
+            Some((table & FRAME) | (linear & 0xfff))
+        } else {
+            let directory = entry((paging.cr3 & 0xffff_f000) + (linear >> 22) * 4, false)?;
+            if directory & LARGE != 0 {
+                return Some((directory & 0xffc0_0000) | (linear & 0x3f_ffff));
+            }
+            let table = entry(
+                (directory & 0xffff_f000) + (linear >> 12 & 0x3ff) * 4,
+                false,
+            )?;
+            Some((table & 0xffff_f000) | (linear & 0xfff))
+        }
+    }
+
+    /// Reads guest memory at a linear address, a page at a time. `false`
+    /// when any of it is unmapped or not RAM.
+    fn read(&self, linear: u64, buf: &mut [u8]) -> bool {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let at = linear.wrapping_add(done as u64);
+            let len = (0x1000 - (at & 0xfff) as usize).min(buf.len() - done);
+            let Some(physical) = self.physical(at) else {
+                return false;
+            };
+            if self
+                .mem
+                .read_slice(&mut buf[done..done + len], GuestAddress(physical))
+                .is_err()
+            {
+                return false;
+            }
+            done += len;
+        }
+        true
+    }
+
+    /// Writes guest memory at a linear address, a page at a time.
+    fn write(&self, linear: u64, bytes: &[u8]) -> bool {
+        let mut done = 0usize;
+        while done < bytes.len() {
+            let at = linear.wrapping_add(done as u64);
+            let len = (0x1000 - (at & 0xfff) as usize).min(bytes.len() - done);
+            let Some(physical) = self.physical(at) else {
+                return false;
+            };
+            if self
+                .mem
+                .write_slice(&bytes[done..done + len], GuestAddress(physical))
+                .is_err()
+            {
+                return false;
+            }
+            done += len;
+        }
+        true
+    }
+
     fn put(&self, at: u64, bytes: &[u8]) -> Result<(), BiosError> {
-        self.mem
-            .write_slice(bytes, GuestAddress(at))
-            .map_err(|_| BiosError::Memory(at))
+        if self.write(at, bytes) {
+            Ok(())
+        } else {
+            Err(BiosError::Memory(at))
+        }
     }
 
     fn put_word(&self, at: u64, value: u16) -> Result<(), BiosError> {
@@ -503,13 +664,13 @@ impl Bios {
 
     fn byte(&self, at: u64) -> u8 {
         let mut b = [0u8; 1];
-        let _ = self.mem.read_slice(&mut b, GuestAddress(at));
+        let _ = self.read(at, &mut b);
         b[0]
     }
 
     fn word(&self, at: u64) -> u16 {
         let mut b = [0u8; 2];
-        let _ = self.mem.read_slice(&mut b, GuestAddress(at));
+        let _ = self.read(at, &mut b);
         u16::from_le_bytes(b)
     }
 
@@ -715,6 +876,11 @@ impl Bios {
         match regs.ah() {
             0x00 => {
                 let mode = regs.al() & 0x7f;
+                // A VGA mode takes the screen back from the framebuffer.
+                if let Some(vbe) = self.vbe.as_mut() {
+                    vbe.disable();
+                }
+                self.vbe_mode = u16::from(mode);
                 if !matches!(mode, 0..=3 | 7) {
                     tracing::warn!(mode, "int 10h: a video mode this BIOS has no display for");
                 }
@@ -801,10 +967,132 @@ impl Bios {
                     regs.set_bx(0x0008);
                 }
             }
-            // VBE: not here yet. AL other than 4Fh says "not supported".
-            0x4f => regs.set_ax(0x0100),
+            0x4f => self.vbe_call(regs),
             _ => self.unhandled(regs),
         }
+    }
+
+    /// The modes on offer: those of [`VBE_MODES`] that fit in video memory,
+    /// with their numbers.
+    fn vbe_modes(&self) -> Vec<(u16, u16, u16)> {
+        let memory = self.vbe.as_ref().map_or(0, |vbe| vbe.memory_bytes());
+        VBE_MODES
+            .iter()
+            .enumerate()
+            .filter(|(_, (w, h))| u64::from(*w) * u64::from(*h) * 4 <= memory)
+            .map(|(n, (w, h))| (VBE_FIRST_MODE + n as u16, *w, *h))
+            .collect()
+    }
+
+    /// `int 10h, AH=4Fh`: the VESA BIOS Extensions, version 2.0, linear
+    /// framebuffer modes only (no bank switching, no palette calls).
+    fn vbe_call(&mut self, regs: &mut Regs) {
+        if self.vbe.is_none() {
+            return regs.set_ax(VBE_UNSUPPORTED);
+        }
+        let block = linear(regs.es, regs.di());
+        let result = match regs.al() {
+            0x00 => {
+                // The controller information. The mode list and the name
+                // live in the block's own reserved area, so the far
+                // pointers to them are ES:DI plus an offset.
+                let modes = self.vbe_modes();
+                let memory = self.vbe.as_ref().map_or(0, |vbe| vbe.memory_bytes());
+                let mut info = [0u8; 256];
+                info[0..4].copy_from_slice(b"VESA");
+                info[4..6].copy_from_slice(&0x0200u16.to_le_bytes());
+                let list_at = 0x22u16;
+                let name_at = list_at + (modes.len() as u16 + 1) * 2;
+                let far = |offset: u16| {
+                    let mut pointer = [0u8; 4];
+                    pointer[..2].copy_from_slice(&regs.di().wrapping_add(offset).to_le_bytes());
+                    pointer[2..].copy_from_slice(&regs.es.to_le_bytes());
+                    pointer
+                };
+                info[0x06..0x0a].copy_from_slice(&far(name_at));
+                info[0x0e..0x12].copy_from_slice(&far(list_at));
+                info[0x12..0x14]
+                    .copy_from_slice(&((memory >> 16).min(0xffff) as u16).to_le_bytes());
+                info[0x14..0x16].copy_from_slice(&0x0100u16.to_le_bytes());
+                for at in [0x16usize, 0x1a, 0x1e] {
+                    info[at..at + 4].copy_from_slice(&far(name_at));
+                }
+                let mut at = usize::from(list_at);
+                for (number, _, _) in &modes {
+                    info[at..at + 2].copy_from_slice(&number.to_le_bytes());
+                    at += 2;
+                }
+                info[at..at + 2].copy_from_slice(&0xffffu16.to_le_bytes());
+                let name = b"Entangled\0";
+                let at = usize::from(name_at);
+                info[at..at + name.len()].copy_from_slice(name);
+                self.write(block, &info)
+            }
+            0x01 => {
+                let wanted = regs.cx() & 0x1ff;
+                let mode = self.vbe_modes().into_iter().find(|m| m.0 == wanted);
+                let base = self.vbe.as_mut().and_then(|vbe| vbe.framebuffer());
+                match (mode, base) {
+                    (Some((_, width, height)), Some(base)) => {
+                        let mut info = [0u8; 256];
+                        let word = |info: &mut [u8; 256], at: usize, v: u16| {
+                            info[at..at + 2].copy_from_slice(&v.to_le_bytes());
+                        };
+                        // Supported, colour, graphics, not VGA compatible,
+                        // no bank switching, linear framebuffer.
+                        word(&mut info, 0x00, 0x00fb);
+                        word(&mut info, 0x04, 64);
+                        word(&mut info, 0x06, 64);
+                        word(&mut info, 0x10, width * 4);
+                        word(&mut info, 0x12, width);
+                        word(&mut info, 0x14, height);
+                        info[0x16] = 8;
+                        info[0x17] = 16;
+                        info[0x18] = 1; // planes
+                        info[0x19] = 32; // bits a pixel
+                        info[0x1a] = 1; // banks
+                        info[0x1b] = 6; // direct colour
+                        info[0x1e] = 1;
+                        // Red, green, blue, reserved: size and position.
+                        info[0x1f..0x27].copy_from_slice(&[8, 16, 8, 8, 8, 0, 8, 24]);
+                        info[0x27] = 0x02;
+                        info[0x28..0x2c].copy_from_slice(&base.to_le_bytes());
+                        // The VBE 3.0 linear fields say the same again.
+                        word(&mut info, 0x32, width * 4);
+                        info[0x36..0x3e].copy_from_slice(&[8, 16, 8, 8, 8, 0, 8, 24]);
+                        self.write(block, &info)
+                    }
+                    _ => false,
+                }
+            }
+            0x02 => {
+                let wanted = regs.bx() & 0x1ff;
+                if wanted < 0x100 {
+                    // A VGA mode through the VBE call: the same as AH=00h.
+                    let mut vga = *regs;
+                    vga.set_ax(wanted & 0x7f);
+                    self.video(&mut vga);
+                    true
+                } else {
+                    let mode = self.vbe_modes().into_iter().find(|m| m.0 == wanted);
+                    let clear = regs.bx() & 0x8000 == 0;
+                    let set = match (mode, self.vbe.as_mut()) {
+                        (Some((_, width, height)), Some(vbe)) => vbe.set_mode(width, height, clear),
+                        _ => false,
+                    };
+                    if set {
+                        self.vbe_mode = regs.bx() & 0x7fff;
+                    }
+                    set
+                }
+            }
+            0x03 => {
+                regs.set_bx(self.vbe_mode);
+                true
+            }
+            _ => return regs.set_ax(VBE_UNSUPPORTED),
+        };
+        regs.set_ax(if result { VBE_OK } else { VBE_FAILED });
     }
 
     fn write_string(&mut self, regs: &mut Regs) {
@@ -851,27 +1139,33 @@ impl Bios {
         count: u32,
         buffer: u64,
     ) -> (u32, u8) {
-        let mem = Arc::clone(&self.mem);
-        let Some(drive) = self.drive(number) else {
+        let Some((size, writable)) = self
+            .drive(number)
+            .map(|drive| (drive.sector_size() as usize, drive.writable))
+        else {
             return (0, 0x01);
         };
-        let size = drive.sector_size() as usize;
         let per_chunk = (TRANSFER_CHUNK / size).max(1) as u32;
         let mut chunk = vec![0u8; per_chunk as usize * size];
         let mut done = 0u32;
         while done < count {
             let n = (count - done).min(per_chunk);
             let bytes = &mut chunk[..n as usize * size];
-            let at = GuestAddress(buffer + u64::from(done) * size as u64);
+            let at = buffer + u64::from(done) * size as u64;
             let sector = lba.saturating_add(u64::from(done));
             let ok = if write {
-                mem.read_slice(bytes, at).is_ok() && drive.write(sector, bytes).is_ok()
+                self.read(at, bytes)
+                    && self
+                        .drive(number)
+                        .is_some_and(|drive| drive.write(sector, bytes).is_ok())
             } else {
-                drive.read(sector, bytes).is_ok() && mem.write_slice(bytes, at).is_ok()
+                self.drive(number)
+                    .is_some_and(|drive| drive.read(sector, bytes).is_ok())
+                    && self.write(at, bytes)
             };
             if !ok {
                 // 04h: sector not found. 03h: write protected.
-                let status = if write && !drive.writable { 0x03 } else { 0x04 };
+                let status = if write && !writable { 0x03 } else { 0x04 };
                 return (done, status);
             }
             done += n;
@@ -990,7 +1284,7 @@ impl Bios {
             0x42 | 0x43 => {
                 let packet = linear(regs.ds, regs.si());
                 let mut dap = [0u8; 16];
-                if self.mem.read_slice(&mut dap, GuestAddress(packet)).is_err() || dap[0] < 16 {
+                if !self.read(packet, &mut dap) || dap[0] < 16 {
                     return Some(0x01);
                 }
                 let count = u32::from(u16::from_le_bytes([dap[2], dap[3]]));
@@ -1115,8 +1409,7 @@ impl Bios {
                 };
                 let (from, to) = (base(self, table + 0x10), base(self, table + 0x18));
                 let mut bytes = vec![0u8; usize::from(regs.cx()) * 2];
-                let moved = self.mem.read_slice(&mut bytes, GuestAddress(from)).is_ok()
-                    && self.mem.write_slice(&bytes, GuestAddress(to)).is_ok();
+                let moved = self.read(from, &mut bytes) && self.write(to, &bytes);
                 if moved {
                     ok(regs);
                 } else {
@@ -1424,7 +1717,7 @@ mod tests {
         bios.mem
             .write_slice(&raw, GuestAddress(u64::from(STACK)))
             .expect("frame");
-        bios.io_out(rom::PORT_STACK_SEGMENT, &0u16.to_le_bytes());
+        bios.io_out(rom::PORT_STACK_SEGMENT, &0u16.to_le_bytes(), None);
         let status = bios.call(0, STACK);
         bios.mem
             .read_slice(&mut raw, GuestAddress(u64::from(STACK)))
@@ -1685,11 +1978,198 @@ mod tests {
     fn a_stack_outside_memory_stops_instead_of_panicking() {
         let mut bios = bios(vec![], vec![]);
         assert_eq!(bios.call(0xffff, 0xffff), Status::Stop);
-        bios.io_out(rom::PORT_STACK_SEGMENT, &[0xff, 0xff]);
-        bios.io_out(rom::PORT_CALL, &[0xff, 0xff]);
+        bios.io_out(rom::PORT_STACK_SEGMENT, &[0xff, 0xff], None);
+        bios.io_out(rom::PORT_CALL, &[0xff, 0xff], None);
         let mut status = [0u8; 2];
         bios.io_in(rom::PORT_CALL, &mut status);
         assert_eq!(u16::from_le_bytes(status), Status::Stop as u16);
+    }
+
+    /// A call made with paging on follows the caller's page tables: the
+    /// stack frame and the buffers are linear addresses.
+    #[test]
+    fn a_call_from_paged_code_reads_its_frame_through_the_page_tables() {
+        for pae in [false, true] {
+            let mut bios = bios(vec![], vec![]);
+            // Linear 0x0040_0000.. maps to physical 0x0010_0000.., one page.
+            let (directory, table) = (0x0018_0000u64, 0x0018_1000u64);
+            let linear = 0x0040_0000u64;
+            if pae {
+                let pointers = 0x0018_2000u64;
+                bios.put(pointers, &(directory | 1).to_le_bytes()).unwrap();
+                // Directory entry 2 (linear >> 21), table entry 0.
+                bios.put(directory + 2 * 8, &(table | 1).to_le_bytes())
+                    .unwrap();
+                bios.put(table, &(0x0010_0000u64 | 1).to_le_bytes())
+                    .unwrap();
+                bios.paging = Some(Paging { cr3: pointers, pae });
+            } else {
+                // Directory entry 1 (linear >> 22), table entry 0.
+                bios.put(directory + 4, &(table as u32 | 1).to_le_bytes())
+                    .unwrap();
+                bios.put(table, &(0x0010_0000u32 | 1).to_le_bytes())
+                    .unwrap();
+                bios.paging = Some(Paging {
+                    cr3: directory,
+                    pae,
+                });
+            }
+            assert_eq!(bios.physical(linear + 0x123), Some(0x0010_0123));
+            assert_eq!(
+                bios.physical(linear + 0x1000),
+                None,
+                "the next page is unmapped"
+            );
+            assert!(bios.write(linear + 0x10, &[0xa5]));
+            bios.paging = None;
+            assert_eq!(bios.byte(0x0010_0010), 0xa5);
+            // A buffer that runs into the unmapped page fails as a whole.
+            bios.paging = Some(Paging {
+                cr3: if pae { 0x0018_2000 } else { directory },
+                pae,
+            });
+            assert!(!bios.write(linear + 0xfff, &[1, 2]));
+        }
+    }
+
+    /// A display that records what the BIOS asked of it.
+    struct FakeVbe(Arc<std::sync::Mutex<Vec<String>>>);
+    impl Vbe for FakeVbe {
+        fn memory_bytes(&self) -> u64 {
+            // Room for 1280x1024 and nothing larger.
+            1280 * 1024 * 4
+        }
+        fn framebuffer(&mut self) -> Option<u32> {
+            Some(0xc800_0000)
+        }
+        fn set_mode(&mut self, width: u16, height: u16, clear: bool) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{width}x{height} clear={clear}"));
+            true
+        }
+        fn disable(&mut self) {
+            self.0.lock().unwrap().push("vga".into());
+        }
+    }
+
+    #[test]
+    fn vbe_lists_the_modes_that_fit_and_sets_one() {
+        let mut bios = bios(vec![], vec![]);
+        // Without a display the extension is not there.
+        let (_, none) = int(
+            &mut bios,
+            0x10,
+            Regs {
+                eax: 0x4f00,
+                edi: 0x6000,
+                ..Regs::default()
+            },
+        );
+        assert_eq!(none.ax(), VBE_UNSUPPORTED);
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        bios.set_vbe(Box::new(FakeVbe(Arc::clone(&log))));
+        let (_, info) = int(
+            &mut bios,
+            0x10,
+            Regs {
+                eax: 0x4f00,
+                edi: 0x6000,
+                ..Regs::default()
+            },
+        );
+        assert_eq!(info.ax(), VBE_OK);
+        assert_eq!(bios.word(0x6000), u16::from_le_bytes(*b"VE"));
+        assert_eq!(bios.word(0x6004), 0x0200);
+        // The mode list, through its far pointer: every resolution up to
+        // 1280x1024 and none above, then the terminator.
+        let list = u64::from(bios.word(0x600e)) + (u64::from(bios.word(0x6010)) << 4);
+        let modes: Vec<u16> = (0..32)
+            .map(|n| bios.word(list + n * 2))
+            .take_while(|m| *m != 0xffff)
+            .collect();
+        assert_eq!(modes.first(), Some(&VBE_FIRST_MODE));
+        assert!(modes.contains(&(VBE_FIRST_MODE + 8)), "1280x1024");
+        assert!(
+            !modes.contains(&(VBE_FIRST_MODE + 14)),
+            "1920x1080 does not fit"
+        );
+
+        // Mode information for 1024x768.
+        let wanted = u32::from(VBE_FIRST_MODE + 2);
+        let (_, mode) = int(
+            &mut bios,
+            0x10,
+            Regs {
+                eax: 0x4f01,
+                ecx: wanted,
+                edi: 0x6200,
+                ..Regs::default()
+            },
+        );
+        assert_eq!(mode.ax(), VBE_OK);
+        assert_eq!(bios.word(0x6200 + 0x12), 1024);
+        assert_eq!(bios.word(0x6200 + 0x14), 768);
+        assert_eq!(bios.byte(0x6200 + 0x19), 32);
+        assert_eq!(bios.word(0x6200 + 0x10), 4096);
+        assert_eq!(
+            bios.word(0x6200 + 0x2a),
+            0xc800,
+            "the framebuffer's address"
+        );
+        let (_, unknown) = int(
+            &mut bios,
+            0x10,
+            Regs {
+                eax: 0x4f01,
+                ecx: 0x1ff,
+                edi: 0x6200,
+                ..Regs::default()
+            },
+        );
+        assert_eq!(unknown.ax(), VBE_FAILED);
+
+        // Set it with the linear framebuffer bit, read it back, then a VGA
+        // mode takes the screen back.
+        let (_, set) = int(
+            &mut bios,
+            0x10,
+            Regs {
+                eax: 0x4f02,
+                ebx: 0x4000 | wanted,
+                ..Regs::default()
+            },
+        );
+        assert_eq!(set.ax(), VBE_OK);
+        let (_, current) = int(
+            &mut bios,
+            0x10,
+            Regs {
+                eax: 0x4f03,
+                ..Regs::default()
+            },
+        );
+        assert_eq!(current.bx(), 0x4000 | wanted as u16);
+        int(
+            &mut bios,
+            0x10,
+            Regs {
+                eax: 0x0003,
+                ..Regs::default()
+            },
+        );
+        let (_, current) = int(
+            &mut bios,
+            0x10,
+            Regs {
+                eax: 0x4f03,
+                ..Regs::default()
+            },
+        );
+        assert_eq!(current.bx(), 3);
+        assert_eq!(*log.lock().unwrap(), ["1024x768 clear=true", "vga"]);
     }
 
     #[test]

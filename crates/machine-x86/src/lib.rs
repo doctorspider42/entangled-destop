@@ -12,6 +12,7 @@ pub mod hda_function;
 pub mod i8042;
 pub mod ide_function;
 pub mod msi_cap;
+pub mod vbe;
 pub mod vga;
 pub mod vga_planes;
 
