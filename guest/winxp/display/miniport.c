@@ -341,6 +341,56 @@ BOOLEAN StartIO(PVOID extension, PVIDEO_REQUEST_PACKET packet)
     return TRUE;
 }
 
+/*
+ * The three callbacks that make this a Plug and Play miniport. Without all
+ * three the video port takes the driver for a legacy one, calls FindAdapter
+ * to *detect* hardware, and expects VideoPortGetAccessRanges to be told a
+ * slot to look in — it dereferences the slot pointer a PnP driver passes as
+ * NULL, and Windows stops with 0x7E in videoprt.sys on the first boot.
+ */
+VP_STATUS GetPowerState(PVOID extension, ULONG id, PVIDEO_POWER_MANAGEMENT power)
+{
+    (void)extension;
+    (void)id;
+    (void)power;
+    /* A virtual adapter and its monitor can be in any power state. */
+    return NO_ERROR;
+}
+
+VP_STATUS SetPowerState(PVOID extension, ULONG id, PVIDEO_POWER_MANAGEMENT power)
+{
+    (void)extension;
+    (void)id;
+    (void)power;
+    return NO_ERROR;
+}
+
+/* One child: the monitor, with the EDID the device shows at the start of
+ * its register page. */
+VP_STATUS GetChildDescriptor(PVOID extension, PVIDEO_CHILD_ENUM_INFO info, PVIDEO_CHILD_TYPE type,
+                             PUCHAR descriptor, PULONG id, PULONG unused)
+{
+    DEVICE_EXT *ext = (DEVICE_EXT *)extension;
+    ULONG i;
+
+    if (info->ChildIndex != 1) {
+        return info->ChildIndex == 0 ? VIDEO_ENUM_INVALID_DEVICE : VIDEO_ENUM_NO_MORE_DEVICES;
+    }
+    *type = Monitor;
+    *id = 1;
+    *unused = 0;
+    if (descriptor != NULL && info->ChildDescriptorSize >= 128) {
+        for (i = 0; i < 128; i++) {
+            descriptor[i] = VideoPortReadRegisterUchar(ext->regs + i);
+        }
+        /* No EDID header: let Windows use its default monitor. */
+        if (descriptor[0] != 0x00 || descriptor[1] != 0xff || descriptor[7] != 0x00) {
+            VideoPortZeroMemory(descriptor, info->ChildDescriptorSize);
+        }
+    }
+    return VIDEO_ENUM_MORE_DEVICES;
+}
+
 ULONG DriverEntry(PVOID context1, PVOID context2)
 {
     VIDEO_HW_INITIALIZATION_DATA init;
@@ -350,6 +400,9 @@ ULONG DriverEntry(PVOID context1, PVOID context2)
     init.HwFindAdapter = FindAdapter;
     init.HwInitialize = Initialize;
     init.HwStartIO = StartIO;
+    init.HwGetPowerState = GetPowerState;
+    init.HwSetPowerState = SetPowerState;
+    init.HwGetVideoChildDescriptor = GetChildDescriptor;
     init.HwDeviceExtensionSize = sizeof(DEVICE_EXT);
     init.AdapterInterfaceType = PCIBus;
     return VideoPortInitialize(context1, context2, &init, NULL);
