@@ -100,9 +100,16 @@ const SHUTDOWN: &str = "shutdown -s -t 5";
 const RUN_ADDITIONS: &str = r"cmd /c for %i in (D E F G H) do if exist %i:\entangled\setup.cmd call %i:\entangled\setup.cmd";
 /// The additions disc's script: the drivers, then the power-off the
 /// installer waits for.
-const SETUP_CMD: &str = "@echo off\r\n\"%~dp0entxp-setup.exe\"\r\nshutdown -s -t 5\r\n";
+const SETUP_CMD: &str = "@echo off\r\ncopy /y \"%~dp0gltest.exe\" \"%SystemRoot%\\gltest.exe\"\r\n\"%~dp0entxp-setup.exe\"\r\nshutdown -s -t 5\r\n";
 /// The files of `guest/winxp/build.sh`'s output the additions disc carries.
-const ADDITIONS: [&str; 4] = ["entxp.sys", "entxp.dll", "entxp.inf", "entxp-setup.exe"];
+const ADDITIONS: [&str; 6] = [
+    "entxp.sys",
+    "entxp.dll",
+    "entxp.inf",
+    "entxp-setup.exe",
+    "entgl.dll",
+    "gltest.exe",
+];
 /// The directory with those files, when the user has them: the display
 /// driver of ADR-0013. Without it Windows keeps its own VGA driver.
 const ADDITIONS_ENV: &str = "ENTANGLED_WINXP_ADDITIONS";

@@ -83,6 +83,12 @@ lld-link -machine:x86 -nodefaultlib -release -dll -subsystem:windows,5.01 -osver
     -entry:DllEntry@12 -def:"$here/opengl/entgl.def" -out:"$out/entgl.dll" "$out/icd.obj" \
     "$libs/kernel32.lib" "$libs/user32.lib" "$libs/gdi32.lib"
 
+echo "gltest.exe (a spinning cube, to see OpenGL work)"
+clang "${setup_cflags[@]}" "$here/opengl/gltest.c" -o "$out/gltest.obj"
+lld-link -machine:x86 -nodefaultlib -release -subsystem:windows,5.01 -osversion:5.1 \
+    -entry:entry -out:"$out/gltest.exe" "$out/gltest.obj" \
+    "$libs/kernel32.lib" "$libs/user32.lib" "$libs/gdi32.lib" "$libs/opengl32.lib"
+
 # The same OpenGL driver for the host, 64-bit, with the escape replaced by a
 # hook: what crates/gl-passthrough/tests/icd.rs loads. Never shipped.
 libs64="${kits/Include/Lib}/um/x64"
