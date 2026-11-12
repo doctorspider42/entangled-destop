@@ -48,19 +48,12 @@ static void cube(void)
 
 static void title(HWND window, unsigned fps)
 {
+    /* "123 fps - <renderer>": the number first, where a narrow title bar
+     * still shows it. */
     char text[200];
     const char *renderer = (const char *)glGetString(GL_RENDERER);
-    const char *prefix = "OpenGL: ";
+    const char *middle = " fps - ";
     char *out = text;
-    while (*prefix) {
-        *out++ = *prefix++;
-    }
-    while (renderer != NULL && *renderer && out < text + 150) {
-        *out++ = *renderer++;
-    }
-    *out++ = ' ';
-    *out++ = '-';
-    *out++ = ' ';
     if (fps >= 1000) {
         *out++ = (char)('0' + fps / 1000 % 10);
     }
@@ -71,10 +64,12 @@ static void title(HWND window, unsigned fps)
         *out++ = (char)('0' + fps / 10 % 10);
     }
     *out++ = (char)('0' + fps % 10);
-    *out++ = ' ';
-    *out++ = 'f';
-    *out++ = 'p';
-    *out++ = 's';
+    while (*middle) {
+        *out++ = *middle++;
+    }
+    while (renderer != NULL && *renderer && out < text + 190) {
+        *out++ = *renderer++;
+    }
     *out = 0;
     SetWindowTextA(window, text);
 }
@@ -161,6 +156,5 @@ void entry(void)
             frames = 0;
             second = now;
         }
-        Sleep(10);
     }
 }

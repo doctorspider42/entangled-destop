@@ -622,13 +622,31 @@ fn dsdt(vcpu_count: u32, mmio64_base: u64) -> Vec<u8> {
         sb.extend_from_slice(&ps2k);
     }
 
+    // Processors. An `ACPI0007` device is ACPI 3.0's way of declaring one,
+    // and Windows XP predates it: it lists each as an unknown device with
+    // no driver. A BIOS-era machine declares them the old way, as
+    // `Processor` objects under `\_PR`, with the id its MADT entry carries.
+    let mut pr = Vec::new();
     for cpu in 0..vcpu_count {
-        let mut processor = aml::name("_HID", &aml::string("ACPI0007"));
-        processor.extend_from_slice(&aml::name("_UID", &aml::integer(u64::from(cpu))));
-        sb.extend_from_slice(&aml::device(&cpu_name(cpu), &processor));
+        if mmio64_base == NO_MMIO64 {
+            // ProcessorOp, PkgLength, name, processor id, no P_BLK.
+            let mut object = aml::name_seg(&cpu_name(cpu)).to_vec();
+            object.push(cpu as u8);
+            object.extend_from_slice(&[0, 0, 0, 0, 0]);
+            pr.extend_from_slice(&[0x5b, 0x83]);
+            pr.extend_from_slice(&aml::pkg_length(object.len()));
+            pr.extend_from_slice(&object);
+        } else {
+            let mut processor = aml::name("_HID", &aml::string("ACPI0007"));
+            processor.extend_from_slice(&aml::name("_UID", &aml::integer(u64::from(cpu))));
+            sb.extend_from_slice(&aml::device(&cpu_name(cpu), &processor));
+        }
     }
 
     body.extend_from_slice(&aml::scope(&aml::root_name("_SB"), &sb));
+    if !pr.is_empty() {
+        body.extend_from_slice(&aml::scope(&aml::root_name("_PR"), &pr));
+    }
 
     // Revision 2 or higher tells the interpreter integers are 64-bit.
     sdt(b"DSDT", 2, &body)
@@ -801,6 +819,27 @@ mod tests {
             |tables: &AcpiTables| tables.blob().windows(3).any(|w| w == [0x8a, 0x2b, 0x00]);
         assert!(has_qword(&with));
         assert!(!has_qword(&without));
+    }
+
+    /// A BIOS machine declares its processors as `Processor` objects, which
+    /// Windows XP knows; every other machine as `ACPI0007` devices.
+    #[test]
+    fn the_legacy_tables_declare_processors_the_old_way() {
+        let count = |tables: &AcpiTables, needle: &[u8]| {
+            tables
+                .blob()
+                .windows(needle.len())
+                .filter(|w| *w == needle)
+                .count()
+        };
+        let modern = AcpiTables::new(2, TEST_MMIO64_BASE).unwrap();
+        let legacy = AcpiTables::new(2, NO_MMIO64).unwrap();
+        assert_eq!(count(&modern, b"ACPI0007"), 2);
+        assert_eq!(count(&legacy, b"ACPI0007"), 0);
+        // ProcessorOp, PkgLength 11, "C001", id 1, no P_BLK.
+        let second = [0x5b, 0x83, 0x0b, b'C', b'0', b'0', b'1', 1, 0, 0, 0, 0, 0];
+        assert_eq!(count(&legacy, &second), 1);
+        assert_eq!(count(&modern, &second), 0);
     }
 
     /// A BIOS machine's root bridge routes its devices' interrupts, and the
