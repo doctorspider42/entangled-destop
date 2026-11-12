@@ -96,6 +96,73 @@ d3d9_log(const char *format, ...)
    LeaveCriticalSection(&log_lock);
 }
 
+/* ----------------------------------------------------------------- rings */
+
+/* The last device functions called, by name: always kept (a store a call),
+ * and printed by the crash report. With ENTANGLED_D3D9_RING=1 a second ring
+ * keeps what the ones that matter were told and answered. */
+static const char *volatile call_ring[64];
+static volatile LONG call_at;
+static char note_ring[96][150];
+static volatile LONG note_at;
+static volatile LONG note_on = -1;
+
+static void
+d3d9_note(const char *format, ...)
+{
+   va_list args;
+   char *line;
+
+   if (note_on == -1) {
+      char want[4] = "";
+
+      GetEnvironmentVariableA("ENTANGLED_D3D9_RING", want, sizeof want);
+      InterlockedExchange(&note_on, want[0] == '1');
+   }
+   if (!note_on)
+      return;
+   line = note_ring[(unsigned)InterlockedIncrement(&note_at) % 96];
+   va_start(args, format);
+   _vsnprintf(line, sizeof note_ring[0] - 1, format, args);
+   va_end(args);
+   line[sizeof note_ring[0] - 1] = 0;
+}
+
+static void
+d3d9_print_rings(void)
+{
+   char line[230];
+   int at = 0;
+   LONG last = call_at;
+
+   for (int i = 39; i >= 0; i--) {
+      const char *name = call_ring[(unsigned)(last - i) & 63];
+
+      if (!name)
+         continue;
+      /* Without the "d3d9_" every one of them begins with. */
+      at += _snprintf(line + at, sizeof line - 1 - at, " %s", name + 5);
+      if (at > 150) {
+         line[at] = 0;
+         d3d9_log("  calls:%s", line);
+         at = 0;
+      }
+   }
+   if (at) {
+      line[at] = 0;
+      d3d9_log("  calls:%s", line);
+   }
+   if (note_on == 1) {
+      last = note_at;
+      for (int i = 59; i >= 0; i--) {
+         const char *note = note_ring[(unsigned)(last - i) % 96];
+
+         if (last - i > 0 && note[0])
+            d3d9_log("  note: %s", note);
+      }
+   }
+}
+
 /* ---------------------------------------------------------------- crash */
 
 /* A fault in the process this DLL is loaded into: say where, once, and let
@@ -169,7 +236,7 @@ d3d9_crash(EXCEPTION_POINTERS *info)
    DWORD code = info->ExceptionRecord->ExceptionCode;
    ULONG_PTR base = (ULONG_PTR)crash_module, top, *word, *limit;
    IMAGE_NT_HEADERS *nt;
-   char line[220];
+   char line[260];
    int at = 0;
    unsigned found = 0;
 
@@ -196,6 +263,67 @@ d3d9_crash(EXCEPTION_POINTERS *info)
             info->ExceptionRecord->NumberParameters > 1
                ? (void *)info->ExceptionRecord->ExceptionInformation[1]
                : NULL);
+   {
+      const BYTE *code = info->ExceptionRecord->ExceptionAddress;
+      char hex[80];
+      SIZE_T got = 0;
+      BYTE bytes[16];
+      int h = 0;
+
+      if (ReadProcessMemory(GetCurrentProcess(), code, bytes, sizeof bytes, &got)) {
+         for (SIZE_T i = 0; i < got; i++)
+            h += _snprintf(hex + h, sizeof hex - 1 - h, "%02x", bytes[i]);
+         hex[h] = 0;
+         d3d9_log("  code: %s", hex);
+      }
+#if defined(_WIN64)
+      d3d9_log("  rax %Ix rbx %Ix rcx %Ix rdx %Ix rsi %Ix rdi %Ix rbp %Ix rsp %Ix",
+               (size_t)info->ContextRecord->Rax, (size_t)info->ContextRecord->Rbx,
+               (size_t)info->ContextRecord->Rcx, (size_t)info->ContextRecord->Rdx,
+               (size_t)info->ContextRecord->Rsi, (size_t)info->ContextRecord->Rdi,
+               (size_t)info->ContextRecord->Rbp, (size_t)info->ContextRecord->Rsp);
+#else
+      d3d9_log("  eax %Ix ebx %Ix ecx %Ix edx %Ix esi %Ix edi %Ix ebp %Ix esp %Ix",
+               (size_t)info->ContextRecord->Eax, (size_t)info->ContextRecord->Ebx,
+               (size_t)info->ContextRecord->Ecx, (size_t)info->ContextRecord->Edx,
+               (size_t)info->ContextRecord->Esi, (size_t)info->ContextRecord->Edi,
+               (size_t)info->ContextRecord->Ebp, (size_t)info->ContextRecord->Esp);
+#endif
+   }
+   d3d9_print_rings();
+#if !defined(_WIN64)
+   {
+      /* The stack's words by module: return addresses mostly, some stale. */
+      ULONG_PTR *w = (ULONG_PTR *)info->ContextRecord->Esp;
+      ULONG_PTR *end = (ULONG_PTR *)((NT_TIB *)NtCurrentTeb())->StackBase;
+      char where[140];
+      unsigned listed = 0;
+      int a = 0;
+
+      for (; w < end && listed < 36; w++) {
+         HMODULE module = NULL;
+
+         if (*w < 0x10000 ||
+             !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 (LPCSTR)*w, &module) ||
+             !module)
+            continue;
+         d3d9_where((const void *)*w, where, sizeof where);
+         a += _snprintf(line + a, sizeof line - 1 - a, " %s", where);
+         listed++;
+         if (a > 110) {
+            line[a] = 0;
+            d3d9_log("  words:%s", line);
+            a = 0;
+         }
+      }
+      if (a) {
+         line[a] = 0;
+         d3d9_log("  words:%s", line);
+      }
+   }
+#endif
 #if defined(_WIN64)
    {
       /* The callers, unwound: whose call it was, in whichever module. */
@@ -340,6 +468,7 @@ d3d9_here(void)
 
 #define D3D9_HERE() \
    do { \
+      call_ring[(unsigned)InterlockedIncrement(&call_at) & 63] = __func__; \
       if (sample_on) \
          d3d9_here(); \
    } while (0)
@@ -511,36 +640,73 @@ d3d9_stub(unsigned index, const char *name)
 
 /* ----------------------------------------------------------------- caps */
 
-/* What the adapter says it can do with a format. Phase N0's list is the
- * handful a desktop program asks for; N1 takes it from the Gallium screen. */
-#define OPS_COLOR                                                            \
-   (FORMATOP_TEXTURE | FORMATOP_CUBETEXTURE | FORMATOP_OFFSCREEN_RENDERTARGET | \
-    FORMATOP_SAME_FORMAT_RENDERTARGET | FORMATOP_CONVERT_TO_ARGB |           \
-    FORMATOP_OFFSCREENPLAIN | FORMATOP_SRGBREAD | FORMATOP_SRGBWRITE |       \
-    FORMATOP_MEMBEROFGROUP_ARGB |                                            \
-    FORMATOP_AUTOGENMIPMAP | FORMATOP_VERTEXTEXTURE)
+/* What the adapter says it can do with a format: what Nine on Zink on a
+ * desktop GPU does with each, written out (the runtime asks before there is a
+ * device, and so before there is a screen to ask). A program that is refused a
+ * format it takes for granted - a volume texture for colour correction, a
+ * float render target - does not always look at the answer. */
+#define OPS_SAMPLED                                                         \
+   (FORMATOP_TEXTURE | FORMATOP_CUBETEXTURE | FORMATOP_VOLUMETEXTURE |      \
+    FORMATOP_OFFSCREENPLAIN | FORMATOP_CONVERT_TO_ARGB | FORMATOP_VERTEXTEXTURE)
+#define OPS_TARGET                                                          \
+   (OPS_SAMPLED | FORMATOP_OFFSCREEN_RENDERTARGET |                         \
+    FORMATOP_SAME_FORMAT_RENDERTARGET | FORMATOP_AUTOGENMIPMAP)
+/* The three the desktop is made of: the runtime lets only these say they
+ * are members of the ARGB group. */
+#define OPS_COLOR                                                           \
+   (OPS_TARGET | FORMATOP_SRGBREAD | FORMATOP_SRGBWRITE | FORMATOP_MEMBEROFGROUP_ARGB)
 #define OPS_DISPLAY (OPS_COLOR | FORMATOP_DISPLAYMODE | FORMATOP_3DACCELERATION)
 #define OPS_DEPTH \
    (FORMATOP_ZSTENCIL | FORMATOP_ZSTENCIL_WITH_ARBITRARY_COLOR_DEPTH)
-#define OPS_TEXTURE \
-   (FORMATOP_TEXTURE | FORMATOP_CUBETEXTURE | FORMATOP_OFFSCREENPLAIN | \
-    FORMATOP_CONVERT_TO_ARGB)
+/* Block-compressed: no volumes (Vulkan has none of them in three dimensions
+ * everywhere). */
+#define OPS_COMPRESSED                                                      \
+   (FORMATOP_TEXTURE | FORMATOP_CUBETEXTURE | FORMATOP_OFFSCREENPLAIN |     \
+    FORMATOP_CONVERT_TO_ARGB | FORMATOP_SRGBREAD)
+#define OPS_BUMP (OPS_SAMPLED | FORMATOP_BUMPMAP)
+#define D3D9_FOURCC(a, b, c, d) \
+   ((D3DDDIFORMAT)((UINT)(a) | ((UINT)(b) << 8) | ((UINT)(c) << 16) | ((UINT)(d) << 24)))
 
 static const FORMATOP d3d9_formats[] = {
    {D3DDDIFMT_X8R8G8B8, OPS_DISPLAY, 0, 0, 0},
    /* Never a display mode: d3d9.dll disables a driver that reports "an alpha
     * format with D3DFORMAT_OP_3DACCELERATION" (its words). */
    {D3DDDIFMT_A8R8G8B8, OPS_COLOR | FORMATOP_SAME_FORMAT_UP_TO_ALPHA_RENDERTARGET, 0, 0, 0},
-   {D3DDDIFMT_R5G6B5, OPS_COLOR, 0, 0, 0},
-   {D3DDDIFMT_A8, OPS_TEXTURE, 0, 0, 0},
-   {D3DDDIFMT_L8, OPS_TEXTURE, 0, 0, 0},
-   {D3DDDIFMT_A8L8, OPS_TEXTURE, 0, 0, 0},
-   {D3DDDIFMT_DXT1, OPS_TEXTURE | FORMATOP_SRGBREAD, 0, 0, 0},
-   {D3DDDIFMT_DXT3, OPS_TEXTURE | FORMATOP_SRGBREAD, 0, 0, 0},
-   {D3DDDIFMT_DXT5, OPS_TEXTURE | FORMATOP_SRGBREAD, 0, 0, 0},
-   {D3DDDIFMT_D16, OPS_DEPTH, 0, 0, 0},
-   {D3DDDIFMT_D24X8, OPS_DEPTH, 0, 0, 0},
-   {D3DDDIFMT_D24S8, OPS_DEPTH, 0, 0, 0},
+   {D3DDDIFMT_R5G6B5, OPS_COLOR & ~FORMATOP_VOLUMETEXTURE, 0, 0, 0},
+   {D3DDDIFMT_A2B10G10R10, OPS_TARGET, 0, 0, 0},
+   {D3DDDIFMT_A2R10G10B10, OPS_TARGET, 0, 0, 0},
+   {D3DDDIFMT_A16B16G16R16, OPS_TARGET, 0, 0, 0},
+   {D3DDDIFMT_G16R16, OPS_TARGET, 0, 0, 0},
+   {D3DDDIFMT_R16F, OPS_TARGET, 0, 0, 0},
+   {D3DDDIFMT_G16R16F, OPS_TARGET, 0, 0, 0},
+   {D3DDDIFMT_A16B16G16R16F, OPS_TARGET, 0, 0, 0},
+   {D3DDDIFMT_R32F, OPS_TARGET, 0, 0, 0},
+   {D3DDDIFMT_G32R32F, OPS_TARGET, 0, 0, 0},
+   {D3DDDIFMT_A32B32G32R32F, OPS_TARGET, 0, 0, 0},
+   {D3DDDIFMT_A8, OPS_SAMPLED, 0, 0, 0},
+   {D3DDDIFMT_L8, OPS_SAMPLED, 0, 0, 0},
+   {D3DDDIFMT_A8L8, OPS_SAMPLED, 0, 0, 0},
+   {D3DDDIFMT_L16, OPS_SAMPLED, 0, 0, 0},
+   {D3DDDIFMT_V8U8, OPS_BUMP, 0, 0, 0},
+   {D3DDDIFMT_Q8W8V8U8, OPS_BUMP, 0, 0, 0},
+   {D3DDDIFMT_V16U16, OPS_BUMP, 0, 0, 0},
+   {D3DDDIFMT_DXT1, OPS_COMPRESSED, 0, 0, 0},
+   {D3DDDIFMT_DXT2, OPS_COMPRESSED, 0, 0, 0},
+   {D3DDDIFMT_DXT3, OPS_COMPRESSED, 0, 0, 0},
+   {D3DDDIFMT_DXT4, OPS_COMPRESSED, 0, 0, 0},
+   {D3DDDIFMT_DXT5, OPS_COMPRESSED, 0, 0, 0},
+   {D3D9_FOURCC('A', 'T', 'I', '1'), OPS_COMPRESSED & ~FORMATOP_SRGBREAD, 0, 0, 0},
+   {D3D9_FOURCC('A', 'T', 'I', '2'), OPS_COMPRESSED & ~FORMATOP_SRGBREAD, 0, 0, 0},
+   /* Depth: as buffers, and as textures a shader compares against (what
+    * Direct3D 9 drivers call hardware shadow maps). */
+   {D3DDDIFMT_D16, OPS_DEPTH | FORMATOP_TEXTURE, 0, 0, 0},
+   {D3DDDIFMT_D24X8, OPS_DEPTH | FORMATOP_TEXTURE, 0, 0, 0},
+   {D3DDDIFMT_D24S8, OPS_DEPTH | FORMATOP_TEXTURE, 0, 0, 0},
+   {D3D9_FOURCC('I', 'N', 'T', 'Z'), OPS_DEPTH | FORMATOP_TEXTURE, 0, 0, 0},
+   /* A render target that is not there, for drawing depth alone. */
+   {D3D9_FOURCC('N', 'U', 'L', 'L'),
+    FORMATOP_TEXTURE | FORMATOP_OFFSCREEN_RENDERTARGET | FORMATOP_SAME_FORMAT_RENDERTARGET, 0, 0,
+    0},
 };
 
 static const D3DDDIQUERYTYPE d3d9_queries[] = {
@@ -933,12 +1099,16 @@ d3d9_tracing_frames(void)
 
 #define D3D9_FRAME(...)         \
    do {                         \
+      if (note_on)              \
+         d3d9_note(__VA_ARGS__); \
       if (d3d9_tracing_frames()) \
          d3d9_log(__VA_ARGS__); \
    } while (0)
 
 #define D3D9_TRACE(...)         \
    do {                         \
+      if (note_on)              \
+         d3d9_note(__VA_ARGS__); \
       if (d3d9_tracing())       \
          d3d9_log(__VA_ARGS__); \
    } while (0)
@@ -1118,6 +1288,11 @@ d3d9_create_resource2(HANDLE handle, D3DDDIARG_CREATERESOURCE2 *arg)
    }
 
    arg->hResource = resource;
+   d3d9_note("resource %p: format %u, %ux%ux%u, %u surfaces, pool %u, flags 0x%x%s%s%s",
+             (void *)resource, (unsigned)arg->Format, resource->width, resource->height,
+             resource->depth, arg->SurfCount, (unsigned)arg->Pool, arg->Flags.Value,
+             resource->nine ? ", nine" : "", resource->sysmem ? ", sysmem" : "",
+             resource->allocation ? ", allocation" : "");
    if (InterlockedIncrement(&said) <= 40)
       d3d9_log("resource %p: format %u, %ux%u, %u surfaces, pool %u, flags 0x%x%s%s%s",
                (void *)resource, (unsigned)arg->Format, resource->width, resource->height,
@@ -1198,8 +1373,14 @@ d3d9_lock(HANDLE handle, D3DDDIARG_LOCK *arg)
       resource->notified_size = whole ? resource->width : box[2] - box[0];
       return S_OK;
    }
-   if (!device->nine || !resource->nine)
-      return S_OK;
+   if (!device->nine || !resource->nine) {
+      static volatile LONG said;
+
+      if (InterlockedIncrement(&said) <= 8)
+         d3d9_log("lock of %p (format %u, %ux%u): neither system memory nor Nine's",
+               (void *)resource, (unsigned)resource->format, resource->width, resource->height);
+      return E_FAIL;
+   }
    if (arg->Flags.ReadOnly)
       flags |= 0x10; /* D3DLOCK_READONLY */
    if (arg->Flags.NoOverwrite)
@@ -1214,6 +1395,8 @@ d3d9_lock(HANDLE handle, D3DDDIARG_LOCK *arg)
       arg->Pitch = pitch;
       arg->SlicePitch = slice_pitch;
    }
+   d3d9_note("  lock of %p.%u: 0x%08lx, %p pitch %u", (void *)resource, arg->SubResourceIndex,
+             (unsigned long)result, data, pitch);
    D3D9_CHECK("lock", result);
 }
 
@@ -1360,6 +1543,46 @@ d3d9_tex_blt1(HANDLE handle, const D3DDDIARG_TEXBLT1 *arg)
                                      x, y, from->memory, from->pitch, rect);
    }
    D3D9_CHECK("texture update", result);
+}
+
+/* UpdateTexture for volumes: every level whole (the box the runtime names is
+ * not looked at), slice by slice and row by row. */
+static HRESULT APIENTRY
+d3d9_vol_blt1(HANDLE handle, const D3DDDIARG_VOLUMEBLT1 *arg)
+{
+   D3D9_HERE();
+   struct d3d9_device *device = handle;
+   struct d3d9_resource *dst = arg->hDstResource, *src = arg->hSrcResource;
+   long result = S_OK;
+
+   if (!device->nine || !dst || !src || !dst->nine || !src->sysmem)
+      return S_OK;
+   for (UINT level = 0; level < min(dst->surfaces, src->surfaces) && result >= 0; level++) {
+      const struct d3d9_sysmem *from = &src->sysmem[level];
+      unsigned pitch = 0, slice_pitch = 0;
+      void *data = NULL;
+
+      if (!from->memory || !from->pitch || !from->slice_pitch)
+         continue;
+      result = entangled_nine_lock(device->nine, dst->nine, dst->kind, dst->levels, level, NULL,
+                                   0, &data, &pitch, &slice_pitch);
+      if (result < 0 || !data)
+         break;
+      if (pitch && slice_pitch) {
+         UINT rows = min(from->slice_pitch / from->pitch, slice_pitch / pitch);
+         UINT bytes = min(from->pitch, pitch);
+
+         for (UINT z = 0; z < max(from->depth, 1); z++) {
+            for (UINT y = 0; y < rows; y++)
+               memcpy((char *)data + (size_t)z * slice_pitch + (size_t)y * pitch,
+                      (const char *)from->memory + (size_t)z * from->slice_pitch +
+                         (size_t)y * from->pitch,
+                      bytes);
+         }
+      }
+      result = entangled_nine_unlock(device->nine, dst->nine, dst->kind, dst->levels, level);
+   }
+   D3D9_CHECK("volume update", result);
 }
 
 /* The same for buffers. */
@@ -2339,6 +2562,7 @@ d3d9_create_device(HANDLE adapter, D3DDDIARG_CREATEDEVICE *arg)
    funcs->pfnRename = d3d9_rename;
    funcs->pfnTexBlt1 = d3d9_tex_blt1;
    funcs->pfnBufBlt1 = d3d9_buf_blt1;
+   funcs->pfnVolBlt1 = d3d9_vol_blt1;
    funcs->pfnBlt = d3d9_blt;
    funcs->pfnColorFill = d3d9_color_fill;
    funcs->pfnGenerateMipSubLevels = d3d9_generate_mips;
@@ -2462,19 +2686,17 @@ OpenAdapter(D3DDDIARG_OPENADAPTER *arg)
    char want[8] = "";
    const char *base = exe;
 
-   /* Until the device draws (phase N2), a program that got one would be
-    * worse off than with none: its locks would return nothing. So only the
-    * test program is served, and whoever sets ENTANGLED_D3D9=1 to see what
-    * a real program calls; everyone else is told there is no driver, which
-    * is what they were told before this DLL existed. */
+   /* Every program is served. ENTANGLED_D3D9=0 in a program's environment
+    * tells it there is no driver, which is what it was told before this DLL
+    * existed (and what sends a game to its own Vulkan or software path). */
    GetModuleFileNameA(NULL, exe, sizeof exe);
    for (const char *p = exe; *p; p++) {
       if (*p == '\\' || *p == '/')
          base = p + 1;
    }
    GetEnvironmentVariableA("ENTANGLED_D3D9", want, sizeof want);
-   if (_strnicmp(base, "d3d9-test", 9) != 0 && strcmp(want, "1") != 0) {
-      d3d9_log("not serving %.150s yet", base);
+   if (strcmp(want, "0") == 0) {
+      d3d9_log("not serving %.150s: ENTANGLED_D3D9=0", base);
       return E_FAIL;
    }
 

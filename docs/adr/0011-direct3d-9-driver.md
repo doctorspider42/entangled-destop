@@ -299,3 +299,63 @@ planes; lost devices. `Present1` is a read-back and a copy per frame —
 N4's overlay plane replaces it. Seen once and not understood: the 64-bit
 test dying on a null pointer in a system DLL when keys were typed at it
 mid-run; the report will name the module next time.
+
+### N3 (2026-11-12): a game
+
+Portal 2, started with no launch option and nothing in its environment,
+comes up on the driver: the menu with its film behind it, and from
+"Continue game" a level, drawn right — lit, textured, the portal's view
+through the glass — and walked about in. Every program is served now
+(`ENTANGLED_D3D9=0` in a program's environment tells it there is no driver).
+It runs at 12–14 frames a second in a 1280×720 window: `Present1` reads the
+frame back and copies it through the guest's CPU, and Nine's context is not
+threaded. Both are N4's.
+
+What stood between the test program and the game, in the order met:
+
+- **An indexed draw from memory in Nine** ran its state update with stream 0
+  unbound; a vertex element took its buffer index from an uninitialised map
+  and the array of vertex buffers was cleared past its end. In the 32-bit
+  build that is a changed stack cookie, which ends the process with a
+  fast-fail no exception handler sees — the DLL carries its own
+  `__report_gsfailure` to say where.
+- **The runtime's worker thread.** With `pfnLockAsync`, `pfnUnlockAsync` and
+  `pfnRename` given, Windows 10's d3d9.dll plays the device's calls from a
+  thread of its own (two 768 KB command buffers, swapped) and calls those
+  three from the program's thread meanwhile. Nothing under the front may be
+  entered by two threads; the threaded context's queue was corrupted and its
+  worker spun on a call number that does not exist, while the program's
+  thread waited for it a second at a time, for ever. The three are not
+  given, and every call arrives in order from one thread at a time
+  (`ENTANGLED_D3D9_ASYNC=1` gives them back, for the day they are made safe).
+- **The format list.** A game takes formats for granted that N0's list did
+  not have and does not look at the refusal (a texture handle of -1, used).
+  The list is now what Nine on Zink does on a desktop GPU: volumes, 10- and
+  16-bit and float targets, bump maps, the block-compressed ones with ATI1
+  and ATI2, depth formats as textures, INTZ and NULL. `VolBlt1` is real.
+- **Buffers freed under queued draws.** Since Mesa 26 a draw in a threaded
+  context's queue holds no reference to its index or vertex buffers — a
+  frontend releases those through the context (`resource_release`) — and
+  Nine drops them the old way. Zink's thread drew from a freed index buffer.
+  Nine asks for a plain context now; porting its releases is N4's, with the
+  thread.
+- **An empty render area.** `Clear` and `ColorFill` with a rectangle the
+  viewport leaves nothing of are skipped. Twice more, before the runtime's
+  worker thread was gone, Zink began a rendering with an empty area from
+  somewhere else and our host refused it (the ring is fatal, the game loses
+  its device); not seen since, not explained.
+
+**How it was found** — the driver's own instruments, all still in it:
+a ring of the last device functions called and (`ENTANGLED_D3D9_RING=1`) of
+what they were told, printed by the crash report with the registers, the
+faulting instruction's bytes and the stack's words by module and nearest
+export; a sampler (`ENTANGLED_D3D9_SAMPLE=1`) that says every five seconds
+where each thread that calls the driver is, what handle it waits on, and
+once, the runtime's code before its return addresses (the guest's build of
+d3d9.dll is not the host's); `ENTANGLED_D3D9_TRACE=2` for where drawing goes.
+Windows' Application event log (event 1000) names the module and offset of a
+death no handler saw.
+
+Not done: user clip planes (Zink has no `set_clip_state`), state blocks of
+a pure device, blits back to system memory, lost devices, `DepthFill`,
+`ValidateDevice`; the caps are still N0's table.
