@@ -45,6 +45,10 @@ BIOS, real VGA, PCI IDE, level-triggered INTx, a PS/2 mouse; phases X0–X5;
 X0 and X1 done: `boot.mode = "bios"`, a BIOS of our own, an IDE
 controller and a VGA register file take the XP CD into text-mode Setup;
 branch `winxp-guests`).
+[docs/adr/0013-windows-xp-3d.md](docs/adr/0013-windows-xp-3d.md)
+(proposed: 3D for XP guests — an XPDM display driver of our own, an OpenGL
+ICD that passes the guest's GL calls to the host's OpenGL, Direct3D through
+a wrapper on top; phases G0–G5, nothing implemented).
 
 ## Build and test
 
