@@ -16,6 +16,7 @@ ahci.workspace = true
 pc-bios.workspace = true
 ide.workspace = true
 rtl8139.workspace = true
+gl-passthrough.workspace = true
 # The shared clipboard's host side (the same arboard the display links).
 arboard = { version = "3.6", default-features = false }
 virtio-console.workspace = true

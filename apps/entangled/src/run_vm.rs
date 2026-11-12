@@ -1891,6 +1891,22 @@ pub fn run_with(
             }
         }
     }
+    // And OpenGL: a BIOS machine's guest has no virtio-gpu to draw 3D
+    // through, so its display driver hands OpenGL calls to the host's
+    // (ADR-0013). A host with no usable OpenGL simply offers none.
+    #[cfg(windows)]
+    if bus.bios().is_some() {
+        if let Some(fb) = bus.pci().and_then(|pci| pci.framebuffer()) {
+            match gl_passthrough::GlThread::start() {
+                Ok(gl) => {
+                    if fb.device.set_accelerator(Arc::new(GlAccelerator(gl))) {
+                        tracing::info!("OpenGL passthrough offered to the guest");
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "no OpenGL passthrough"),
+            }
+        }
+    }
     let _bios_text_presenter = match bus.bios() {
         Some(bios) => {
             let mem = match bios.lock() {
@@ -4005,5 +4021,34 @@ mod tests {
         ] {
             assert!(!shares_scanout(&plan, ScanoutPath::Shared), "{plan:?}");
         }
+    }
+}
+
+/// The host's OpenGL as the boot framebuffer's accelerator (ADR-0013).
+#[cfg(windows)]
+struct GlAccelerator(gl_passthrough::GlThread);
+
+#[cfg(windows)]
+impl machine_x86::framebuffer::Accelerator for GlAccelerator {
+    fn run(&self, commands: &[u8]) -> machine_x86::framebuffer::Accelerated {
+        let outcome = self.0.run(gl_passthrough::words_of(commands));
+        machine_x86::framebuffer::Accelerated {
+            response: outcome.response,
+            blits: outcome
+                .presents
+                .into_iter()
+                .map(|p| machine_x86::framebuffer::Blit {
+                    x: p.x,
+                    y: p.y,
+                    width: p.width,
+                    height: p.height,
+                    pixels: p.pixels,
+                })
+                .collect(),
+        }
+    }
+
+    fn reset(&self) {
+        self.0.reset();
     }
 }

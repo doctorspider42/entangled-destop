@@ -1441,6 +1441,7 @@ dependencies = [
  "display",
  "ext4-view",
  "flate2",
+ "gl-passthrough",
  "ide",
  "libc",
  "linux-boot",
