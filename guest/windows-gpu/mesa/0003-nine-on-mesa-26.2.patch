@@ -371,7 +371,7 @@ index 8352a2e7..14c3ea4a 100644
 -  ]
  )
 diff --git a/src/gallium/frontends/nine/nine_ff.c b/src/gallium/frontends/nine/nine_ff.c
-index 2a9fd461..06beeb27 100644
+index 2a9fd461..04f66301 100644
 --- a/src/gallium/frontends/nine/nine_ff.c
 +++ b/src/gallium/frontends/nine/nine_ff.c
 @@ -336,7 +336,7 @@ static void *
@@ -392,6 +392,69 @@ index 2a9fd461..06beeb27 100644
      struct ureg_dst oCol;
      unsigned s;
      const unsigned texcoord_sn = get_texcoord_sn(device->screen);
+@@ -2068,11 +2068,31 @@ nine_ff_load_viewport_info(struct NineDevice9 *device)
+     dst[101].z = (float)(viewport->MinZ);
+ }
+ 
++static void
++nine_ff_upload_constants(struct nine_context *context, struct pipe_constant_buffer *slot,
++                         const void *data, unsigned size)
++{
++    struct pipe_constant_buffer cb;
++
++    /* Into a real buffer, as the constants of a program's shaders go: a
++     * driver need not take a user buffer (Zink in Mesa 26.2 reads nothing
++     * right out of one). */
++    cb.buffer = NULL;
++    cb.buffer_offset = 0;
++    cb.buffer_size = size;
++    cb.user_buffer = NULL;
++    u_upload_data_ref(context->pipe->const_uploader, 0, size, 256, data,
++                      &cb.buffer_offset, &cb.buffer);
++    u_upload_unmap(context->pipe->const_uploader);
++
++    pipe_resource_reference(&slot->buffer, NULL);
++    *slot = cb;
++}
++
+ void
+ nine_ff_update(struct NineDevice9 *device)
+ {
+     struct nine_context *context = &device->context;
+-    struct pipe_constant_buffer cb;
+ 
+     DBG("vs=%p ps=%p\n", context->vs, context->ps);
+ 
+@@ -2095,12 +2115,8 @@ nine_ff_update(struct NineDevice9 *device)
+ 
+         memset(context->ff.changed.transform, 0, sizeof(context->ff.changed.transform));
+ 
+-        cb.buffer_offset = 0;
+-        cb.buffer = NULL;
+-        cb.user_buffer = device->ff.vs_const;
+-        cb.buffer_size = NINE_FF_NUM_VS_CONST * 4 * sizeof(float);
+-
+-        context->pipe_data.cb_vs_ff = cb;
++        nine_ff_upload_constants(context, &context->pipe_data.cb_vs_ff, device->ff.vs_const,
++                                 NINE_FF_NUM_VS_CONST * 4 * sizeof(float));
+         context->commit |= NINE_STATE_COMMIT_CONST_VS;
+ 
+         context->changed.group &= ~NINE_STATE_FF_VS;
+@@ -2109,12 +2125,8 @@ nine_ff_update(struct NineDevice9 *device)
+     if (!context->ps) {
+         nine_ff_load_ps_params(device);
+ 
+-        cb.buffer_offset = 0;
+-        cb.buffer = NULL;
+-        cb.user_buffer = device->ff.ps_const;
+-        cb.buffer_size = NINE_FF_NUM_PS_CONST * 4 * sizeof(float);
+-
+-        context->pipe_data.cb_ps_ff = cb;
++        nine_ff_upload_constants(context, &context->pipe_data.cb_ps_ff, device->ff.ps_const,
++                                 NINE_FF_NUM_PS_CONST * 4 * sizeof(float));
+         context->commit |= NINE_STATE_COMMIT_CONST_PS;
+ 
+         context->changed.group &= ~NINE_STATE_FF_PS;
 diff --git a/src/gallium/frontends/nine/nine_memory_helper.c b/src/gallium/frontends/nine/nine_memory_helper.c
 index 67febdda..cb78df9f 100644
 --- a/src/gallium/frontends/nine/nine_memory_helper.c
@@ -454,7 +517,7 @@ index 01dd49d5..740e5595 100644
  }
  
 diff --git a/src/gallium/frontends/nine/nine_shader.c b/src/gallium/frontends/nine/nine_shader.c
-index cc70f6fd..a15a8b2d 100644
+index cc70f6fd..3c1ff2f1 100644
 --- a/src/gallium/frontends/nine/nine_shader.c
 +++ b/src/gallium/frontends/nine/nine_shader.c
 @@ -429,7 +429,7 @@ struct shader_translator
@@ -495,7 +558,19 @@ index cc70f6fd..a15a8b2d 100644
          break;
      }
  }
-@@ -3244,7 +3244,7 @@ create_op_info_map(struct shader_translator *tx)
+@@ -3173,7 +3173,10 @@ static const struct sm1_op_info inst_table[] =
+     _OPI(REP,    NOP,    V(2,0), V(3,0), V(2,1), V(3,0), 0, 1, SPECIAL(REP)),
+     _OPI(ENDREP, NOP,    V(2,0), V(3,0), V(2,1), V(3,0), 0, 0, SPECIAL(ENDREP)),
+     _OPI(IF,     IF,     V(2,0), V(3,0), V(2,1), V(3,0), 0, 1, SPECIAL(IF)),
+-    _OPI(IFC,    IF,     V(2,1), V(3,0), V(2,1), V(3,0), 0, 2, SPECIAL(IFC)),
++    /* From vs_2_0, not 2_x as the language has it: the shaders Windows' runtime
++     * writes for the fixed-function pipeline under a WDDM driver are vs_2_0 and
++     * use it, and a skipped ifc leaves its endif with nothing to close. */
++    _OPI(IFC,    IF,     V(2,0), V(3,0), V(2,1), V(3,0), 0, 2, SPECIAL(IFC)),
+     _OPI(ELSE,   ELSE,   V(2,0), V(3,0), V(2,1), V(3,0), 0, 0, SPECIAL(ELSE)),
+     _OPI(ENDIF,  ENDIF,  V(2,0), V(3,0), V(2,1), V(3,0), 0, 0, SPECIAL(ENDIF)),
+     _OPI(BREAK,  BRK,    V(2,1), V(3,0), V(2,1), V(3,0), 0, 0, NULL),
+@@ -3244,7 +3247,7 @@ create_op_info_map(struct shader_translator *tx)
      for (i = 0; i < ARRAY_SIZE(tx->op_info_map); ++i)
          tx->op_info_map[i] = -1;
  
@@ -504,7 +579,7 @@ index cc70f6fd..a15a8b2d 100644
          for (i = 0; i < ARRAY_SIZE(inst_table); ++i) {
              assert(inst_table[i].sio < ARRAY_SIZE(tx->op_info_map));
              if (inst_table[i].vert_version.min <= version &&
-@@ -3315,8 +3315,8 @@ sm1_read_version(struct shader_translator *tx)
+@@ -3315,8 +3318,8 @@ sm1_read_version(struct shader_translator *tx)
      tx->version.minor = D3DSHADER_VERSION_MINOR(tok);
  
      switch (tok >> 16) {
@@ -515,7 +590,7 @@ index cc70f6fd..a15a8b2d 100644
      default:
         DBG("Invalid shader type: %x\n", tok);
         tx->processor = ~0;
-@@ -4000,13 +4000,13 @@ nine_ureg_create_shader(struct ureg_program                  *ureg,
+@@ -4000,13 +4003,13 @@ nine_ureg_create_shader(struct ureg_program                  *ureg,
      bool use_nir = true;
  
      /* Allow user to override preferred IR, this is very useful for debugging */
@@ -532,7 +607,7 @@ index cc70f6fd..a15a8b2d 100644
           use_nir ? "NIR" : "TGSI");
  
      if (use_nir) {
-@@ -4023,12 +4023,12 @@ nine_ureg_create_shader(struct ureg_program                  *ureg,
+@@ -4023,12 +4026,12 @@ nine_ureg_create_shader(struct ureg_program                  *ureg,
      state.report_compile_error = false;
  
      switch (shader_type) {
@@ -548,7 +623,7 @@ index cc70f6fd..a15a8b2d 100644
      }
  }
  
-@@ -4079,7 +4079,7 @@ nine_translate_shader(struct NineDevice9 *device, struct nine_shader_info *info,
+@@ -4079,7 +4082,7 @@ nine_translate_shader(struct NineDevice9 *device, struct nine_shader_info *info,
          DBG("Shader type mismatch: %u / %u !\n", tx->processor, processor);
          goto out;
      }
@@ -558,7 +633,7 @@ index cc70f6fd..a15a8b2d 100644
  
      parse_shader(tx);
 diff --git a/src/gallium/frontends/nine/nine_state.c b/src/gallium/frontends/nine/nine_state.c
-index 623f1dc3..ab663bfb 100644
+index 623f1dc3..eaface38 100644
 --- a/src/gallium/frontends/nine/nine_state.c
 +++ b/src/gallium/frontends/nine/nine_state.c
 @@ -519,7 +519,7 @@ prepare_vs_constants_userbuf(struct NineDevice9 *device)
@@ -700,7 +775,20 @@ index 623f1dc3..ab663bfb 100644
  }
  
  static inline void
-@@ -2297,7 +2297,7 @@ CSMT_ITEM_NO_WAIT(nine_context_clear_fb,
+@@ -1309,7 +1309,11 @@ nine_update_state(struct NineDevice9 *device)
+     context->commit = 0;
+ 
+     if (unlikely(context->changed.ucp)) {
+-        pipe->set_clip_state(pipe, &context->clip);
++        /* A driver with no user clip planes of its own (Zink: clip_planes is 0
++         * and the frontend is to lower them into the shader) has no such
++         * call. Not lowered here yet: the planes are then not applied. */
++        if (pipe->set_clip_state)
++            pipe->set_clip_state(pipe, &context->clip);
+         context->changed.ucp = false;
+     }
+ 
+@@ -2297,7 +2301,7 @@ CSMT_ITEM_NO_WAIT(nine_context_clear_fb,
  
      if (Flags & D3DCLEAR_TARGET) bufs |= PIPE_CLEAR_COLOR;
      /* Ignore Z buffer if not bound */
@@ -709,7 +797,7 @@ index 623f1dc3..ab663bfb 100644
          if (Flags & D3DCLEAR_ZBUFFER) bufs |= PIPE_CLEAR_DEPTH;
          if (Flags & D3DCLEAR_STENCIL) bufs |= PIPE_CLEAR_STENCIL;
      }
-@@ -2350,7 +2350,7 @@ CSMT_ITEM_NO_WAIT(nine_context_clear_fb,
+@@ -2350,7 +2354,7 @@ CSMT_ITEM_NO_WAIT(nine_context_clear_fb,
           rect.x2 >= zsbuf_surf->desc.Width &&
           rect.y2 >= zsbuf_surf->desc.Height))) {
          DBG("Clear fast path\n");
@@ -718,7 +806,7 @@ index 623f1dc3..ab663bfb 100644
          return;
      }
  
-@@ -2430,7 +2430,6 @@ init_draw_info(struct pipe_draw_info *info,
+@@ -2430,7 +2434,6 @@ init_draw_info(struct pipe_draw_info *info,
          info->instance_count = MAX2(dev->context.stream_freq[0] & 0x7FFFFF, 1);
      info->primitive_restart = false;
      info->has_user_indices = false;
@@ -726,7 +814,7 @@ index 623f1dc3..ab663bfb 100644
      info->index_bias_varies = false;
      info->increment_draw_id = false;
      info->was_line_loop = false;
-@@ -2534,7 +2533,7 @@ CSMT_ITEM_NO_WAIT(nine_context_draw_indexed_primitive_from_vtxbuf_idxbuf,
+@@ -2534,7 +2537,7 @@ CSMT_ITEM_NO_WAIT(nine_context_draw_indexed_primitive_from_vtxbuf_idxbuf,
      else
          info.index.user = user_ibuf;
  
@@ -735,7 +823,7 @@ index 623f1dc3..ab663bfb 100644
      context->changed.vtxbuf_dirty = true;
  
      context->pipe->draw_vbo(context->pipe, &info, 0, NULL, &draw, 1);
-@@ -3045,14 +3044,14 @@ nine_context_clear(struct NineDevice9 *device)
+@@ -3045,14 +3048,14 @@ nine_context_clear(struct NineDevice9 *device)
       * do not change on Reset.
       */
  
@@ -754,7 +842,16 @@ index 623f1dc3..ab663bfb 100644
                              NINE_MAX_SAMPLERS_PS, NULL);
  
      pipe->set_vertex_buffers(pipe, 0, NULL);
-@@ -3244,7 +3243,7 @@ update_vertex_buffers_sw(struct NineDevice9 *device, int dummy_vbo_stream,
+@@ -3068,6 +3071,8 @@ nine_context_clear(struct NineDevice9 *device)
+     pipe_resource_reference(&context->idxbuf, NULL);
+     pipe_resource_reference(&context->pipe_data.cb_vs.buffer, NULL);
+     pipe_resource_reference(&context->pipe_data.cb_ps.buffer, NULL);
++    pipe_resource_reference(&context->pipe_data.cb_vs_ff.buffer, NULL);
++    pipe_resource_reference(&context->pipe_data.cb_ps_ff.buffer, NULL);
+ 
+     for (i = 0; i < NINE_MAX_SAMPLERS; ++i) {
+         context->texture[i].enabled = false;
+@@ -3244,7 +3249,7 @@ update_vertex_buffers_sw(struct NineDevice9 *device, int dummy_vbo_stream,
              if (!device->driver_caps.user_sw_vbufs) {
                  vbuffer[j].buffer.resource = NULL;
                  vbuffer[j].is_user_buffer = false;
@@ -763,7 +860,7 @@ index 623f1dc3..ab663bfb 100644
                                0,
                                box.width,
                                16,
-@@ -3299,13 +3298,13 @@ update_vs_constants_sw(struct NineDevice9 *device)
+@@ -3299,13 +3304,13 @@ update_vs_constants_sw(struct NineDevice9 *device)
  
          buf = cb.user_buffer;
  
@@ -779,7 +876,7 @@ index 623f1dc3..ab663bfb 100644
          if (cb.buffer)
              pipe_resource_reference(&cb.buffer, NULL);
      }
-@@ -3318,7 +3317,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
+@@ -3318,7 +3323,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
          cb.buffer_size = 2048 * sizeof(float[4]);
          cb.user_buffer = state->vs_const_i;
  
@@ -788,7 +885,7 @@ index 623f1dc3..ab663bfb 100644
          if (cb.buffer)
              pipe_resource_reference(&cb.buffer, NULL);
      }
-@@ -3331,7 +3330,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
+@@ -3331,7 +3336,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
          cb.buffer_size = 512 * sizeof(float[4]);
          cb.user_buffer = state->vs_const_b;
  
@@ -797,7 +894,7 @@ index 623f1dc3..ab663bfb 100644
          if (cb.buffer)
              pipe_resource_reference(&cb.buffer, NULL);
      }
-@@ -3351,7 +3350,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
+@@ -3351,7 +3356,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
          cb.user_buffer = viewport_data;
  
          {
@@ -806,7 +903,7 @@ index 623f1dc3..ab663bfb 100644
                            0,
                            cb.buffer_size,
                            16,
-@@ -3362,7 +3361,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
+@@ -3362,7 +3367,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
              cb.user_buffer = NULL;
          }
  

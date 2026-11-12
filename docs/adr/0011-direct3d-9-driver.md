@@ -225,3 +225,77 @@ runtime's minimum list.
 
 Not done here: a run of the workflow (the build step is rewritten and has
 not run), and the 12 MB DLLs through `install windows`.
+
+### N2 (2026-11-12): a picture
+
+`d3d9-test.exe` and its 32-bit build draw, in a window DWM composes: a
+square turning about its axis, lit by a directional light and textured from
+a managed 64×64 texture with mips, out of a vertex buffer; a
+`D3DFVF_XYZRHW` triangle with a colour at each corner from `DrawPrimitiveUP`
+and another out of a vertex buffer; a clip-space triangle; and the square
+four more times with lighting and the texture on and off. The frame is
+cleared, drawn by Nine on Zink on Venus, read back and handed to the kernel
+driver, which copies it onto DWM's redirection surface when the runtime
+presents (`0007-a-present-between-held-frames.patch`, escape 0x904).
+
+What the device's functions do now, across the seam: resources (render
+targets, depth, textures, vertex and index buffers, system-memory ones
+kept as plain memory), `Lock`/`Unlock` and their asynchronous forms and
+rename, `TexBlt1`/`BufBlt1`/`Blt`/`ColorFill`/`GenerateMipSubLevels`, render
+target and depth, `Clear`, render, sampler and texture-stage states,
+textures, viewport and depth range, scissor, clip planes, transforms,
+material and lights, declarations, both kinds of shader and their
+constants, streams and indices, the six draws, queries, `Flush1` and
+`Present1`.
+
+**What the runtime does, which decides the driver's shape.**
+
+- *It writes the fixed-function shaders itself.* A program that sets no
+  shader still reaches the driver with a `vs_2_0` and a `ps_2_0` (their
+  comment says `$FF`), remade as the lighting and texture states change.
+  Nine's own fixed-function code runs for one case only: vertices the
+  declaration calls `POSITIONT`, for which the runtime sets no vertex
+  shader.
+- *Its `vs_2_0` uses `ifc`*, which the shader model's documents give to 2.x;
+  Nine's table said so too and is widened.
+- *Vertex and index buffers arrive as system memory* (`pSysMem`). A
+  program's own are announced by `Lock` with `NotifyOnly`, and copied into
+  Nine's buffer at the unlock; the runtime's own dynamic ones (where it
+  puts the vertices of a `Draw…UP`) are written with no word to the driver,
+  so a draw from one of those is drawn from memory.
+- *`DrawPrimitive2` and `DrawIndexedPrimitive2` are "out of the runtime's
+  buffer, addressed in bytes"*, not "already transformed", whatever the DDI's
+  document says: a clip-space `DrawPrimitiveUP` with a vertex shader bound
+  comes through them. What a vertex is comes from the declaration alone.
+- *The DDI's texture-stage numbering includes the sampler states* (13
+  `ADDRESSU` to 31 `DMAPOFFSET`); the front sorts them back apart.
+
+**Three things in Nine and Zink.**
+
+- Zink in Mesa 26.2 does not serve a constant buffer given as a pointer
+  (`user_buffer`): the shader reads something else, and the process dies
+  later on the dangling buffer. Nine gave its fixed-function constants
+  that way; they are uploaded now, like a program's. This was the last
+  one found — the pre-transformed triangles drew nowhere — by putting the
+  viewport into the shader as immediates, then the constants into a real
+  buffer, one switch at a time.
+- Zink has no `set_clip_state`; Nine's call is guarded. User clip planes
+  are therefore not applied yet (N3: lowered into the vertex shader).
+- A Nine device without a swap chain needs a software screen for its
+  reference paths all the same: softpipe on the null winsys.
+
+**Bring-up switches**, all environment variables read by the DLL:
+`ENTANGLED_D3D9=1` (serve this process — still required for anything but
+the test program), `ENTANGLED_D3D9_TRACE=1` (the first 400 draw-related
+calls), `ENTANGLED_D3D9_SHADERS=1` (shader bytecode), `ENTANGLED_D3D9_LOG`
+(a file to log into as well). A fault anywhere in the process is reported
+by module and offset with its callers (unwound on x64).
+
+Not done, and N3's: the caps are still N0's table rather than Nine's;
+state blocks of a pure device (`StateSet`), `VolBlt1`, `DepthFill`,
+`ValidateDevice`, `UpdateWInfo`; blits back to system memory
+(`GetRenderTargetData`); streams other than 0 out of memory; user clip
+planes; lost devices. `Present1` is a read-back and a copy per frame —
+N4's overlay plane replaces it. Seen once and not understood: the 64-bit
+test dying on a null pointer in a system DLL when keys were typed at it
+mid-run; the report will name the module next time.
