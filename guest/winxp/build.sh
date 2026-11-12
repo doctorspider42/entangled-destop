@@ -38,7 +38,9 @@ echo "headers: $kits"
 # headers declare their callbacks without naming one.
 cflags=(--target=i686-pc-windows-msvc -c -O2 -mrtd -ffreestanding -fno-stack-protector
         -fno-builtin -Wall -Wno-unknown-pragmas -Wno-pragma-pack -Wno-microsoft-anon-tag
-        -Wno-ignored-attributes -Wno-unused-function -Wno-missing-prototype-for-cc -Wno-nonportable-include-path -Wno-ignored-pragma-intrinsic -Wno-deprecated-declarations
+        -Wno-ignored-attributes -Wno-unused-function -Wno-missing-prototype-for-cc
+        -Wno-nonportable-include-path -Wno-ignored-pragma-intrinsic
+        -Wno-deprecated-declarations
         -D_X86_=1 -Di386=1 -D_WIN32_WINNT=0x0501 -DWINVER=0x0501 -DNTDDI_VERSION=0x05010000
         -I"$kits/km" -I"$kits/shared" -I"$kits/um" -I"$kits/km/crt")
 
@@ -64,8 +66,14 @@ lld-link "${lflags[@]}" -dll -entry:DrvEnableDriver@12 -export:DrvEnableDriver=_
 
 echo "entxp-setup.exe (driver installer)"
 libs="${kits/Include/Lib}/um/x86"
-clang --target=i686-pc-windows-msvc -c -O2 -ffreestanding -fno-stack-protector -fno-builtin     -Wall -Wno-pragma-pack -Wno-nonportable-include-path -Wno-ignored-attributes     -D_WIN32_WINNT=0x0501 -DWINVER=0x0501 -I"$kits/um" -I"$kits/shared"     "$here/setup/setup.c" -o "$out/setup.obj"
-lld-link -machine:x86 -nodefaultlib -release -subsystem:console,5.01 -osversion:5.1     -entry:entry -out:"$out/entxp-setup.exe" "$out/setup.obj"     "$libs/kernel32.lib" "$libs/newdev.lib"
+setup_cflags=(--target=i686-pc-windows-msvc -c -O2 -ffreestanding -fno-stack-protector
+              -fno-builtin -Wall -Wno-pragma-pack -Wno-nonportable-include-path
+              -Wno-ignored-attributes -Wno-ignored-pragma-intrinsic -Wno-microsoft-anon-tag
+              -D_WIN32_WINNT=0x0501 -DWINVER=0x0501 -I"$kits/um" -I"$kits/shared")
+clang "${setup_cflags[@]}" "$here/setup/setup.c" -o "$out/setup.obj"
+lld-link -machine:x86 -nodefaultlib -release -subsystem:console,5.01 -osversion:5.1 \
+    -entry:entry -out:"$out/entxp-setup.exe" "$out/setup.obj" \
+    "$libs/kernel32.lib" "$libs/newdev.lib"
 
 cp "$here/display/entxp.inf" "$out/entxp.inf"
 rm -f "$out"/*.obj "$out"/*.lib "$out"/*.exp

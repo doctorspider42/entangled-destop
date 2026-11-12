@@ -90,11 +90,45 @@ JoinWorkgroup=WORKGROUP
 InstallDefaultComponents=Yes
 
 [GuiRunOnce]
-Command0="shutdown -s -t 5"
+Command0="@FIRST_LOGON@"
 "#;
 
-fn answer_file(product_key: &str, computer_name: &str) -> String {
+/// What the first logon runs when there is nothing to install.
+const SHUTDOWN: &str = "shutdown -s -t 5";
+/// What it runs when the additions disc is in a drive: the disc's own
+/// script, wherever the disc got its letter.
+const RUN_ADDITIONS: &str = r"cmd /c for %i in (D E F G H) do if exist %i:\entangled\setup.cmd call %i:\entangled\setup.cmd";
+/// The additions disc's script: the drivers, then the power-off the
+/// installer waits for.
+const SETUP_CMD: &str = "@echo off\r\n\"%~dp0entxp-setup.exe\"\r\nshutdown -s -t 5\r\n";
+/// The files of `guest/winxp/build.sh`'s output the additions disc carries.
+const ADDITIONS: [&str; 4] = ["entxp.sys", "entxp.dll", "entxp.inf", "entxp-setup.exe"];
+/// The directory with those files, when the user has them: the display
+/// driver of ADR-0013. Without it Windows keeps its own VGA driver.
+const ADDITIONS_ENV: &str = "ENTANGLED_WINXP_ADDITIONS";
+
+/// The additions disc: the driver files and the script that installs them,
+/// under `entangled/`.
+fn additions_disc(dir: &Path) -> Result<Vec<u8>, String> {
+    let mut disc = optical::iso9660::IsoBuilder::new("ENTANGLED");
+    for name in ADDITIONS {
+        let path = dir.join(name);
+        let bytes = std::fs::read(&path)
+            .map_err(|e| format!("{ADDITIONS_ENV}: cannot read {}: {e}", path.display()))?;
+        disc.add_file(&format!("entangled/{name}"), bytes)
+            .map_err(|e| e.to_string())?;
+    }
+    disc.add_file("entangled/setup.cmd", SETUP_CMD.as_bytes().to_vec())
+        .map_err(|e| e.to_string())?;
+    Ok(disc.build())
+}
+
+fn answer_file(product_key: &str, computer_name: &str, additions: bool) -> String {
     WINNT_SIF
+        .replace(
+            "@FIRST_LOGON@",
+            if additions { RUN_ADDITIONS } else { SHUTDOWN },
+        )
         .replace("@PRODUCT_KEY@", product_key)
         .replace("@COMPUTER_NAME@", computer_name)
         .replace("@WIDTH@", &DESKTOP.0.to_string())
@@ -192,6 +226,8 @@ struct Plan {
     installed: VmConfig,
     profile: PathBuf,
     floppy: PathBuf,
+    /// The additions disc, when one was written.
+    additions: Option<PathBuf>,
 }
 
 fn prepare(args: &InstallArgs) -> Result<Plan, String> {
@@ -288,6 +324,17 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
     };
     let mut install = installed.clone();
     install.boot.floppy = Some(floppy.clone());
+    // The additions disc rides in the second drive for the install only.
+    let additions = match std::env::var_os(ADDITIONS_ENV) {
+        Some(dir) => {
+            let path = target.with_file_name(format!("{name}-additions.iso"));
+            std::fs::write(&path, additions_disc(Path::new(&dir))?)
+                .map_err(|e| format!("cannot write the additions disc {}: {e}", path.display()))?;
+            install.optical.push(OpticalSection { path: path.clone() });
+            Some(path)
+        }
+        None => None,
+    };
     // Both through the validator a profile on disk would meet.
     let reparse = |cfg: &VmConfig| {
         VmConfig::from_toml(&toml::to_string_pretty(cfg).map_err(|e| e.to_string())?)
@@ -295,7 +342,11 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
     };
     let (installed, install) = (reparse(&installed)?, reparse(&install)?);
 
-    let answers = answer_file(&key, &crate::install_windows::computer_name(&name));
+    let answers = answer_file(
+        &key,
+        &crate::install_windows::computer_name(&name),
+        additions.is_some(),
+    );
     std::fs::write(&floppy, floppy_image("WINNT.SIF", answers.as_bytes())?)
         .map_err(|e| format!("cannot write the answer floppy {}: {e}", floppy.display()))?;
     if !target.exists() {
@@ -306,6 +357,7 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
         installed,
         profile,
         floppy,
+        additions,
     })
 }
 
@@ -338,6 +390,9 @@ pub(crate) fn run(args: &InstallArgs) -> Result<(), String> {
     if let Err(error) = std::fs::remove_file(&plan.floppy) {
         tracing::warn!(%error, path = %plan.floppy.display(), "could not remove the answer floppy");
     }
+    if let Some(disc) = &plan.additions {
+        let _ = std::fs::remove_file(disc);
+    }
     tracing::info!(
         profile = %plan.profile.display(),
         "Windows XP is installed; start it with `entangled run {}`",
@@ -352,7 +407,10 @@ mod tests {
 
     #[test]
     fn the_answer_file_carries_the_key_and_the_name_with_dos_line_ends() {
-        let text = answer_file("ABCDE-12345-FGHIJ-67890-KLMNO", "XPBOX");
+        let text = answer_file("ABCDE-12345-FGHIJ-67890-KLMNO", "XPBOX", false);
+        assert!(text.contains("Command0=\"shutdown -s -t 5\"\r\n"));
+        let with_disc = answer_file("ABCDE-12345-FGHIJ-67890-KLMNO", "XPBOX", true);
+        assert!(with_disc.contains(r"if exist %i:\entangled\setup.cmd call"));
         assert!(text.contains("ProductKey=ABCDE-12345-FGHIJ-67890-KLMNO\r\n"));
         assert!(text.contains("ComputerName=XPBOX\r\n"));
         assert!(text.contains("Xresolution=1024\r\n"));
