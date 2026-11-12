@@ -9,3 +9,6 @@ VideoPortMapMemory@24
 VideoPortUnmapMemory@12
 VideoPortReadRegisterUshort@4
 VideoPortWriteRegisterUshort@8
+VideoPortReadRegisterUlong@4
+VideoPortWriteRegisterUlong@8
+VideoPortMoveMemory@12

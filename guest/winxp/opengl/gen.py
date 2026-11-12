@@ -76,7 +76,7 @@ def prototypes(header):
                 pointer = "*" in param
                 words = param.replace("*", " ").split()
                 kind = [w for w in words if w not in ("const",)][0]
-                args.append((kind, words[-1], pointer))
+                args.append((kind, words[-1], "const *" if pointer and "const" in words else pointer))
         out[name] = (returns, args)
     return out
 
@@ -102,7 +102,7 @@ def main():
     for i, name in enumerate(table):
         returns, args = protos[name]
         signature = ", ".join(
-            f"{'const ' if ptr else ''}{kind} {'*' if ptr else ''}{arg}" for kind, arg, ptr in args
+            f"{'const ' if ptr == 'const *' else ''}{kind} {'*' if ptr else ''}{arg}" for kind, arg, ptr in args
         ) or "void"
         vector = VECTOR.match(name)
         if vector and len(args) == 1 and args[0][2]:
@@ -124,20 +124,20 @@ def main():
             by_hand.append(name)
             continue
         words = sum(SCALAR_WORDS[kind] for kind, _, _ in args)
-        body = [f"    unsigned *c = entgl_command({i}, {words});"]
+        body = [f"    unsigned *entgl_a = entgl_command({i}, {words});"]
         at = 0
         rust_args, rust_types = [], []
         for kind, arg, _ in args:
             if kind in DOUBLES:
-                body.append(f"    entgl_put_double(c + {at}, {arg});")
+                body.append(f"    entgl_put_double(entgl_a + {at}, {arg});")
                 rust_args.append(f"crate::f64_at(a, {at})")
                 at += 2
             elif kind in FLOATS:
-                body.append(f"    entgl_put_float(c + {at}, {arg});")
+                body.append(f"    entgl_put_float(entgl_a + {at}, {arg});")
                 rust_args.append(f"f32::from_bits(a[{at}])")
                 at += 1
             else:
-                body.append(f"    c[{at}] = (unsigned){arg};")
+                body.append(f"    entgl_a[{at}] = (unsigned){arg};")
                 rust_args.append(f"a[{at}] as _")
                 at += 1
             rust_types.append(kind)
@@ -155,7 +155,7 @@ def main():
     for name in table:
         returns, args = protos[name]
         signature = ", ".join(
-            f"{'const ' if ptr else ''}{kind} {'*' if ptr else ''}{arg}" for kind, arg, ptr in args
+            f"{'const ' if ptr == 'const *' else ''}{kind} {'*' if ptr else ''}{arg}" for kind, arg, ptr in args
         ) or "void"
         declarations.append(f"static {returns} APIENTRY icd_{name[2:]}({signature});")
     ops = ["enum {"] + [f"    ENTGL_OP_{name[2:]} = {i}," for i, name in enumerate(table)] + ["};", ""]

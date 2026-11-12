@@ -47,6 +47,8 @@ pub trait Platform {
     fn make_current(&mut self, context: Option<&Self::Context>) -> bool;
     /// `wglCopyContext`.
     fn copy(&mut self, from: &Self::Context, to: &Self::Context, mask: u32) -> bool;
+    /// `wglShareLists`: `second` shares `first`'s objects from now on.
+    fn share(&mut self, first: &Self::Context, second: &Self::Context) -> bool;
 }
 
 const NO_ERROR: u32 = 0;
@@ -91,6 +93,14 @@ struct Slot<C> {
     drawable: Option<Drawable>,
     /// An OpenGL error this crate read off the flag on the guest's behalf.
     held_error: u32,
+    /// When it was last selected, on [`Executor::clock`].
+    used: u64,
+}
+
+impl<C> Slot<C> {
+    fn context_differs(&self, other: &Self) -> bool {
+        !std::ptr::eq(self, other)
+    }
 }
 
 /// The guest's contexts, and the means to run its records on them.
@@ -101,6 +111,8 @@ pub struct Executor<P: Platform> {
     next_id: u32,
     /// The context current on this thread, by id.
     current: Option<u32>,
+    /// Counts selections.
+    clock: u64,
 }
 
 struct Arrays<'a> {
@@ -226,6 +238,7 @@ impl<P: Platform> Executor<P> {
             slots: HashMap::new(),
             next_id: 1,
             current: None,
+            clock: 0,
         }
     }
 
@@ -314,13 +327,36 @@ impl<P: Platform> Executor<P> {
                     self.platform.copy(&from.context, &to.context, mask);
                 }
             }
+            (control::CONTEXT_SHARE, &[first, second]) => {
+                let shared = match (self.slots.get(&first), self.slots.get(&second)) {
+                    (Some(first), Some(second)) if first.context_differs(second) => {
+                        self.platform.share(&first.context, &second.context)
+                    }
+                    _ => false,
+                };
+                answer(out, &[u32::from(shared)]);
+            }
             _ => tracing::debug!(opcode = record.opcode, "malformed control record"),
         }
     }
 
     fn create(&mut self, share: u32) -> Option<u32> {
         if self.slots.len() >= MAX_CONTEXTS {
-            return None;
+            // A guest program that was killed never deleted its contexts;
+            // the one selected longest ago makes room.
+            let oldest = self
+                .slots
+                .iter()
+                .filter(|(id, _)| **id != share)
+                .min_by_key(|(_, slot)| slot.used)
+                .map(|(id, _)| *id)?;
+            if self.current == Some(oldest) {
+                self.platform.make_current(None);
+                self.current = None;
+            }
+            if let Some(slot) = self.slots.remove(&oldest) {
+                self.platform.destroy(slot.context);
+            }
         }
         let share = match share {
             0 => None,
@@ -339,6 +375,7 @@ impl<P: Platform> Executor<P> {
                 context,
                 drawable: None,
                 held_error: NO_ERROR,
+                used: self.clock,
             },
         );
         Some(id)
@@ -348,6 +385,8 @@ impl<P: Platform> Executor<P> {
         let Some(slot) = self.slots.get_mut(&id) else {
             return false;
         };
+        self.clock += 1;
+        slot.used = self.clock;
         if self.current != Some(id) {
             if !self.platform.make_current(Some(&slot.context)) {
                 self.current = None;

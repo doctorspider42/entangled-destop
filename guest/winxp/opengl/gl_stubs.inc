@@ -533,8 +533,8 @@ static void APIENTRY icd_TexGenf(GLenum coord, GLenum pname, GLfloat param);
 static void APIENTRY icd_TexGenfv(GLenum coord, GLenum pname, const GLfloat *params);
 static void APIENTRY icd_TexGeni(GLenum coord, GLenum pname, GLint param);
 static void APIENTRY icd_TexGeniv(GLenum coord, GLenum pname, const GLint *params);
-static void APIENTRY icd_FeedbackBuffer(GLsizei size, GLenum type, const GLfloat *buffer);
-static void APIENTRY icd_SelectBuffer(GLsizei size, const GLuint *buffer);
+static void APIENTRY icd_FeedbackBuffer(GLsizei size, GLenum type, GLfloat *buffer);
+static void APIENTRY icd_SelectBuffer(GLsizei size, GLuint *buffer);
 static GLint APIENTRY icd_RenderMode(GLenum mode);
 static void APIENTRY icd_InitNames(void);
 static void APIENTRY icd_LoadName(GLuint name);
@@ -595,36 +595,36 @@ static void APIENTRY icd_PixelMapuiv(GLenum map, GLsizei mapsize, const GLuint *
 static void APIENTRY icd_PixelMapusv(GLenum map, GLsizei mapsize, const GLushort *values);
 static void APIENTRY icd_ReadBuffer(GLenum mode);
 static void APIENTRY icd_CopyPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum type);
-static void APIENTRY icd_ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels);
+static void APIENTRY icd_ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid *pixels);
 static void APIENTRY icd_DrawPixels(GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels);
-static void APIENTRY icd_GetBooleanv(GLenum pname, const GLboolean *params);
-static void APIENTRY icd_GetClipPlane(GLenum plane, const GLdouble *equation);
-static void APIENTRY icd_GetDoublev(GLenum pname, const GLdouble *params);
+static void APIENTRY icd_GetBooleanv(GLenum pname, GLboolean *params);
+static void APIENTRY icd_GetClipPlane(GLenum plane, GLdouble *equation);
+static void APIENTRY icd_GetDoublev(GLenum pname, GLdouble *params);
 static GLenum APIENTRY icd_GetError(void);
-static void APIENTRY icd_GetFloatv(GLenum pname, const GLfloat *params);
-static void APIENTRY icd_GetIntegerv(GLenum pname, const GLint *params);
-static void APIENTRY icd_GetLightfv(GLenum light, GLenum pname, const GLfloat *params);
-static void APIENTRY icd_GetLightiv(GLenum light, GLenum pname, const GLint *params);
-static void APIENTRY icd_GetMapdv(GLenum target, GLenum query, const GLdouble *v);
-static void APIENTRY icd_GetMapfv(GLenum target, GLenum query, const GLfloat *v);
-static void APIENTRY icd_GetMapiv(GLenum target, GLenum query, const GLint *v);
-static void APIENTRY icd_GetMaterialfv(GLenum face, GLenum pname, const GLfloat *params);
-static void APIENTRY icd_GetMaterialiv(GLenum face, GLenum pname, const GLint *params);
-static void APIENTRY icd_GetPixelMapfv(GLenum map, const GLfloat *values);
-static void APIENTRY icd_GetPixelMapuiv(GLenum map, const GLuint *values);
-static void APIENTRY icd_GetPixelMapusv(GLenum map, const GLushort *values);
-static void APIENTRY icd_GetPolygonStipple(const GLubyte *mask);
+static void APIENTRY icd_GetFloatv(GLenum pname, GLfloat *params);
+static void APIENTRY icd_GetIntegerv(GLenum pname, GLint *params);
+static void APIENTRY icd_GetLightfv(GLenum light, GLenum pname, GLfloat *params);
+static void APIENTRY icd_GetLightiv(GLenum light, GLenum pname, GLint *params);
+static void APIENTRY icd_GetMapdv(GLenum target, GLenum query, GLdouble *v);
+static void APIENTRY icd_GetMapfv(GLenum target, GLenum query, GLfloat *v);
+static void APIENTRY icd_GetMapiv(GLenum target, GLenum query, GLint *v);
+static void APIENTRY icd_GetMaterialfv(GLenum face, GLenum pname, GLfloat *params);
+static void APIENTRY icd_GetMaterialiv(GLenum face, GLenum pname, GLint *params);
+static void APIENTRY icd_GetPixelMapfv(GLenum map, GLfloat *values);
+static void APIENTRY icd_GetPixelMapuiv(GLenum map, GLuint *values);
+static void APIENTRY icd_GetPixelMapusv(GLenum map, GLushort *values);
+static void APIENTRY icd_GetPolygonStipple(GLubyte *mask);
 static const GLubyte * APIENTRY icd_GetString(GLenum name);
-static void APIENTRY icd_GetTexEnvfv(GLenum target, GLenum pname, const GLfloat *params);
-static void APIENTRY icd_GetTexEnviv(GLenum target, GLenum pname, const GLint *params);
-static void APIENTRY icd_GetTexGendv(GLenum coord, GLenum pname, const GLdouble *params);
-static void APIENTRY icd_GetTexGenfv(GLenum coord, GLenum pname, const GLfloat *params);
-static void APIENTRY icd_GetTexGeniv(GLenum coord, GLenum pname, const GLint *params);
-static void APIENTRY icd_GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, const GLvoid *pixels);
-static void APIENTRY icd_GetTexParameterfv(GLenum target, GLenum pname, const GLfloat *params);
-static void APIENTRY icd_GetTexParameteriv(GLenum target, GLenum pname, const GLint *params);
-static void APIENTRY icd_GetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, const GLfloat *params);
-static void APIENTRY icd_GetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, const GLint *params);
+static void APIENTRY icd_GetTexEnvfv(GLenum target, GLenum pname, GLfloat *params);
+static void APIENTRY icd_GetTexEnviv(GLenum target, GLenum pname, GLint *params);
+static void APIENTRY icd_GetTexGendv(GLenum coord, GLenum pname, GLdouble *params);
+static void APIENTRY icd_GetTexGenfv(GLenum coord, GLenum pname, GLfloat *params);
+static void APIENTRY icd_GetTexGeniv(GLenum coord, GLenum pname, GLint *params);
+static void APIENTRY icd_GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid *pixels);
+static void APIENTRY icd_GetTexParameterfv(GLenum target, GLenum pname, GLfloat *params);
+static void APIENTRY icd_GetTexParameteriv(GLenum target, GLenum pname, GLint *params);
+static void APIENTRY icd_GetTexLevelParameterfv(GLenum target, GLint level, GLenum pname, GLfloat *params);
+static void APIENTRY icd_GetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *params);
 static GLboolean APIENTRY icd_IsEnabled(GLenum cap);
 static GLboolean APIENTRY icd_IsList(GLuint list);
 static void APIENTRY icd_DepthRange(GLclampd zNear, GLclampd zFar);
@@ -661,14 +661,14 @@ static void APIENTRY icd_NormalPointer(GLenum type, GLsizei stride, const GLvoid
 static void APIENTRY icd_PolygonOffset(GLfloat factor, GLfloat units);
 static void APIENTRY icd_TexCoordPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer);
 static void APIENTRY icd_VertexPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer);
-static GLboolean APIENTRY icd_AreTexturesResident(GLsizei n, const GLuint *textures, const GLboolean *residences);
+static GLboolean APIENTRY icd_AreTexturesResident(GLsizei n, const GLuint *textures, GLboolean *residences);
 static void APIENTRY icd_CopyTexImage1D(GLenum target, GLint level, GLenum internalFormat, GLint x, GLint y, GLsizei width, GLint border);
 static void APIENTRY icd_CopyTexImage2D(GLenum target, GLint level, GLenum internalFormat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border);
 static void APIENTRY icd_CopyTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLint x, GLint y, GLsizei width);
 static void APIENTRY icd_CopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height);
 static void APIENTRY icd_DeleteTextures(GLsizei n, const GLuint *textures);
-static void APIENTRY icd_GenTextures(GLsizei n, const GLuint *textures);
-static void APIENTRY icd_GetPointerv(GLenum pname, const GLvoid *params);
+static void APIENTRY icd_GenTextures(GLsizei n, GLuint *textures);
+static void APIENTRY icd_GetPointerv(GLenum pname, GLvoid *params);
 static GLboolean APIENTRY icd_IsTexture(GLuint texture);
 static void APIENTRY icd_PrioritizeTextures(GLsizei n, const GLuint *textures, const GLclampf *priorities);
 static void APIENTRY icd_TexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsizei width, GLenum format, GLenum type, const GLvoid *pixels);
@@ -678,9 +678,9 @@ static void APIENTRY icd_PushClientAttrib(GLbitfield mask);
 
 static void APIENTRY icd_NewList(GLuint list, GLenum mode)
 {
-    unsigned *c = entgl_command(0, 2);
-    c[0] = (unsigned)list;
-    c[1] = (unsigned)mode;
+    unsigned *entgl_a = entgl_command(0, 2);
+    entgl_a[0] = (unsigned)list;
+    entgl_a[1] = (unsigned)mode;
 }
 
 static void APIENTRY icd_EndList(void)
@@ -690,35 +690,35 @@ static void APIENTRY icd_EndList(void)
 
 static void APIENTRY icd_CallList(GLuint list)
 {
-    unsigned *c = entgl_command(2, 1);
-    c[0] = (unsigned)list;
+    unsigned *entgl_a = entgl_command(2, 1);
+    entgl_a[0] = (unsigned)list;
 }
 
 static void APIENTRY icd_DeleteLists(GLuint list, GLsizei range)
 {
-    unsigned *c = entgl_command(4, 2);
-    c[0] = (unsigned)list;
-    c[1] = (unsigned)range;
+    unsigned *entgl_a = entgl_command(4, 2);
+    entgl_a[0] = (unsigned)list;
+    entgl_a[1] = (unsigned)range;
 }
 
 static void APIENTRY icd_ListBase(GLuint base)
 {
-    unsigned *c = entgl_command(6, 1);
-    c[0] = (unsigned)base;
+    unsigned *entgl_a = entgl_command(6, 1);
+    entgl_a[0] = (unsigned)base;
 }
 
 static void APIENTRY icd_Begin(GLenum mode)
 {
-    unsigned *c = entgl_command(7, 1);
-    c[0] = (unsigned)mode;
+    unsigned *entgl_a = entgl_command(7, 1);
+    entgl_a[0] = (unsigned)mode;
 }
 
 static void APIENTRY icd_Color3b(GLbyte red, GLbyte green, GLbyte blue)
 {
-    unsigned *c = entgl_command(9, 3);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
+    unsigned *entgl_a = entgl_command(9, 3);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
 }
 
 static void APIENTRY icd_Color3bv(const GLbyte *v)
@@ -728,10 +728,10 @@ static void APIENTRY icd_Color3bv(const GLbyte *v)
 
 static void APIENTRY icd_Color3d(GLdouble red, GLdouble green, GLdouble blue)
 {
-    unsigned *c = entgl_command(11, 6);
-    entgl_put_double(c + 0, red);
-    entgl_put_double(c + 2, green);
-    entgl_put_double(c + 4, blue);
+    unsigned *entgl_a = entgl_command(11, 6);
+    entgl_put_double(entgl_a + 0, red);
+    entgl_put_double(entgl_a + 2, green);
+    entgl_put_double(entgl_a + 4, blue);
 }
 
 static void APIENTRY icd_Color3dv(const GLdouble *v)
@@ -741,10 +741,10 @@ static void APIENTRY icd_Color3dv(const GLdouble *v)
 
 static void APIENTRY icd_Color3f(GLfloat red, GLfloat green, GLfloat blue)
 {
-    unsigned *c = entgl_command(13, 3);
-    entgl_put_float(c + 0, red);
-    entgl_put_float(c + 1, green);
-    entgl_put_float(c + 2, blue);
+    unsigned *entgl_a = entgl_command(13, 3);
+    entgl_put_float(entgl_a + 0, red);
+    entgl_put_float(entgl_a + 1, green);
+    entgl_put_float(entgl_a + 2, blue);
 }
 
 static void APIENTRY icd_Color3fv(const GLfloat *v)
@@ -754,10 +754,10 @@ static void APIENTRY icd_Color3fv(const GLfloat *v)
 
 static void APIENTRY icd_Color3i(GLint red, GLint green, GLint blue)
 {
-    unsigned *c = entgl_command(15, 3);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
+    unsigned *entgl_a = entgl_command(15, 3);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
 }
 
 static void APIENTRY icd_Color3iv(const GLint *v)
@@ -767,10 +767,10 @@ static void APIENTRY icd_Color3iv(const GLint *v)
 
 static void APIENTRY icd_Color3s(GLshort red, GLshort green, GLshort blue)
 {
-    unsigned *c = entgl_command(17, 3);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
+    unsigned *entgl_a = entgl_command(17, 3);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
 }
 
 static void APIENTRY icd_Color3sv(const GLshort *v)
@@ -780,10 +780,10 @@ static void APIENTRY icd_Color3sv(const GLshort *v)
 
 static void APIENTRY icd_Color3ub(GLubyte red, GLubyte green, GLubyte blue)
 {
-    unsigned *c = entgl_command(19, 3);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
+    unsigned *entgl_a = entgl_command(19, 3);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
 }
 
 static void APIENTRY icd_Color3ubv(const GLubyte *v)
@@ -793,10 +793,10 @@ static void APIENTRY icd_Color3ubv(const GLubyte *v)
 
 static void APIENTRY icd_Color3ui(GLuint red, GLuint green, GLuint blue)
 {
-    unsigned *c = entgl_command(21, 3);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
+    unsigned *entgl_a = entgl_command(21, 3);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
 }
 
 static void APIENTRY icd_Color3uiv(const GLuint *v)
@@ -806,10 +806,10 @@ static void APIENTRY icd_Color3uiv(const GLuint *v)
 
 static void APIENTRY icd_Color3us(GLushort red, GLushort green, GLushort blue)
 {
-    unsigned *c = entgl_command(23, 3);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
+    unsigned *entgl_a = entgl_command(23, 3);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
 }
 
 static void APIENTRY icd_Color3usv(const GLushort *v)
@@ -819,11 +819,11 @@ static void APIENTRY icd_Color3usv(const GLushort *v)
 
 static void APIENTRY icd_Color4b(GLbyte red, GLbyte green, GLbyte blue, GLbyte alpha)
 {
-    unsigned *c = entgl_command(25, 4);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
-    c[3] = (unsigned)alpha;
+    unsigned *entgl_a = entgl_command(25, 4);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
+    entgl_a[3] = (unsigned)alpha;
 }
 
 static void APIENTRY icd_Color4bv(const GLbyte *v)
@@ -833,11 +833,11 @@ static void APIENTRY icd_Color4bv(const GLbyte *v)
 
 static void APIENTRY icd_Color4d(GLdouble red, GLdouble green, GLdouble blue, GLdouble alpha)
 {
-    unsigned *c = entgl_command(27, 8);
-    entgl_put_double(c + 0, red);
-    entgl_put_double(c + 2, green);
-    entgl_put_double(c + 4, blue);
-    entgl_put_double(c + 6, alpha);
+    unsigned *entgl_a = entgl_command(27, 8);
+    entgl_put_double(entgl_a + 0, red);
+    entgl_put_double(entgl_a + 2, green);
+    entgl_put_double(entgl_a + 4, blue);
+    entgl_put_double(entgl_a + 6, alpha);
 }
 
 static void APIENTRY icd_Color4dv(const GLdouble *v)
@@ -847,11 +847,11 @@ static void APIENTRY icd_Color4dv(const GLdouble *v)
 
 static void APIENTRY icd_Color4f(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
 {
-    unsigned *c = entgl_command(29, 4);
-    entgl_put_float(c + 0, red);
-    entgl_put_float(c + 1, green);
-    entgl_put_float(c + 2, blue);
-    entgl_put_float(c + 3, alpha);
+    unsigned *entgl_a = entgl_command(29, 4);
+    entgl_put_float(entgl_a + 0, red);
+    entgl_put_float(entgl_a + 1, green);
+    entgl_put_float(entgl_a + 2, blue);
+    entgl_put_float(entgl_a + 3, alpha);
 }
 
 static void APIENTRY icd_Color4fv(const GLfloat *v)
@@ -861,11 +861,11 @@ static void APIENTRY icd_Color4fv(const GLfloat *v)
 
 static void APIENTRY icd_Color4i(GLint red, GLint green, GLint blue, GLint alpha)
 {
-    unsigned *c = entgl_command(31, 4);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
-    c[3] = (unsigned)alpha;
+    unsigned *entgl_a = entgl_command(31, 4);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
+    entgl_a[3] = (unsigned)alpha;
 }
 
 static void APIENTRY icd_Color4iv(const GLint *v)
@@ -875,11 +875,11 @@ static void APIENTRY icd_Color4iv(const GLint *v)
 
 static void APIENTRY icd_Color4s(GLshort red, GLshort green, GLshort blue, GLshort alpha)
 {
-    unsigned *c = entgl_command(33, 4);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
-    c[3] = (unsigned)alpha;
+    unsigned *entgl_a = entgl_command(33, 4);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
+    entgl_a[3] = (unsigned)alpha;
 }
 
 static void APIENTRY icd_Color4sv(const GLshort *v)
@@ -889,11 +889,11 @@ static void APIENTRY icd_Color4sv(const GLshort *v)
 
 static void APIENTRY icd_Color4ub(GLubyte red, GLubyte green, GLubyte blue, GLubyte alpha)
 {
-    unsigned *c = entgl_command(35, 4);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
-    c[3] = (unsigned)alpha;
+    unsigned *entgl_a = entgl_command(35, 4);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
+    entgl_a[3] = (unsigned)alpha;
 }
 
 static void APIENTRY icd_Color4ubv(const GLubyte *v)
@@ -903,11 +903,11 @@ static void APIENTRY icd_Color4ubv(const GLubyte *v)
 
 static void APIENTRY icd_Color4ui(GLuint red, GLuint green, GLuint blue, GLuint alpha)
 {
-    unsigned *c = entgl_command(37, 4);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
-    c[3] = (unsigned)alpha;
+    unsigned *entgl_a = entgl_command(37, 4);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
+    entgl_a[3] = (unsigned)alpha;
 }
 
 static void APIENTRY icd_Color4uiv(const GLuint *v)
@@ -917,11 +917,11 @@ static void APIENTRY icd_Color4uiv(const GLuint *v)
 
 static void APIENTRY icd_Color4us(GLushort red, GLushort green, GLushort blue, GLushort alpha)
 {
-    unsigned *c = entgl_command(39, 4);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
-    c[3] = (unsigned)alpha;
+    unsigned *entgl_a = entgl_command(39, 4);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
+    entgl_a[3] = (unsigned)alpha;
 }
 
 static void APIENTRY icd_Color4usv(const GLushort *v)
@@ -931,8 +931,8 @@ static void APIENTRY icd_Color4usv(const GLushort *v)
 
 static void APIENTRY icd_EdgeFlag(GLboolean flag)
 {
-    unsigned *c = entgl_command(41, 1);
-    c[0] = (unsigned)flag;
+    unsigned *entgl_a = entgl_command(41, 1);
+    entgl_a[0] = (unsigned)flag;
 }
 
 static void APIENTRY icd_End(void)
@@ -942,8 +942,8 @@ static void APIENTRY icd_End(void)
 
 static void APIENTRY icd_Indexd(GLdouble c)
 {
-    unsigned *c = entgl_command(44, 2);
-    entgl_put_double(c + 0, c);
+    unsigned *entgl_a = entgl_command(44, 2);
+    entgl_put_double(entgl_a + 0, c);
 }
 
 static void APIENTRY icd_Indexdv(const GLdouble *c)
@@ -953,8 +953,8 @@ static void APIENTRY icd_Indexdv(const GLdouble *c)
 
 static void APIENTRY icd_Indexf(GLfloat c)
 {
-    unsigned *c = entgl_command(46, 1);
-    entgl_put_float(c + 0, c);
+    unsigned *entgl_a = entgl_command(46, 1);
+    entgl_put_float(entgl_a + 0, c);
 }
 
 static void APIENTRY icd_Indexfv(const GLfloat *c)
@@ -964,8 +964,8 @@ static void APIENTRY icd_Indexfv(const GLfloat *c)
 
 static void APIENTRY icd_Indexi(GLint c)
 {
-    unsigned *c = entgl_command(48, 1);
-    c[0] = (unsigned)c;
+    unsigned *entgl_a = entgl_command(48, 1);
+    entgl_a[0] = (unsigned)c;
 }
 
 static void APIENTRY icd_Indexiv(const GLint *c)
@@ -975,8 +975,8 @@ static void APIENTRY icd_Indexiv(const GLint *c)
 
 static void APIENTRY icd_Indexs(GLshort c)
 {
-    unsigned *c = entgl_command(50, 1);
-    c[0] = (unsigned)c;
+    unsigned *entgl_a = entgl_command(50, 1);
+    entgl_a[0] = (unsigned)c;
 }
 
 static void APIENTRY icd_Indexsv(const GLshort *c)
@@ -986,10 +986,10 @@ static void APIENTRY icd_Indexsv(const GLshort *c)
 
 static void APIENTRY icd_Normal3b(GLbyte nx, GLbyte ny, GLbyte nz)
 {
-    unsigned *c = entgl_command(52, 3);
-    c[0] = (unsigned)nx;
-    c[1] = (unsigned)ny;
-    c[2] = (unsigned)nz;
+    unsigned *entgl_a = entgl_command(52, 3);
+    entgl_a[0] = (unsigned)nx;
+    entgl_a[1] = (unsigned)ny;
+    entgl_a[2] = (unsigned)nz;
 }
 
 static void APIENTRY icd_Normal3bv(const GLbyte *v)
@@ -999,10 +999,10 @@ static void APIENTRY icd_Normal3bv(const GLbyte *v)
 
 static void APIENTRY icd_Normal3d(GLdouble nx, GLdouble ny, GLdouble nz)
 {
-    unsigned *c = entgl_command(54, 6);
-    entgl_put_double(c + 0, nx);
-    entgl_put_double(c + 2, ny);
-    entgl_put_double(c + 4, nz);
+    unsigned *entgl_a = entgl_command(54, 6);
+    entgl_put_double(entgl_a + 0, nx);
+    entgl_put_double(entgl_a + 2, ny);
+    entgl_put_double(entgl_a + 4, nz);
 }
 
 static void APIENTRY icd_Normal3dv(const GLdouble *v)
@@ -1012,10 +1012,10 @@ static void APIENTRY icd_Normal3dv(const GLdouble *v)
 
 static void APIENTRY icd_Normal3f(GLfloat nx, GLfloat ny, GLfloat nz)
 {
-    unsigned *c = entgl_command(56, 3);
-    entgl_put_float(c + 0, nx);
-    entgl_put_float(c + 1, ny);
-    entgl_put_float(c + 2, nz);
+    unsigned *entgl_a = entgl_command(56, 3);
+    entgl_put_float(entgl_a + 0, nx);
+    entgl_put_float(entgl_a + 1, ny);
+    entgl_put_float(entgl_a + 2, nz);
 }
 
 static void APIENTRY icd_Normal3fv(const GLfloat *v)
@@ -1025,10 +1025,10 @@ static void APIENTRY icd_Normal3fv(const GLfloat *v)
 
 static void APIENTRY icd_Normal3i(GLint nx, GLint ny, GLint nz)
 {
-    unsigned *c = entgl_command(58, 3);
-    c[0] = (unsigned)nx;
-    c[1] = (unsigned)ny;
-    c[2] = (unsigned)nz;
+    unsigned *entgl_a = entgl_command(58, 3);
+    entgl_a[0] = (unsigned)nx;
+    entgl_a[1] = (unsigned)ny;
+    entgl_a[2] = (unsigned)nz;
 }
 
 static void APIENTRY icd_Normal3iv(const GLint *v)
@@ -1038,10 +1038,10 @@ static void APIENTRY icd_Normal3iv(const GLint *v)
 
 static void APIENTRY icd_Normal3s(GLshort nx, GLshort ny, GLshort nz)
 {
-    unsigned *c = entgl_command(60, 3);
-    c[0] = (unsigned)nx;
-    c[1] = (unsigned)ny;
-    c[2] = (unsigned)nz;
+    unsigned *entgl_a = entgl_command(60, 3);
+    entgl_a[0] = (unsigned)nx;
+    entgl_a[1] = (unsigned)ny;
+    entgl_a[2] = (unsigned)nz;
 }
 
 static void APIENTRY icd_Normal3sv(const GLshort *v)
@@ -1051,9 +1051,9 @@ static void APIENTRY icd_Normal3sv(const GLshort *v)
 
 static void APIENTRY icd_RasterPos2d(GLdouble x, GLdouble y)
 {
-    unsigned *c = entgl_command(62, 4);
-    entgl_put_double(c + 0, x);
-    entgl_put_double(c + 2, y);
+    unsigned *entgl_a = entgl_command(62, 4);
+    entgl_put_double(entgl_a + 0, x);
+    entgl_put_double(entgl_a + 2, y);
 }
 
 static void APIENTRY icd_RasterPos2dv(const GLdouble *v)
@@ -1063,9 +1063,9 @@ static void APIENTRY icd_RasterPos2dv(const GLdouble *v)
 
 static void APIENTRY icd_RasterPos2f(GLfloat x, GLfloat y)
 {
-    unsigned *c = entgl_command(64, 2);
-    entgl_put_float(c + 0, x);
-    entgl_put_float(c + 1, y);
+    unsigned *entgl_a = entgl_command(64, 2);
+    entgl_put_float(entgl_a + 0, x);
+    entgl_put_float(entgl_a + 1, y);
 }
 
 static void APIENTRY icd_RasterPos2fv(const GLfloat *v)
@@ -1075,9 +1075,9 @@ static void APIENTRY icd_RasterPos2fv(const GLfloat *v)
 
 static void APIENTRY icd_RasterPos2i(GLint x, GLint y)
 {
-    unsigned *c = entgl_command(66, 2);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
+    unsigned *entgl_a = entgl_command(66, 2);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
 }
 
 static void APIENTRY icd_RasterPos2iv(const GLint *v)
@@ -1087,9 +1087,9 @@ static void APIENTRY icd_RasterPos2iv(const GLint *v)
 
 static void APIENTRY icd_RasterPos2s(GLshort x, GLshort y)
 {
-    unsigned *c = entgl_command(68, 2);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
+    unsigned *entgl_a = entgl_command(68, 2);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
 }
 
 static void APIENTRY icd_RasterPos2sv(const GLshort *v)
@@ -1099,10 +1099,10 @@ static void APIENTRY icd_RasterPos2sv(const GLshort *v)
 
 static void APIENTRY icd_RasterPos3d(GLdouble x, GLdouble y, GLdouble z)
 {
-    unsigned *c = entgl_command(70, 6);
-    entgl_put_double(c + 0, x);
-    entgl_put_double(c + 2, y);
-    entgl_put_double(c + 4, z);
+    unsigned *entgl_a = entgl_command(70, 6);
+    entgl_put_double(entgl_a + 0, x);
+    entgl_put_double(entgl_a + 2, y);
+    entgl_put_double(entgl_a + 4, z);
 }
 
 static void APIENTRY icd_RasterPos3dv(const GLdouble *v)
@@ -1112,10 +1112,10 @@ static void APIENTRY icd_RasterPos3dv(const GLdouble *v)
 
 static void APIENTRY icd_RasterPos3f(GLfloat x, GLfloat y, GLfloat z)
 {
-    unsigned *c = entgl_command(72, 3);
-    entgl_put_float(c + 0, x);
-    entgl_put_float(c + 1, y);
-    entgl_put_float(c + 2, z);
+    unsigned *entgl_a = entgl_command(72, 3);
+    entgl_put_float(entgl_a + 0, x);
+    entgl_put_float(entgl_a + 1, y);
+    entgl_put_float(entgl_a + 2, z);
 }
 
 static void APIENTRY icd_RasterPos3fv(const GLfloat *v)
@@ -1125,10 +1125,10 @@ static void APIENTRY icd_RasterPos3fv(const GLfloat *v)
 
 static void APIENTRY icd_RasterPos3i(GLint x, GLint y, GLint z)
 {
-    unsigned *c = entgl_command(74, 3);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
-    c[2] = (unsigned)z;
+    unsigned *entgl_a = entgl_command(74, 3);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
+    entgl_a[2] = (unsigned)z;
 }
 
 static void APIENTRY icd_RasterPos3iv(const GLint *v)
@@ -1138,10 +1138,10 @@ static void APIENTRY icd_RasterPos3iv(const GLint *v)
 
 static void APIENTRY icd_RasterPos3s(GLshort x, GLshort y, GLshort z)
 {
-    unsigned *c = entgl_command(76, 3);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
-    c[2] = (unsigned)z;
+    unsigned *entgl_a = entgl_command(76, 3);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
+    entgl_a[2] = (unsigned)z;
 }
 
 static void APIENTRY icd_RasterPos3sv(const GLshort *v)
@@ -1151,11 +1151,11 @@ static void APIENTRY icd_RasterPos3sv(const GLshort *v)
 
 static void APIENTRY icd_RasterPos4d(GLdouble x, GLdouble y, GLdouble z, GLdouble w)
 {
-    unsigned *c = entgl_command(78, 8);
-    entgl_put_double(c + 0, x);
-    entgl_put_double(c + 2, y);
-    entgl_put_double(c + 4, z);
-    entgl_put_double(c + 6, w);
+    unsigned *entgl_a = entgl_command(78, 8);
+    entgl_put_double(entgl_a + 0, x);
+    entgl_put_double(entgl_a + 2, y);
+    entgl_put_double(entgl_a + 4, z);
+    entgl_put_double(entgl_a + 6, w);
 }
 
 static void APIENTRY icd_RasterPos4dv(const GLdouble *v)
@@ -1165,11 +1165,11 @@ static void APIENTRY icd_RasterPos4dv(const GLdouble *v)
 
 static void APIENTRY icd_RasterPos4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w)
 {
-    unsigned *c = entgl_command(80, 4);
-    entgl_put_float(c + 0, x);
-    entgl_put_float(c + 1, y);
-    entgl_put_float(c + 2, z);
-    entgl_put_float(c + 3, w);
+    unsigned *entgl_a = entgl_command(80, 4);
+    entgl_put_float(entgl_a + 0, x);
+    entgl_put_float(entgl_a + 1, y);
+    entgl_put_float(entgl_a + 2, z);
+    entgl_put_float(entgl_a + 3, w);
 }
 
 static void APIENTRY icd_RasterPos4fv(const GLfloat *v)
@@ -1179,11 +1179,11 @@ static void APIENTRY icd_RasterPos4fv(const GLfloat *v)
 
 static void APIENTRY icd_RasterPos4i(GLint x, GLint y, GLint z, GLint w)
 {
-    unsigned *c = entgl_command(82, 4);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
-    c[2] = (unsigned)z;
-    c[3] = (unsigned)w;
+    unsigned *entgl_a = entgl_command(82, 4);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
+    entgl_a[2] = (unsigned)z;
+    entgl_a[3] = (unsigned)w;
 }
 
 static void APIENTRY icd_RasterPos4iv(const GLint *v)
@@ -1193,11 +1193,11 @@ static void APIENTRY icd_RasterPos4iv(const GLint *v)
 
 static void APIENTRY icd_RasterPos4s(GLshort x, GLshort y, GLshort z, GLshort w)
 {
-    unsigned *c = entgl_command(84, 4);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
-    c[2] = (unsigned)z;
-    c[3] = (unsigned)w;
+    unsigned *entgl_a = entgl_command(84, 4);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
+    entgl_a[2] = (unsigned)z;
+    entgl_a[3] = (unsigned)w;
 }
 
 static void APIENTRY icd_RasterPos4sv(const GLshort *v)
@@ -1207,44 +1207,44 @@ static void APIENTRY icd_RasterPos4sv(const GLshort *v)
 
 static void APIENTRY icd_Rectd(GLdouble x1, GLdouble y1, GLdouble x2, GLdouble y2)
 {
-    unsigned *c = entgl_command(86, 8);
-    entgl_put_double(c + 0, x1);
-    entgl_put_double(c + 2, y1);
-    entgl_put_double(c + 4, x2);
-    entgl_put_double(c + 6, y2);
+    unsigned *entgl_a = entgl_command(86, 8);
+    entgl_put_double(entgl_a + 0, x1);
+    entgl_put_double(entgl_a + 2, y1);
+    entgl_put_double(entgl_a + 4, x2);
+    entgl_put_double(entgl_a + 6, y2);
 }
 
 static void APIENTRY icd_Rectf(GLfloat x1, GLfloat y1, GLfloat x2, GLfloat y2)
 {
-    unsigned *c = entgl_command(88, 4);
-    entgl_put_float(c + 0, x1);
-    entgl_put_float(c + 1, y1);
-    entgl_put_float(c + 2, x2);
-    entgl_put_float(c + 3, y2);
+    unsigned *entgl_a = entgl_command(88, 4);
+    entgl_put_float(entgl_a + 0, x1);
+    entgl_put_float(entgl_a + 1, y1);
+    entgl_put_float(entgl_a + 2, x2);
+    entgl_put_float(entgl_a + 3, y2);
 }
 
 static void APIENTRY icd_Recti(GLint x1, GLint y1, GLint x2, GLint y2)
 {
-    unsigned *c = entgl_command(90, 4);
-    c[0] = (unsigned)x1;
-    c[1] = (unsigned)y1;
-    c[2] = (unsigned)x2;
-    c[3] = (unsigned)y2;
+    unsigned *entgl_a = entgl_command(90, 4);
+    entgl_a[0] = (unsigned)x1;
+    entgl_a[1] = (unsigned)y1;
+    entgl_a[2] = (unsigned)x2;
+    entgl_a[3] = (unsigned)y2;
 }
 
 static void APIENTRY icd_Rects(GLshort x1, GLshort y1, GLshort x2, GLshort y2)
 {
-    unsigned *c = entgl_command(92, 4);
-    c[0] = (unsigned)x1;
-    c[1] = (unsigned)y1;
-    c[2] = (unsigned)x2;
-    c[3] = (unsigned)y2;
+    unsigned *entgl_a = entgl_command(92, 4);
+    entgl_a[0] = (unsigned)x1;
+    entgl_a[1] = (unsigned)y1;
+    entgl_a[2] = (unsigned)x2;
+    entgl_a[3] = (unsigned)y2;
 }
 
 static void APIENTRY icd_TexCoord1d(GLdouble s)
 {
-    unsigned *c = entgl_command(94, 2);
-    entgl_put_double(c + 0, s);
+    unsigned *entgl_a = entgl_command(94, 2);
+    entgl_put_double(entgl_a + 0, s);
 }
 
 static void APIENTRY icd_TexCoord1dv(const GLdouble *v)
@@ -1254,8 +1254,8 @@ static void APIENTRY icd_TexCoord1dv(const GLdouble *v)
 
 static void APIENTRY icd_TexCoord1f(GLfloat s)
 {
-    unsigned *c = entgl_command(96, 1);
-    entgl_put_float(c + 0, s);
+    unsigned *entgl_a = entgl_command(96, 1);
+    entgl_put_float(entgl_a + 0, s);
 }
 
 static void APIENTRY icd_TexCoord1fv(const GLfloat *v)
@@ -1265,8 +1265,8 @@ static void APIENTRY icd_TexCoord1fv(const GLfloat *v)
 
 static void APIENTRY icd_TexCoord1i(GLint s)
 {
-    unsigned *c = entgl_command(98, 1);
-    c[0] = (unsigned)s;
+    unsigned *entgl_a = entgl_command(98, 1);
+    entgl_a[0] = (unsigned)s;
 }
 
 static void APIENTRY icd_TexCoord1iv(const GLint *v)
@@ -1276,8 +1276,8 @@ static void APIENTRY icd_TexCoord1iv(const GLint *v)
 
 static void APIENTRY icd_TexCoord1s(GLshort s)
 {
-    unsigned *c = entgl_command(100, 1);
-    c[0] = (unsigned)s;
+    unsigned *entgl_a = entgl_command(100, 1);
+    entgl_a[0] = (unsigned)s;
 }
 
 static void APIENTRY icd_TexCoord1sv(const GLshort *v)
@@ -1287,9 +1287,9 @@ static void APIENTRY icd_TexCoord1sv(const GLshort *v)
 
 static void APIENTRY icd_TexCoord2d(GLdouble s, GLdouble t)
 {
-    unsigned *c = entgl_command(102, 4);
-    entgl_put_double(c + 0, s);
-    entgl_put_double(c + 2, t);
+    unsigned *entgl_a = entgl_command(102, 4);
+    entgl_put_double(entgl_a + 0, s);
+    entgl_put_double(entgl_a + 2, t);
 }
 
 static void APIENTRY icd_TexCoord2dv(const GLdouble *v)
@@ -1299,9 +1299,9 @@ static void APIENTRY icd_TexCoord2dv(const GLdouble *v)
 
 static void APIENTRY icd_TexCoord2f(GLfloat s, GLfloat t)
 {
-    unsigned *c = entgl_command(104, 2);
-    entgl_put_float(c + 0, s);
-    entgl_put_float(c + 1, t);
+    unsigned *entgl_a = entgl_command(104, 2);
+    entgl_put_float(entgl_a + 0, s);
+    entgl_put_float(entgl_a + 1, t);
 }
 
 static void APIENTRY icd_TexCoord2fv(const GLfloat *v)
@@ -1311,9 +1311,9 @@ static void APIENTRY icd_TexCoord2fv(const GLfloat *v)
 
 static void APIENTRY icd_TexCoord2i(GLint s, GLint t)
 {
-    unsigned *c = entgl_command(106, 2);
-    c[0] = (unsigned)s;
-    c[1] = (unsigned)t;
+    unsigned *entgl_a = entgl_command(106, 2);
+    entgl_a[0] = (unsigned)s;
+    entgl_a[1] = (unsigned)t;
 }
 
 static void APIENTRY icd_TexCoord2iv(const GLint *v)
@@ -1323,9 +1323,9 @@ static void APIENTRY icd_TexCoord2iv(const GLint *v)
 
 static void APIENTRY icd_TexCoord2s(GLshort s, GLshort t)
 {
-    unsigned *c = entgl_command(108, 2);
-    c[0] = (unsigned)s;
-    c[1] = (unsigned)t;
+    unsigned *entgl_a = entgl_command(108, 2);
+    entgl_a[0] = (unsigned)s;
+    entgl_a[1] = (unsigned)t;
 }
 
 static void APIENTRY icd_TexCoord2sv(const GLshort *v)
@@ -1335,10 +1335,10 @@ static void APIENTRY icd_TexCoord2sv(const GLshort *v)
 
 static void APIENTRY icd_TexCoord3d(GLdouble s, GLdouble t, GLdouble r)
 {
-    unsigned *c = entgl_command(110, 6);
-    entgl_put_double(c + 0, s);
-    entgl_put_double(c + 2, t);
-    entgl_put_double(c + 4, r);
+    unsigned *entgl_a = entgl_command(110, 6);
+    entgl_put_double(entgl_a + 0, s);
+    entgl_put_double(entgl_a + 2, t);
+    entgl_put_double(entgl_a + 4, r);
 }
 
 static void APIENTRY icd_TexCoord3dv(const GLdouble *v)
@@ -1348,10 +1348,10 @@ static void APIENTRY icd_TexCoord3dv(const GLdouble *v)
 
 static void APIENTRY icd_TexCoord3f(GLfloat s, GLfloat t, GLfloat r)
 {
-    unsigned *c = entgl_command(112, 3);
-    entgl_put_float(c + 0, s);
-    entgl_put_float(c + 1, t);
-    entgl_put_float(c + 2, r);
+    unsigned *entgl_a = entgl_command(112, 3);
+    entgl_put_float(entgl_a + 0, s);
+    entgl_put_float(entgl_a + 1, t);
+    entgl_put_float(entgl_a + 2, r);
 }
 
 static void APIENTRY icd_TexCoord3fv(const GLfloat *v)
@@ -1361,10 +1361,10 @@ static void APIENTRY icd_TexCoord3fv(const GLfloat *v)
 
 static void APIENTRY icd_TexCoord3i(GLint s, GLint t, GLint r)
 {
-    unsigned *c = entgl_command(114, 3);
-    c[0] = (unsigned)s;
-    c[1] = (unsigned)t;
-    c[2] = (unsigned)r;
+    unsigned *entgl_a = entgl_command(114, 3);
+    entgl_a[0] = (unsigned)s;
+    entgl_a[1] = (unsigned)t;
+    entgl_a[2] = (unsigned)r;
 }
 
 static void APIENTRY icd_TexCoord3iv(const GLint *v)
@@ -1374,10 +1374,10 @@ static void APIENTRY icd_TexCoord3iv(const GLint *v)
 
 static void APIENTRY icd_TexCoord3s(GLshort s, GLshort t, GLshort r)
 {
-    unsigned *c = entgl_command(116, 3);
-    c[0] = (unsigned)s;
-    c[1] = (unsigned)t;
-    c[2] = (unsigned)r;
+    unsigned *entgl_a = entgl_command(116, 3);
+    entgl_a[0] = (unsigned)s;
+    entgl_a[1] = (unsigned)t;
+    entgl_a[2] = (unsigned)r;
 }
 
 static void APIENTRY icd_TexCoord3sv(const GLshort *v)
@@ -1387,11 +1387,11 @@ static void APIENTRY icd_TexCoord3sv(const GLshort *v)
 
 static void APIENTRY icd_TexCoord4d(GLdouble s, GLdouble t, GLdouble r, GLdouble q)
 {
-    unsigned *c = entgl_command(118, 8);
-    entgl_put_double(c + 0, s);
-    entgl_put_double(c + 2, t);
-    entgl_put_double(c + 4, r);
-    entgl_put_double(c + 6, q);
+    unsigned *entgl_a = entgl_command(118, 8);
+    entgl_put_double(entgl_a + 0, s);
+    entgl_put_double(entgl_a + 2, t);
+    entgl_put_double(entgl_a + 4, r);
+    entgl_put_double(entgl_a + 6, q);
 }
 
 static void APIENTRY icd_TexCoord4dv(const GLdouble *v)
@@ -1401,11 +1401,11 @@ static void APIENTRY icd_TexCoord4dv(const GLdouble *v)
 
 static void APIENTRY icd_TexCoord4f(GLfloat s, GLfloat t, GLfloat r, GLfloat q)
 {
-    unsigned *c = entgl_command(120, 4);
-    entgl_put_float(c + 0, s);
-    entgl_put_float(c + 1, t);
-    entgl_put_float(c + 2, r);
-    entgl_put_float(c + 3, q);
+    unsigned *entgl_a = entgl_command(120, 4);
+    entgl_put_float(entgl_a + 0, s);
+    entgl_put_float(entgl_a + 1, t);
+    entgl_put_float(entgl_a + 2, r);
+    entgl_put_float(entgl_a + 3, q);
 }
 
 static void APIENTRY icd_TexCoord4fv(const GLfloat *v)
@@ -1415,11 +1415,11 @@ static void APIENTRY icd_TexCoord4fv(const GLfloat *v)
 
 static void APIENTRY icd_TexCoord4i(GLint s, GLint t, GLint r, GLint q)
 {
-    unsigned *c = entgl_command(122, 4);
-    c[0] = (unsigned)s;
-    c[1] = (unsigned)t;
-    c[2] = (unsigned)r;
-    c[3] = (unsigned)q;
+    unsigned *entgl_a = entgl_command(122, 4);
+    entgl_a[0] = (unsigned)s;
+    entgl_a[1] = (unsigned)t;
+    entgl_a[2] = (unsigned)r;
+    entgl_a[3] = (unsigned)q;
 }
 
 static void APIENTRY icd_TexCoord4iv(const GLint *v)
@@ -1429,11 +1429,11 @@ static void APIENTRY icd_TexCoord4iv(const GLint *v)
 
 static void APIENTRY icd_TexCoord4s(GLshort s, GLshort t, GLshort r, GLshort q)
 {
-    unsigned *c = entgl_command(124, 4);
-    c[0] = (unsigned)s;
-    c[1] = (unsigned)t;
-    c[2] = (unsigned)r;
-    c[3] = (unsigned)q;
+    unsigned *entgl_a = entgl_command(124, 4);
+    entgl_a[0] = (unsigned)s;
+    entgl_a[1] = (unsigned)t;
+    entgl_a[2] = (unsigned)r;
+    entgl_a[3] = (unsigned)q;
 }
 
 static void APIENTRY icd_TexCoord4sv(const GLshort *v)
@@ -1443,9 +1443,9 @@ static void APIENTRY icd_TexCoord4sv(const GLshort *v)
 
 static void APIENTRY icd_Vertex2d(GLdouble x, GLdouble y)
 {
-    unsigned *c = entgl_command(126, 4);
-    entgl_put_double(c + 0, x);
-    entgl_put_double(c + 2, y);
+    unsigned *entgl_a = entgl_command(126, 4);
+    entgl_put_double(entgl_a + 0, x);
+    entgl_put_double(entgl_a + 2, y);
 }
 
 static void APIENTRY icd_Vertex2dv(const GLdouble *v)
@@ -1455,9 +1455,9 @@ static void APIENTRY icd_Vertex2dv(const GLdouble *v)
 
 static void APIENTRY icd_Vertex2f(GLfloat x, GLfloat y)
 {
-    unsigned *c = entgl_command(128, 2);
-    entgl_put_float(c + 0, x);
-    entgl_put_float(c + 1, y);
+    unsigned *entgl_a = entgl_command(128, 2);
+    entgl_put_float(entgl_a + 0, x);
+    entgl_put_float(entgl_a + 1, y);
 }
 
 static void APIENTRY icd_Vertex2fv(const GLfloat *v)
@@ -1467,9 +1467,9 @@ static void APIENTRY icd_Vertex2fv(const GLfloat *v)
 
 static void APIENTRY icd_Vertex2i(GLint x, GLint y)
 {
-    unsigned *c = entgl_command(130, 2);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
+    unsigned *entgl_a = entgl_command(130, 2);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
 }
 
 static void APIENTRY icd_Vertex2iv(const GLint *v)
@@ -1479,9 +1479,9 @@ static void APIENTRY icd_Vertex2iv(const GLint *v)
 
 static void APIENTRY icd_Vertex2s(GLshort x, GLshort y)
 {
-    unsigned *c = entgl_command(132, 2);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
+    unsigned *entgl_a = entgl_command(132, 2);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
 }
 
 static void APIENTRY icd_Vertex2sv(const GLshort *v)
@@ -1491,10 +1491,10 @@ static void APIENTRY icd_Vertex2sv(const GLshort *v)
 
 static void APIENTRY icd_Vertex3d(GLdouble x, GLdouble y, GLdouble z)
 {
-    unsigned *c = entgl_command(134, 6);
-    entgl_put_double(c + 0, x);
-    entgl_put_double(c + 2, y);
-    entgl_put_double(c + 4, z);
+    unsigned *entgl_a = entgl_command(134, 6);
+    entgl_put_double(entgl_a + 0, x);
+    entgl_put_double(entgl_a + 2, y);
+    entgl_put_double(entgl_a + 4, z);
 }
 
 static void APIENTRY icd_Vertex3dv(const GLdouble *v)
@@ -1504,10 +1504,10 @@ static void APIENTRY icd_Vertex3dv(const GLdouble *v)
 
 static void APIENTRY icd_Vertex3f(GLfloat x, GLfloat y, GLfloat z)
 {
-    unsigned *c = entgl_command(136, 3);
-    entgl_put_float(c + 0, x);
-    entgl_put_float(c + 1, y);
-    entgl_put_float(c + 2, z);
+    unsigned *entgl_a = entgl_command(136, 3);
+    entgl_put_float(entgl_a + 0, x);
+    entgl_put_float(entgl_a + 1, y);
+    entgl_put_float(entgl_a + 2, z);
 }
 
 static void APIENTRY icd_Vertex3fv(const GLfloat *v)
@@ -1517,10 +1517,10 @@ static void APIENTRY icd_Vertex3fv(const GLfloat *v)
 
 static void APIENTRY icd_Vertex3i(GLint x, GLint y, GLint z)
 {
-    unsigned *c = entgl_command(138, 3);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
-    c[2] = (unsigned)z;
+    unsigned *entgl_a = entgl_command(138, 3);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
+    entgl_a[2] = (unsigned)z;
 }
 
 static void APIENTRY icd_Vertex3iv(const GLint *v)
@@ -1530,10 +1530,10 @@ static void APIENTRY icd_Vertex3iv(const GLint *v)
 
 static void APIENTRY icd_Vertex3s(GLshort x, GLshort y, GLshort z)
 {
-    unsigned *c = entgl_command(140, 3);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
-    c[2] = (unsigned)z;
+    unsigned *entgl_a = entgl_command(140, 3);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
+    entgl_a[2] = (unsigned)z;
 }
 
 static void APIENTRY icd_Vertex3sv(const GLshort *v)
@@ -1543,11 +1543,11 @@ static void APIENTRY icd_Vertex3sv(const GLshort *v)
 
 static void APIENTRY icd_Vertex4d(GLdouble x, GLdouble y, GLdouble z, GLdouble w)
 {
-    unsigned *c = entgl_command(142, 8);
-    entgl_put_double(c + 0, x);
-    entgl_put_double(c + 2, y);
-    entgl_put_double(c + 4, z);
-    entgl_put_double(c + 6, w);
+    unsigned *entgl_a = entgl_command(142, 8);
+    entgl_put_double(entgl_a + 0, x);
+    entgl_put_double(entgl_a + 2, y);
+    entgl_put_double(entgl_a + 4, z);
+    entgl_put_double(entgl_a + 6, w);
 }
 
 static void APIENTRY icd_Vertex4dv(const GLdouble *v)
@@ -1557,11 +1557,11 @@ static void APIENTRY icd_Vertex4dv(const GLdouble *v)
 
 static void APIENTRY icd_Vertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w)
 {
-    unsigned *c = entgl_command(144, 4);
-    entgl_put_float(c + 0, x);
-    entgl_put_float(c + 1, y);
-    entgl_put_float(c + 2, z);
-    entgl_put_float(c + 3, w);
+    unsigned *entgl_a = entgl_command(144, 4);
+    entgl_put_float(entgl_a + 0, x);
+    entgl_put_float(entgl_a + 1, y);
+    entgl_put_float(entgl_a + 2, z);
+    entgl_put_float(entgl_a + 3, w);
 }
 
 static void APIENTRY icd_Vertex4fv(const GLfloat *v)
@@ -1571,11 +1571,11 @@ static void APIENTRY icd_Vertex4fv(const GLfloat *v)
 
 static void APIENTRY icd_Vertex4i(GLint x, GLint y, GLint z, GLint w)
 {
-    unsigned *c = entgl_command(146, 4);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
-    c[2] = (unsigned)z;
-    c[3] = (unsigned)w;
+    unsigned *entgl_a = entgl_command(146, 4);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
+    entgl_a[2] = (unsigned)z;
+    entgl_a[3] = (unsigned)w;
 }
 
 static void APIENTRY icd_Vertex4iv(const GLint *v)
@@ -1585,11 +1585,11 @@ static void APIENTRY icd_Vertex4iv(const GLint *v)
 
 static void APIENTRY icd_Vertex4s(GLshort x, GLshort y, GLshort z, GLshort w)
 {
-    unsigned *c = entgl_command(148, 4);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
-    c[2] = (unsigned)z;
-    c[3] = (unsigned)w;
+    unsigned *entgl_a = entgl_command(148, 4);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
+    entgl_a[2] = (unsigned)z;
+    entgl_a[3] = (unsigned)w;
 }
 
 static void APIENTRY icd_Vertex4sv(const GLshort *v)
@@ -1599,185 +1599,185 @@ static void APIENTRY icd_Vertex4sv(const GLshort *v)
 
 static void APIENTRY icd_ColorMaterial(GLenum face, GLenum mode)
 {
-    unsigned *c = entgl_command(151, 2);
-    c[0] = (unsigned)face;
-    c[1] = (unsigned)mode;
+    unsigned *entgl_a = entgl_command(151, 2);
+    entgl_a[0] = (unsigned)face;
+    entgl_a[1] = (unsigned)mode;
 }
 
 static void APIENTRY icd_CullFace(GLenum mode)
 {
-    unsigned *c = entgl_command(152, 1);
-    c[0] = (unsigned)mode;
+    unsigned *entgl_a = entgl_command(152, 1);
+    entgl_a[0] = (unsigned)mode;
 }
 
 static void APIENTRY icd_Fogf(GLenum pname, GLfloat param)
 {
-    unsigned *c = entgl_command(153, 2);
-    c[0] = (unsigned)pname;
-    entgl_put_float(c + 1, param);
+    unsigned *entgl_a = entgl_command(153, 2);
+    entgl_a[0] = (unsigned)pname;
+    entgl_put_float(entgl_a + 1, param);
 }
 
 static void APIENTRY icd_Fogi(GLenum pname, GLint param)
 {
-    unsigned *c = entgl_command(155, 2);
-    c[0] = (unsigned)pname;
-    c[1] = (unsigned)param;
+    unsigned *entgl_a = entgl_command(155, 2);
+    entgl_a[0] = (unsigned)pname;
+    entgl_a[1] = (unsigned)param;
 }
 
 static void APIENTRY icd_FrontFace(GLenum mode)
 {
-    unsigned *c = entgl_command(157, 1);
-    c[0] = (unsigned)mode;
+    unsigned *entgl_a = entgl_command(157, 1);
+    entgl_a[0] = (unsigned)mode;
 }
 
 static void APIENTRY icd_Hint(GLenum target, GLenum mode)
 {
-    unsigned *c = entgl_command(158, 2);
-    c[0] = (unsigned)target;
-    c[1] = (unsigned)mode;
+    unsigned *entgl_a = entgl_command(158, 2);
+    entgl_a[0] = (unsigned)target;
+    entgl_a[1] = (unsigned)mode;
 }
 
 static void APIENTRY icd_Lightf(GLenum light, GLenum pname, GLfloat param)
 {
-    unsigned *c = entgl_command(159, 3);
-    c[0] = (unsigned)light;
-    c[1] = (unsigned)pname;
-    entgl_put_float(c + 2, param);
+    unsigned *entgl_a = entgl_command(159, 3);
+    entgl_a[0] = (unsigned)light;
+    entgl_a[1] = (unsigned)pname;
+    entgl_put_float(entgl_a + 2, param);
 }
 
 static void APIENTRY icd_Lighti(GLenum light, GLenum pname, GLint param)
 {
-    unsigned *c = entgl_command(161, 3);
-    c[0] = (unsigned)light;
-    c[1] = (unsigned)pname;
-    c[2] = (unsigned)param;
+    unsigned *entgl_a = entgl_command(161, 3);
+    entgl_a[0] = (unsigned)light;
+    entgl_a[1] = (unsigned)pname;
+    entgl_a[2] = (unsigned)param;
 }
 
 static void APIENTRY icd_LightModelf(GLenum pname, GLfloat param)
 {
-    unsigned *c = entgl_command(163, 2);
-    c[0] = (unsigned)pname;
-    entgl_put_float(c + 1, param);
+    unsigned *entgl_a = entgl_command(163, 2);
+    entgl_a[0] = (unsigned)pname;
+    entgl_put_float(entgl_a + 1, param);
 }
 
 static void APIENTRY icd_LightModeli(GLenum pname, GLint param)
 {
-    unsigned *c = entgl_command(165, 2);
-    c[0] = (unsigned)pname;
-    c[1] = (unsigned)param;
+    unsigned *entgl_a = entgl_command(165, 2);
+    entgl_a[0] = (unsigned)pname;
+    entgl_a[1] = (unsigned)param;
 }
 
 static void APIENTRY icd_LineStipple(GLint factor, GLushort pattern)
 {
-    unsigned *c = entgl_command(167, 2);
-    c[0] = (unsigned)factor;
-    c[1] = (unsigned)pattern;
+    unsigned *entgl_a = entgl_command(167, 2);
+    entgl_a[0] = (unsigned)factor;
+    entgl_a[1] = (unsigned)pattern;
 }
 
 static void APIENTRY icd_LineWidth(GLfloat width)
 {
-    unsigned *c = entgl_command(168, 1);
-    entgl_put_float(c + 0, width);
+    unsigned *entgl_a = entgl_command(168, 1);
+    entgl_put_float(entgl_a + 0, width);
 }
 
 static void APIENTRY icd_Materialf(GLenum face, GLenum pname, GLfloat param)
 {
-    unsigned *c = entgl_command(169, 3);
-    c[0] = (unsigned)face;
-    c[1] = (unsigned)pname;
-    entgl_put_float(c + 2, param);
+    unsigned *entgl_a = entgl_command(169, 3);
+    entgl_a[0] = (unsigned)face;
+    entgl_a[1] = (unsigned)pname;
+    entgl_put_float(entgl_a + 2, param);
 }
 
 static void APIENTRY icd_Materiali(GLenum face, GLenum pname, GLint param)
 {
-    unsigned *c = entgl_command(171, 3);
-    c[0] = (unsigned)face;
-    c[1] = (unsigned)pname;
-    c[2] = (unsigned)param;
+    unsigned *entgl_a = entgl_command(171, 3);
+    entgl_a[0] = (unsigned)face;
+    entgl_a[1] = (unsigned)pname;
+    entgl_a[2] = (unsigned)param;
 }
 
 static void APIENTRY icd_PointSize(GLfloat size)
 {
-    unsigned *c = entgl_command(173, 1);
-    entgl_put_float(c + 0, size);
+    unsigned *entgl_a = entgl_command(173, 1);
+    entgl_put_float(entgl_a + 0, size);
 }
 
 static void APIENTRY icd_PolygonMode(GLenum face, GLenum mode)
 {
-    unsigned *c = entgl_command(174, 2);
-    c[0] = (unsigned)face;
-    c[1] = (unsigned)mode;
+    unsigned *entgl_a = entgl_command(174, 2);
+    entgl_a[0] = (unsigned)face;
+    entgl_a[1] = (unsigned)mode;
 }
 
 static void APIENTRY icd_Scissor(GLint x, GLint y, GLsizei width, GLsizei height)
 {
-    unsigned *c = entgl_command(176, 4);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
-    c[2] = (unsigned)width;
-    c[3] = (unsigned)height;
+    unsigned *entgl_a = entgl_command(176, 4);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
+    entgl_a[2] = (unsigned)width;
+    entgl_a[3] = (unsigned)height;
 }
 
 static void APIENTRY icd_ShadeModel(GLenum mode)
 {
-    unsigned *c = entgl_command(177, 1);
-    c[0] = (unsigned)mode;
+    unsigned *entgl_a = entgl_command(177, 1);
+    entgl_a[0] = (unsigned)mode;
 }
 
 static void APIENTRY icd_TexParameterf(GLenum target, GLenum pname, GLfloat param)
 {
-    unsigned *c = entgl_command(178, 3);
-    c[0] = (unsigned)target;
-    c[1] = (unsigned)pname;
-    entgl_put_float(c + 2, param);
+    unsigned *entgl_a = entgl_command(178, 3);
+    entgl_a[0] = (unsigned)target;
+    entgl_a[1] = (unsigned)pname;
+    entgl_put_float(entgl_a + 2, param);
 }
 
 static void APIENTRY icd_TexParameteri(GLenum target, GLenum pname, GLint param)
 {
-    unsigned *c = entgl_command(180, 3);
-    c[0] = (unsigned)target;
-    c[1] = (unsigned)pname;
-    c[2] = (unsigned)param;
+    unsigned *entgl_a = entgl_command(180, 3);
+    entgl_a[0] = (unsigned)target;
+    entgl_a[1] = (unsigned)pname;
+    entgl_a[2] = (unsigned)param;
 }
 
 static void APIENTRY icd_TexEnvf(GLenum target, GLenum pname, GLfloat param)
 {
-    unsigned *c = entgl_command(184, 3);
-    c[0] = (unsigned)target;
-    c[1] = (unsigned)pname;
-    entgl_put_float(c + 2, param);
+    unsigned *entgl_a = entgl_command(184, 3);
+    entgl_a[0] = (unsigned)target;
+    entgl_a[1] = (unsigned)pname;
+    entgl_put_float(entgl_a + 2, param);
 }
 
 static void APIENTRY icd_TexEnvi(GLenum target, GLenum pname, GLint param)
 {
-    unsigned *c = entgl_command(186, 3);
-    c[0] = (unsigned)target;
-    c[1] = (unsigned)pname;
-    c[2] = (unsigned)param;
+    unsigned *entgl_a = entgl_command(186, 3);
+    entgl_a[0] = (unsigned)target;
+    entgl_a[1] = (unsigned)pname;
+    entgl_a[2] = (unsigned)param;
 }
 
 static void APIENTRY icd_TexGend(GLenum coord, GLenum pname, GLdouble param)
 {
-    unsigned *c = entgl_command(188, 4);
-    c[0] = (unsigned)coord;
-    c[1] = (unsigned)pname;
-    entgl_put_double(c + 2, param);
+    unsigned *entgl_a = entgl_command(188, 4);
+    entgl_a[0] = (unsigned)coord;
+    entgl_a[1] = (unsigned)pname;
+    entgl_put_double(entgl_a + 2, param);
 }
 
 static void APIENTRY icd_TexGenf(GLenum coord, GLenum pname, GLfloat param)
 {
-    unsigned *c = entgl_command(190, 3);
-    c[0] = (unsigned)coord;
-    c[1] = (unsigned)pname;
-    entgl_put_float(c + 2, param);
+    unsigned *entgl_a = entgl_command(190, 3);
+    entgl_a[0] = (unsigned)coord;
+    entgl_a[1] = (unsigned)pname;
+    entgl_put_float(entgl_a + 2, param);
 }
 
 static void APIENTRY icd_TexGeni(GLenum coord, GLenum pname, GLint param)
 {
-    unsigned *c = entgl_command(192, 3);
-    c[0] = (unsigned)coord;
-    c[1] = (unsigned)pname;
-    c[2] = (unsigned)param;
+    unsigned *entgl_a = entgl_command(192, 3);
+    entgl_a[0] = (unsigned)coord;
+    entgl_a[1] = (unsigned)pname;
+    entgl_a[2] = (unsigned)param;
 }
 
 static void APIENTRY icd_InitNames(void)
@@ -1787,14 +1787,14 @@ static void APIENTRY icd_InitNames(void)
 
 static void APIENTRY icd_LoadName(GLuint name)
 {
-    unsigned *c = entgl_command(198, 1);
-    c[0] = (unsigned)name;
+    unsigned *entgl_a = entgl_command(198, 1);
+    entgl_a[0] = (unsigned)name;
 }
 
 static void APIENTRY icd_PassThrough(GLfloat token)
 {
-    unsigned *c = entgl_command(199, 1);
-    entgl_put_float(c + 0, token);
+    unsigned *entgl_a = entgl_command(199, 1);
+    entgl_put_float(entgl_a + 0, token);
 }
 
 static void APIENTRY icd_PopName(void)
@@ -1804,96 +1804,96 @@ static void APIENTRY icd_PopName(void)
 
 static void APIENTRY icd_PushName(GLuint name)
 {
-    unsigned *c = entgl_command(201, 1);
-    c[0] = (unsigned)name;
+    unsigned *entgl_a = entgl_command(201, 1);
+    entgl_a[0] = (unsigned)name;
 }
 
 static void APIENTRY icd_Clear(GLbitfield mask)
 {
-    unsigned *c = entgl_command(203, 1);
-    c[0] = (unsigned)mask;
+    unsigned *entgl_a = entgl_command(203, 1);
+    entgl_a[0] = (unsigned)mask;
 }
 
 static void APIENTRY icd_ClearAccum(GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
 {
-    unsigned *c = entgl_command(204, 4);
-    entgl_put_float(c + 0, red);
-    entgl_put_float(c + 1, green);
-    entgl_put_float(c + 2, blue);
-    entgl_put_float(c + 3, alpha);
+    unsigned *entgl_a = entgl_command(204, 4);
+    entgl_put_float(entgl_a + 0, red);
+    entgl_put_float(entgl_a + 1, green);
+    entgl_put_float(entgl_a + 2, blue);
+    entgl_put_float(entgl_a + 3, alpha);
 }
 
 static void APIENTRY icd_ClearIndex(GLfloat c)
 {
-    unsigned *c = entgl_command(205, 1);
-    entgl_put_float(c + 0, c);
+    unsigned *entgl_a = entgl_command(205, 1);
+    entgl_put_float(entgl_a + 0, c);
 }
 
 static void APIENTRY icd_ClearColor(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha)
 {
-    unsigned *c = entgl_command(206, 4);
-    entgl_put_float(c + 0, red);
-    entgl_put_float(c + 1, green);
-    entgl_put_float(c + 2, blue);
-    entgl_put_float(c + 3, alpha);
+    unsigned *entgl_a = entgl_command(206, 4);
+    entgl_put_float(entgl_a + 0, red);
+    entgl_put_float(entgl_a + 1, green);
+    entgl_put_float(entgl_a + 2, blue);
+    entgl_put_float(entgl_a + 3, alpha);
 }
 
 static void APIENTRY icd_ClearStencil(GLint s)
 {
-    unsigned *c = entgl_command(207, 1);
-    c[0] = (unsigned)s;
+    unsigned *entgl_a = entgl_command(207, 1);
+    entgl_a[0] = (unsigned)s;
 }
 
 static void APIENTRY icd_ClearDepth(GLclampd depth)
 {
-    unsigned *c = entgl_command(208, 2);
-    entgl_put_double(c + 0, depth);
+    unsigned *entgl_a = entgl_command(208, 2);
+    entgl_put_double(entgl_a + 0, depth);
 }
 
 static void APIENTRY icd_StencilMask(GLuint mask)
 {
-    unsigned *c = entgl_command(209, 1);
-    c[0] = (unsigned)mask;
+    unsigned *entgl_a = entgl_command(209, 1);
+    entgl_a[0] = (unsigned)mask;
 }
 
 static void APIENTRY icd_ColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha)
 {
-    unsigned *c = entgl_command(210, 4);
-    c[0] = (unsigned)red;
-    c[1] = (unsigned)green;
-    c[2] = (unsigned)blue;
-    c[3] = (unsigned)alpha;
+    unsigned *entgl_a = entgl_command(210, 4);
+    entgl_a[0] = (unsigned)red;
+    entgl_a[1] = (unsigned)green;
+    entgl_a[2] = (unsigned)blue;
+    entgl_a[3] = (unsigned)alpha;
 }
 
 static void APIENTRY icd_DepthMask(GLboolean flag)
 {
-    unsigned *c = entgl_command(211, 1);
-    c[0] = (unsigned)flag;
+    unsigned *entgl_a = entgl_command(211, 1);
+    entgl_a[0] = (unsigned)flag;
 }
 
 static void APIENTRY icd_IndexMask(GLuint mask)
 {
-    unsigned *c = entgl_command(212, 1);
-    c[0] = (unsigned)mask;
+    unsigned *entgl_a = entgl_command(212, 1);
+    entgl_a[0] = (unsigned)mask;
 }
 
 static void APIENTRY icd_Accum(GLenum op, GLfloat value)
 {
-    unsigned *c = entgl_command(213, 2);
-    c[0] = (unsigned)op;
-    entgl_put_float(c + 1, value);
+    unsigned *entgl_a = entgl_command(213, 2);
+    entgl_a[0] = (unsigned)op;
+    entgl_put_float(entgl_a + 1, value);
 }
 
 static void APIENTRY icd_Disable(GLenum cap)
 {
-    unsigned *c = entgl_command(214, 1);
-    c[0] = (unsigned)cap;
+    unsigned *entgl_a = entgl_command(214, 1);
+    entgl_a[0] = (unsigned)cap;
 }
 
 static void APIENTRY icd_Enable(GLenum cap)
 {
-    unsigned *c = entgl_command(215, 1);
-    c[0] = (unsigned)cap;
+    unsigned *entgl_a = entgl_command(215, 1);
+    entgl_a[0] = (unsigned)cap;
 }
 
 static void APIENTRY icd_PopAttrib(void)
@@ -1903,52 +1903,52 @@ static void APIENTRY icd_PopAttrib(void)
 
 static void APIENTRY icd_PushAttrib(GLbitfield mask)
 {
-    unsigned *c = entgl_command(219, 1);
-    c[0] = (unsigned)mask;
+    unsigned *entgl_a = entgl_command(219, 1);
+    entgl_a[0] = (unsigned)mask;
 }
 
 static void APIENTRY icd_MapGrid1d(GLint un, GLdouble u1, GLdouble u2)
 {
-    unsigned *c = entgl_command(224, 5);
-    c[0] = (unsigned)un;
-    entgl_put_double(c + 1, u1);
-    entgl_put_double(c + 3, u2);
+    unsigned *entgl_a = entgl_command(224, 5);
+    entgl_a[0] = (unsigned)un;
+    entgl_put_double(entgl_a + 1, u1);
+    entgl_put_double(entgl_a + 3, u2);
 }
 
 static void APIENTRY icd_MapGrid1f(GLint un, GLfloat u1, GLfloat u2)
 {
-    unsigned *c = entgl_command(225, 3);
-    c[0] = (unsigned)un;
-    entgl_put_float(c + 1, u1);
-    entgl_put_float(c + 2, u2);
+    unsigned *entgl_a = entgl_command(225, 3);
+    entgl_a[0] = (unsigned)un;
+    entgl_put_float(entgl_a + 1, u1);
+    entgl_put_float(entgl_a + 2, u2);
 }
 
 static void APIENTRY icd_MapGrid2d(GLint un, GLdouble u1, GLdouble u2, GLint vn, GLdouble v1, GLdouble v2)
 {
-    unsigned *c = entgl_command(226, 10);
-    c[0] = (unsigned)un;
-    entgl_put_double(c + 1, u1);
-    entgl_put_double(c + 3, u2);
-    c[5] = (unsigned)vn;
-    entgl_put_double(c + 6, v1);
-    entgl_put_double(c + 8, v2);
+    unsigned *entgl_a = entgl_command(226, 10);
+    entgl_a[0] = (unsigned)un;
+    entgl_put_double(entgl_a + 1, u1);
+    entgl_put_double(entgl_a + 3, u2);
+    entgl_a[5] = (unsigned)vn;
+    entgl_put_double(entgl_a + 6, v1);
+    entgl_put_double(entgl_a + 8, v2);
 }
 
 static void APIENTRY icd_MapGrid2f(GLint un, GLfloat u1, GLfloat u2, GLint vn, GLfloat v1, GLfloat v2)
 {
-    unsigned *c = entgl_command(227, 6);
-    c[0] = (unsigned)un;
-    entgl_put_float(c + 1, u1);
-    entgl_put_float(c + 2, u2);
-    c[3] = (unsigned)vn;
-    entgl_put_float(c + 4, v1);
-    entgl_put_float(c + 5, v2);
+    unsigned *entgl_a = entgl_command(227, 6);
+    entgl_a[0] = (unsigned)un;
+    entgl_put_float(entgl_a + 1, u1);
+    entgl_put_float(entgl_a + 2, u2);
+    entgl_a[3] = (unsigned)vn;
+    entgl_put_float(entgl_a + 4, v1);
+    entgl_put_float(entgl_a + 5, v2);
 }
 
 static void APIENTRY icd_EvalCoord1d(GLdouble u)
 {
-    unsigned *c = entgl_command(228, 2);
-    entgl_put_double(c + 0, u);
+    unsigned *entgl_a = entgl_command(228, 2);
+    entgl_put_double(entgl_a + 0, u);
 }
 
 static void APIENTRY icd_EvalCoord1dv(const GLdouble *u)
@@ -1958,8 +1958,8 @@ static void APIENTRY icd_EvalCoord1dv(const GLdouble *u)
 
 static void APIENTRY icd_EvalCoord1f(GLfloat u)
 {
-    unsigned *c = entgl_command(230, 1);
-    entgl_put_float(c + 0, u);
+    unsigned *entgl_a = entgl_command(230, 1);
+    entgl_put_float(entgl_a + 0, u);
 }
 
 static void APIENTRY icd_EvalCoord1fv(const GLfloat *u)
@@ -1969,9 +1969,9 @@ static void APIENTRY icd_EvalCoord1fv(const GLfloat *u)
 
 static void APIENTRY icd_EvalCoord2d(GLdouble u, GLdouble v)
 {
-    unsigned *c = entgl_command(232, 4);
-    entgl_put_double(c + 0, u);
-    entgl_put_double(c + 2, v);
+    unsigned *entgl_a = entgl_command(232, 4);
+    entgl_put_double(entgl_a + 0, u);
+    entgl_put_double(entgl_a + 2, v);
 }
 
 static void APIENTRY icd_EvalCoord2dv(const GLdouble *u)
@@ -1981,9 +1981,9 @@ static void APIENTRY icd_EvalCoord2dv(const GLdouble *u)
 
 static void APIENTRY icd_EvalCoord2f(GLfloat u, GLfloat v)
 {
-    unsigned *c = entgl_command(234, 2);
-    entgl_put_float(c + 0, u);
-    entgl_put_float(c + 1, v);
+    unsigned *entgl_a = entgl_command(234, 2);
+    entgl_put_float(entgl_a + 0, u);
+    entgl_put_float(entgl_a + 1, v);
 }
 
 static void APIENTRY icd_EvalCoord2fv(const GLfloat *u)
@@ -1993,124 +1993,124 @@ static void APIENTRY icd_EvalCoord2fv(const GLfloat *u)
 
 static void APIENTRY icd_EvalMesh1(GLenum mode, GLint i1, GLint i2)
 {
-    unsigned *c = entgl_command(236, 3);
-    c[0] = (unsigned)mode;
-    c[1] = (unsigned)i1;
-    c[2] = (unsigned)i2;
+    unsigned *entgl_a = entgl_command(236, 3);
+    entgl_a[0] = (unsigned)mode;
+    entgl_a[1] = (unsigned)i1;
+    entgl_a[2] = (unsigned)i2;
 }
 
 static void APIENTRY icd_EvalPoint1(GLint i)
 {
-    unsigned *c = entgl_command(237, 1);
-    c[0] = (unsigned)i;
+    unsigned *entgl_a = entgl_command(237, 1);
+    entgl_a[0] = (unsigned)i;
 }
 
 static void APIENTRY icd_EvalMesh2(GLenum mode, GLint i1, GLint i2, GLint j1, GLint j2)
 {
-    unsigned *c = entgl_command(238, 5);
-    c[0] = (unsigned)mode;
-    c[1] = (unsigned)i1;
-    c[2] = (unsigned)i2;
-    c[3] = (unsigned)j1;
-    c[4] = (unsigned)j2;
+    unsigned *entgl_a = entgl_command(238, 5);
+    entgl_a[0] = (unsigned)mode;
+    entgl_a[1] = (unsigned)i1;
+    entgl_a[2] = (unsigned)i2;
+    entgl_a[3] = (unsigned)j1;
+    entgl_a[4] = (unsigned)j2;
 }
 
 static void APIENTRY icd_EvalPoint2(GLint i, GLint j)
 {
-    unsigned *c = entgl_command(239, 2);
-    c[0] = (unsigned)i;
-    c[1] = (unsigned)j;
+    unsigned *entgl_a = entgl_command(239, 2);
+    entgl_a[0] = (unsigned)i;
+    entgl_a[1] = (unsigned)j;
 }
 
 static void APIENTRY icd_AlphaFunc(GLenum func, GLclampf ref)
 {
-    unsigned *c = entgl_command(240, 2);
-    c[0] = (unsigned)func;
-    entgl_put_float(c + 1, ref);
+    unsigned *entgl_a = entgl_command(240, 2);
+    entgl_a[0] = (unsigned)func;
+    entgl_put_float(entgl_a + 1, ref);
 }
 
 static void APIENTRY icd_BlendFunc(GLenum sfactor, GLenum dfactor)
 {
-    unsigned *c = entgl_command(241, 2);
-    c[0] = (unsigned)sfactor;
-    c[1] = (unsigned)dfactor;
+    unsigned *entgl_a = entgl_command(241, 2);
+    entgl_a[0] = (unsigned)sfactor;
+    entgl_a[1] = (unsigned)dfactor;
 }
 
 static void APIENTRY icd_LogicOp(GLenum opcode)
 {
-    unsigned *c = entgl_command(242, 1);
-    c[0] = (unsigned)opcode;
+    unsigned *entgl_a = entgl_command(242, 1);
+    entgl_a[0] = (unsigned)opcode;
 }
 
 static void APIENTRY icd_StencilFunc(GLenum func, GLint ref, GLuint mask)
 {
-    unsigned *c = entgl_command(243, 3);
-    c[0] = (unsigned)func;
-    c[1] = (unsigned)ref;
-    c[2] = (unsigned)mask;
+    unsigned *entgl_a = entgl_command(243, 3);
+    entgl_a[0] = (unsigned)func;
+    entgl_a[1] = (unsigned)ref;
+    entgl_a[2] = (unsigned)mask;
 }
 
 static void APIENTRY icd_StencilOp(GLenum fail, GLenum zfail, GLenum zpass)
 {
-    unsigned *c = entgl_command(244, 3);
-    c[0] = (unsigned)fail;
-    c[1] = (unsigned)zfail;
-    c[2] = (unsigned)zpass;
+    unsigned *entgl_a = entgl_command(244, 3);
+    entgl_a[0] = (unsigned)fail;
+    entgl_a[1] = (unsigned)zfail;
+    entgl_a[2] = (unsigned)zpass;
 }
 
 static void APIENTRY icd_DepthFunc(GLenum func)
 {
-    unsigned *c = entgl_command(245, 1);
-    c[0] = (unsigned)func;
+    unsigned *entgl_a = entgl_command(245, 1);
+    entgl_a[0] = (unsigned)func;
 }
 
 static void APIENTRY icd_PixelZoom(GLfloat xfactor, GLfloat yfactor)
 {
-    unsigned *c = entgl_command(246, 2);
-    entgl_put_float(c + 0, xfactor);
-    entgl_put_float(c + 1, yfactor);
+    unsigned *entgl_a = entgl_command(246, 2);
+    entgl_put_float(entgl_a + 0, xfactor);
+    entgl_put_float(entgl_a + 1, yfactor);
 }
 
 static void APIENTRY icd_PixelTransferf(GLenum pname, GLfloat param)
 {
-    unsigned *c = entgl_command(247, 2);
-    c[0] = (unsigned)pname;
-    entgl_put_float(c + 1, param);
+    unsigned *entgl_a = entgl_command(247, 2);
+    entgl_a[0] = (unsigned)pname;
+    entgl_put_float(entgl_a + 1, param);
 }
 
 static void APIENTRY icd_PixelTransferi(GLenum pname, GLint param)
 {
-    unsigned *c = entgl_command(248, 2);
-    c[0] = (unsigned)pname;
-    c[1] = (unsigned)param;
+    unsigned *entgl_a = entgl_command(248, 2);
+    entgl_a[0] = (unsigned)pname;
+    entgl_a[1] = (unsigned)param;
 }
 
 static void APIENTRY icd_CopyPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum type)
 {
-    unsigned *c = entgl_command(255, 5);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
-    c[2] = (unsigned)width;
-    c[3] = (unsigned)height;
-    c[4] = (unsigned)type;
+    unsigned *entgl_a = entgl_command(255, 5);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
+    entgl_a[2] = (unsigned)width;
+    entgl_a[3] = (unsigned)height;
+    entgl_a[4] = (unsigned)type;
 }
 
 static void APIENTRY icd_DepthRange(GLclampd zNear, GLclampd zFar)
 {
-    unsigned *c = entgl_command(288, 4);
-    entgl_put_double(c + 0, zNear);
-    entgl_put_double(c + 2, zFar);
+    unsigned *entgl_a = entgl_command(288, 4);
+    entgl_put_double(entgl_a + 0, zNear);
+    entgl_put_double(entgl_a + 2, zFar);
 }
 
 static void APIENTRY icd_Frustum(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble zNear, GLdouble zFar)
 {
-    unsigned *c = entgl_command(289, 12);
-    entgl_put_double(c + 0, left);
-    entgl_put_double(c + 2, right);
-    entgl_put_double(c + 4, bottom);
-    entgl_put_double(c + 6, top);
-    entgl_put_double(c + 8, zNear);
-    entgl_put_double(c + 10, zFar);
+    unsigned *entgl_a = entgl_command(289, 12);
+    entgl_put_double(entgl_a + 0, left);
+    entgl_put_double(entgl_a + 2, right);
+    entgl_put_double(entgl_a + 4, bottom);
+    entgl_put_double(entgl_a + 6, top);
+    entgl_put_double(entgl_a + 8, zNear);
+    entgl_put_double(entgl_a + 10, zFar);
 }
 
 static void APIENTRY icd_LoadIdentity(void)
@@ -2120,19 +2120,19 @@ static void APIENTRY icd_LoadIdentity(void)
 
 static void APIENTRY icd_MatrixMode(GLenum mode)
 {
-    unsigned *c = entgl_command(293, 1);
-    c[0] = (unsigned)mode;
+    unsigned *entgl_a = entgl_command(293, 1);
+    entgl_a[0] = (unsigned)mode;
 }
 
 static void APIENTRY icd_Ortho(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble zNear, GLdouble zFar)
 {
-    unsigned *c = entgl_command(296, 12);
-    entgl_put_double(c + 0, left);
-    entgl_put_double(c + 2, right);
-    entgl_put_double(c + 4, bottom);
-    entgl_put_double(c + 6, top);
-    entgl_put_double(c + 8, zNear);
-    entgl_put_double(c + 10, zFar);
+    unsigned *entgl_a = entgl_command(296, 12);
+    entgl_put_double(entgl_a + 0, left);
+    entgl_put_double(entgl_a + 2, right);
+    entgl_put_double(entgl_a + 4, bottom);
+    entgl_put_double(entgl_a + 6, top);
+    entgl_put_double(entgl_a + 8, zNear);
+    entgl_put_double(entgl_a + 10, zFar);
 }
 
 static void APIENTRY icd_PopMatrix(void)
@@ -2147,74 +2147,74 @@ static void APIENTRY icd_PushMatrix(void)
 
 static void APIENTRY icd_Rotated(GLdouble angle, GLdouble x, GLdouble y, GLdouble z)
 {
-    unsigned *c = entgl_command(299, 8);
-    entgl_put_double(c + 0, angle);
-    entgl_put_double(c + 2, x);
-    entgl_put_double(c + 4, y);
-    entgl_put_double(c + 6, z);
+    unsigned *entgl_a = entgl_command(299, 8);
+    entgl_put_double(entgl_a + 0, angle);
+    entgl_put_double(entgl_a + 2, x);
+    entgl_put_double(entgl_a + 4, y);
+    entgl_put_double(entgl_a + 6, z);
 }
 
 static void APIENTRY icd_Rotatef(GLfloat angle, GLfloat x, GLfloat y, GLfloat z)
 {
-    unsigned *c = entgl_command(300, 4);
-    entgl_put_float(c + 0, angle);
-    entgl_put_float(c + 1, x);
-    entgl_put_float(c + 2, y);
-    entgl_put_float(c + 3, z);
+    unsigned *entgl_a = entgl_command(300, 4);
+    entgl_put_float(entgl_a + 0, angle);
+    entgl_put_float(entgl_a + 1, x);
+    entgl_put_float(entgl_a + 2, y);
+    entgl_put_float(entgl_a + 3, z);
 }
 
 static void APIENTRY icd_Scaled(GLdouble x, GLdouble y, GLdouble z)
 {
-    unsigned *c = entgl_command(301, 6);
-    entgl_put_double(c + 0, x);
-    entgl_put_double(c + 2, y);
-    entgl_put_double(c + 4, z);
+    unsigned *entgl_a = entgl_command(301, 6);
+    entgl_put_double(entgl_a + 0, x);
+    entgl_put_double(entgl_a + 2, y);
+    entgl_put_double(entgl_a + 4, z);
 }
 
 static void APIENTRY icd_Scalef(GLfloat x, GLfloat y, GLfloat z)
 {
-    unsigned *c = entgl_command(302, 3);
-    entgl_put_float(c + 0, x);
-    entgl_put_float(c + 1, y);
-    entgl_put_float(c + 2, z);
+    unsigned *entgl_a = entgl_command(302, 3);
+    entgl_put_float(entgl_a + 0, x);
+    entgl_put_float(entgl_a + 1, y);
+    entgl_put_float(entgl_a + 2, z);
 }
 
 static void APIENTRY icd_Translated(GLdouble x, GLdouble y, GLdouble z)
 {
-    unsigned *c = entgl_command(303, 6);
-    entgl_put_double(c + 0, x);
-    entgl_put_double(c + 2, y);
-    entgl_put_double(c + 4, z);
+    unsigned *entgl_a = entgl_command(303, 6);
+    entgl_put_double(entgl_a + 0, x);
+    entgl_put_double(entgl_a + 2, y);
+    entgl_put_double(entgl_a + 4, z);
 }
 
 static void APIENTRY icd_Translatef(GLfloat x, GLfloat y, GLfloat z)
 {
-    unsigned *c = entgl_command(304, 3);
-    entgl_put_float(c + 0, x);
-    entgl_put_float(c + 1, y);
-    entgl_put_float(c + 2, z);
+    unsigned *entgl_a = entgl_command(304, 3);
+    entgl_put_float(entgl_a + 0, x);
+    entgl_put_float(entgl_a + 1, y);
+    entgl_put_float(entgl_a + 2, z);
 }
 
 static void APIENTRY icd_Viewport(GLint x, GLint y, GLsizei width, GLsizei height)
 {
-    unsigned *c = entgl_command(305, 4);
-    c[0] = (unsigned)x;
-    c[1] = (unsigned)y;
-    c[2] = (unsigned)width;
-    c[3] = (unsigned)height;
+    unsigned *entgl_a = entgl_command(305, 4);
+    entgl_a[0] = (unsigned)x;
+    entgl_a[1] = (unsigned)y;
+    entgl_a[2] = (unsigned)width;
+    entgl_a[3] = (unsigned)height;
 }
 
 static void APIENTRY icd_BindTexture(GLenum target, GLuint texture)
 {
-    unsigned *c = entgl_command(307, 2);
-    c[0] = (unsigned)target;
-    c[1] = (unsigned)texture;
+    unsigned *entgl_a = entgl_command(307, 2);
+    entgl_a[0] = (unsigned)target;
+    entgl_a[1] = (unsigned)texture;
 }
 
 static void APIENTRY icd_Indexub(GLubyte c)
 {
-    unsigned *c = entgl_command(315, 1);
-    c[0] = (unsigned)c;
+    unsigned *entgl_a = entgl_command(315, 1);
+    entgl_a[0] = (unsigned)c;
 }
 
 static void APIENTRY icd_Indexubv(const GLubyte *c)
@@ -2224,58 +2224,58 @@ static void APIENTRY icd_Indexubv(const GLubyte *c)
 
 static void APIENTRY icd_PolygonOffset(GLfloat factor, GLfloat units)
 {
-    unsigned *c = entgl_command(319, 2);
-    entgl_put_float(c + 0, factor);
-    entgl_put_float(c + 1, units);
+    unsigned *entgl_a = entgl_command(319, 2);
+    entgl_put_float(entgl_a + 0, factor);
+    entgl_put_float(entgl_a + 1, units);
 }
 
 static void APIENTRY icd_CopyTexImage1D(GLenum target, GLint level, GLenum internalFormat, GLint x, GLint y, GLsizei width, GLint border)
 {
-    unsigned *c = entgl_command(323, 7);
-    c[0] = (unsigned)target;
-    c[1] = (unsigned)level;
-    c[2] = (unsigned)internalFormat;
-    c[3] = (unsigned)x;
-    c[4] = (unsigned)y;
-    c[5] = (unsigned)width;
-    c[6] = (unsigned)border;
+    unsigned *entgl_a = entgl_command(323, 7);
+    entgl_a[0] = (unsigned)target;
+    entgl_a[1] = (unsigned)level;
+    entgl_a[2] = (unsigned)internalFormat;
+    entgl_a[3] = (unsigned)x;
+    entgl_a[4] = (unsigned)y;
+    entgl_a[5] = (unsigned)width;
+    entgl_a[6] = (unsigned)border;
 }
 
 static void APIENTRY icd_CopyTexImage2D(GLenum target, GLint level, GLenum internalFormat, GLint x, GLint y, GLsizei width, GLsizei height, GLint border)
 {
-    unsigned *c = entgl_command(324, 8);
-    c[0] = (unsigned)target;
-    c[1] = (unsigned)level;
-    c[2] = (unsigned)internalFormat;
-    c[3] = (unsigned)x;
-    c[4] = (unsigned)y;
-    c[5] = (unsigned)width;
-    c[6] = (unsigned)height;
-    c[7] = (unsigned)border;
+    unsigned *entgl_a = entgl_command(324, 8);
+    entgl_a[0] = (unsigned)target;
+    entgl_a[1] = (unsigned)level;
+    entgl_a[2] = (unsigned)internalFormat;
+    entgl_a[3] = (unsigned)x;
+    entgl_a[4] = (unsigned)y;
+    entgl_a[5] = (unsigned)width;
+    entgl_a[6] = (unsigned)height;
+    entgl_a[7] = (unsigned)border;
 }
 
 static void APIENTRY icd_CopyTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLint x, GLint y, GLsizei width)
 {
-    unsigned *c = entgl_command(325, 6);
-    c[0] = (unsigned)target;
-    c[1] = (unsigned)level;
-    c[2] = (unsigned)xoffset;
-    c[3] = (unsigned)x;
-    c[4] = (unsigned)y;
-    c[5] = (unsigned)width;
+    unsigned *entgl_a = entgl_command(325, 6);
+    entgl_a[0] = (unsigned)target;
+    entgl_a[1] = (unsigned)level;
+    entgl_a[2] = (unsigned)xoffset;
+    entgl_a[3] = (unsigned)x;
+    entgl_a[4] = (unsigned)y;
+    entgl_a[5] = (unsigned)width;
 }
 
 static void APIENTRY icd_CopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y, GLsizei width, GLsizei height)
 {
-    unsigned *c = entgl_command(326, 8);
-    c[0] = (unsigned)target;
-    c[1] = (unsigned)level;
-    c[2] = (unsigned)xoffset;
-    c[3] = (unsigned)yoffset;
-    c[4] = (unsigned)x;
-    c[5] = (unsigned)y;
-    c[6] = (unsigned)width;
-    c[7] = (unsigned)height;
+    unsigned *entgl_a = entgl_command(326, 8);
+    entgl_a[0] = (unsigned)target;
+    entgl_a[1] = (unsigned)level;
+    entgl_a[2] = (unsigned)xoffset;
+    entgl_a[3] = (unsigned)yoffset;
+    entgl_a[4] = (unsigned)x;
+    entgl_a[5] = (unsigned)y;
+    entgl_a[6] = (unsigned)width;
+    entgl_a[7] = (unsigned)height;
 }
 
 /* The dispatch table opengl32.dll takes, in its order. */

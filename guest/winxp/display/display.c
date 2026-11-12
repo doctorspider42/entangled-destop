@@ -21,6 +21,7 @@
 #include <ntddvdeo.h>
 
 #include "entxp.h"
+#include "../opengl/entgl.h"
 
 #define POOL_TAG 0x70787445 /* 'Etxp' */
 
@@ -317,6 +318,51 @@ ULONG APIENTRY DrvGetModes(HANDLE driver, ULONG size, DEVMODEW *devmode)
     return needed;
 }
 
+/*
+ * OpenGL (ADR-0013). The OpenGL driver is a user-mode DLL and cannot reach
+ * the device; it sends its command buffers here as an escape, and here they
+ * go on to the miniport, which owns the registers. Nothing in this driver
+ * looks inside one.
+ */
+ULONG APIENTRY DrvEscape(SURFOBJ *surface, ULONG escape, ULONG in_size, PVOID in, ULONG out_size,
+                         PVOID out)
+{
+    PDEV *pdev = (PDEV *)surface->dhpdev;
+    ULONG returned = 0;
+
+    if (escape == QUERYESCSUPPORT) {
+        return in_size >= sizeof(ULONG) && *(ULONG *)in == ENTGL_ESCAPE;
+    }
+    if (escape != ENTGL_ESCAPE || pdev == NULL) {
+        return 0;
+    }
+    if (EngDeviceIoControl(pdev->driver, IOCTL_ENTXP_ACCEL_RUN, in, in_size, out, out_size,
+                           &returned) != 0) {
+        return 0;
+    }
+    return 1 + returned;
+}
+
+/* GDI keeps a window's pixel format and asks the display driver whether it
+ * exists; the formats themselves are the OpenGL driver's business. */
+LONG APIENTRY DrvDescribePixelFormat(DHPDEV dhpdev, LONG format, ULONG size,
+                                     PIXELFORMATDESCRIPTOR *descriptor)
+{
+    (void)dhpdev;
+    if (descriptor != NULL && size >= sizeof(PIXELFORMATDESCRIPTOR) && format >= 1 &&
+        format <= ENTGL_FORMAT_COUNT) {
+        ENTGL_DESCRIBE(descriptor, format);
+    }
+    return ENTGL_FORMAT_COUNT;
+}
+
+BOOL APIENTRY DrvSetPixelFormat(SURFOBJ *surface, LONG format, HWND window)
+{
+    (void)surface;
+    (void)window;
+    return format >= 1 && format <= ENTGL_FORMAT_COUNT;
+}
+
 static DRVFN functions[] = {
     {INDEX_DrvEnablePDEV, (PFN)DrvEnablePDEV},
     {INDEX_DrvCompletePDEV, (PFN)DrvCompletePDEV},
@@ -325,6 +371,9 @@ static DRVFN functions[] = {
     {INDEX_DrvDisableSurface, (PFN)DrvDisableSurface},
     {INDEX_DrvAssertMode, (PFN)DrvAssertMode},
     {INDEX_DrvGetModes, (PFN)DrvGetModes},
+    {INDEX_DrvEscape, (PFN)DrvEscape},
+    {INDEX_DrvSetPixelFormat, (PFN)DrvSetPixelFormat},
+    {INDEX_DrvDescribePixelFormat, (PFN)DrvDescribePixelFormat},
 };
 
 BOOL APIENTRY DrvEnableDriver(ULONG engine_version, ULONG size, DRVENABLEDATA *data)

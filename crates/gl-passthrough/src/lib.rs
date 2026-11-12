@@ -70,6 +70,9 @@ pub mod control {
     pub const DRAW_ELEMENTS: u16 = 0x8005;
     /// `src, dst, mask`: `wglCopyContext`.
     pub const CONTEXT_COPY: u16 = 0x8006;
+    /// `first, second`: `wglShareLists` — `second` takes up `first`'s
+    /// display lists and textures. Answers one word, 1 if it did.
+    pub const CONTEXT_SHARE: u16 = 0x8007;
 }
 
 /// The most contexts all the guest's programs can hold together.

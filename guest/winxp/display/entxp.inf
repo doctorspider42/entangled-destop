@@ -19,6 +19,7 @@ entxp.Display=11
 [SourceDisksFiles]
 entxp.sys=1
 entxp.dll=1
+entgl.dll=1
 
 [Manufacturer]
 %Entangled%=Entangled.Mfg
@@ -34,6 +35,7 @@ entxp.sys
 
 [entxp.Display]
 entxp.dll
+entgl.dll
 
 [entxp.Services]
 AddService=entxp,0x00000002,entxp_Service_Inst,entxp_EventLog_Inst
@@ -53,7 +55,15 @@ HKR,,EventMessageFile,0x00020000,"%SystemRoot%\System32\IoLogMsg.dll;%SystemRoot
 HKR,,TypesSupported,0x00010001,7
 
 [entxp.SoftwareSettings]
-AddReg=entxp_SoftwareDeviceSettings
+AddReg=entxp_SoftwareDeviceSettings,entxp_OpenGL
+
+; opengl32.dll asks GDI for the display driver's name and looks its OpenGL
+; driver up under that name.
+[entxp_OpenGL]
+HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\OpenGLDrivers\entxp",Dll,0x00000000,"entgl.dll"
+HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\OpenGLDrivers\entxp",DriverVersion,0x00010001,1
+HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\OpenGLDrivers\entxp",Flags,0x00010001,1
+HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\OpenGLDrivers\entxp",Version,0x00010001,2
 
 [entxp_SoftwareDeviceSettings]
 HKR,,InstalledDisplayDrivers,0x00010000,entxp

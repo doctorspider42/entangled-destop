@@ -3671,6 +3671,35 @@ fn extend_cmdline(configured: &str, clauses: &str) -> String {
     format!("{configured} {clauses}")
 }
 
+/// The host's OpenGL as the boot framebuffer's accelerator (ADR-0013).
+#[cfg(windows)]
+struct GlAccelerator(gl_passthrough::GlThread);
+
+#[cfg(windows)]
+impl machine_x86::framebuffer::Accelerator for GlAccelerator {
+    fn run(&self, commands: &[u8]) -> machine_x86::framebuffer::Accelerated {
+        let outcome = self.0.run(gl_passthrough::words_of(commands));
+        machine_x86::framebuffer::Accelerated {
+            response: outcome.response,
+            blits: outcome
+                .presents
+                .into_iter()
+                .map(|p| machine_x86::framebuffer::Blit {
+                    x: p.x,
+                    y: p.y,
+                    width: p.width,
+                    height: p.height,
+                    pixels: p.pixels,
+                })
+                .collect(),
+        }
+    }
+
+    fn reset(&self) {
+        self.0.reset();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The actual supervisor must survive a refused save and still service
@@ -4021,34 +4050,5 @@ mod tests {
         ] {
             assert!(!shares_scanout(&plan, ScanoutPath::Shared), "{plan:?}");
         }
-    }
-}
-
-/// The host's OpenGL as the boot framebuffer's accelerator (ADR-0013).
-#[cfg(windows)]
-struct GlAccelerator(gl_passthrough::GlThread);
-
-#[cfg(windows)]
-impl machine_x86::framebuffer::Accelerator for GlAccelerator {
-    fn run(&self, commands: &[u8]) -> machine_x86::framebuffer::Accelerated {
-        let outcome = self.0.run(gl_passthrough::words_of(commands));
-        machine_x86::framebuffer::Accelerated {
-            response: outcome.response,
-            blits: outcome
-                .presents
-                .into_iter()
-                .map(|p| machine_x86::framebuffer::Blit {
-                    x: p.x,
-                    y: p.y,
-                    width: p.width,
-                    height: p.height,
-                    pixels: p.pixels,
-                })
-                .collect(),
-        }
-    }
-
-    fn reset(&self) {
-        self.0.reset();
     }
 }

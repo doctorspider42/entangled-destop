@@ -19,6 +19,7 @@
 #include <video.h>
 
 #include "entxp.h"
+#include "../opengl/entgl.h"
 
 /* DISPI register indexes; each is a 16-bit register at DISPI_BASE + 2*n. */
 #define DISPI_BASE 0x500
@@ -40,7 +41,53 @@ typedef struct {
     ULONG vram_length;
     ULONG mode_count;          /* how many of entxp_modes fit in VRAM */
     ULONG current;             /* index of the mode in effect */
+    /* The accelerator's transfer area at the top of VRAM (ADR-0013), mapped
+     * for good; NULL when the host offers no accelerator. */
+    PUCHAR accel_commands;
+    ULONG accel_commands_bytes;
+    PUCHAR accel_response;
+    ULONG accel_response_bytes;
 } DEVICE_EXT;
+
+static ULONG accel_read(DEVICE_EXT *ext, ULONG index)
+{
+    return VideoPortReadRegisterUlong((PULONG)(ext->regs + ACCEL_BASE + 4 * index));
+}
+
+/* Finds and maps the transfer area, if the device has an accelerator. */
+static void accel_find(PVOID extension, DEVICE_EXT *ext)
+{
+    ULONG commands, commands_bytes, response, response_bytes;
+    PHYSICAL_ADDRESS at;
+    PUCHAR base;
+
+    ext->accel_commands = NULL;
+    if (accel_read(ext, ACCEL_ID) != ACCEL_MAGIC) {
+        return;
+    }
+    commands = accel_read(ext, ACCEL_COMMANDS);
+    commands_bytes = accel_read(ext, ACCEL_COMMANDS_BYTES);
+    response = accel_read(ext, ACCEL_RESPONSE);
+    response_bytes = accel_read(ext, ACCEL_RESPONSE_BYTES);
+    /* One mapping for both: the response area follows the command area. */
+    if (commands_bytes == 0 || response_bytes == 0 || response != commands + commands_bytes ||
+        commands >= ext->vram_length || commands_bytes + response_bytes > ext->vram_length - commands) {
+        return;
+    }
+    at = ext->vram;
+    at.LowPart += commands;
+    base = (PUCHAR)VideoPortGetDeviceBase(extension, at, commands_bytes + response_bytes,
+                                          VIDEO_MEMORY_SPACE_MEMORY);
+    if (base == NULL) {
+        return;
+    }
+    ext->accel_commands = base;
+    ext->accel_commands_bytes = commands_bytes;
+    ext->accel_response = base + commands_bytes;
+    ext->accel_response_bytes = response_bytes;
+    /* The modes must leave the area alone. */
+    ext->vram_length = commands;
+}
 
 static USHORT dispi_read(DEVICE_EXT *ext, ULONG index)
 {
@@ -134,6 +181,7 @@ VP_STATUS FindAdapter(PVOID extension, PVOID context, PWSTR argument,
     if ((id & 0xfff0) != 0xb0c0) {
         return ERROR_DEV_NOT_EXIST;
     }
+    accel_find(extension, ext);
     ext->mode_count = 0;
     for (i = 0; i < ENTXP_MODE_COUNT; i++) {
         if ((ULONG)entxp_modes[i].width * entxp_modes[i].height * 4 <= ext->vram_length) {
@@ -247,6 +295,34 @@ BOOLEAN StartIO(PVOID extension, PVIDEO_REQUEST_PACKET packet)
         out->FrameBufferBase = base;
         out->FrameBufferLength = length;
         packet->StatusBlock->Information = sizeof(*out);
+        break;
+    }
+    case IOCTL_ENTXP_ACCEL_RUN: {
+        /* Buffered: the input and the output are the same system buffer, so
+         * the commands are out of it before the response goes in. */
+        ULONG produced;
+        if (ext->accel_commands == NULL) {
+            status = ERROR_DEV_NOT_EXIST;
+            break;
+        }
+        if (packet->InputBufferLength > ext->accel_commands_bytes) {
+            status = ERROR_INSUFFICIENT_BUFFER;
+            break;
+        }
+        VideoPortMoveMemory(ext->accel_commands, packet->InputBuffer, packet->InputBufferLength);
+        /* The host runs the buffer inside this write. */
+        VideoPortWriteRegisterUlong((PULONG)(ext->regs + ACCEL_BASE + 4 * ACCEL_RUN),
+                                    packet->InputBufferLength);
+        produced = accel_read(ext, ACCEL_RUN);
+        if (produced > ext->accel_response_bytes) {
+            produced = ext->accel_response_bytes;
+        }
+        if (produced > packet->OutputBufferLength) {
+            produced = packet->OutputBufferLength;
+        }
+        VideoPortMoveMemory(packet->OutputBuffer, ext->accel_response, produced);
+        packet->StatusBlock->Information = produced;
+        status = NO_ERROR;
         break;
     }
     case IOCTL_VIDEO_UNMAP_VIDEO_MEMORY: {

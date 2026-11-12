@@ -75,6 +75,33 @@ lld-link -machine:x86 -nodefaultlib -release -subsystem:console,5.01 -osversion:
     -entry:entry -out:"$out/entxp-setup.exe" "$out/setup.obj" \
     "$libs/kernel32.lib" "$libs/newdev.lib"
 
+echo "entgl.dll (OpenGL driver)"
+# User mode, so no -mrtd: every entry point names its convention.
+clang "${setup_cflags[@]}" -Wno-unused-function -Wno-unused-but-set-variable \
+    "$here/opengl/icd.c" -o "$out/icd.obj"
+lld-link -machine:x86 -nodefaultlib -release -dll -subsystem:windows,5.01 -osversion:5.1 \
+    -entry:DllEntry@12 -def:"$here/opengl/entgl.def" -out:"$out/entgl.dll" "$out/icd.obj" \
+    "$libs/kernel32.lib" "$libs/user32.lib" "$libs/gdi32.lib"
+
+# The same OpenGL driver for the host, 64-bit, with the escape replaced by a
+# hook: what crates/gl-passthrough/tests/icd.rs loads. Never shipped.
+libs64="${kits/Include/Lib}/um/x64"
+if [ -f "$libs64/kernel32.lib" ]; then
+    echo "test/entgl-test.dll (the OpenGL driver, for the host's tests)"
+    mkdir -p "$out/test"
+    test_cflags=("${setup_cflags[@]/--target=i686-pc-windows-msvc/--target=x86_64-pc-windows-msvc}")
+    clang "${test_cflags[@]}" -DENTGL_TEST -Wno-unused-function -Wno-unused-but-set-variable \
+        -Wno-unreachable-code "$here/opengl/icd.c" -o "$out/icd-test.obj"
+    exports=()
+    while read -r name; do
+        exports+=("-export:$name")
+    done < <(sed -n 's/^\(Drv[A-Za-z]*\)=.*/\1/p' "$here/opengl/entgl.def")
+    lld-link -machine:x64 -nodefaultlib -dll -entry:DllEntry "${exports[@]}" \
+        -out:"$out/test/entgl-test.dll" "$out/icd-test.obj" \
+        "$libs64/kernel32.lib" "$libs64/user32.lib" "$libs64/gdi32.lib"
+    rm -f "$out/test"/*.lib "$out/test"/*.exp
+fi
+
 cp "$here/display/entxp.inf" "$out/entxp.inf"
 rm -f "$out"/*.obj "$out"/*.lib "$out"/*.exp
 ls -l "$out"

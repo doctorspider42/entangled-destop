@@ -246,6 +246,11 @@ impl Platform for Wgl {
         }
     }
 
+    fn share(&mut self, first: &Context, second: &Context) -> bool {
+        // SAFETY: both are live contexts of this window.
+        unsafe { wglShareLists(first.0, second.0) != 0 }
+    }
+
     fn copy(&mut self, from: &Context, to: &Context, mask: u32) -> bool {
         // SAFETY: both are live contexts of this window.
         unsafe { wglCopyContext(from.0, to.0, mask) != 0 }
