@@ -326,7 +326,10 @@ main(int argc, char **argv)
       return 2;
    }
    /* "d3d9-test <frames> full": the whole screen, exclusively. */
-   int full = argc > 2 && strcmp(argv[2], "full") == 0;
+   int full = argc > 2 && strncmp(argv[2], "full", 4) == 0;
+   /* "full2": two back buffers; "fullcopy": presented by a copy; "fullflip":
+    * D3DSWAPEFFECT_FLIP. */
+   const char *how = full ? argv[2] + 4 : "";
 
    if (argc > 2 && !full)
       print_runtime_state(d3d);
@@ -365,7 +368,11 @@ main(int argc, char **argv)
       IDirect3D9_GetAdapterDisplayMode(d3d, D3DADAPTER_DEFAULT, &mode);
       pp.BackBufferWidth = mode.Width;
       pp.BackBufferHeight = mode.Height;
-      pp.BackBufferCount = 1;
+      pp.BackBufferCount = strcmp(how, "2") == 0 ? 2 : 1;
+      if (strcmp(how, "copy") == 0)
+         pp.SwapEffect = D3DSWAPEFFECT_COPY;
+      if (strcmp(how, "flip") == 0)
+         pp.SwapEffect = D3DSWAPEFFECT_FLIP;
       pp.FullScreen_RefreshRateInHz = mode.RefreshRate;
       pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
    }

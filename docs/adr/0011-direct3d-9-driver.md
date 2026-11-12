@@ -399,6 +399,14 @@ is known:
   ("Failed to create driver primary surface chain", "Failed to create dummy
   primary surface" are its sentences there), not yet read.
 
+- The test program's variants narrow it: with two back buffers the runtime
+  makes two resources of one surface each; presented by a copy
+  (`fullcopy`) the back buffer is in another pool and the death is
+  elsewhere in the runtime. In no variant is a front buffer made through
+  the driver. The runtime's own count of the chain for
+  `D3DSWAPEFFECT_DISCARD` is two (front and back), made through one of its
+  internal functions, and only the backs reach `pfnCreateResource2`.
+
 Until then a game must be started in a window (`-windowed`, or its own
 setting), which Portal 2 remembers once set.
 
