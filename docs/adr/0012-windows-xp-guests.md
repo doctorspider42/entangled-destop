@@ -370,3 +370,58 @@ volume-licence media has no keyless path.
 **Still open:** sound; bus-master DMA (the disk is PIO, and it shows);
 a RAM trap and INTx resampling on KVM; snapshots of a BIOS machine, which
 `entangled` refuses; a PCI identity for the VGA.
+
+## Amendment, 2026-11-13: an installed XP, and the three things its desktop took
+
+With a real volume-licence key, `entangled install windows` on the XP CD
+ran from the boot sector to a powered-off, installed system in 51 minutes
+with no input, and the system it left boots to a desktop with a network.
+Measured on WHP; KVM still only builds.
+
+**VBE carried GUI-mode Setup.** With no virtio functions on the bus and
+VRAM below 4 GiB, XP's `vga.sys` took the BIOS's VBE modes and GUI-mode
+Setup ran on the linear framebuffer, in colour, instead of through the
+planar memory trap.
+
+**ACPI power-off works.** Setup's own shutdown, and `shutdown -s` from
+the desktop, end the run through S5.
+
+**A BIOS enables PCI devices; ours did not, and XP noticed.** The first
+desktop had three devices that would not start — our display adapter and
+the RTL8139 with code 10 — and nothing wrong with either driver. A PC
+BIOS's POST switches on I/O and memory decoding on every PCI function
+and hands the system a live bus. This machine handed XP functions whose
+command registers were zero. XP's PCI driver then treated their BAR
+assignments as nobody's, moved every BAR to the top of the bridge's
+window, and started the display driver with **bus-mastering on and memory
+decoding still off** (command `0x0004`): the miniport mapped its register
+page and read zeroes. The fix is the BIOS's job done at the bus:
+`PciRoot::decode_from_power_on` makes every function of a BIOS machine
+come out of reset — every reset — with I/O, memory and bus-master
+enabled, at the address the host placed it. XP now keeps the BARs where
+they are. (A UEFI machine is unchanged: its firmware does this itself,
+and a function that decodes before firmware has placed it would be the
+bug ADR-0005 warns about.)
+
+**The RTL8139's EEPROM auto-load has to finish.** XP's in-box driver
+writes `0x40` to `9346CR` — "reload the configuration from the EEPROM" —
+and polls until the card clears the mode bits by itself. The model kept
+them set; the driver read the register twenty thousand times and gave
+up. The load is instant now. With that, DHCP, ping and DNS work from the
+desktop through user-mode networking.
+
+**Processors, the old way.** XP predates the `ACPI0007` processor device
+and listed each as an unknown device; a BIOS machine's DSDT now declares
+`Processor` objects under `\_PR`.
+
+**How it was found.** Three devices failing at once pointed at the
+machine, not a driver; `wmic path Win32_PnPEntity where
+"ConfigManagerErrorCode<>0"` gave the codes; a debug console at port
+`0xE9` (a byte at a time, lines into the host's log) let the miniport say
+what it saw before it had mapped anything; and `machine_x86::pci=debug`
+logs every configuration write, which is where command `0x0004` showed.
+
+**Still open:** a root-enumerated COM1 left by Setup's hardware detection
+conflicts with the ACPI one (code 12, harmless); sound; bus-master DMA;
+KVM; snapshots; the PS/2 mouse has a cursor but has not been driven from
+a host window in this work.

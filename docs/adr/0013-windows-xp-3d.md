@@ -189,3 +189,44 @@ table and reading the picture back. What none of them covers is everything
 Windows XP decides: whether `opengl32.dll` finds the driver through
 `OpenGLDrivers\entxp`, whether win32k passes the escape, and whether the
 pixel formats are accepted.
+
+## Amendment, 2026-11-13: it draws in Windows XP
+
+On the installed XP guest of ADR-0012's last amendment, with the drivers
+from the additions disc:
+
+- **G0** — the desktop runs at 1024x768x32 on `entxp.sys`/`entxp.dll`;
+  the mode is set by the miniport through DISPI, with no VBE call after
+  boot.
+- **G1** — the miniport finds the accelerator (`ENGL`, a 3 MiB command
+  area) and the display driver forwards the escape.
+- **G2** — `gltest.exe`'s title reads `Entangled OpenGL on NVIDIA GeForce
+  RTX 2070…`: `opengl32.dll` found `entgl.dll` through
+  `OpenGLDrivers\entxp`, took its pixel formats, and the lit cube is
+  drawn by the host's GPU. It runs at about 700 frames a second with a
+  debug build of the host — every frame a synchronous round trip and a
+  read-back. A console window on top of it covers it correctly: the
+  visible-region clipping works.
+
+Two things the guest taught that the host-side tests could not:
+
+**A miniport must be a Plug and Play one.** The first driver filled in
+`HwFindAdapter`, `HwInitialize` and `HwStartIO` and nothing else. Without
+`HwGetPowerState`, `HwSetPowerState` and `HwGetVideoChildDescriptor` the
+video port takes the driver for a legacy one, calls `FindAdapter` to
+detect hardware, and dereferences the slot pointer a PnP driver passes to
+`VideoPortGetAccessRanges` as `NULL`: stop `0x7E` in `videoprt.sys` at
+the first boot after installation. The miniport now has all three, and
+its one child is a monitor carrying the device's EDID.
+
+**Its own registers read zero** — which was the machine's fault, not the
+driver's; see ADR-0012.
+
+Both were found with the drivers' own log: `trace()` in the miniport
+writes to the debug console port, and the display driver's goes through
+an IOCTL to the same place, so `RUST_LOG=guest_driver=info` shows the
+driver's progress in the host's log, in order with everything else.
+
+**Not yet:** a program beyond the test cube; evaluators, selection,
+`glGetTexImage`, extensions; the cursor over an OpenGL window; a Linux
+host; Direct3D (G4, by a wrapper onto this OpenGL).
