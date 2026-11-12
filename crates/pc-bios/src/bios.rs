@@ -42,6 +42,7 @@ mod bda {
     pub const MEMORY_KB: u64 = 0x13;
     pub const SHIFT_FLAGS: u64 = 0x17;
     pub const KBD_HEAD: u64 = 0x1a;
+    pub const TICKS: u64 = 0x6c;
     pub const KBD_TAIL: u64 = 0x1c;
     pub const VIDEO_MODE: u64 = 0x49;
     pub const COLUMNS: u64 = 0x4a;
@@ -300,7 +301,7 @@ impl Bios {
 
         let mut vectors = [0u8; 1024];
         for (vector, slot) in vectors.chunks_exact_mut(4).enumerate() {
-            slot[..2].copy_from_slice(&rom::stub_offset(vector as u8).to_le_bytes());
+            slot[..2].copy_from_slice(&rom::vector_offset(vector as u8).to_le_bytes());
             slot[2..].copy_from_slice(&rom::SEGMENT.to_le_bytes());
         }
         self.put(0, &vectors)?;
@@ -325,6 +326,9 @@ impl Bios {
         self.put(BDA + bda::KBD_FLAGS_3, &[0x10])?;
         self.put(BDA + bda::VIDEO_CTL, &[0x60, 0xf9, 0x51, 0x08])?;
         self.put_word(EBDA, 1)?;
+        // The tick count starts at the host's time of day; the timer
+        // interrupt counts on from there.
+        self.put(BDA + bda::TICKS, &ticks_since_midnight().to_le_bytes())?;
         self.set_text_mode(true)?;
         Ok(())
     }
@@ -1283,9 +1287,9 @@ impl Bios {
         let bcd = |v: u64| (((v / 10 % 10) << 4) | (v % 10)) as u8;
         match regs.ah() {
             0x00 => {
-                // The 8254's 18.2 Hz: 1 193 182 / 65 536 ticks a second.
-                let micros = of_day * 1_000_000 + u64::from(now.subsec_micros());
-                let ticks = (u128::from(micros) * 1_193_182 / 65_536 / 1_000_000) as u32;
+                // What the timer interrupt has counted.
+                let ticks = u32::from(self.word(BDA + bda::TICKS))
+                    | u32::from(self.word(BDA + bda::TICKS + 2)) << 16;
                 regs.set_cx((ticks >> 16) as u16);
                 regs.set_dx(ticks as u16);
                 regs.set_al(0);
@@ -1326,6 +1330,16 @@ impl Bios {
             }
         }
     }
+}
+
+/// The 8254's ticks since midnight by the host's clock: 1 193 182 / 65 536
+/// (18.2) a second.
+fn ticks_since_midnight() -> u32 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let micros = now.as_secs() % 86_400 * 1_000_000 + u64::from(now.subsec_micros());
+    (u128::from(micros) * 1_193_182 / 65_536 / 1_000_000) as u32
 }
 
 /// The year, month and day of a count of days since 1970-01-01.

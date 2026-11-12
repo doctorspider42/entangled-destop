@@ -41,8 +41,9 @@ Nine's state machine behind the WDDM DDI — so a game needs no switch; phases
 N0–N4; N0 and N1 done, nothing drawn yet).
 [docs/adr/0012-windows-xp-guests.md](docs/adr/0012-windows-xp-guests.md)
 (proposed: Windows XP guests need the legacy PC this machine never was — a
-BIOS, real VGA, PCI IDE, level-triggered INTx, a PS/2 mouse; phases X0–X5,
-nothing implemented; branch `winxp-guests`).
+BIOS, real VGA, PCI IDE, level-triggered INTx, a PS/2 mouse; phases X0–X5;
+X0 done: `boot.mode = "bios"` and a BIOS of our own take the XP CD to its
+kernel; branch `winxp-guests`).
 
 ## Build and test
 
@@ -123,6 +124,7 @@ kernel and initramfs artifacts, and self-skips without them.
 | `crates/virtio-balloon` | free page reporting only: pages the guest reports free are discarded on the host (`reclaim_memory = true`) | — |
 | `crates/virtio-input` | keyboard + absolute pointer devices | EPIC 9 |
 | `crates/virtio-sound` | virtio-snd playback: control/event/TX queues, PCM lifecycle, host sinks behind `AudioSink` (null/recording everywhere, ALSA dlopen'd on Linux, WASAPI on Windows) | EPIC 21, GAME-2102 |
+| `crates/pc-bios` | A PC BIOS served by the host: a ROM of interrupt stubs assembled in Rust, and the `int 10h/13h/15h/16h/1Ah` services behind them, for `boot.mode = "bios"` | ADR-0012 |
 | `crates/hda` | Intel HD Audio controller + one-output codec for Windows guests (in-box driver), playing into virtio-sound's `AudioSink` | ADR-0008 |
 | `crates/ahci` | AHCI controller with ATAPI drives (`[[optical]]`), so Windows PE sees the untouched ISO | ADR-0008 |
 | `crates/display` | winit window, wgpu renderer, host input capture | EPIC 7 |

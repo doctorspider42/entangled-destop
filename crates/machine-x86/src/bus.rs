@@ -142,7 +142,7 @@ impl MachineBus {
     }
 
     /// One BIOS port write. Before a call runs, the bytes waiting in the
-    /// keyboard controller go to the BIOS: it takes no interrupts, so this is
+    /// keyboard controller go to the BIOS: it takes no keyboard interrupt, so this is
     /// how `int 16h` gets its keys.
     fn bios_write(&self, bios: &Mutex<pc_bios::Bios>, port: u16, data: &[u8]) {
         let mut codes = [0u8; 16];
@@ -803,5 +803,17 @@ impl ExitHandler for MachineBus {
         if let Some(irqchip) = &self.irqchip {
             irqchip.eoi(vector);
         }
+    }
+
+    /// The userspace 8259 pair's `INTR` line (ADR-0012); never set on a
+    /// machine that did not enable legacy interrupts.
+    fn ext_interrupt_pending(&self) -> bool {
+        self.irqchip
+            .as_ref()
+            .is_some_and(|irqchip| irqchip.ext_interrupt_pending())
+    }
+
+    fn ext_interrupt_ack(&mut self) -> Option<u8> {
+        self.irqchip.as_ref()?.ext_interrupt_ack()
     }
 }

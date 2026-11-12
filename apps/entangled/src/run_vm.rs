@@ -2071,7 +2071,10 @@ mod host_api {
         /// is a host mapping like the one above; what it keeps in guest RAM
         /// (the stubs at `F000:1000`, the interrupt vectors, the BIOS data
         /// area, an empty text screen) is written again here.
-        Bios { bios: Arc<Mutex<pc_bios::Bios>> },
+        Bios {
+            bios: Arc<Mutex<pc_bios::Bios>>,
+            vcpus: u32,
+        },
     }
 
     /// Where a vCPU starts, and in which of the three start-of-day states.
@@ -2119,11 +2122,15 @@ mod host_api {
                 argument: 0,
                 kind: BootEntryKind::ResetVector,
             }),
-            BootPlan::Bios { bios } => {
+            BootPlan::Bios { bios, vcpus } => {
                 bios.lock()
                     .map_err(|_| "the BIOS lock is poisoned".to_string())?
                     .install()
                     .map_err(|e| e.to_string())?;
+                // A guest old enough to want a BIOS reads the RSDT, not the
+                // XSDT every other guest here follows, and cannot address a
+                // PCI window above 4 GiB.
+                machine_x86::acpi::write_legacy(mem, *vcpus).map_err(|e| e.to_string())?;
                 Ok(BootEntry {
                     entry: machine_x86::layout::RESET_VECTOR,
                     argument: 0,
@@ -2816,7 +2823,10 @@ mod host {
                 // and copied into the F segment by `load_boot`.
                 vm.map_rom(pc_bios::rom::RESET_ALIAS, &pc_bios::rom::image())
                     .map_err(|e| e.to_string())?;
-                BootPlan::Bios { bios }
+                BootPlan::Bios {
+                    bios,
+                    vcpus: cfg.vcpus,
+                }
             }
         };
         // The pause gate goes in before anything can activate a device: a
@@ -3050,6 +3060,11 @@ mod host {
         // 8259/8254/IOAPIC live in this process (WHP-1703).
         let irqchip =
             UserspaceIrqChip::new(vm.interrupt_delivery(), cfg.vcpus).map_err(|e| e.to_string())?;
+        // A BIOS guest lives on the 8259s until its kernel programs the
+        // IOAPIC (ADR-0012); every other guest keeps them inert.
+        if cfg.boot.mode == BootMode::Bios {
+            irqchip.enable_legacy_interrupts();
+        }
         let serial = SerialConsole::with_trigger(irqchip.serial_line(), out);
 
         let mem = Arc::new(vm.memory().clone());
@@ -3154,7 +3169,10 @@ mod host {
                 // and copied into the F segment by `load_boot`.
                 vm.map_rom(pc_bios::rom::RESET_ALIAS, &pc_bios::rom::image())
                     .map_err(|e| e.to_string())?;
-                BootPlan::Bios { bios }
+                BootPlan::Bios {
+                    bios,
+                    vcpus: cfg.vcpus,
+                }
             }
         };
         // Before anything can activate a device; see the KVM path.

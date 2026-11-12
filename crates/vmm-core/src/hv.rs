@@ -181,6 +181,15 @@ pub struct InterruptRequest {
 /// callers are vCPU threads inside an exit and the PIT's timer thread.
 pub trait InterruptDelivery: Send + Sync {
     fn request(&self, interrupt: &InterruptRequest) -> Result<(), HvError>;
+
+    /// Gets `vcpu` out of the guest (or out of its halt) so its run loop
+    /// looks at [`ExitHandler::ext_interrupt_pending`] again. For the one
+    /// interrupt source that is not a request to a local APIC: the 8259's
+    /// `INTR` line. A backend whose hypervisor owns the 8259 needs nothing
+    /// here, which is the default.
+    fn kick(&self, vcpu: u32) {
+        let _ = vcpu;
+    }
 }
 
 /// What a single step of guest execution produced, hypervisor-neutral.
@@ -254,6 +263,24 @@ pub trait ExitHandler: Send {
     /// the flag it reads is shared by every vCPU's handler clone.
     fn shutdown_requested(&self) -> bool {
         false
+    }
+
+    /// True while the machine's legacy interrupt controller (the 8259 pair)
+    /// holds an interrupt for the boot CPU: its `INTR` output.
+    ///
+    /// Only a host whose hypervisor has no interrupt controller of its own
+    /// asks (WHP); KVM's in-kernel 8259 delivers by itself. The default is
+    /// `false`, which is every machine that routes nothing through an 8259.
+    /// Read before every entry into the guest, so it must be one atomic load.
+    fn ext_interrupt_pending(&self) -> bool {
+        false
+    }
+
+    /// The interrupt acknowledge cycle: the boot CPU can take an external
+    /// interrupt now, so the controller names the vector and marks the line
+    /// in service. `None` when the request went away in the meantime.
+    fn ext_interrupt_ack(&mut self) -> Option<u8> {
+        None
     }
 
     /// True once a device has latched a guest **reset** request — the 0xCF9

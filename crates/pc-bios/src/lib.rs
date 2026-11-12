@@ -19,10 +19,11 @@
 //! see `vmm-core`'s `whp_smoke`), that is the difference between booting and
 //! not.
 //!
-//! It takes **no interrupts**. Both 8259s stay masked; the time of day comes
-//! from the host's clock and the keys from whoever feeds [`Bios::scancode`].
-//! A loader that only calls the BIOS never notices. A DOS that hooks the
-//! timer tick would.
+//! It takes **one interrupt**, the 8254's tick on IRQ 0, and handles it in
+//! the ROM without calling the host: the tick is counted at `0040:006C` and
+//! `int 1Ch` is called, because a loader hooks that to time itself (Windows
+//! XP's does, before anything else). Every other 8259 line stays masked; the
+//! keys come from whoever feeds [`Bios::scancode`].
 //!
 //! The guest is untrusted here as everywhere: every pointer, count and drive
 //! number in a call is the guest's, every access to its memory is checked,

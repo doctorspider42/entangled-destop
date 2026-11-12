@@ -1,6 +1,8 @@
 # ADR-0012: Windows XP guests — the legacy PC this machine never was
 
-Status: **proposed** (2026-11-11); nothing implemented, nothing booted.
+Status: **proposed** (2026-11-11); phase X0 done (2026-11-12): the untouched
+XP CD boots through a BIOS of our own to the XP kernel, which stops where it
+should without a disk controller (0x7B). Nothing is installed yet.
 Extends ADR-0008 (Windows guests), which reached Windows 10, 11 and 7 through
 UEFI, virtio and MSI. Branch: `winxp-guests`, cut from `windows-guests`.
 
@@ -57,35 +59,44 @@ the PCI root bus, the ATAPI command set in `crates/ahci`, the VRAM
 
 ## Decision
 
-A second x86 machine profile, `[machine] chipset = "legacy"` (name open),
-selected by a third boot mode `mode = "bios"`. The default machine stays
-byte-identical; a test pins it, as ADR-0008 did for the Linux CPUID policy.
-Each piece below is its own change with a test that fails before it.
+A third boot mode, `boot.mode = "bios"`, selects a BIOS-era machine: the
+BIOS of §1, the 8259 pair delivering, and ACPI tables shaped for a guest of
+that era. The default machine stays byte-identical: everything below is
+switched by the boot mode, and tests pin the default tables. Each piece is
+its own change with a test that fails before it.
 
-### 1. A BIOS (the blocker, and the open question)
+### 1. A BIOS of our own, served by the host
 
-Three ways to get `int 10h/13h/15h/16h/1Ah`, El Torito and an E820 map:
+Decided 2026-11-11 by the project owner: no LGPL firmware, so not SeaBIOS
+(which would also have needed the `fw_cfg` interface and a pinned binary),
+and not EDK2's CSM (removed upstream, and a CSM needs a 16-bit core, which
+is SeaBIOS again). The BIOS is `crates/pc-bios`, and it is not written the
+way a BIOS usually is:
 
-- **(a) SeaBIOS + SeaVGABIOS**, built from pinned sources and fetched with a
-  pinned digest like `CLOUDHV.fd`. LGPLv3. It runs *in the guest*; nothing
-  links it, and CLAUDE.md's copyleft rule covers host code. But a release
-  would carry (or point at) an LGPL binary, which is a licensing choice
-  only the project owner makes. It expects a machine description from the
-  host: the `fw_cfg` port interface (`0x510/0x511` + DMA) for the E820 map,
-  the ACPI tables and the boot order. That interface is a published
-  de-facto standard like Bochs DISPI; no QEMU code is involved. It does its
-  hardware work in 32-bit mode, which suits the WHP limit above. It also
-  already boots from IDE, AHCI and virtio-blk.
-- **(b) A BIOS of our own** (Rust `no_std` + a real-mode stub). Clean
-  licence, exactly the services XP uses, and it can read our tables
-  directly. Cost: weeks before `SETUPLDR` prints anything, and every
-  `int 13h`/`int 10h` corner XP touches is found by bugcheck.
-- **(c) EDK2 with a CSM.** Upstream removed the CSM, and a CSM needs a
-  16-bit core, which is SeaBIOS again. Not an option.
+- **The ROM is a few hundred bytes.** Every interrupt vector points at a
+  five-byte stub that pushes its number and jumps to one routine; the
+  routine saves the registers on the guest's stack and writes `SS`, then
+  `SP`, to two I/O ports (`0x4e0`, `0x4e2`). The machine code is assembled
+  in Rust (`pc_bios::rom`), next to the comment that names each byte, so
+  there is no 16-bit toolchain in the build.
+- **The services run in the host.** On that port write `pc_bios::Bios`
+  reads the saved registers out of guest memory, does the service — an
+  `int 13h` read is a file read into guest memory, `int 10h` writes two
+  bytes at `B800:0000`, `int 15h/E820` returns `machine_x86::e820_map` —
+  writes the registers back, and the routine pops them and `iret`s. They
+  are ordinary Rust with ordinary unit tests, on both hosts.
+- **Nothing in real mode touches a device**, which is what the WHP limit
+  above needed: the host writes text memory, and the drives are read from
+  their image files with no controller in between.
+- The interface between the two halves is guest memory and two ports, so
+  it goes through `ExitHandler` as it is: no backend API changed for it.
 
-Recommendation: **(a)** to reach a desktop and learn what XP needs, keeping
-(b) possible later because the host side (`fw_cfg`, the devices) is the
-same for both. **This needs the owner's yes before any binary is fetched.**
+What it owes a guest is found the way ADR-0008 found things: by running
+the guest. `RUST_LOG=pc_bios=trace` prints every call with its registers,
+and a service that is not there is reported once (`debug`).
+
+It takes exactly one interrupt, the timer's (below). The keys come from
+the 8042, which the machine drains into the BIOS before each call.
 
 ### 2. Real VGA
 
@@ -129,7 +140,7 @@ and sound, and it also repairs what ADR-0008 worked around with forced MSI.
 
 ### 6. What every new device owes
 
-VGA, IDE, `fw_cfg`, the mouse, the NIC: each a `reset()`, a `Quiesce` gate
+VGA, IDE, the mouse, the NIC: each a `reset()`, a `Quiesce` gate
 where a host thread touches guest memory (the IDE DMA worker, the
 presenter), and a save/load pair or a named snapshot refusal until it has
 one (ADR-0005, ADR-0006). All guest-supplied lengths, PRDs and register
@@ -139,7 +150,7 @@ indexes are bounded and go through `vm-memory`.
 
 | Phase | Contents | Acceptance (WHP first) |
 |---|---|---|
-| **X0 — the BIOS speaks** | `mode = "bios"`, the legacy memory layout, `fw_cfg`, the BIOS decision of §1 | the BIOS banner and "no bootable device" on ttyS0 |
+| **X0 — the BIOS speaks** (done) | `mode = "bios"`, the BIOS of §1, the 8259's interrupt, the legacy ACPI tables | the XP CD's loader runs and starts the XP kernel |
 | **X1 — a screen and a CD** | VGA text mode, IDE + ATAPI | the XP CD boots to the blue "Windows XP Professional Setup" screen and takes keys |
 | **X2 — Setup runs** | ATA disk, bus-master DMA, planar VGA | text-mode Setup formats and copies; GUI-mode Setup draws; the mouse moves |
 | **X3 — a desktop** | whatever the first boots stop on (ACPI, MSRs, timers), VBE modes | the installed system reaches the desktop, 10 boots without a stop, shutdown ends the run |
@@ -168,3 +179,70 @@ X0–X3 are the decision this ADR asks for.
    split has to be per boot mode without forking `layout.rs` into two files
    nobody can compare.
 4. KVM cannot be tested on this machine at all (no `/dev/kvm` in WSL).
+
+## Amendment, 2026-11-12: X0 on WHP, and what the first boot took
+
+`boot.mode = "bios"` boots the untouched XP SP3 CD on the Windows/WHP host:
+the El Torito loader, `SETUPLDR.BIN` and `NTDETECT.COM` run on the BIOS of
+§1, the blue "Windows Setup" screen and "Setup is starting Windows" are
+drawn from text memory in the window, about 770 `int 13h` reads load the
+kernel and the boot drivers, and the XP kernel starts and runs for a few
+seconds. It ends at **stop 0x7B, INACCESSIBLE_BOOT_DEVICE**: there is no
+disk controller XP has a driver for, which is phase X1. One vCPU, 512 MiB,
+`ignore_msrs = true`; the machine still carries its virtio devices and the
+AHCI controller, which XP ignores.
+
+What stood between the first call and that stop, in the order it was found:
+
+1. **The loader waits for a timer tick.** `SETUPLDR` hooks `int 1Ch` and
+   spins until the BIOS's timer interrupt calls it, to calibrate its delay
+   loop. "A BIOS that takes no interrupts" lasted one evening. The 8259 pair
+   was a register model with no delivery (`irqchip::pic`: "No delivery");
+   it now resolves priority and answers the acknowledge cycle, and
+   `UserspaceIrqChip::enable_legacy_interrupts` wires the 8254 to its IRQ 0.
+   It is off for every machine but a BIOS one, so no other guest sees a
+   second timer interrupt. On WHP the vector goes in as a pending
+   external-interrupt event when the boot CPU can take it, with an
+   interrupt-window notification when it cannot
+   (`WhpVcpu::offer_ext_interrupt`); two defaulted methods on `ExitHandler`
+   and one on `InterruptDelivery` carry it, and KVM, whose in-kernel 8259
+   delivers by itself, implements none of them. The ROM's `int 08h` handler
+   counts the tick at `0040:006C`, calls `int 1Ch` and ends the interrupt,
+   on the interrupted code's stack: the loader's hook rewrites the return
+   address the interrupt pushed, so the frame has to be exactly where the
+   CPU left it.
+2. **XP's loader follows the RSDT.** The tables are XSDT-only; with
+   `RsdtAddress` 0 the loader read a table length out of the interrupt
+   vectors at physical address 4 and tried to map 3.75 GiB.
+   `acpi::write_rsdt` adds an RSDT beside the XSDT.
+3. **Stop 0xA5 (2): a root bridge window above 4 GiB.** `PCI0._CRS` named
+   the 64-bit aperture, which a 32-bit XP cannot represent. The tables of a
+   BIOS machine (`acpi::write_legacy`) leave it out.
+4. **Stop 0x7E in `acpi.sys`, a null interrupt-routing interface.** XP
+   reserves a device's interrupt when it enumerates it, and its ACPI driver
+   asks the PCI driver how to route only once the root bridge has started.
+   The keyboard (`PS2K`, IRQ 1) was the bridge's sibling under `\_SB`, so
+   it was enumerated first. In the legacy tables it is the bridge's child,
+   as on a real board, and the bridge has a hard-wired `_PRT` for the
+   bus's INTx lines. (The `_PRT` describes wiring the host does not honour
+   yet: level-triggered INTx is still §4.)
+
+Not needed after all, at least not yet: `fw_cfg`, a separate "legacy
+chipset" switch (the boot mode selects everything above), and the PM
+timer's `TMR_STS` — added while chasing stop 0xA5, kept because it is what
+ACPI specifies, and not what XP was waiting for.
+
+**Reading a stop that cannot be seen.** XP draws its blue screen in a VGA
+graphics mode this machine does not have, then sits in the HAL polling the
+power button. `ENTANGLED_WHP_SAMPLE_PAUSE=1` prints, when the VM is paused,
+the vCPU's registers, the code at its RIP and — for a Windows kernel,
+32-bit ones included now — the stop code and parameters from
+`KiBugCheckData`, with the memory the parameters point at. The full exit
+trace is no substitute here: it slows this guest enough that the loader
+never reaches the kernel. The faulting driver was named by searching the
+CD's own driver files for the code bytes at the fault address.
+
+Not done: KVM (the legacy tables, the BIOS and the boot plan build there
+and the in-kernel 8259 needs nothing, but no BIOS guest has run on it); a
+snapshot of a BIOS machine (refused by name); `int 10h` beyond text mode;
+`int 13h` for floppies; the timer tick's midnight rollover.
