@@ -114,10 +114,11 @@ fn pixel(present: &Present, x: u32, y: u32) -> [u8; 3] {
 
 macro_rules! call {
     ($driver:expr, $op:ident, fn($($ty:ty),*) $(-> $ret:ty)?, $($arg:expr),*) => {{
+        let entry = $driver.gl(op::$op);
+        type Entry = unsafe extern "system" fn($($ty),*) $(-> $ret)?;
         // SAFETY: the entry is the driver's implementation of that OpenGL
         // function, which has this signature.
-        let f: unsafe extern "system" fn($($ty),*) $(-> $ret)? =
-            unsafe { std::mem::transmute($driver.gl(op::$op)) };
+        let f = unsafe { std::mem::transmute::<*const c_void, Entry>(entry) };
         // SAFETY: as above; pointers passed are to live locals.
         unsafe { f($($arg),*) }
     }};
@@ -167,9 +168,8 @@ fn a_program_draws_through_the_driver_and_sees_it_come_back() {
     };
     // SAFETY: the driver's exports, with the signatures an ICD has.
     let (create, set, swap, release, delete) = unsafe {
-        let hook: unsafe extern "C" fn(
-            extern "C" fn(*const u32, u32, *mut u8, u32) -> i32,
-        ) = std::mem::transmute(driver.symbol(c"entgl_test_hook"));
+        let hook: unsafe extern "C" fn(extern "C" fn(*const u32, u32, *mut u8, u32) -> i32) =
+            std::mem::transmute(driver.symbol(c"entgl_test_hook"));
         hook(transact);
         let create: unsafe extern "system" fn(Handle) -> usize =
             std::mem::transmute(driver.symbol(c"DrvCreateContext"));
@@ -198,11 +198,25 @@ fn a_program_draws_through_the_driver_and_sees_it_come_back() {
     // SAFETY: a NUL-terminated string the driver keeps.
     assert_eq!(unsafe { CStr::from_ptr(version) }.to_bytes(), b"1.1.0");
     let mut viewport = [0i32; 4];
-    call!(driver, GetIntegerv, fn(u32, *mut i32), 0x0ba2, viewport.as_mut_ptr());
+    call!(
+        driver,
+        GetIntegerv,
+        fn(u32, *mut i32),
+        0x0ba2,
+        viewport.as_mut_ptr()
+    );
     assert_eq!(viewport, [0, 0, 64, 48]);
 
     // Immediate mode: a red triangle over the bottom-left half, on blue.
-    call!(driver, ClearColor, fn(f32, f32, f32, f32), 0.0, 0.0, 1.0, 1.0);
+    call!(
+        driver,
+        ClearColor,
+        fn(f32, f32, f32, f32),
+        0.0,
+        0.0,
+        1.0,
+        1.0
+    );
     call!(driver, Clear, fn(u32), 0x4000);
     call!(driver, Begin, fn(u32), 4);
     call!(driver, Color3ub, fn(u8, u8, u8), 255, 0, 0);
@@ -328,7 +342,7 @@ fn a_program_draws_through_the_driver_and_sees_it_come_back() {
     assert_eq!((present.width, present.height), (64, 48));
     assert_eq!(pixel(&present, 4, 44), [255, 0, 0], "triangle");
     assert_eq!(pixel(&present, 56, 4), [0, 255, 0], "quad from arrays");
-    assert_eq!(pixel(&present, 40, 30), [0, 0, 255], "background");
+    assert_eq!(pixel(&present, 40, 14), [0, 0, 255], "background");
 
     // SAFETY: as declared above.
     unsafe {
