@@ -13,3 +13,5 @@ VideoPortReadRegisterUlong@4
 VideoPortWriteRegisterUlong@8
 VideoPortMoveMemory@12
 VideoPortReadRegisterUchar@4
+VideoPortWriteRegisterUchar@8
+VideoPortWritePortUchar@8

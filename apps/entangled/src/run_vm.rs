@@ -1880,6 +1880,11 @@ pub fn run_with(
             bios.set_video_modes(Box::new(modes));
         }
     }
+    // A PC BIOS enables every PCI device during POST; ours has no POST to
+    // do it in, so the bus starts that way.
+    if let (Some(_), Some(pci)) = (bus.bios(), bus.pci_shared()) {
+        pci.firmware_enables_decoding();
+    }
     // The BIOS offers the linear framebuffer through VBE, when the machine
     // has one beside its VGA.
     if let (Some(bios), Some(pci)) = (bus.bios(), bus.pci_shared()) {

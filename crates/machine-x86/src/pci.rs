@@ -607,6 +607,24 @@ impl ConfigSpace {
         }
     }
 
+    /// Makes the function come out of reset decoding its BARs, as it does
+    /// on a machine whose firmware enables every device during POST and
+    /// hands the operating system a bus that is already live (ADR-0012).
+    ///
+    /// Without it a BIOS-era system sees devices its firmware "left
+    /// disabled": Windows XP then treats their BAR assignments as nobody's,
+    /// moves them, and starts a driver before it has switched memory
+    /// decoding on — the driver reads zeroes from its own registers.
+    pub fn decode_from_power_on(&mut self) {
+        let bits = u32::from(command::IO_SPACE | command::MEMORY_SPACE | command::BUS_MASTER);
+        let index = Self::index(reg::COMMAND);
+        self.power_on[index] |= bits;
+        self.regs[index] |= bits;
+        for (register, handle) in &self.mirrors {
+            handle.store(self.regs[Self::index(*register)], Ordering::Release);
+        }
+    }
+
     /// This function's register file, for a snapshot (ADR-0006).
     ///
     /// The whole file, not a list of the interesting registers — the same
@@ -895,6 +913,16 @@ impl PciRoot {
         }
     }
 
+    /// Every device on the bus decodes its BARs from power-on: what a PC
+    /// BIOS's POST leaves behind. See [`ConfigSpace::decode_from_power_on`].
+    pub fn decode_from_power_on(&mut self) {
+        for function in &mut self.functions {
+            if function.owner.is_some() {
+                function.config.decode_from_power_on();
+            }
+        }
+    }
+
     /// The bus, for a snapshot (ADR-0006): the latched configuration address
     /// and every function's register file, host bridge included.
     pub fn save_state(&self) -> crate::state::SavedPciRoot {
@@ -1073,6 +1101,14 @@ impl PciRoot {
             .config
             .write_dword_bytes(target.register, within, data);
         let after = function.config.decode_state();
+        tracing::debug!(
+            device = target.device,
+            register = format_args!("{:#04x}", target.register),
+            within,
+            data = ?data,
+            now = format_args!("{:#010x}", function.config.read_dword(target.register)),
+            "PCI configuration write"
+        );
         ConfigWrite {
             owner,
             decode_changed: before != after,
@@ -1120,6 +1156,26 @@ impl PciRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bios_machines_devices_decode_from_power_on_and_after_a_reset() {
+        let mut space = ConfigSpace::type0(0x1234, 0x1111, 0x0300_0000, 2)
+            .with_memory_bar(0, 0xc000_8000, 0x1000)
+            .unwrap();
+        space.seal();
+        assert_eq!(space.bar_window(0), None, "disabled, as on a UEFI machine");
+        space.decode_from_power_on();
+        assert_eq!(space.bar_window(0), Some((0xc000_8000, 0x1000)));
+        assert_eq!(
+            space.command() & 0x7,
+            command::IO_SPACE | command::MEMORY_SPACE | command::BUS_MASTER
+        );
+        // The guest switches it off; a reset is a new POST.
+        space.write_dword_bytes(reg::COMMAND, 0, &0u16.to_le_bytes());
+        assert_eq!(space.bar_window(0), None);
+        space.reset();
+        assert_eq!(space.bar_window(0), Some((0xc000_8000, 0x1000)));
+    }
 
     /// A stand-in for a virtio device: one 16 KiB memory BAR in the aperture,
     /// INTA# on the first PCI GSI, and two capability records.

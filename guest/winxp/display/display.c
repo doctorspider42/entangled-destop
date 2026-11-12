@@ -64,6 +64,16 @@ static BOOL ioctl(HANDLE driver, DWORD code, PVOID in, ULONG in_size, PVOID out,
     return EngDeviceIoControl(driver, code, in, in_size, out, out_size, &returned) == 0;
 }
 
+/* A line in the host's log, by way of the miniport. */
+static void trace(HANDLE driver, const char *text)
+{
+    ULONG length = 0, returned = 0;
+    while (text[length]) {
+        length++;
+    }
+    EngDeviceIoControl(driver, IOCTL_ENTXP_LOG, (PVOID)text, length, NULL, 0, &returned);
+}
+
 /* How many of the table's modes the miniport offers (those that fit VRAM). */
 static ULONG mode_count(HANDLE driver)
 {
@@ -114,7 +124,9 @@ DHPDEV APIENTRY DrvEnablePDEV(DEVMODEW *devmode, LPWSTR logical_address, ULONG p
     (void)pattern_count;
     (void)patterns;
     (void)device_name;
+    trace(driver, "display: DrvEnablePDEV");
     if (count == 0) {
+        trace(driver, "display: no modes");
         return NULL;
     }
     /* The mode asked for; with nothing asked (a first start), 1024x768 if
@@ -127,6 +139,7 @@ DHPDEV APIENTRY DrvEnablePDEV(DEVMODEW *devmode, LPWSTR logical_address, ULONG p
     if (devmode != NULL && devmode->dmPelsWidth != 0 && devmode->dmPelsHeight != 0) {
         BOOL found = FALSE;
         if (devmode->dmBitsPerPel != 0 && devmode->dmBitsPerPel != 32) {
+            trace(driver, "display: asked for a depth other than 32");
             return NULL;
         }
         for (i = 0; i < count; i++) {
@@ -137,6 +150,7 @@ DHPDEV APIENTRY DrvEnablePDEV(DEVMODEW *devmode, LPWSTR logical_address, ULONG p
             }
         }
         if (!found) {
+            trace(driver, "display: asked for a mode not in the list");
             return NULL;
         }
     }
@@ -241,7 +255,9 @@ HSURF APIENTRY DrvEnableSurface(DHPDEV dhpdev)
     SIZEL size;
     HSURF surface;
 
+    trace(pdev->driver, "display: DrvEnableSurface");
     if (!show_mode(pdev)) {
+        trace(pdev->driver, "display: the mode was refused");
         return NULL;
     }
     wanted.RequestedVirtualAddress = NULL;
@@ -261,9 +277,11 @@ HSURF APIENTRY DrvEnableSurface(DHPDEV dhpdev)
         wanted.RequestedVirtualAddress = pdev->vram;
         ioctl(pdev->driver, IOCTL_VIDEO_UNMAP_VIDEO_MEMORY, &wanted, sizeof(wanted), NULL, 0);
         pdev->vram = NULL;
+        trace(pdev->driver, "display: no surface");
         return NULL;
     }
     pdev->surface = surface;
+    trace(pdev->driver, "display: surface enabled");
     return surface;
 }
 

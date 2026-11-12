@@ -21,6 +21,12 @@
  * METHOD_BUFFERED, FILE_ANY_ACCESS). */
 #define IOCTL_ENTXP_ACCEL_RUN ((0x23u << 16) | (0x900u << 2))
 
+/* The miniport's log IOCTL, CTL_CODE(FILE_DEVICE_VIDEO, 0x901, ...): the
+ * input is text for the host's log. And the register the text goes to, a
+ * byte at a time; a line feed ends a line. */
+#define IOCTL_ENTXP_LOG ((0x23u << 16) | (0x901u << 2))
+#define LOG_REGISTER 0x700
+
 /* The device's accelerator registers: 32 bits each, from this offset of
  * the register page (machine_x86::framebuffer::accel). */
 #define ACCEL_BASE 0x600

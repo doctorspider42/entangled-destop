@@ -97,6 +97,9 @@ mod regs {
     /// The accelerator's registers (ADR-0013), 32 bits each.
     pub const ACCEL: u64 = 0x600;
     pub const ACCEL_END: u64 = ACCEL + 4 * super::accel::COUNT as u64;
+    /// One byte, write-only: a character of the guest drivers' log. A line
+    /// feed ends a line, which the host then logs (ADR-0013).
+    pub const LOG: u64 = 0x700;
 }
 
 /// The accelerator's registers: how a guest driver hands the host a buffer
@@ -281,6 +284,8 @@ pub struct Framebuffer {
     accelerator: std::sync::OnceLock<Arc<dyn Accelerator>>,
     /// Bytes of response the last buffer produced.
     accel_response: std::sync::atomic::AtomicU32,
+    /// The line of guest log being written.
+    log: Mutex<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Framebuffer {
@@ -322,7 +327,30 @@ impl Framebuffer {
             generation: AtomicU64::new(0),
             accelerator: std::sync::OnceLock::new(),
             accel_response: std::sync::atomic::AtomicU32::new(0),
+            log: Mutex::new(Vec::new()),
         })
+    }
+
+    /// One character of the guest drivers' log. Lines are cut at 200 bytes
+    /// and logged with their unprintable bytes replaced: the text is the
+    /// guest's.
+    fn log_byte(&self, byte: u8) {
+        const LINE: usize = 200;
+        let mut line = self
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if byte != b'\n' {
+            line.push(if byte.is_ascii_graphic() || byte == b' ' {
+                byte
+            } else {
+                b'?'
+            });
+        }
+        if byte == b'\n' || line.len() >= LINE {
+            tracing::info!(target: "guest_driver", "{}", String::from_utf8_lossy(&line));
+            line.clear();
+        }
     }
 
     /// Gives the device an accelerator (ADR-0013); `false` if it has one, or
@@ -588,6 +616,12 @@ impl Framebuffer {
     /// writes do anything; everything else (the VGA ports, the EDID, stray
     /// bytes) is absorbed.
     pub fn mmio_write(&self, offset: u64, data: &[u8]) {
+        if offset == regs::LOG {
+            if let [byte] = data {
+                self.log_byte(*byte);
+            }
+            return;
+        }
         if offset == regs::ACCEL + 4 * accel::RUN as u64 {
             if let Ok(bytes) = <[u8; 4]>::try_from(data) {
                 self.run_accel(u32::from_le_bytes(bytes));

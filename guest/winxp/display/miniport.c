@@ -49,6 +49,23 @@ typedef struct {
     ULONG accel_response_bytes;
 } DEVICE_EXT;
 
+/* A line in the host's log: `text`, then `value` in hexadecimal. */
+static void trace(DEVICE_EXT *ext, const char *text, ULONG value)
+{
+    static const char digits[] = "0123456789abcdef";
+    int shift;
+    (void)ext;
+    /* The debug console port: there before any register is mapped. */
+    while (*text) {
+        VideoPortWritePortUchar((PUCHAR)0xe9, (UCHAR)*text++);
+    }
+    VideoPortWritePortUchar((PUCHAR)0xe9, ' ');
+    for (shift = 28; shift >= 0; shift -= 4) {
+        VideoPortWritePortUchar((PUCHAR)0xe9, digits[(value >> shift) & 15]);
+    }
+    VideoPortWritePortUchar((PUCHAR)0xe9, '\n');
+}
+
 static ULONG accel_read(DEVICE_EXT *ext, ULONG index)
 {
     return VideoPortReadRegisterUlong((PULONG)(ext->regs + ACCEL_BASE + 4 * index));
@@ -150,11 +167,18 @@ VP_STATUS FindAdapter(PVOID extension, PVOID context, PWSTR argument,
     (void)context;
     (void)argument;
     *again = FALSE;
+    trace(ext, "miniport: FindAdapter, config length", config->Length);
+    trace(ext, "miniport:   this build expects", sizeof(VIDEO_PORT_CONFIG_INFO));
     if (config->Length < sizeof(VIDEO_PORT_CONFIG_INFO)) {
         return ERROR_INVALID_PARAMETER;
     }
     VideoPortZeroMemory(ranges, sizeof(ranges));
     status = VideoPortGetAccessRanges(extension, 0, NULL, 6, ranges, NULL, NULL, NULL);
+    trace(ext, "miniport: access ranges, status", status);
+    for (i = 0; i < 6; i++) {
+        trace(ext, "miniport:   range start", ranges[i].RangeStart.LowPart);
+        trace(ext, "miniport:   range length", ranges[i].RangeLength);
+    }
     if (status != NO_ERROR) {
         return status;
     }
@@ -173,15 +197,19 @@ VP_STATUS FindAdapter(PVOID extension, PVOID context, PWSTR argument,
             ext->vram_length = ranges[i].RangeLength;
         }
     }
+    trace(ext, "miniport: FindAdapter, vram bytes", ext->vram_length);
+    trace(ext, "miniport:   register page mapped at", (ULONG)(ULONG_PTR)ext->regs);
     if (ext->regs == NULL || ext->vram_length == 0) {
         return ERROR_DEV_NOT_EXIST;
     }
     /* The device answers with the newest DISPI interface it speaks. */
     id = dispi_read(ext, DISPI_ID);
+    trace(ext, "miniport:   DISPI id", id);
     if ((id & 0xfff0) != 0xb0c0) {
         return ERROR_DEV_NOT_EXIST;
     }
     accel_find(extension, ext);
+    trace(ext, "miniport: accelerator area bytes", ext->accel_commands_bytes);
     ext->mode_count = 0;
     for (i = 0; i < ENTXP_MODE_COUNT; i++) {
         if ((ULONG)entxp_modes[i].width * entxp_modes[i].height * 4 <= ext->vram_length) {
@@ -189,6 +217,7 @@ VP_STATUS FindAdapter(PVOID extension, PVOID context, PWSTR argument,
         }
     }
     ext->current = 0;
+    trace(ext, "miniport: modes", ext->mode_count);
 
     /* No VGA emulation for full-screen DOS boxes, no saved hardware state. */
     config->NumEmulatorAccessEntries = 0;
@@ -325,6 +354,16 @@ BOOLEAN StartIO(PVOID extension, PVIDEO_REQUEST_PACKET packet)
         status = NO_ERROR;
         break;
     }
+    case IOCTL_ENTXP_LOG: {
+        ULONG n;
+        for (n = 0; n < packet->InputBufferLength && n < 200; n++) {
+            VideoPortWriteRegisterUchar(ext->regs + LOG_REGISTER,
+                                        ((UCHAR *)packet->InputBuffer)[n]);
+        }
+        VideoPortWriteRegisterUchar(ext->regs + LOG_REGISTER, '\n');
+        status = NO_ERROR;
+        break;
+    }
     case IOCTL_VIDEO_UNMAP_VIDEO_MEMORY: {
         VIDEO_MEMORY *in = (VIDEO_MEMORY *)packet->InputBuffer;
         if (packet->InputBufferLength < sizeof(*in)) {
@@ -336,6 +375,10 @@ BOOLEAN StartIO(PVOID extension, PVIDEO_REQUEST_PACKET packet)
     }
     default:
         break;
+    }
+    if (status != NO_ERROR || packet->IoControlCode != IOCTL_ENTXP_ACCEL_RUN) {
+        trace(ext, "miniport: ioctl", packet->IoControlCode);
+        trace(ext, "miniport:   status", status);
     }
     packet->StatusBlock->Status = status;
     return TRUE;
@@ -405,5 +448,10 @@ ULONG DriverEntry(PVOID context1, PVOID context2)
     init.HwGetVideoChildDescriptor = GetChildDescriptor;
     init.HwDeviceExtensionSize = sizeof(DEVICE_EXT);
     init.AdapterInterfaceType = PCIBus;
-    return VideoPortInitialize(context1, context2, &init, NULL);
+    trace(NULL, "miniport: DriverEntry, init data size", sizeof(init));
+    {
+        ULONG result = VideoPortInitialize(context1, context2, &init, NULL);
+        trace(NULL, "miniport: VideoPortInitialize", result);
+        return result;
+    }
 }

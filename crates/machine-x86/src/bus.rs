@@ -710,8 +710,39 @@ impl MachineBus {
     }
 }
 
+/// The debug console port a guest driver of ours writes its log to, a byte
+/// at a time, before it has any device of its own to write through (the
+/// port Bochs made the convention). A line feed ends a line.
+const DEBUG_CONSOLE_PORT: u16 = 0xe9;
+
+/// One byte of the debug console; logs the line when it ends. The text is
+/// the guest's: unprintable bytes are replaced and lines cut at 200.
+fn debug_console(byte: u8) {
+    static LINE: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+    let mut line = LINE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if byte != b'\n' {
+        line.push(if byte.is_ascii_graphic() || byte == b' ' {
+            byte
+        } else {
+            b'?'
+        });
+    }
+    if byte == b'\n' || line.len() >= 200 {
+        tracing::info!(target: "guest_driver", "{}", String::from_utf8_lossy(&line));
+        line.clear();
+    }
+}
+
 impl ExitHandler for MachineBus {
     fn io_out(&mut self, port: u16, data: &[u8]) {
+        if port == DEBUG_CONSOLE_PORT {
+            if let [byte] = data {
+                debug_console(*byte);
+            }
+            return;
+        }
         if let Some(vga) = &self.vga {
             if crate::vga::contains(port) {
                 let wanted = match vga.lock() {

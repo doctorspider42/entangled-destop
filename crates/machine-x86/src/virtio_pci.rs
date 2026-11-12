@@ -1453,6 +1453,20 @@ impl VirtioPciBus {
         }
     }
 
+    /// The machine's firmware is a PC BIOS, which enables every PCI device
+    /// during POST: from now on, and after every reset, the functions decode
+    /// their BARs where the host placed them (ADR-0012).
+    pub fn firmware_enables_decoding(&self) {
+        match self.root.lock() {
+            Ok(mut root) => root.decode_from_power_on(),
+            Err(_) => {
+                tracing::error!("PCI root lock is poisoned; devices stay disabled");
+                return;
+            }
+        }
+        self.reconcile_shm();
+    }
+
     /// Every function on this bus whose device would refuse a snapshot now,
     /// each as its own sentence (ADR-0006).
     pub fn snapshot_refusals(&self) -> Vec<String> {
