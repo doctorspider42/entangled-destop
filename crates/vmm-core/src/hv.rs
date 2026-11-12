@@ -192,6 +192,23 @@ pub trait InterruptDelivery: Send + Sync {
     }
 }
 
+/// A range of guest RAM the machine can take away from the guest and hand
+/// back.
+///
+/// While it is trapped the guest's accesses to the range leave the guest as
+/// memory-mapped I/O (`ExitHandler::mmio_read`/`mmio_write`) instead of
+/// reaching the RAM behind it; the host's own view of that RAM
+/// (`GuestMem`) is unchanged throughout. The one user is the VGA
+/// (`machine_x86::vga`): `0xa0000..0xbffff` is RAM in text mode and four
+/// planes behind write logic in the 16-colour modes.
+///
+/// A capability, not part of every backend: a host that cannot split its
+/// RAM mapping simply offers none, and the machine then has no planar modes.
+pub trait RamTrap: Send + Sync {
+    /// Traps the range, or gives it back to the guest. Idempotent.
+    fn set_trapped(&self, trapped: bool) -> Result<(), HvError>;
+}
+
 /// What a single step of guest execution produced, hypervisor-neutral.
 /// Buffers borrow from the backend's run context (KVM's kvm_run mmap; WHP's
 /// exit context), so they are consumed before the next `run`.

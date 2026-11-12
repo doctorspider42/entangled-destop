@@ -1101,6 +1101,72 @@ pub const CONTROL_PREFIX: &str = control_api::control::PREFIX;
 /// second, each delivery under a pause-gate pass like the input pump's — a
 /// paused VM's event ring is not written (ADR-0005), and what waits keeps
 /// waiting until it resumes.
+/// The host pointer as a PS/2 mouse (ADR-0012).
+///
+/// The window reports where the pointer *is*, on the tablet's axes; a PS/2
+/// mouse reports how far it *moved*. This keeps the last position, in guest
+/// pixels, and hands the 8042 the difference. The guest applies its own
+/// acceleration to that, so its cursor drifts from the host's: an absolute
+/// pointer needs a guest driver, which a guest this old does not have yet.
+#[derive(Default)]
+struct Ps2Pointer {
+    /// The tablet axes as last reported.
+    x: u32,
+    y: u32,
+    /// The position last sent, in guest pixels.
+    sent: Option<(i32, i32)>,
+    buttons: u8,
+    sent_buttons: u8,
+}
+
+impl Ps2Pointer {
+    fn feed(
+        &mut self,
+        events: &[virtio_input::InputEvent],
+        ps2: &Mutex<machine_x86::i8042::I8042>,
+        (width, height): (u32, u32),
+    ) {
+        const BTN_LEFT: u16 = 0x110;
+        for event in events {
+            match (event.event_type, event.code) {
+                (virtio_input::ev::ABS, 0) => self.x = event.value,
+                (virtio_input::ev::ABS, 1) => self.y = event.value,
+                (virtio_input::ev::KEY, code @ BTN_LEFT..=0x112) => {
+                    let bit = 1u8 << (code - BTN_LEFT);
+                    if event.value != 0 {
+                        self.buttons |= bit;
+                    } else {
+                        self.buttons &= !bit;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if events.is_empty() {
+            return;
+        }
+        let scale = |value: u32, size: u32| {
+            (u64::from(value.min(virtio_input::ABS_AXIS_MAX)) * u64::from(size)
+                / u64::from(virtio_input::ABS_AXIS_MAX)) as i32
+        };
+        let now = (scale(self.x, width), scale(self.y, height));
+        let (dx, dy) = match self.sent {
+            Some((x, y)) => (now.0 - x, now.1 - y),
+            None => (0, 0),
+        };
+        if dx == 0 && dy == 0 && self.buttons == self.sent_buttons && self.sent.is_some() {
+            return;
+        }
+        if let Ok(mut ps2) = ps2.lock() {
+            if ps2.mouse_active() {
+                ps2.mouse_move(dx, dy, self.buttons);
+                self.sent_buttons = self.buttons;
+            }
+        }
+        self.sent = Some(now);
+    }
+}
+
 /// The host's keys: to the virtio keyboard once the guest drives it, else to
 /// the 8042 (ADR-0008 §5) — Windows' recovery environment, and anything else
 /// that runs before `vioinput`. Never both, so nothing is typed twice.
@@ -1863,6 +1929,8 @@ pub fn run_with(
             let pump_requests = Arc::clone(&requests);
             let pump_quiesce = Arc::clone(&quiesce);
             let pump_ps2 = bus.keyboard();
+            let pump_display = display_handle.clone();
+            let mut ps2_pointer = Ps2Pointer::default();
             let pump_snapshot = snapshot.clone();
             let pump = std::thread::spawn(move || {
                 while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
@@ -1904,6 +1972,11 @@ pub fn run_with(
                     }
                     if let Err(e) = tablet_sink.push(&pointer) {
                         tracing::warn!(error = %e, "pointer event delivery failed");
+                    }
+                    // A guest with no virtio-input driver gets the pointer
+                    // as a PS/2 mouse, if the machine has one (ADR-0012).
+                    if let Some(ps2) = pump_ps2.as_ref().filter(|_| !tablet_sink.is_active()) {
+                        ps2_pointer.feed(&pointer, ps2, pump_display.resolution());
                     }
                     // Relative deltas are additive. Never run these through the
                     // tablet's last-position-wins coalescer.
@@ -2783,7 +2856,11 @@ mod host {
                 };
                 let mut ide = super::build_ide(cfg)?;
                 ide.connect(line(ide::PRIMARY_IRQ)?, line(ide::SECONDARY_IRQ)?);
-                bus.with_ide(ide).with_vga()
+                // No planar modes on this host yet: taking a piece of a
+                // KVM memory slot away needs the slot split at creation.
+                bus.with_ide(ide)
+                    .with_vga(None)
+                    .with_mouse(line(machine_x86::i8042::MOUSE_IRQ as u8)?)
             }
             BootMode::DirectLinux | BootMode::Uefi => bus,
         };
@@ -3180,7 +3257,14 @@ mod host {
                 };
                 let mut ide = super::build_ide(cfg)?;
                 ide.connect(line(ide::PRIMARY_IRQ)?, line(ide::SECONDARY_IRQ)?);
-                bus.with_ide(ide).with_vga()
+                // The VGA's window is RAM in text mode and trapped in the
+                // planar ones.
+                let window = vm
+                    .ram_trap(0x000a_0000, 0x0002_0000)
+                    .map_err(|e| e.to_string())?;
+                bus.with_ide(ide)
+                    .with_vga(Some(window))
+                    .with_mouse(line(machine_x86::i8042::MOUSE_IRQ as u8)?)
             }
             BootMode::DirectLinux | BootMode::Uefi => bus,
         };

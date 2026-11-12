@@ -96,6 +96,13 @@ pub struct MachineBus {
     /// The VGA's registers on a BIOS-era machine (ADR-0012). `None` leaves
     /// `0x3c0..0x3df` undecoded, as on every other machine.
     vga: Option<Arc<Mutex<crate::vga::Vga>>>,
+    /// How the VGA's memory window is taken from the guest while a mode
+    /// needs the planes, on a host that can; and whether it is now.
+    vga_trap: Option<Arc<dyn vmm_core::hv::RamTrap>>,
+    vga_trapped: Arc<std::sync::atomic::AtomicBool>,
+    /// IRQ 12 for a PS/2 mouse on the keyboard controller's second port
+    /// (ADR-0012); given to the controller when both exist.
+    mouse_line: Option<Arc<dyn virtio_core::interrupt::IrqLine>>,
 }
 
 #[cfg(test)]
@@ -118,6 +125,9 @@ impl MachineBus {
             bios: None,
             ide: None,
             vga: None,
+            vga_trap: None,
+            vga_trapped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mouse_line: None,
         }
     }
 
@@ -152,10 +162,38 @@ impl MachineBus {
         self
     }
 
-    /// Gives the machine a VGA register file (ADR-0012).
-    pub fn with_vga(mut self) -> Self {
+    /// Gives the machine a VGA (ADR-0012). `trap` is the host's way of
+    /// taking `0xa0000..0xbffff` from the guest while a mode needs the
+    /// planes; without one the machine has text mode only.
+    pub fn with_vga(mut self, trap: Option<Arc<dyn vmm_core::hv::RamTrap>>) -> Self {
         self.vga = Some(Arc::new(Mutex::new(crate::vga::Vga::new())));
+        self.vga_trap = trap;
         self
+    }
+
+    /// Makes the hypervisor's mapping of the VGA window agree with what the
+    /// registers now ask for.
+    fn sync_vga_trap(&self, wanted: bool) {
+        use std::sync::atomic::Ordering;
+        let Some(trap) = &self.vga_trap else {
+            return;
+        };
+        if self.vga_trapped.load(Ordering::Acquire) == wanted {
+            return;
+        }
+        match trap.set_trapped(wanted) {
+            Ok(()) => self.vga_trapped.store(wanted, Ordering::Release),
+            Err(error) => tracing::warn!(%error, wanted, "cannot switch the VGA memory window"),
+        }
+    }
+
+    /// A guest access to `0xa0000..0xbffff` that exited: the window is
+    /// trapped, so it belongs to the VGA's planes.
+    fn vga_memory(&self, addr: u64) -> Option<&Arc<Mutex<crate::vga::Vga>>> {
+        (0x000a_0000..0x000c_0000)
+            .contains(&addr)
+            .then_some(self.vga.as_ref())
+            .flatten()
     }
 
     /// The machine's VGA, when it has one: what a presenter draws text mode
@@ -218,7 +256,22 @@ impl MachineBus {
     /// Puts the 8042 keyboard controller on `0x60`/`0x64`, raising `line`
     /// (IRQ 1).
     pub fn with_keyboard(mut self, line: Arc<dyn virtio_core::interrupt::IrqLine>) -> Self {
-        self.keyboard = Some(Arc::new(Mutex::new(crate::i8042::I8042::new(line))));
+        let mut controller = crate::i8042::I8042::new(line);
+        if let Some(mouse) = &self.mouse_line {
+            controller.connect_mouse(Arc::clone(mouse));
+        }
+        self.keyboard = Some(Arc::new(Mutex::new(controller)));
+        self
+    }
+
+    /// Plugs a PS/2 mouse into the keyboard controller's second port,
+    /// raising `line` (IRQ 12). In either order with
+    /// [`Self::with_keyboard`].
+    pub fn with_mouse(mut self, line: Arc<dyn virtio_core::interrupt::IrqLine>) -> Self {
+        if let Some(Ok(mut controller)) = self.keyboard.as_ref().map(|k| k.lock()) {
+            controller.connect_mouse(Arc::clone(&line));
+        }
+        self.mouse_line = Some(line);
         self
     }
 
@@ -560,6 +613,8 @@ impl MachineBus {
         if let Some(Ok(mut vga)) = self.vga.as_ref().map(|vga| vga.lock()) {
             vga.reset();
         }
+        // Text mode again: the window is RAM.
+        self.sync_vga_trap(false);
         if let Some(ide) = &self.ide {
             match ide.lock() {
                 Ok(mut ide) => ide.reset(),
@@ -603,11 +658,19 @@ impl ExitHandler for MachineBus {
     fn io_out(&mut self, port: u16, data: &[u8]) {
         if let Some(vga) = &self.vga {
             if crate::vga::contains(port) {
-                if let Ok(mut vga) = vga.lock() {
-                    // `out dx, ax` on an index port writes the data port too.
-                    for (n, &byte) in data.iter().enumerate() {
-                        vga.write(port.wrapping_add(n as u16), byte);
+                let wanted = match vga.lock() {
+                    Ok(mut vga) => {
+                        // `out dx, ax` on an index port writes the data
+                        // port too.
+                        for (n, &byte) in data.iter().enumerate() {
+                            vga.write(port.wrapping_add(n as u16), byte);
+                        }
+                        Some(vga.wants_trap())
                     }
+                    Err(_) => None,
+                };
+                if let Some(wanted) = wanted {
+                    self.sync_vga_trap(wanted);
                 }
                 return;
             }
@@ -775,6 +838,14 @@ impl ExitHandler for MachineBus {
     }
 
     fn mmio_write(&mut self, addr: u64, data: &[u8]) {
+        if let Some(vga) = self.vga_memory(addr) {
+            if let Ok(mut vga) = vga.lock() {
+                for (n, &byte) in data.iter().enumerate() {
+                    vga.mem_write(addr.wrapping_add(n as u64), byte);
+                }
+            }
+            return;
+        }
         if let Some(pflash) = &self.pflash {
             match pflash.lock() {
                 Ok(mut flash) if flash.contains(addr) => {
@@ -821,6 +892,17 @@ impl ExitHandler for MachineBus {
     }
 
     fn mmio_read(&mut self, addr: u64, data: &mut [u8]) {
+        if let Some(vga) = self.vga_memory(addr) {
+            match vga.lock() {
+                Ok(mut vga) => {
+                    for (n, byte) in data.iter_mut().enumerate() {
+                        *byte = vga.mem_read(addr.wrapping_add(n as u64));
+                    }
+                }
+                Err(_) => data.fill(0xff),
+            }
+            return;
+        }
         data.fill(0);
         if let Some(pflash) = &self.pflash {
             match pflash.lock() {

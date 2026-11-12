@@ -13,8 +13,9 @@
 //!   the cursor from the CRT controller, the palette through the attribute
 //!   controller and the DAC, and the font the guest loaded.
 //!
-//! A graphics mode shows nothing new: the machine has no planar display
-//! memory yet, so the last text frame stays up.
+//! A graphics mode is drawn from the VGA's planes, when the host can trap
+//! the display memory (`machine_x86::vga`); otherwise the last text frame
+//! stays up.
 //!
 //! It yields to virtio-gpu while a guest driver has a scanout bound, and it
 //! takes the VM's pause gate (ADR-0005) before each read.
@@ -99,7 +100,9 @@ struct Source {
 /// Who owns the display now.
 enum Owner {
     Bios,
-    Vga(TextMode),
+    /// Text mode as the VGA describes it, and the font the guest loaded
+    /// through the planes, if it did.
+    Vga(TextMode, Option<Vec<u8>>),
     /// The guest programmed a graphics mode.
     Graphics,
 }
@@ -111,7 +114,26 @@ fn owner(vga: Option<&Mutex<Vga>>) -> Owner {
     if !vga.programmed() {
         return Owner::Bios;
     }
-    vga.text_mode().map_or(Owner::Graphics, Owner::Vga)
+    match vga.text_mode() {
+        Some(mode) => {
+            let font = vga.font_plane().map(<[u8]>::to_vec);
+            Owner::Vga(mode, font)
+        }
+        None => Owner::Graphics,
+    }
+}
+
+/// Hands the display one whole picture.
+fn present(
+    display: &display::DisplayHandle,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<(), display::DisplayError> {
+    if display.resolution() != (width, height) {
+        display.set_resolution(width, height)?;
+    }
+    display.update_scanout(0, 0, width, height, pixels)
 }
 
 fn run(
@@ -139,16 +161,40 @@ fn run(
         }
         let mut source = Source::default();
         match owner(vga) {
-            Owner::Graphics => continue,
+            Owner::Graphics => {
+                // Drawn from the planes, under the VGA's lock, and only when
+                // something changed (or the last frame was text).
+                if let Some(Ok(mut vga)) = vga.map(|vga| vga.lock()) {
+                    if vga.take_dirty() || shown.is_some() {
+                        if let Some((width, height)) = vga.render_graphics(&mut pixels) {
+                            drop(vga);
+                            match present(display, width, height, &pixels) {
+                                Ok(()) => shown = None,
+                                Err(error) => {
+                                    tracing::warn!(%error, "graphics screen not presented");
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             Owner::Bios => {
                 source.bios_cursor = pc_bios::read_text_screen(mem, &mut source.cells);
             }
-            Owner::Vga(mode) => {
+            Owner::Vga(mode, loaded) => {
                 source.cells.resize(mode.columns * mode.rows * 2, 0);
                 let _ = mem.read_slice(&mut source.cells, GuestAddress(mode.cells_at));
-                if let Some(at) = mode.font_at {
-                    source.font.resize(font::GLYPH_PLANE_BYTES, 0);
-                    let _ = mem.read_slice(&mut source.font, GuestAddress(at));
+                if mode.guest_font {
+                    match loaded {
+                        Some(loaded) => source.font = loaded,
+                        // No planes on this host: the load went to the RAM
+                        // where plane 2 would have been mapped.
+                        None => {
+                            source.font.resize(font::GLYPH_PLANE_BYTES, 0);
+                            let _ = mem.read_slice(&mut source.font, GuestAddress(0x000a_0000));
+                        }
+                    }
                 }
                 source.vga = Some(mode);
             }
@@ -181,13 +227,7 @@ fn run(
                 &mut pixels,
             ),
         };
-        let sent = (|| {
-            if display.resolution() != (width, height) {
-                display.set_resolution(width, height)?;
-            }
-            display.update_scanout(0, 0, width, height, &pixels)
-        })();
-        match sent {
+        match present(display, width, height, &pixels) {
             Ok(()) => shown = Some(source),
             Err(error) => tracing::warn!(%error, "text screen not presented"),
         }

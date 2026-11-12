@@ -608,6 +608,14 @@ fn dsdt(vcpu_count: u32, mmio64_base: u64) -> Vec<u8> {
     let ps2k = aml::device("PS2K", &ps2);
     if mmio64_base == NO_MMIO64 {
         pci0.extend_from_slice(&ps2k);
+        // The PS/2 mouse on the controller's second port: only the
+        // interrupt is its own. A BIOS-era guest has no other pointer.
+        let mut mouse = aml::name("_HID", &aml::eisa_id("PNP0F13"));
+        mouse.extend_from_slice(&aml::name(
+            "_CRS",
+            &aml::resource_template(&[aml::irq_no_flags(crate::i8042::MOUSE_IRQ as u8)]),
+        ));
+        pci0.extend_from_slice(&aml::device("PS2M", &mouse));
         sb.extend_from_slice(&aml::device("PCI0", &pci0));
     } else {
         sb.extend_from_slice(&aml::device("PCI0", &pci0));
@@ -805,6 +813,8 @@ mod tests {
         let legacy = AcpiTables::new(1, NO_MMIO64).unwrap();
         let default = AcpiTables::new(1, TEST_MMIO64_BASE).unwrap();
         assert!(find(&default, b"_PRT").is_none());
+        assert!(find(&legacy, b"PS2M").is_some());
+        assert!(find(&default, b"PS2M").is_none());
         // The legacy bridge owns the I/O space on both sides of 0xcf8.
         let io_window = |min: u16, max: u16| {
             let mut bytes = vec![0x88, 0x0d, 0x00, 0x01];

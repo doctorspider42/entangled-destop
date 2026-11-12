@@ -1,5 +1,12 @@
-//! An 8042 keyboard controller with a PS/2 keyboard and no mouse
-//! (ADR-0008 §5), at the legacy ports `0x60`/`0x64` on IRQ 1.
+//! An 8042 keyboard controller with a PS/2 keyboard (ADR-0008 §5) at the
+//! legacy ports `0x60`/`0x64` on IRQ 1, and — on a machine that wires its
+//! interrupt ([`I8042::connect_mouse`], ADR-0012) — a PS/2 mouse on the
+//! second port, IRQ 12. Without that wiring the second port is as empty as
+//! it always was: its clock line tests "stuck" and bytes sent to it vanish.
+//!
+//! The mouse is the plain three-byte one: relative motion and three
+//! buttons, no wheel. A guest old enough to need it (Windows XP has no
+//! virtio-input driver) gets the host pointer's motion as deltas.
 //!
 //! It exists for the screens that run before any virtio driver: Windows'
 //! recovery environment (WinRE has no `vioinput`, so without this a guest
@@ -35,8 +42,15 @@ const STATUS_OUTPUT_FULL: u8 = 1 << 0;
 const STATUS_SYSTEM: u8 = 1 << 2;
 const STATUS_LAST_WAS_COMMAND: u8 = 1 << 3;
 const STATUS_NOT_INHIBITED: u8 = 1 << 4;
+/// The byte in the output buffer came from the mouse.
+const STATUS_AUX_FULL: u8 = 1 << 5;
+/// A queue entry from the mouse: bit 8 of the entry.
+const FROM_MOUSE: u16 = 1 << 8;
+/// The mouse's ISA interrupt.
+pub const MOUSE_IRQ: u32 = 12;
 
 const CONFIG_KEYBOARD_IRQ: u8 = 1 << 0;
+const CONFIG_MOUSE_IRQ: u8 = 1 << 1;
 const CONFIG_SYSTEM: u8 = 1 << 2;
 const CONFIG_KEYBOARD_DISABLED: u8 = 1 << 4;
 const CONFIG_AUX_DISABLED: u8 = 1 << 5;
@@ -54,7 +68,16 @@ const STATE_VERSION: u8 = 1;
 /// The controller and its keyboard.
 pub struct I8042 {
     interrupt: Arc<dyn IrqLine>,
-    queue: VecDeque<u8>,
+    /// IRQ 12, on a machine that has a mouse.
+    mouse_interrupt: Option<Arc<dyn IrqLine>>,
+    /// Bytes for the guest; [`FROM_MOUSE`] marks the mouse's.
+    queue: VecDeque<u16>,
+    /// The mouse sends motion (`0xf4`/`0xf5`).
+    mouse_reporting: bool,
+    /// A mouse command waiting for its parameter.
+    mouse_pending: Option<u8>,
+    /// The buttons as last reported: left, right, middle in bits 0-2.
+    mouse_buttons: u8,
     /// What a read of an empty data port returns: the last byte read.
     last: u8,
     config: u8,
@@ -84,7 +107,11 @@ impl I8042 {
     pub fn new(interrupt: Arc<dyn IrqLine>) -> Self {
         Self {
             interrupt,
+            mouse_interrupt: None,
             queue: VecDeque::new(),
+            mouse_reporting: false,
+            mouse_pending: None,
+            mouse_buttons: 0,
             last: 0,
             config: CONFIG_POWER_ON,
             last_was_command: false,
@@ -102,7 +129,50 @@ impl I8042 {
     /// Machine reset (ADR-0005): power-on registers, nothing queued.
     pub fn reset(&mut self) {
         let interrupt = Arc::clone(&self.interrupt);
+        let mouse = self.mouse_interrupt.take();
         *self = Self::new(interrupt);
+        self.mouse_interrupt = mouse;
+    }
+
+    /// Plugs a mouse into the second port, raising `interrupt` (IRQ 12).
+    pub fn connect_mouse(&mut self, interrupt: Arc<dyn IrqLine>) {
+        self.mouse_interrupt = Some(interrupt);
+    }
+
+    /// Whether the guest would see the mouse move now: there is one, its
+    /// driver enabled reporting, and the controller has not disabled the
+    /// port.
+    pub fn mouse_active(&self) -> bool {
+        self.mouse_interrupt.is_some()
+            && self.mouse_reporting
+            && self.config & CONFIG_AUX_DISABLED == 0
+    }
+
+    /// The pointer moved by (`dx`, `dy`) pixels, right and down positive,
+    /// with `buttons` (left, right, middle in bits 0-2) now held. Sent as
+    /// as many three-byte packets as the motion needs, up to a few; a mouse
+    /// the guest is not listening to, or a full buffer, drops it.
+    pub fn mouse_move(&mut self, dx: i32, dy: i32, buttons: u8) {
+        if !self.mouse_active() {
+            return;
+        }
+        let buttons = buttons & 0x07;
+        // PS/2 counts up as positive.
+        let (mut dx, mut dy) = (dx, -dy);
+        for _ in 0..8 {
+            if self.queue.len() + 3 > MAX_QUEUED {
+                return;
+            }
+            let (x, y) = (dx.clamp(-255, 255), dy.clamp(-255, 255));
+            let flags = 0x08 | buttons | u8::from(x < 0) << 4 | u8::from(y < 0) << 5;
+            self.queue_from(&[flags, x as u8, y as u8], true);
+            self.mouse_buttons = buttons;
+            dx -= x;
+            dy -= y;
+            if dx == 0 && dy == 0 {
+                return;
+            }
+        }
     }
 
     /// Whether the guest would see a key now: the keyboard is scanning and
@@ -132,8 +202,11 @@ impl I8042 {
     pub fn io_read(&mut self, port: u16) -> u8 {
         if port == PORT_COMMAND {
             let mut status = STATUS_SYSTEM | STATUS_NOT_INHIBITED;
-            if !self.queue.is_empty() {
+            if let Some(&head) = self.queue.front() {
                 status |= STATUS_OUTPUT_FULL;
+                if head & FROM_MOUSE != 0 {
+                    status |= STATUS_AUX_FULL;
+                }
             }
             if self.last_was_command {
                 status |= STATUS_LAST_WAS_COMMAND;
@@ -141,7 +214,7 @@ impl I8042 {
             return status;
         }
         if let Some(byte) = self.queue.pop_front() {
-            self.last = byte;
+            self.last = byte as u8;
             if !self.queue.is_empty() {
                 self.raise();
             }
@@ -169,7 +242,16 @@ impl I8042 {
                 self.queue_bytes(&[value]);
                 false
             }
-            // Bytes for a mouse that is not there.
+            // Write the mouse's output buffer: as if the mouse sent it.
+            Some(0xd3) => {
+                self.queue_from(&[value], true);
+                false
+            }
+            // A byte for the mouse.
+            Some(0xd4) => {
+                self.mouse_command(value);
+                false
+            }
             Some(_) => false,
             None => {
                 self.keyboard_command(value);
@@ -184,8 +266,12 @@ impl I8042 {
             0x60 | 0xd1 | 0xd2 | 0xd3 | 0xd4 => self.controller_pending = Some(command),
             0xa7 => self.config |= CONFIG_AUX_DISABLED,
             0xa8 => self.config &= !CONFIG_AUX_DISABLED,
-            // The mouse port's clock line is stuck: there is no mouse.
-            0xa9 => self.queue_bytes(&[0x01]),
+            // The mouse port's test: fine with a mouse, and "the clock
+            // line is stuck" without one.
+            0xa9 => {
+                let result = u8::from(self.mouse_interrupt.is_none());
+                self.queue_bytes(&[result]);
+            }
             0xaa => {
                 self.config = CONFIG_POWER_ON;
                 self.queue_bytes(&[0x55]);
@@ -248,11 +334,60 @@ impl I8042 {
         }
     }
 
+    /// One byte the guest sent to the mouse. Every command is
+    /// acknowledged; the ones that carry state are kept.
+    fn mouse_command(&mut self, value: u8) {
+        if self.mouse_interrupt.is_none() {
+            // No mouse: the byte goes nowhere and nothing answers.
+            return;
+        }
+        if self.mouse_pending.take().is_some() {
+            // The parameter of a sample-rate or resolution command.
+            return self.queue_from(&[ACK], true);
+        }
+        match value {
+            // Reset: self-test passed, device id 0 (a plain mouse).
+            0xff => {
+                self.mouse_reporting = false;
+                self.queue_from(&[ACK, 0xaa, 0x00], true);
+            }
+            0xf2 => self.queue_from(&[ACK, 0x00], true),
+            0xf3 | 0xe8 => {
+                self.mouse_pending = Some(value);
+                self.queue_from(&[ACK], true);
+            }
+            0xf4 => {
+                self.mouse_reporting = true;
+                self.queue_from(&[ACK], true);
+            }
+            0xf5 | 0xf6 => {
+                self.mouse_reporting = false;
+                self.queue_from(&[ACK], true);
+            }
+            // Status: reporting and the buttons, 4 counts/mm, 100 samples/s.
+            0xe9 => {
+                let status = u8::from(self.mouse_reporting) << 5
+                    | (self.mouse_buttons & 1) << 2
+                    | (self.mouse_buttons >> 1 & 1)
+                    | (self.mouse_buttons >> 2 & 1) << 1;
+                self.queue_from(&[ACK, status, 0x02, 100], true);
+            }
+            // Read data: a packet with no motion.
+            0xeb => self.queue_from(&[ACK, 0x08 | self.mouse_buttons, 0, 0], true),
+            _ => self.queue_from(&[ACK], true),
+        }
+    }
+
     fn queue_bytes(&mut self, bytes: &[u8]) {
+        self.queue_from(bytes, false);
+    }
+
+    fn queue_from(&mut self, bytes: &[u8], mouse: bool) {
         let was_empty = self.queue.is_empty();
+        let source = if mouse { FROM_MOUSE } else { 0 };
         for &byte in bytes {
             if self.queue.len() < MAX_QUEUED {
-                self.queue.push_back(byte);
+                self.queue.push_back(u16::from(byte) | source);
             }
         }
         if was_empty && !self.queue.is_empty() {
@@ -260,16 +395,31 @@ impl I8042 {
         }
     }
 
+    /// The interrupt of whichever device the readable byte came from.
     fn raise(&self) {
-        if self.config & CONFIG_KEYBOARD_IRQ != 0 {
-            if let Err(error) = self.interrupt.trigger() {
-                tracing::warn!(%error, "the keyboard interrupt could not be raised");
+        let from_mouse = self.queue.front().is_some_and(|b| b & FROM_MOUSE != 0);
+        let (line, enabled) = if from_mouse {
+            (self.mouse_interrupt.as_ref(), CONFIG_MOUSE_IRQ)
+        } else {
+            (Some(&self.interrupt), CONFIG_KEYBOARD_IRQ)
+        };
+        if let (Some(line), true) = (line, self.config & enabled != 0) {
+            if let Err(error) = line.trigger() {
+                tracing::warn!(%error, from_mouse, "an 8042 interrupt could not be raised");
             }
         }
     }
 
-    /// The controller's state, for a snapshot (ADR-0006).
+    /// The controller's state, for a snapshot (ADR-0006). The keyboard's
+    /// only: the mouse's waiting bytes and its reporting switch are not
+    /// carried, and the one machine that has a mouse refuses snapshots.
     pub fn save(&self) -> Vec<u8> {
+        let queue: Vec<u8> = self
+            .queue
+            .iter()
+            .filter(|byte| *byte & FROM_MOUSE == 0)
+            .map(|byte| *byte as u8)
+            .collect();
         let flags = u8::from(self.scanning) | (u8::from(self.last_was_command) << 1);
         let mut out = vec![
             STATE_VERSION,
@@ -278,9 +428,9 @@ impl I8042 {
             flags,
             self.controller_pending.unwrap_or(0),
             self.keyboard_pending.unwrap_or(0),
-            u8::try_from(self.queue.len()).unwrap_or(0),
+            u8::try_from(queue.len()).unwrap_or(0),
         ];
-        out.extend(self.queue.iter().copied());
+        out.extend(queue);
         out
     }
 
@@ -301,7 +451,7 @@ impl I8042 {
         self.last_was_command = flags & 2 != 0;
         self.controller_pending = (*controller != 0).then_some(*controller);
         self.keyboard_pending = (*keyboard != 0).then_some(*keyboard);
-        self.queue = rest.iter().copied().collect();
+        self.queue = rest.iter().map(|byte| u16::from(*byte)).collect();
         Ok(())
     }
 }
@@ -354,6 +504,81 @@ mod tests {
             out.push(kbc.io_read(PORT_DATA));
         }
         out
+    }
+
+    /// A controller with a mouse, the way a driver leaves it: port and
+    /// both interrupts on, reporting enabled, the acknowledgement read.
+    fn with_mouse() -> (I8042, Arc<Count>, Arc<Count>) {
+        let (keyboard, mouse) = (Arc::new(Count::default()), Arc::new(Count::default()));
+        let mut kbc = I8042::new(keyboard.clone());
+        kbc.connect_mouse(mouse.clone());
+        kbc.io_write(PORT_COMMAND, 0x60);
+        kbc.io_write(PORT_DATA, 0x47);
+        kbc.io_write(PORT_COMMAND, 0xd4);
+        kbc.io_write(PORT_DATA, 0xf4);
+        assert_eq!(drain(&mut kbc), [ACK]);
+        (kbc, keyboard, mouse)
+    }
+
+    #[test]
+    fn the_mouse_answers_on_the_second_port_with_its_own_interrupt() {
+        let keyboard = Arc::new(Count::default());
+        let mut kbc = I8042::new(keyboard.clone());
+        // Without a mouse the port tests bad and a byte to it vanishes.
+        kbc.io_write(PORT_COMMAND, 0xa9);
+        assert_eq!(drain(&mut kbc), [0x01]);
+        kbc.io_write(PORT_COMMAND, 0xd4);
+        kbc.io_write(PORT_DATA, 0xff);
+        assert!(drain(&mut kbc).is_empty());
+        assert!(!kbc.mouse_active());
+
+        let (mut kbc, keyboard, mouse) = with_mouse();
+        kbc.io_write(PORT_COMMAND, 0xa9);
+        assert_eq!(drain(&mut kbc), [0x00]);
+        let before = (
+            keyboard.0.load(Ordering::SeqCst),
+            mouse.0.load(Ordering::SeqCst),
+        );
+        // Reset: acknowledge, self-test passed, id 0 — flagged as the
+        // mouse's in the status register, on the mouse's interrupt.
+        kbc.io_write(PORT_COMMAND, 0xd4);
+        kbc.io_write(PORT_DATA, 0xff);
+        assert_ne!(kbc.io_read(PORT_COMMAND) & STATUS_AUX_FULL, 0);
+        assert_eq!(drain(&mut kbc), [ACK, 0xaa, 0x00]);
+        assert_eq!(keyboard.0.load(Ordering::SeqCst), before.0);
+        assert_eq!(mouse.0.load(Ordering::SeqCst), before.1 + 3);
+        // A reset turns reporting off again.
+        assert!(!kbc.mouse_active());
+    }
+
+    #[test]
+    fn motion_is_three_byte_packets_with_signs_and_buttons() {
+        let (mut kbc, _, _) = with_mouse();
+        assert!(kbc.mouse_active());
+        // Right 5, down 3 (PS/2 counts up as positive), left button held.
+        kbc.mouse_move(5, 3, 1);
+        assert_eq!(drain(&mut kbc), [0x08 | 0x01 | 0x20, 5, (-3i8) as u8]);
+        // More than one packet's worth is split, not lost.
+        kbc.mouse_move(-300, 0, 0);
+        assert_eq!(
+            drain(&mut kbc),
+            [
+                0x08 | 0x10,
+                (-255i32) as u8,
+                0,
+                0x08 | 0x10,
+                (-45i32) as u8,
+                0
+            ]
+        );
+        // A key between packets keeps its own flag and interrupt.
+        kbc.key(30, true);
+        assert_eq!(kbc.io_read(PORT_COMMAND) & STATUS_AUX_FULL, 0);
+        assert_eq!(drain(&mut kbc), [0x1e]);
+        // The controller can disable the port.
+        kbc.io_write(PORT_COMMAND, 0xa7);
+        kbc.mouse_move(1, 1, 0);
+        assert!(drain(&mut kbc).is_empty());
     }
 
     #[test]

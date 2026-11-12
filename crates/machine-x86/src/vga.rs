@@ -10,17 +10,24 @@
 //! the sixteen colours through the attribute palette and the DAC, and the
 //! font.
 //!
-//! # What is not here
+//! # Display memory
 //!
-//! Display memory is not modelled. `0xa0000..0xbffff` is ordinary guest RAM:
-//! the character cells at `B800:0000` are read from it as they are, and a
-//! font the guest loads lands in it at `A000:0000`, where plane 2 would be
-//! mapped while the sequencer selects it — which is where
-//! [`Vga::text_mode`] says to read it back from. That is enough for text and
-//! wrong for everything planar: the 16-colour graphics modes Windows' boot
-//! screen and GUI-mode Setup draw in need the four planes and the write
-//! modes behind a trap, which is phase X2. A graphics mode is reported as
-//! "no text mode" and shows nothing.
+//! Text mode's character cells are ordinary guest RAM at `B800:0000`, read
+//! as they are. Anything else — a font load into plane 2, the 16-colour
+//! graphics modes, mode 13h — goes through the planes and the graphics
+//! controller's read and write logic (`crate::vga_planes`), which needs
+//! every access: [`Vga::wants_trap`] says when, and the machine then takes
+//! the guest's mapping of `0xa0000..0xbffff` away so that the accesses
+//! arrive at [`Vga::mem_read`] and [`Vga::mem_write`]. On a host that
+//! cannot do that, a font load lands in the RAM at `A000:0000` and is read
+//! back from there, and graphics modes show nothing.
+//!
+//! The two views are not kept in step: text written before a graphics mode
+//! is still in RAM after it, and what a graphics mode left in planes 0 and
+//! 1 is not the text. Guests clear the screen when they change modes.
+//!
+//! Not modelled: the line compare (split screen), pixel panning, the CGA
+//! shift-register modes, and the 9-dot character clock (cells are 8 wide).
 //!
 //! The guest is untrusted: every index is masked to its register file, and
 //! the geometry a presenter gets is clamped.
@@ -50,9 +57,8 @@ pub struct TextMode {
     /// Whether attribute bit 7 means "blink" (the background then has three
     /// bits) rather than a bright background.
     pub blink: bool,
-    /// Where the guest's own font is in guest memory (256 glyphs of 32
-    /// bytes), once it has loaded one.
-    pub font_at: Option<u64>,
+    /// The guest has loaded a font of its own ([`Vga::font_plane`]).
+    pub guest_font: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +98,9 @@ pub struct Vga {
     programmed: bool,
     /// The guest has written plane 2 through the sequencer: it loaded a font.
     font_loaded: bool,
+    planes: crate::vga_planes::Planes,
+    /// Something a frame depends on changed since [`Vga::take_dirty`].
+    dirty: bool,
 }
 
 impl Default for Vga {
@@ -129,6 +138,8 @@ impl Vga {
             retrace: false,
             programmed: false,
             font_loaded: false,
+            planes: crate::vga_planes::Planes::default(),
+            dirty: true,
         };
         // 80x25 cells of 16 lines: 400 lines, the cursor on lines 13-14.
         vga.crtc[0x01] = 79;
@@ -219,6 +230,7 @@ impl Vga {
 
     /// A guest write of one port.
     pub fn write(&mut self, port: u16, value: u8) {
+        self.dirty = true;
         match port {
             0x3c0 => {
                 if self.attribute_data_next {
@@ -273,6 +285,145 @@ impl Vga {
             }
             _ => {}
         }
+    }
+
+    /// Whether display memory needs its logic now: a graphics mode, or
+    /// sequential addressing (a font load). In plain text mode — odd/even
+    /// addressing, alphanumeric — the window is RAM.
+    pub fn wants_trap(&self) -> bool {
+        self.graphics[0x06] & 1 != 0 || self.sequencer[0x04] & 0x04 != 0
+    }
+
+    fn controls(&self) -> crate::vga_planes::Controls {
+        crate::vga_planes::Controls {
+            map_mask: self.sequencer[0x02],
+            memory_mode: self.sequencer[0x04],
+            set_reset: self.graphics[0x00],
+            enable_set_reset: self.graphics[0x01],
+            colour_compare: self.graphics[0x02],
+            rotate_function: self.graphics[0x03],
+            read_map: self.graphics[0x04],
+            mode: self.graphics[0x05],
+            colour_dont_care: self.graphics[0x07],
+            bit_mask: self.graphics[0x08],
+        }
+    }
+
+    /// Where `addr` falls in the window the memory map select decodes, if
+    /// it does.
+    fn window_offset(&self, addr: u64) -> Option<usize> {
+        let (base, len) = match self.graphics[0x06] >> 2 & 3 {
+            0 => (0x000a_0000u64, 0x2_0000u64),
+            1 => (0x000a_0000, 0x1_0000),
+            2 => (0x000b_0000, 0x8000),
+            _ => (0x000b_8000, 0x8000),
+        };
+        addr.checked_sub(base)
+            .filter(|offset| *offset < len)
+            .map(|offset| offset as usize)
+    }
+
+    /// A guest read of display memory, while it is trapped.
+    pub fn mem_read(&mut self, addr: u64) -> u8 {
+        let controls = self.controls();
+        match self.window_offset(addr) {
+            Some(offset) => self.planes.read(&controls, offset),
+            None => 0xff,
+        }
+    }
+
+    /// A guest write of display memory, while it is trapped.
+    pub fn mem_write(&mut self, addr: u64, value: u8) {
+        let controls = self.controls();
+        if let Some(offset) = self.window_offset(addr) {
+            self.planes.write(&controls, offset, value);
+            self.dirty = true;
+        }
+    }
+
+    /// The font the guest loaded into plane 2, in the layout
+    /// `pc_bios::font::render_frame` takes: 256 glyphs of 32 bytes. `None`
+    /// until a load went through the planes.
+    pub fn font_plane(&self) -> Option<&[u8]> {
+        let plane = &self.planes.plane(2)[..256 * 32];
+        (self.font_loaded && plane.iter().any(|&b| b != 0)).then_some(plane)
+    }
+
+    /// Whether anything changed since the last call, and forgets it.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// Draws the graphics mode the registers describe as BGRA into `out`
+    /// and returns its width and height; `None` in text mode.
+    pub fn render_graphics(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        if self.text_mode().is_some() {
+            return None;
+        }
+        let overflow = usize::from(self.crtc[0x07]);
+        let lines =
+            (usize::from(self.crtc[0x12]) | (overflow & 0x02) << 7 | (overflow & 0x40) << 3) + 1;
+        // A row of pixels is repeated: the scan-line count, and double scan.
+        let repeat = (usize::from(self.crtc[0x09] & 0x1f) + 1)
+            * if self.crtc[0x09] & 0x80 != 0 { 2 } else { 1 };
+        let height = (lines / repeat).clamp(1, 1024);
+        let characters = (usize::from(self.crtc[0x01]) + 1).clamp(1, 160);
+        let start = usize::from(self.crtc[0x0c]) << 8 | usize::from(self.crtc[0x0d]);
+        let row_bytes = match usize::from(self.crtc[0x13]) * 2 {
+            0 => characters,
+            n => n,
+        };
+        let wrap = crate::vga_planes::PLANE - 1;
+        let packed = self.graphics[0x05] & 0x40 != 0;
+        let width = if packed {
+            characters * 4
+        } else {
+            characters * 8
+        };
+        out.clear();
+        out.resize(width * height * 4, 0xff);
+        if packed {
+            // 256 colours: one byte a pixel, spread over the planes.
+            for y in 0..height {
+                for x in 0..width {
+                    let address = start * 4 + y * row_bytes * 4 + x;
+                    let index = self.planes.plane(address & 3)[address & !3 & wrap];
+                    let [r, g, b] = self.dac[usize::from(index & self.dac_mask)];
+                    let at = (y * width + x) * 4;
+                    out[at..at + 3].copy_from_slice(&[expand(b), expand(g), expand(r)]);
+                }
+            }
+        } else {
+            let mut palette = [[0u8; 3]; 16];
+            for (index, entry) in palette.iter_mut().enumerate() {
+                *entry = self.colour(index);
+            }
+            let planes: [&[u8]; 4] = std::array::from_fn(|p| self.planes.plane(p));
+            for y in 0..height {
+                let row = start + y * row_bytes;
+                for byte in 0..characters {
+                    let offset = (row + byte) & wrap;
+                    let bits = [
+                        planes[0][offset],
+                        planes[1][offset],
+                        planes[2][offset],
+                        planes[3][offset],
+                    ];
+                    for bit in 0..8 {
+                        let shift = 7 - bit;
+                        let colour = usize::from(
+                            (bits[0] >> shift & 1)
+                                | (bits[1] >> shift & 1) << 1
+                                | (bits[2] >> shift & 1) << 2
+                                | (bits[3] >> shift & 1) << 3,
+                        );
+                        let at = (y * width + byte * 8 + bit) * 4;
+                        out[at..at + 3].copy_from_slice(&palette[colour]);
+                    }
+                }
+            }
+        }
+        Some((width as u32, height as u32))
     }
 
     /// Whether the guest has programmed the display itself; until then the
@@ -337,7 +488,7 @@ impl Vga {
             cursor,
             palette,
             blink: self.attribute[0x10] & 0x08 != 0,
-            font_at: self.font_loaded.then_some(0x000a_0000),
+            guest_font: self.font_loaded,
         })
     }
 }
@@ -357,7 +508,7 @@ mod tests {
         let text = vga.text_mode().expect("text mode");
         assert_eq!((text.columns, text.rows, text.cell_height), (80, 25, 16));
         assert_eq!(text.cells_at, 0xb8000);
-        assert_eq!(text.font_at, None);
+        assert!(!text.guest_font);
         assert!(text.blink);
         // Colour 1 is blue, colour 15 white, as B, G, R.
         assert_eq!(text.palette[1], [0xaa, 0x00, 0x00]);
@@ -409,7 +560,7 @@ mod tests {
         write_indexed(&mut vga, 0x3c4, 0x04, 0x07);
         write_indexed(&mut vga, 0x3c4, 0x02, 0x03);
         write_indexed(&mut vga, 0x3c4, 0x04, 0x03);
-        assert_eq!(vga.text_mode().unwrap().font_at, Some(0xa0000));
+        assert!(vga.text_mode().unwrap().guest_font);
     }
 
     #[test]
@@ -434,6 +585,76 @@ mod tests {
         );
     }
 
+    /// The registers of mode 12h that matter here: 640x480, planar.
+    fn mode_12h() -> Vga {
+        let mut vga = Vga::new();
+        write_indexed(&mut vga, 0x3d4, 0x11, 0x00);
+        for (index, value) in [
+            (0x01u8, 0x4fu8),
+            (0x07, 0x3e),
+            (0x09, 0x40),
+            (0x12, 0xdf),
+            (0x13, 0x28),
+        ] {
+            write_indexed(&mut vga, 0x3d4, index, value);
+        }
+        write_indexed(&mut vga, 0x3c4, 0x02, 0x0f);
+        write_indexed(&mut vga, 0x3c4, 0x04, 0x06);
+        write_indexed(&mut vga, 0x3ce, 0x05, 0x00);
+        write_indexed(&mut vga, 0x3ce, 0x06, 0x05);
+        write_indexed(&mut vga, 0x3ce, 0x08, 0xff);
+        vga.read(0x3da);
+        vga.write(0x3c0, 0x10);
+        vga.write(0x3c0, 0x01);
+        vga
+    }
+
+    #[test]
+    fn mode_12h_draws_what_was_written_through_the_planes() {
+        let mut vga = mode_12h();
+        assert!(vga.wants_trap());
+        assert_eq!(vga.text_mode(), None);
+        // Write mode 2: the byte is a colour. Red (4) in the first eight
+        // pixels of the second row, through the window at A0000.
+        write_indexed(&mut vga, 0x3ce, 0x05, 0x02);
+        vga.mem_read(0xa0000 + 80);
+        vga.mem_write(0xa0000 + 80, 0x04);
+        assert!(vga.take_dirty());
+        let mut out = Vec::new();
+        assert_eq!(vga.render_graphics(&mut out), Some((640, 480)));
+        let pixel = |x: usize, y: usize| &out[(y * 640 + x) * 4..(y * 640 + x) * 4 + 4];
+        assert_eq!(pixel(0, 1), &[0x00, 0x00, 0xaa, 0xff]);
+        assert_eq!(pixel(7, 1), &[0x00, 0x00, 0xaa, 0xff]);
+        assert_eq!(pixel(8, 1), &[0x00, 0x00, 0x00, 0xff]);
+        assert_eq!(pixel(0, 0), &[0x00, 0x00, 0x00, 0xff]);
+        // An address outside the decoded window (B0000 with map 1) is not
+        // display memory.
+        assert_eq!(vga.mem_read(0xb0000), 0xff);
+        assert!(!vga.take_dirty());
+    }
+
+    #[test]
+    fn a_font_load_goes_to_plane_two_and_text_mode_is_ram_again_after() {
+        let mut vga = Vga::new();
+        assert!(!vga.wants_trap());
+        assert_eq!(vga.font_plane(), None);
+        // What a driver does to load a font: plane 2, sequential, map A0000.
+        write_indexed(&mut vga, 0x3c4, 0x02, 0x04);
+        write_indexed(&mut vga, 0x3c4, 0x04, 0x07);
+        write_indexed(&mut vga, 0x3ce, 0x05, 0x00);
+        write_indexed(&mut vga, 0x3ce, 0x06, 0x04);
+        assert!(vga.wants_trap());
+        vga.mem_write(0xa0000 + 65 * 32, 0x18);
+        // And back to text addressing.
+        write_indexed(&mut vga, 0x3c4, 0x02, 0x03);
+        write_indexed(&mut vga, 0x3c4, 0x04, 0x03);
+        write_indexed(&mut vga, 0x3ce, 0x05, 0x10);
+        write_indexed(&mut vga, 0x3ce, 0x06, 0x0e);
+        assert!(!vga.wants_trap());
+        assert_eq!(vga.font_plane().expect("the font")[65 * 32], 0x18);
+        assert_eq!(vga.render_graphics(&mut Vec::new()), None);
+    }
+
     #[test]
     fn a_graphics_mode_is_not_text_and_wild_registers_stay_in_bounds() {
         let mut vga = Vga::new();
@@ -451,6 +672,15 @@ mod tests {
         vga.read(0x3da);
         vga.write(0x3c0, 0x10);
         vga.write(0x3c0, 0x00);
+        // Every wild register, in a graphics mode: the picture is bounded.
+        let mut wild = vga.clone();
+        write_indexed(&mut wild, 0x3ce, 0x06, 0x05);
+        let mut out = Vec::new();
+        let (width, height) = wild.render_graphics(&mut out).expect("graphics");
+        assert!(width <= 160 * 8 && height <= 1024);
+        assert_eq!(out.len(), (width * height * 4) as usize);
+        wild.mem_write(0xbffff, 0xff);
+        wild.mem_read(u64::MAX);
         let text = vga.text_mode().expect("text");
         assert!(text.columns <= 132 && text.rows <= 60 && text.cell_height <= 32);
         assert!(text.cells_at < 0xc0000);
