@@ -131,6 +131,8 @@ kernel and initramfs artifacts, and self-skips without them.
 | `crates/virtio-sound` | virtio-snd playback: control/event/TX queues, PCM lifecycle, host sinks behind `AudioSink` (null/recording everywhere, ALSA dlopen'd on Linux, WASAPI on Windows) | EPIC 21, GAME-2102 |
 | `crates/pc-bios` | A PC BIOS served by the host: a ROM of interrupt stubs assembled in Rust, and the `int 10h/13h/15h/16h/1Ah` services behind them, for `boot.mode = "bios"` | ADR-0012 |
 | `crates/ide` | Dual-channel IDE controller, PIO only: ATA disks and ATAPI drives (the AHCI crate's packet set) at the fixed ISA ports, for BIOS-era guests | ADR-0012 |
+| `crates/rtl8139` | Realtek RTL8139 network card on virtio-net's `NetBackend`, for guests with no virtio-net driver (Windows XP's in-box driver) | ADR-0012 |
+| `crates/gl-passthrough` | A guest's OpenGL 1.1 command stream run on the host's OpenGL: the wire format, every size check, the executor and its WGL contexts; `guest/winxp/opengl/gen.py` generates the plain calls for both ends | ADR-0013 |
 | `crates/hda` | Intel HD Audio controller + one-output codec for Windows guests (in-box driver), playing into virtio-sound's `AudioSink` | ADR-0008 |
 | `crates/ahci` | AHCI controller with ATAPI drives (`[[optical]]`), so Windows PE sees the untouched ISO | ADR-0008 |
 | `crates/display` | winit window, wgpu renderer, host input capture | EPIC 7 |

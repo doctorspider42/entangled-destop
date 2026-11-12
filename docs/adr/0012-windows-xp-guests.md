@@ -311,3 +311,62 @@ Not done: KVM (builds; IRQ 14/15 are irqfds there; nothing run); bus-master
 DMA; a snapshot of a BIOS machine; the PCI identity of the VGA (XP's
 `VgaSave` finds it at the legacy ports; a PnP display driver will want a
 class-`0300` function); `[[disk]]`/`[[optical]]` beyond two each.
+
+## Amendment, 2026-11-12: past text mode — what GUI-mode Setup and an unattended install took
+
+Everything here was measured on WHP with the untouched XP Professional SP3
+volume-licence CD. KVM builds and passes its unit tests; nothing below has
+run on it.
+
+**Planar VGA (X2).** GUI-mode Setup draws in mode 12h, sixteen colours in
+four bit planes, and reads its own pixels back. `machine_x86::vga_planes`
+is that memory — write modes 0 to 3, read modes 0 and 1, chain-4 and
+odd/even — behind a new `vmm_core::hv::RamTrap`, which takes a sub-range of
+guest RAM out of the hypervisor's map so that every access to
+`0xA0000..0xBFFFF` exits. One thing it cost: WHP's instruction emulator
+wrote "RAM" directly, trap or no trap, and Setup's screen stayed black
+until `ExitHandler::ram_is_trapped` sent those accesses to the device. KVM
+offers no trap yet. The throughput is what it sounds like — eighteen to
+twenty-two thousand exits a second while Setup paints — and it is the
+reason GUI-mode Setup takes about forty minutes here.
+
+**The BIOS sets standard modes.** NTLDR asks `int 10h AX=0012h` for the
+boot menu and the progress bar; the BIOS now carries register tables for
+modes 03h, 12h and 13h and programs the VGA with them.
+
+**VBE over the boot framebuffer.** `int 10h AH=4Fh` (4F00–4F03, modes from
+0x140, 32 bpp, linear) is answered from the Bochs-DISPI framebuffer device,
+whose VRAM a BIOS machine places below 4 GiB (`low_vram_base`) because
+XP's `_CRS` has no 64-bit window. XP calls the BIOS from virtual-8086 mode
+with paging on, so a BIOS call's memory accesses walk the guest's page
+tables (`pc_bios::Paging`).
+
+**PS/2 mouse.** The i8042 has its second port: a mouse on IRQ 12 (`PS2M`,
+`PNP0F13`), fed relative motion converted from the host's absolute pointer.
+
+**A floppy, for the answers.** `boot.floppy` is a 1.44 MB image the BIOS
+serves as drive 0; `entangled install windows` on an XP ISO builds a FAT12
+one holding `WINNT.SIF`, and text-mode Setup then asks nothing. The floppy
+holds the product key and is deleted when the install ends.
+
+**No virtio on a BIOS machine.** XP has no driver for any of it, and each
+function was a "Found New Hardware" wizard waiting for a click nobody is
+there to make. A BIOS machine gets the IDE controller, the VGA, the boot
+framebuffer and the network card below — nothing else on the bus.
+
+**RTL8139 (X4).** `crates/rtl8139` is the card XP has an in-box driver
+for, on the `NetBackend` virtio-net already sends through, with its
+registers in an I/O BAR (`ConfigSpace::with_io_bar`). Its `INTA#` is a
+level and this machine's lines are edges, so the card raises an edge
+whenever a cause becomes pending and an `EoiListener` relay raises one
+more when the guest ends an interrupt with a cause still set.
+
+**What an install with a made-up key proved.** With an answer floppy and
+a placeholder key, Setup ran from the CD's boot sector to the "Your
+Product Key" page of GUI mode with no input: text mode in about fifteen
+minutes, then device installation. The page is where it should stop —
+volume-licence media has no keyless path.
+
+**Still open:** sound; bus-master DMA (the disk is PIO, and it shows);
+a RAM trap and INTx resampling on KVM; snapshots of a BIOS machine, which
+`entangled` refuses; a PCI identity for the VGA.

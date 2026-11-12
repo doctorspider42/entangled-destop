@@ -126,3 +126,66 @@ the unattended install answers (`DriverSigningPolicy=Ignore`).
    presents full-screen and windowed-unobscured only.
 3. Nothing here can be tested until an XP guest is installed, which needs
    the user's product key (ADR-0012, X5).
+
+## Amendment, 2026-11-12: G1 and G2 as built, before a guest has run them
+
+What exists, and how far each piece has been taken. **No part of this has
+drawn inside Windows XP yet**; the last section says what has stood in for
+that.
+
+**The stream** (`crates/gl-passthrough`). Little-endian words; a record is
+`opcode | words << 16` and its arguments, with a count of `0xffff` meaning
+the real count follows. Opcodes 0 to 335 are the OpenGL 1.1 functions in
+the order of an XP driver's dispatch table — read out of XP's own
+`opengl32.dll` and kept in `guest/winxp/opengl/icd_table.txt` — and the
+ones from `0x8000` are the protocol's: create, destroy, select, swap, the
+two array draws, copy and share. `gen.py` writes both ends of the 165
+functions that take only numbers, and turns 70 fixed-size vector forms
+into their scalar twins on the guest so the host never sees them.
+
+**The executor.** A context is a WGL context on a window nobody sees, and
+draws into a framebuffer object the size of the guest's window; a swap
+reads it back and returns the picture. The rule the ADR set for pointers
+held up, with one correction: **enum allow-listing is only needed where an
+enum decides a size.** Image formats and types are tables, because the
+byte count comes from them; `glGet*` needs no table, because the host
+writes into room for 1024 values and sends 16. Vertex arrays turned out to
+need one more defence than sizes: if a `gl*Pointer` call fails, OpenGL
+keeps the previous draw's pointer, so the arrays are checked against what
+each call accepts first, and the error flag is read before drawing (what
+it held is kept for the guest's `glGetError`). When every context slot is
+taken, the one selected longest ago is destroyed — a killed guest program
+never deletes its own.
+
+**The channel** (`machine_x86::framebuffer::accel`). Six 32-bit registers
+on the boot framebuffer's register page and the top 4 MiB of its VRAM: 3
+for commands, 1 for the response. The guest copies a buffer in and writes
+its length to `RUN`; the host copies it out — so it cannot change after it
+was checked — runs it on the vCPU thread, and has written the response and
+put the pictures in the scanout before the write returns. The device knows
+nothing of OpenGL: it has an `Accelerator` trait and `entangled` puts a
+`GlThread` behind it, on Windows hosts, for BIOS machines.
+
+**The guest.** `entxp.sys` maps the transfer area and takes one IOCTL;
+`entxp.dll` forwards an escape to it and answers GDI's pixel-format
+questions; `entgl.dll` is the ICD — 70 KiB, importing eleven functions
+from kernel32, five from user32 and four from gdi32. Client state stays in
+it: images are repacked tight, and a draw from arrays sends exactly the
+vertices it reads (for `glDrawElements`, only the range the indices reach,
+renumbered). `gltest.exe` is a lit cube that puts `GL_RENDERER` and its
+frame rate in its title bar.
+
+**Not there:** evaluators, selection and feedback, `glGetTexImage`, pixel
+maps, every extension (it reports 1.1 and no extensions), clipping against
+windows on top, the cursor over an OpenGL window, a Linux host (the
+executor's platform trait has one implementation, WGL), and Direct3D.
+
+**What stands in for a guest so far.** Three tests on this host's real
+OpenGL: streams written by hand (a triangle, a textured quad from arrays,
+a buffer of hostile records); the device's registers against a fake
+accelerator; and the ICD's own source compiled for the host with its
+escape replaced by a hook (`tests/icd.rs`), drawing through the dispatch
+table and reading the picture back. What none of them covers is everything
+Windows XP decides: whether `opengl32.dll` finds the driver through
+`OpenGLDrivers\entxp`, whether win32k passes the escape, and whether the
+pixel formats are accepted.
