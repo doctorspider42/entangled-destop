@@ -426,6 +426,19 @@ pub(crate) fn run(args: &InstallArgs) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A developer's tool, not a test: writes the additions disc on its own,
+    /// to bring new drivers to a guest that is already installed.
+    ///
+    /// `ENTANGLED_WINXP_ADDITIONS=<dir> ENTANGLED_ADDITIONS_OUT=<iso> cargo
+    /// test -p entangled writes_the_additions_disc -- --ignored`
+    #[test]
+    #[ignore = "writes a file named by the environment"]
+    fn writes_the_additions_disc() {
+        let dir = std::env::var_os(ADDITIONS_ENV).expect(ADDITIONS_ENV);
+        let out = std::env::var_os("ENTANGLED_ADDITIONS_OUT").expect("ENTANGLED_ADDITIONS_OUT");
+        std::fs::write(out, additions_disc(Path::new(&dir)).unwrap()).unwrap();
+    }
+
     #[test]
     fn the_answer_file_carries_the_key_and_the_name_with_dos_line_ends() {
         let text = answer_file("ABCDE-12345-FGHIJ-67890-KLMNO", "XPBOX", false);
