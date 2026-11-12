@@ -325,7 +325,10 @@ main(int argc, char **argv)
       printf("Direct3DCreate9: nothing\n");
       return 2;
    }
-   if (argc > 2)
+   /* "d3d9-test <frames> full": the whole screen, exclusively. */
+   int full = argc > 2 && strcmp(argv[2], "full") == 0;
+
+   if (argc > 2 && !full)
       print_runtime_state(d3d);
    hr = IDirect3D9_GetAdapterIdentifier(d3d, D3DADAPTER_DEFAULT, 0, &id);
    printf("adapter: 0x%08lx \"%s\" driver \"%s\"\n", (unsigned long)hr,
@@ -353,9 +356,19 @@ main(int argc, char **argv)
    window = CreateWindowExA(0, "STATIC", "d3d9-test", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                             100, 100, 640, 480, NULL, NULL, NULL, NULL);
    memset(&pp, 0, sizeof pp);
-   pp.Windowed = TRUE;
+   pp.Windowed = !full;
    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
    pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+   if (full) {
+      D3DDISPLAYMODE mode;
+
+      IDirect3D9_GetAdapterDisplayMode(d3d, D3DADAPTER_DEFAULT, &mode);
+      pp.BackBufferWidth = mode.Width;
+      pp.BackBufferHeight = mode.Height;
+      pp.BackBufferCount = 1;
+      pp.FullScreen_RefreshRateInHz = mode.RefreshRate;
+      pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+   }
    pp.EnableAutoDepthStencil = TRUE;
    pp.AutoDepthStencilFormat = D3DFMT_D24S8;
    pp.hDeviceWindow = window;
@@ -388,6 +401,11 @@ main(int argc, char **argv)
       if (SUCCEEDED(scene.made))
          scene_draw(device, &scene, frame, frame == 0);
       IDirect3DDevice9_EndScene(device);
+      if (full && frame == 0) {
+         /* What the runtime said to itself while it took the screen. */
+         print_runtime_errors();
+         fflush(stdout);
+      }
       hr = IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL);
       if (frame == 0)
          printf("present: 0x%08lx\n", (unsigned long)hr);

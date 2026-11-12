@@ -103,6 +103,25 @@ d3d9_log(const char *format, ...)
  * keeps what the ones that matter were told and answered. */
 static const char *volatile call_ring[64];
 static volatile LONG call_at;
+/* ENTANGLED_D3D9_CALLS=1: the first thousand device functions called, by
+ * name, placeholders included - what the runtime does and in what order. */
+static volatile LONG calls_left = -1;
+
+static void
+d3d9_log(const char *format, ...);
+
+static void
+d3d9_called(const char *name)
+{
+   if (calls_left == -1) {
+      char want[4] = "";
+
+      GetEnvironmentVariableA("ENTANGLED_D3D9_CALLS", want, sizeof want);
+      InterlockedExchange(&calls_left, want[0] == '1' ? 1000 : 0);
+   }
+   if (calls_left > 0 && InterlockedDecrement(&calls_left) >= 0)
+      d3d9_log("call: %s", name);
+}
 static char note_ring[96][150];
 static volatile LONG note_at;
 static volatile LONG note_on = -1;
@@ -469,6 +488,8 @@ d3d9_here(void)
 #define D3D9_HERE() \
    do { \
       call_ring[(unsigned)InterlockedIncrement(&call_at) & 63] = __func__; \
+      if (calls_left) \
+         d3d9_called(__func__); \
       if (sample_on) \
          d3d9_here(); \
    } while (0)
@@ -631,6 +652,8 @@ static volatile LONG stub_said[160];
 static HRESULT
 d3d9_stub(unsigned index, const char *name)
 {
+   if (calls_left)
+      d3d9_called(name);
    if (index < 160 && InterlockedExchange(&stub_said[index], 1) == 0)
       d3d9_log("stub: %s", name);
    return S_OK;
@@ -1294,9 +1317,10 @@ d3d9_create_resource2(HANDLE handle, D3DDDIARG_CREATERESOURCE2 *arg)
              resource->nine ? ", nine" : "", resource->sysmem ? ", sysmem" : "",
              resource->allocation ? ", allocation" : "");
    if (InterlockedIncrement(&said) <= 40)
-      d3d9_log("resource %p: format %u, %ux%u, %u surfaces, pool %u, flags 0x%x%s%s%s",
+      d3d9_log("resource %p: format %u, %ux%u, %u surfaces, pool %u, flags 0x%x/0x%x, source %u%s%s%s",
                (void *)resource, (unsigned)arg->Format, resource->width, resource->height,
-               arg->SurfCount, (unsigned)arg->Pool, arg->Flags.Value,
+               arg->SurfCount, (unsigned)arg->Pool, arg->Flags.Value, arg->Flags2.Value,
+               arg->VidPnSourceId,
                resource->nine ? ", nine" : "", resource->sysmem ? ", sysmem" : "",
                resource->allocation ? ", allocation" : "");
    return S_OK;
@@ -1305,6 +1329,7 @@ d3d9_create_resource2(HANDLE handle, D3DDDIARG_CREATERESOURCE2 *arg)
 static HRESULT APIENTRY
 d3d9_open_resource(HANDLE device, D3DDDIARG_OPENRESOURCE *arg)
 {
+   D3D9_HERE();
    struct d3d9_resource *resource = calloc(1, sizeof *resource);
 
    (void)device;
@@ -2461,6 +2486,26 @@ d3d9_flush1(HANDLE handle, UINT flags)
    return S_OK;
 }
 
+/* Microseconds since some fixed moment. */
+static LONGLONG
+d3d9_now(void)
+{
+   static LARGE_INTEGER frequency;
+   LARGE_INTEGER now;
+
+   if (!frequency.QuadPart)
+      QueryPerformanceFrequency(&frequency);
+   QueryPerformanceCounter(&now);
+   return now.QuadPart * 1000000 / frequency.QuadPart;
+}
+
+/* Where the frames' time went, since it was last said. */
+static struct {
+   LONGLONG last, read, escape, present, frames;
+   LONG draws;
+   unsigned count;
+} pace;
+
 /* A present: the frame leaves the GPU for the back buffer's allocation, and
  * the kernel driver copies it on to wherever Windows shows this window (the
  * surface DWM composes from, or the screen). Through the guest's CPU, like
@@ -2488,8 +2533,11 @@ d3d9_present1(HANDLE handle, const D3DDDIARG_PRESENT1 *arg)
       return S_OK;
    }
 
+   LONGLONG t0 = d3d9_now(), t1, t2, t3;
+
    result = entangled_nine_read_surface(device->nine, resource->nine, resource->pixels,
                                         resource->width, resource->height);
+   t1 = d3d9_now();
    if (result < 0) {
       if (InterlockedIncrement(&said) <= 4)
          d3d9_log("present: reading the frame failed 0x%08lx", (unsigned long)result);
@@ -2509,10 +2557,34 @@ d3d9_present1(HANDLE handle, const D3DDDIARG_PRESENT1 *arg)
                   (unsigned long)status);
    }
 
+   t2 = d3d9_now();
    memset(&present, 0, sizeof present);
    present.hSrcAllocation = resource->allocation;
    present.hContext = device->context;
    hr = device->callbacks.pfnPresentCb(device->runtime, &present);
+   t3 = d3d9_now();
+   pace.read += t1 - t0;
+   pace.escape += t2 - t1;
+   pace.present += t3 - t2;
+   if (pace.last)
+      pace.frames += t3 - pace.last;
+   pace.last = t3;
+   if (++pace.count == 120) {
+      LONG draws = count_draws;
+
+      d3d9_log("pace: %u.%u ms a frame (%u.%u fps), of which reading back %u.%u, to the kernel "
+               "%u.%u, its present %u.%u; %ld draws a frame",
+               (unsigned)(pace.frames / 120000), (unsigned)(pace.frames / 12000 % 10),
+               pace.frames ? (unsigned)(120000000 / pace.frames) : 0,
+               pace.frames ? (unsigned)(1200000000 / pace.frames % 10) : 0,
+               (unsigned)(pace.read / 120000), (unsigned)(pace.read / 12000 % 10),
+               (unsigned)(pace.escape / 120000), (unsigned)(pace.escape / 12000 % 10),
+               (unsigned)(pace.present / 120000), (unsigned)(pace.present / 12000 % 10),
+               (long)((draws - pace.draws) / 120));
+      pace.draws = draws;
+      pace.read = pace.escape = pace.present = pace.frames = 0;
+      pace.count = 0;
+   }
    if (InterlockedIncrement(&said) <= 2 || FAILED(hr))
       d3d9_log("present %ux%u: 0x%08lx", resource->width, resource->height, (unsigned long)hr);
    return hr;

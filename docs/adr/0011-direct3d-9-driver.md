@@ -359,3 +359,53 @@ death no handler saw.
 Not done: user clip planes (Zink has no `set_clip_state`), state blocks of
 a pure device, blits back to system memory, lost devices, `DepthFill`,
 `ValidateDevice`; the caps are still N0's table.
+
+### N4, begun (2026-11-12): where the time goes, and the whole screen
+
+Measured in the level, in a 1280×720 window (the driver says it itself every
+120 presents, `pace:` in its log): 86 ms a frame, 11.5 a second. Of that:
+
+- **27 ms inside the kernel's present**, whatever the game's vertical sync
+  setting. Not the copy (a memcpy of 3.7 MB) and not the read-back from the
+  GPU (1.2 ms) or the hand-over to the kernel driver (0.7 ms): a present
+  into a window waits for DWM to take the frame and show it, about three of
+  the guest's 120 Hz refreshes. The menu's 35 ms is the same wait. A window
+  cannot be made faster than DWM here; the answer is the whole screen.
+- **57 ms in 318 draws**, 0.18 ms each, every one made in turn on the
+  program's thread: Nine's context is not threaded (N3), and neither is the
+  runtime's (N3). Not yet profiled further.
+
+**The whole screen does not work yet**, and it is how a game starts when
+nobody has told it otherwise: Portal 2 with `-fullscreen`, and the test
+program with `full`, both die inside d3d9.dll — the game at its first
+`SetRenderTarget` of the back buffer, the test at its first `Present`. What
+is known:
+
+- The runtime makes the same resources as for a window: one back buffer of
+  one surface (flags `RenderTarget | NotLockable`, no `Primary`, no source
+  id), and calls neither `pfnOpenResource` nor `pfnSetDisplayMode`. The
+  kernel is asked meanwhile for a shared primary and a shadow surface
+  (`GetStandardAllocationDriverData` types 1 and 2) and gives them.
+- The present goes down the runtime's flip (`DdFlipLH`, by its own error
+  strings), which takes the surface to show from the *second* surface of
+  the chain; that surface's link to a driver resource is NULL, and the
+  runtime reads through it. The first frame is drawn all the same: the
+  device's own render target points at the resource directly.
+- Windows' "fullscreen optimizations" are not it
+  (`__COMPAT_LAYER=DISABLEDXMAXIMIZEDWINDOWEDMODE` changes nothing), and the
+  runtime's table of last errors is empty.
+- So the runtime expected a chain of two — a front buffer it would have had
+  from somewhere — and what decides that is in its surface-creation code
+  ("Failed to create driver primary surface chain", "Failed to create dummy
+  primary surface" are its sentences there), not yet read.
+
+Until then a game must be started in a window (`-windowed`, or its own
+setting), which Portal 2 remembers once set.
+
+Instruments added on the way: `ENTANGLED_D3D9_CALLS=1` (the first thousand
+device functions called, placeholders included), the `pace:` line, and the
+test program's `full` argument. The guest's d3d9.dll is not the host's
+build (functions sit 0xb0 lower); a guest file can be had by copying it
+behind a marker (`copy /b marker + file`) and finding the marker in the raw
+disk image with the VM off, though a fragmented copy is useless — matching
+the faulting instruction's bytes in the host's build finds the function.
