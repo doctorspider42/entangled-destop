@@ -458,6 +458,15 @@ impl Shared {
             reg::MPC => state.missed = 0,
             reg::CR9346 => {
                 let value = value as u8;
+                // EEM = 01 is "auto-load": the card reloads its configuration
+                // from the EEPROM and returns to normal mode by itself. The
+                // load is instant here, and Windows XP's driver waits for the
+                // bits to clear before it does anything else.
+                let value = if value >> 6 == 0b01 {
+                    value & 0x3f
+                } else {
+                    value
+                };
                 state.cr9346 = value;
                 // EEM = 10: the lines below are the EEPROM's.
                 if value >> 6 == 0b10 {
@@ -551,6 +560,12 @@ impl Rtl8139 {
     pub fn read(&self, offset: u16, data: &mut [u8]) {
         let mut state = self.shared.state();
         let value = self.shared.read(&mut state, offset, data.len());
+        tracing::trace!(
+            offset = format_args!("{offset:#04x}"),
+            len = data.len(),
+            value = format_args!("{value:#x}"),
+            "RTL8139 read"
+        );
         for (out, byte) in data.iter_mut().zip(value.to_le_bytes()) {
             *out = byte;
         }
@@ -562,6 +577,12 @@ impl Rtl8139 {
         for (slot, byte) in bytes.iter_mut().zip(data) {
             *slot = *byte;
         }
+        tracing::trace!(
+            offset = format_args!("{offset:#04x}"),
+            len = data.len(),
+            value = format_args!("{:#x}", u32::from_le_bytes(bytes)),
+            "RTL8139 write"
+        );
         let mut state = self.shared.state();
         self.shared
             .write(&mut state, offset, data.len(), u32::from_le_bytes(bytes));
@@ -793,6 +814,17 @@ mod tests {
             word = word << 1 | (read(&rig.card, reg::CR9346, 1) & 1) as u16;
         }
         assert_eq!(word, u16::from_le_bytes([0x52, 0x54]));
+    }
+
+    #[test]
+    fn an_eeprom_auto_load_finishes_by_itself() {
+        let rig = rig();
+        write(&rig.card, reg::CR9346, 1, 0x40);
+        assert_eq!(
+            read(&rig.card, reg::CR9346, 1) & 0xc0,
+            0,
+            "back in normal mode"
+        );
     }
 
     #[test]
