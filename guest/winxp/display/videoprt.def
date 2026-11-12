@@ -1,0 +1,11 @@
+LIBRARY videoprt.sys
+EXPORTS
+VideoPortInitialize@16
+VideoPortZeroMemory@8
+VideoPortGetAccessRanges@32
+VideoPortGetDeviceBase@20
+VideoPortSetRegistryParameters@16
+VideoPortMapMemory@24
+VideoPortUnmapMemory@12
+VideoPortReadRegisterUshort@4
+VideoPortWriteRegisterUshort@8
