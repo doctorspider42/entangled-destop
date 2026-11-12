@@ -297,9 +297,15 @@ impl<P: Platform> Executor<P> {
             (control::SELECT, &[id, width, height]) => {
                 *selected = self.select(id, width, height);
             }
-            (control::SWAP, &[x, y]) => {
+            (control::SWAP, &[x, y, ref rects @ ..])
+                if rects.len() % 4 == 0 && rects.len() <= 4 * crate::MAX_CLIP_RECTS =>
+            {
                 if *selected {
-                    if let Some(present) = self.read_back(x as i32, y as i32) {
+                    if let Some(mut present) = self.read_back(x as i32, y as i32) {
+                        present.clip = rects
+                            .chunks_exact(4)
+                            .map(|r| [r[0] as i32, r[1] as i32, r[2] as i32, r[3] as i32])
+                            .collect();
                         out.presents.push(present);
                     }
                 }
@@ -528,6 +534,7 @@ impl<P: Platform> Executor<P> {
             width,
             height,
             pixels: flipped,
+            clip: Vec::new(),
         })
     }
 

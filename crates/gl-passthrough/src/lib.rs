@@ -60,8 +60,12 @@ pub mod control {
     /// `id, width, height`: the records after this one are for context `id`,
     /// whose window is `width`×`height` pixels. Every buffer starts with one.
     pub const SELECT: u16 = 0x8002;
-    /// `x, y`: show the picture, with its top-left corner at this place on
-    /// the guest's screen. Answers one word, so the guest waits for it.
+    /// `x, y, rect…`: show the picture, with its top-left corner at this
+    /// place on the guest's screen — all of it, or, if rectangles follow
+    /// (`left, top, right, bottom` each, in screen coordinates, at most
+    /// [`crate::MAX_CLIP_RECTS`]), only what lies inside them: the part of
+    /// the window no other window covers. Answers one word, so the guest
+    /// waits for it.
     pub const SWAP: u16 = 0x8003;
     /// `mode, count, arrays…`: `glDrawArrays` with the vertices in the
     /// record. See [`crate::exec`].
@@ -79,6 +83,8 @@ pub mod control {
 pub const MAX_CONTEXTS: usize = 64;
 /// The largest window a context draws for, each way.
 pub const MAX_DRAWABLE: u32 = 4096;
+/// The most rectangles a swap's visible region can have.
+pub const MAX_CLIP_RECTS: usize = 64;
 /// The most bytes one buffer's answer can be.
 pub const MAX_RESPONSE: usize = 1 << 20;
 
@@ -91,6 +97,9 @@ pub struct Present {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    /// Where on the screen it may land: `[left, top, right, bottom]` each,
+    /// right and bottom exclusive. Empty means anywhere.
+    pub clip: Vec<[i32; 4]>,
 }
 
 /// What running one buffer produced.

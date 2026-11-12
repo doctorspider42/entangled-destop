@@ -81,6 +81,7 @@ typedef struct {
 #define MAX_RECORD_WORDS 0xb0000u    /* what fits the device's command area */
 #define ONE_RECORD_BYTES (1u << 20)  /* images larger than this go in strips */
 #define CLIENT_STACK 16
+#define MAX_CLIP_RECTS 64            /* gl_passthrough::MAX_CLIP_RECTS */
 
 typedef struct Context {
     unsigned id;          /* the host's name for it */
@@ -545,6 +546,43 @@ static void present(Context *c)
     }
 #endif
     ClientToScreen(c->window, &corner);
+#ifndef ENTGL_TEST
+    {
+        /* The part of the window nothing else covers, in screen coordinates
+         * (which is what the "system region" is on Windows NT): the picture
+         * must not land on the windows on top of this one. */
+        struct {
+            RGNDATAHEADER header;
+            RECT rects[MAX_CLIP_RECTS];
+        } data;
+        HRGN region = CreateRectRgn(0, 0, 0, 0);
+        int has = GetRandomRgn(c->dc, region, 4 /* SYSRGN */);
+        DWORD size = has == 1 ? GetRegionData(region, sizeof(data), (RGNDATA *)&data) : 0;
+        DeleteObject(region);
+        if (has == 1 && size != 0) {
+            unsigned count = data.header.nCount, i;
+            if (count == 0) {
+                /* Wholly covered: nothing to show. */
+                flush(c, NULL, 0);
+                return;
+            }
+            a = entgl_large(c, ENTGL_SWAP, 2 + 4 * count);
+            if (a != NULL) {
+                a[0] = (unsigned)corner.x;
+                a[1] = (unsigned)corner.y;
+                for (i = 0; i < count; i++) {
+                    a[2 + 4 * i] = (unsigned)data.rects[i].left;
+                    a[3 + 4 * i] = (unsigned)data.rects[i].top;
+                    a[4 + 4 * i] = (unsigned)data.rects[i].right;
+                    a[5 + 4 * i] = (unsigned)data.rects[i].bottom;
+                }
+                flush(c, &done, sizeof(done));
+                return;
+            }
+        }
+        /* A region too intricate for the record, or none: the whole window. */
+    }
+#endif
     a = entgl_command(ENTGL_SWAP, 2);
     a[0] = (unsigned)corner.x;
     a[1] = (unsigned)corner.y;

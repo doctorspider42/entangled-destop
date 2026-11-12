@@ -154,6 +154,9 @@ pub struct Blit {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    /// Where on the screen it may land: `[left, top, right, bottom]` each,
+    /// right and bottom exclusive. Empty means anywhere.
+    pub clip: Vec<[i32; 4]>,
 }
 
 /// The DISPI register indices and the bits that mean something.
@@ -376,7 +379,8 @@ impl Framebuffer {
         }
     }
 
-    /// Puts a picture on the guest's screen, clipped to the mode it shows.
+    /// Puts a picture on the guest's screen, clipped to the mode it shows
+    /// and to the picture's own clip rectangles.
     fn blit(&self, blit: &Blit) {
         let Some(mode) = self.scanout() else {
             return;
@@ -385,8 +389,31 @@ impl Framebuffer {
         if row == 0 || blit.pixels.len() != row * blit.height as usize {
             return;
         }
-        let left = i64::from(blit.x).max(0);
-        let right = (i64::from(blit.x) + i64::from(blit.width)).min(i64::from(mode.width));
+        let screen = [0, 0, i64::from(mode.width), i64::from(mode.height)];
+        if blit.clip.is_empty() {
+            self.blit_within(blit, &mode, screen);
+        }
+        for clip in &blit.clip {
+            let [left, top, right, bottom] = clip.map(i64::from);
+            self.blit_within(
+                blit,
+                &mode,
+                [
+                    left.max(0),
+                    top.max(0),
+                    right.min(screen[2]),
+                    bottom.min(screen[3]),
+                ],
+            );
+        }
+    }
+
+    /// The part of `blit` inside `[left, top, right, bottom)`, which is
+    /// inside the screen.
+    fn blit_within(&self, blit: &Blit, mode: &ScanoutMode, within: [i64; 4]) {
+        let row = blit.width as usize * 4;
+        let left = i64::from(blit.x).max(within[0]);
+        let right = (i64::from(blit.x) + i64::from(blit.width)).min(within[2]);
         if left >= right {
             return;
         }
@@ -394,7 +421,7 @@ impl Framebuffer {
         let take = (right - left) as usize * 4;
         for (line, pixels) in blit.pixels.chunks_exact(row).enumerate() {
             let y = i64::from(blit.y) + line as i64;
-            if y < 0 || y >= i64::from(mode.height) {
+            if y < within[1] || y >= within[3] {
                 continue;
             }
             let at = mode.offset + y as u64 * u64::from(mode.stride) + left as u64 * 4;
@@ -763,6 +790,11 @@ mod tests {
                     width: 2,
                     height: 2,
                     pixels: (1..=16).collect(),
+                    // A third byte asks for the right column only.
+                    clip: match commands.get(2) {
+                        Some(1) => vec![[at(0) + 1, -5, 4000, 4000]],
+                        _ => Vec::new(),
+                    },
                 }],
             }
         }
@@ -866,6 +898,22 @@ mod tests {
         let mut pixels = [0u8; 8];
         vram.read(0, &mut pixels).unwrap();
         assert_eq!(pixels, [0; 8]);
+    }
+
+    #[test]
+    fn pictures_keep_to_their_clip_rectangles() {
+        let (fb, vram, _) = accelerated();
+        let commands = u64::from(accel_read(&fb, accel::COMMANDS));
+        set_mode(&fb, 640, 480);
+        // At (3, 1), right column only: (4, 1) and (4, 2) are written,
+        // (3, 1) and (3, 2) are not.
+        vram.write(commands, &[3, 1, 1]).unwrap();
+        accel_run(&fb, 3);
+        let mut row = [0u8; 8];
+        vram.read((640 + 3) * 4, &mut row).unwrap();
+        assert_eq!(row, [0, 0, 0, 0, 5, 6, 7, 8]);
+        vram.read((2 * 640 + 3) * 4, &mut row).unwrap();
+        assert_eq!(row, [0, 0, 0, 0, 13, 14, 15, 16]);
     }
 
     #[test]

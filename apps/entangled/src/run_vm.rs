@@ -3690,6 +3690,7 @@ impl machine_x86::framebuffer::Accelerator for GlAccelerator {
                     width: p.width,
                     height: p.height,
                     pixels: p.pixels,
+                    clip: p.clip,
                 })
                 .collect(),
         }
