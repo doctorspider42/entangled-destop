@@ -23,6 +23,10 @@
 #include "entxp.h"
 #include "../opengl/entgl.h"
 
+#ifndef OPENGL_GETINFO
+#define OPENGL_GETINFO 4353
+#endif
+
 #define POOL_TAG 0x70787445 /* 'Etxp' */
 
 typedef struct {
@@ -331,7 +335,26 @@ ULONG APIENTRY DrvEscape(SURFOBJ *surface, ULONG escape, ULONG in_size, PVOID in
     ULONG returned = 0;
 
     if (escape == QUERYESCSUPPORT) {
-        return in_size >= sizeof(ULONG) && *(ULONG *)in == ENTGL_ESCAPE;
+        return in_size >= sizeof(ULONG) &&
+               (*(ULONG *)in == ENTGL_ESCAPE || *(ULONG *)in == OPENGL_GETINFO);
+    }
+    if (escape == OPENGL_GETINFO) {
+        /* What opengl32.dll asks before it looks for an OpenGL driver: the
+         * name of its registry key under OpenGLDrivers, and the two version
+         * numbers that key must also hold (entxp.inf writes the same). */
+        struct {
+            ULONG version;
+            ULONG driver_version;
+            WCHAR name[MAX_PATH + 1];
+        } *info = out;
+        if (out == NULL || out_size < sizeof(*info)) {
+            return 0;
+        }
+        memset(info, 0, sizeof(*info));
+        info->version = 2;
+        info->driver_version = 1;
+        copy_wide(info->name, L"entxp", MAX_PATH);
+        return 1;
     }
     if (escape != ENTGL_ESCAPE || pdev == NULL) {
         return 0;
