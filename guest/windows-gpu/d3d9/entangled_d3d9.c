@@ -125,6 +125,41 @@ d3d9_where(const void *address, char *text, size_t size)
    }
    _snprintf(text, size - 1, "%s+0x%Ix", name, (size_t)((ULONG_PTR)address - (ULONG_PTR)module));
    text[size - 1] = 0;
+   /* The nearest export below it, when the module has any: the system DLLs'
+    * names are most of what a stack through them says. */
+   if (module) {
+      const BYTE *base = (const BYTE *)module;
+      const IMAGE_NT_HEADERS *nt =
+         (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+      const IMAGE_DATA_DIRECTORY *entry =
+         &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+      DWORD rva = (DWORD)((ULONG_PTR)address - (ULONG_PTR)module), best = 0;
+      const char *best_name = NULL;
+
+      if (entry->VirtualAddress && entry->Size) {
+         const IMAGE_EXPORT_DIRECTORY *exports =
+            (const IMAGE_EXPORT_DIRECTORY *)(base + entry->VirtualAddress);
+         const DWORD *functions = (const DWORD *)(base + exports->AddressOfFunctions);
+         const DWORD *names = (const DWORD *)(base + exports->AddressOfNames);
+         const WORD *ordinals = (const WORD *)(base + exports->AddressOfNameOrdinals);
+
+         for (DWORD i = 0; i < exports->NumberOfNames; i++) {
+            DWORD at = functions[ordinals[i]];
+
+            if (at <= rva && at > best) {
+               best = at;
+               best_name = (const char *)(base + names[i]);
+            }
+         }
+      }
+      if (best_name && rva - best < 0x2000) {
+         size_t used = strlen(text);
+
+         _snprintf(text + used, size - 1 - used, "(%s+0x%lx)", best_name,
+                   (unsigned long)(rva - best));
+         text[size - 1] = 0;
+      }
+   }
 }
 
 static LONG CALLBACK
@@ -210,6 +245,254 @@ d3d9_crash(EXCEPTION_POINTERS *info)
       d3d9_log("  stack:%s", line);
    }
    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+#if defined(_M_IX86)
+/* A stack cookie found changed (a buffer on the stack overrun, or a callee
+ * that popped the wrong number of arguments): the C runtime's own report ends
+ * the process with a fast-fail no handler sees. Ours, which the linker takes
+ * instead, first says where: the stack's words that point into this DLL, the
+ * first of them in the function whose cookie it was. */
+__declspec(noreturn) void __cdecl
+__report_gsfailure(void)
+{
+   ULONG_PTR base = (ULONG_PTR)crash_module, top, *word, *limit, here = 0;
+   IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+   char line[220];
+   int at = 0;
+   unsigned found = 0;
+
+   top = base + nt->OptionalHeader.SizeOfImage;
+   word = &here;
+   limit = (ULONG_PTR *)((NT_TIB *)NtCurrentTeb())->StackBase;
+   d3d9_log("a stack cookie changed in thread %lu", (unsigned long)GetCurrentThreadId());
+   for (; word < limit && found < 30; word++) {
+      if (*word < base || *word >= top)
+         continue;
+      at += _snprintf(line + at, sizeof line - 1 - at, " 0x%lx", (unsigned long)(*word - base));
+      found++;
+      if (at > 150) {
+         line[at] = 0;
+         d3d9_log("  stack:%s", line);
+         at = 0;
+      }
+   }
+   if (at) {
+      line[at] = 0;
+      d3d9_log("  stack:%s", line);
+   }
+   __fastfail(2 /* FAST_FAIL_STACK_COOKIE_CHECK_FAILURE */);
+}
+
+/* The rest of what the C runtime keeps in the same object as its report, so
+ * the linker takes ours whole and not both. */
+__declspec(noreturn) void __cdecl
+__report_rangecheckfailure(void)
+{
+   d3d9_log("a range check failed in thread %lu", (unsigned long)GetCurrentThreadId());
+   __fastfail(8 /* FAST_FAIL_RANGE_CHECK_FAILURE */);
+}
+
+__declspec(noreturn) void __cdecl
+__report_securefailure(ULONG code)
+{
+   __fastfail(code);
+}
+
+__declspec(noreturn) void __cdecl
+__report_securefailureEx(ULONG code, ULONG count, void **parameters)
+{
+   (void)count;
+   (void)parameters;
+   __fastfail(code);
+}
+#endif
+
+/* --------------------------------------------------------------- sampler */
+
+#pragma comment(lib, "ntdll.lib") /* NtQueryObject */
+
+/* Bring-up: with ENTANGLED_D3D9_SAMPLE=1, where the thread that last called
+ * the driver is, every five seconds: where it executes, and the words of its
+ * stack that point into a module (ours as offsets for the linker map). For a
+ * program that neither draws nor dies. */
+static volatile LONG sample_on;
+static volatile LONG ddi_threads[8];
+static volatile LONG count_presents, count_draws;
+
+/* Said at the head of every device function: the threads that call the
+ * driver (Windows 10's runtime plays batches of calls from a worker of its
+ * own, while the program's thread waits for it). */
+static void
+d3d9_here(void)
+{
+   LONG id = (LONG)GetCurrentThreadId();
+
+   for (unsigned i = 0; i < 8; i++) {
+      LONG seen = ddi_threads[i];
+
+      if (seen == id)
+         return;
+      if (!seen && InterlockedCompareExchange(&ddi_threads[i], id, 0) == 0)
+         return;
+   }
+}
+
+#define D3D9_HERE() \
+   do { \
+      if (sample_on) \
+         d3d9_here(); \
+   } while (0)
+
+static void
+d3d9_sample(DWORD id, unsigned samples)
+{
+   ULONG_PTR base = (ULONG_PTR)crash_module, top;
+   IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+
+   top = base + nt->OptionalHeader.SizeOfImage;
+   {
+      static ULONG_PTR words[1024];
+      CONTEXT context;
+      SIZE_T got = 0;
+      char line[260], where[140];
+      int at = 0;
+      unsigned found = 0;
+      static unsigned dumped;
+
+      HANDLE sample_thread;
+
+      sample_thread = id ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, id) : NULL;
+      if (!sample_thread) {
+         d3d9_log("sample: thread %lu is gone", (unsigned long)id);
+         return;
+      }
+      memset(&context, 0, sizeof context);
+      context.ContextFlags = CONTEXT_CONTROL;
+      if (SuspendThread(sample_thread) == (DWORD)-1) {
+         CloseHandle(sample_thread);
+         return;
+      }
+      if (!GetThreadContext(sample_thread, &context)) {
+         ResumeThread(sample_thread);
+         CloseHandle(sample_thread);
+         return;
+      }
+#if defined(_WIN64)
+      ReadProcessMemory(GetCurrentProcess(), (const void *)context.Rsp, words, sizeof words, &got);
+      ResumeThread(sample_thread);
+      CloseHandle(sample_thread);
+      d3d9_where((const void *)context.Rip, where, sizeof where);
+#else
+      ReadProcessMemory(GetCurrentProcess(), (const void *)context.Esp, words, sizeof words, &got);
+      ResumeThread(sample_thread);
+      CloseHandle(sample_thread);
+      d3d9_where((const void *)context.Eip, where, sizeof where);
+#endif
+      d3d9_log("sample: thread %lu at %s; %ld presents and %ld draws so far", (unsigned long)id,
+               where, (long)count_presents, (long)count_draws);
+      /* The top of the stack raw: a wait's arguments are among it. */
+      if (got >= 8 * sizeof words[0])
+         d3d9_log("  top: %Ix %Ix %Ix %Ix %Ix %Ix %Ix %Ix", (size_t)words[0], (size_t)words[1],
+                  (size_t)words[2], (size_t)words[3], (size_t)words[4], (size_t)words[5],
+                  (size_t)words[6], (size_t)words[7]);
+      for (SIZE_T i = 0; i < 8 && i < got / sizeof words[0]; i++) {
+         /* A small multiple of four may be a handle: say what kind. */
+         if (words[i] >= 4 && words[i] < 0x10000 && !(words[i] & 3)) {
+            struct {
+               UNICODE_STRING name;
+               WCHAR text[64];
+            } type;
+            ULONG length = 0;
+
+            memset(&type, 0, sizeof type);
+            if (NtQueryObject((HANDLE)words[i], 2 /* ObjectTypeInformation */, &type,
+                              sizeof type, &length) >= 0 &&
+                type.name.Buffer)
+               d3d9_log("  handle 0x%Ix is a %.20ls", (size_t)words[i], type.name.Buffer);
+         }
+      }
+      /* Every word of the stack that points into a module: return addresses
+       * mostly, some stale. Ours as plain offsets, for the map. */
+      for (SIZE_T i = 0; i < got / sizeof words[0] && found < 40; i++) {
+         HMODULE module = NULL;
+
+         if (words[i] < 0x10000)
+            continue;
+         if (words[i] >= base && words[i] < top) {
+            at += _snprintf(line + at, sizeof line - 1 - at, " 0x%lx",
+                            (unsigned long)(words[i] - base));
+         } else if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       (LPCSTR)words[i], &module) &&
+                    module) {
+            d3d9_where((const void *)words[i], where, sizeof where);
+            at += _snprintf(line + at, sizeof line - 1 - at, " %s", where);
+            /* The runtime's code before the address, a few times over: what
+             * it called, for whoever has no copy of this build of it. */
+            if (samples == 6 && dumped < 6 && module == GetModuleHandleA("d3d9.dll")) {
+               char hex[200];
+               const BYTE *code = (const BYTE *)words[i] - 80;
+               int h = 0;
+
+               dumped++;
+               for (int row = 0; row < 2; row++) {
+                  h = 0;
+                  for (int b = 0; b < 48; b++)
+                     h += _snprintf(hex + h, sizeof hex - 1 - h, "%02x", code[row * 48 + b]);
+                  hex[h] = 0;
+                  d3d9_log("  code d3d9+0x%Ix: %s",
+                           (size_t)((ULONG_PTR)code + row * 48 - (ULONG_PTR)module), hex);
+               }
+            }
+         } else {
+            continue;
+         }
+         found++;
+         if (at > 110) {
+            line[at] = 0;
+            d3d9_log("  sample stack:%s", line);
+            at = 0;
+         }
+      }
+      if (at) {
+         line[at] = 0;
+         d3d9_log("  sample stack:%s", line);
+      }
+   }
+}
+
+static DWORD WINAPI
+d3d9_sampler(void *unused)
+{
+   (void)unused;
+   for (unsigned samples = 0;; samples++) {
+      Sleep(samples < 6 ? 5000 : 30000);
+      for (unsigned i = 0; i < 8; i++) {
+         if (ddi_threads[i])
+            d3d9_sample((DWORD)ddi_threads[i], samples);
+      }
+   }
+   return 0;
+}
+
+static void
+d3d9_sample_this_thread(void)
+{
+   char want[4] = "";
+
+   if (sample_on)
+      return;
+   GetEnvironmentVariableA("ENTANGLED_D3D9_SAMPLE", want, sizeof want);
+   if (want[0] != '1')
+      return;
+   if (InterlockedExchange(&sample_on, 1) == 0) {
+      HANDLE thread = CreateThread(NULL, 0, d3d9_sampler, NULL, 0, NULL);
+
+      d3d9_here();
+      if (thread)
+         CloseHandle(thread);
+   }
 }
 
 /* ---------------------------------------------------------------- stubs */
@@ -621,8 +904,11 @@ d3d9_escape(struct d3d9_device *device, void *data, UINT size)
 }
 
 /* Bring-up: with ENTANGLED_D3D9_TRACE=1, the first few hundred calls that
- * decide what a draw is (streams, declaration, shaders, the draws). */
+ * decide what a draw is (streams, declaration, shaders, the draws); with 2,
+ * the calls that decide where drawing goes instead (targets, clears, copies,
+ * presents, queries), up to a few thousand. */
 static volatile LONG trace_left = -1;
+static volatile LONG trace_frame_left;
 
 static BOOL
 d3d9_tracing(void)
@@ -631,10 +917,25 @@ d3d9_tracing(void)
       char want[4] = "";
 
       GetEnvironmentVariableA("ENTANGLED_D3D9_TRACE", want, sizeof want);
+      InterlockedExchange(&trace_frame_left, want[0] == '2' ? 4000 : 0);
       InterlockedExchange(&trace_left, want[0] == '1' ? 400 : 0);
    }
    return trace_left > 0 && InterlockedDecrement(&trace_left) >= 0;
 }
+
+static BOOL
+d3d9_tracing_frames(void)
+{
+   if (trace_left == -1)
+      d3d9_tracing();
+   return trace_frame_left > 0 && InterlockedDecrement(&trace_frame_left) >= 0;
+}
+
+#define D3D9_FRAME(...)         \
+   do {                         \
+      if (d3d9_tracing_frames()) \
+         d3d9_log(__VA_ARGS__); \
+   } while (0)
 
 #define D3D9_TRACE(...)         \
    do {                         \
@@ -718,6 +1019,7 @@ d3d9_resource_free(struct d3d9_device *device, struct d3d9_resource *resource)
 static HRESULT APIENTRY
 d3d9_create_resource2(HANDLE handle, D3DDDIARG_CREATERESOURCE2 *arg)
 {
+   D3D9_HERE();
    static volatile LONG said;
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = calloc(1, sizeof *resource);
@@ -842,6 +1144,7 @@ d3d9_open_resource(HANDLE device, D3DDDIARG_OPENRESOURCE *arg)
 static HRESULT APIENTRY
 d3d9_destroy_resource(HANDLE handle, HANDLE resource_handle)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = resource_handle;
 
@@ -856,6 +1159,7 @@ d3d9_destroy_resource(HANDLE handle, HANDLE resource_handle)
 static HRESULT APIENTRY
 d3d9_lock(HANDLE handle, D3DDDIARG_LOCK *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = arg->hResource;
    unsigned box[6] = {0, 0, 0, 0, 0, 1}, flags = 0, pitch = 0, slice_pitch = 0;
@@ -916,6 +1220,7 @@ d3d9_lock(HANDLE handle, D3DDDIARG_LOCK *arg)
 static HRESULT APIENTRY
 d3d9_unlock(HANDLE handle, const D3DDDIARG_UNLOCK *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = arg->hResource;
 
@@ -954,6 +1259,7 @@ d3d9_unlock(HANDLE handle, const D3DDDIARG_UNLOCK *arg)
 static HRESULT APIENTRY
 d3d9_lock_async(HANDLE handle, D3DDDIARG_LOCKASYNC *arg)
 {
+   D3D9_HERE();
    D3DDDIARG_LOCK lock;
    HRESULT hr;
 
@@ -977,6 +1283,7 @@ d3d9_lock_async(HANDLE handle, D3DDDIARG_LOCKASYNC *arg)
 static HRESULT APIENTRY
 d3d9_unlock_async(HANDLE handle, const D3DDDIARG_UNLOCKASYNC *arg)
 {
+   D3D9_HERE();
    D3DDDIARG_UNLOCK unlock;
 
    memset(&unlock, 0, sizeof unlock);
@@ -989,6 +1296,7 @@ d3d9_unlock_async(HANDLE handle, const D3DDDIARG_UNLOCKASYNC *arg)
 static HRESULT APIENTRY
 d3d9_rename(HANDLE handle, const D3DDDIARG_RENAME *arg)
 {
+   D3D9_HERE();
    (void)handle;
    (void)arg;
    return S_OK;
@@ -1008,6 +1316,7 @@ d3d9_level(UINT size, UINT level)
 static HRESULT APIENTRY
 d3d9_tex_blt1(HANDLE handle, const D3DDDIARG_TEXBLT1 *arg)
 {
+   D3D9_HERE();
    static volatile LONG said;
    struct d3d9_device *device = handle;
    struct d3d9_resource *dst = arg->hDstResource, *src = arg->hSrcResource;
@@ -1057,6 +1366,7 @@ d3d9_tex_blt1(HANDLE handle, const D3DDDIARG_TEXBLT1 *arg)
 static HRESULT APIENTRY
 d3d9_buf_blt1(HANDLE handle, const D3DDDIARG_BUFFERBLT1 *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_resource *dst = arg->hDstResource, *src = arg->hSrcResource;
    unsigned box[6] = {0, 0, 0, 0, 0, 1}, pitch, slice_pitch;
@@ -1080,10 +1390,15 @@ d3d9_buf_blt1(HANDLE handle, const D3DDDIARG_BUFFERBLT1 *arg)
 static HRESULT APIENTRY
 d3d9_blt(HANDLE handle, const D3DDDIARG_BLT *arg)
 {
+   D3D9_HERE();
    static volatile LONG said;
    struct d3d9_device *device = handle;
    struct d3d9_resource *dst = arg->hDstResource, *src = arg->hSrcResource;
 
+   D3D9_FRAME("blt %p.%u (%ld,%ld-%ld,%ld) to %p.%u (%ld,%ld-%ld,%ld) flags 0x%x", (void *)src,
+              arg->SrcSubResourceIndex, arg->SrcRect.left, arg->SrcRect.top, arg->SrcRect.right,
+              arg->SrcRect.bottom, (void *)dst, arg->DstSubResourceIndex, arg->DstRect.left,
+              arg->DstRect.top, arg->DstRect.right, arg->DstRect.bottom, arg->Flags.Value);
    if (!device->nine || !dst || !src)
       return S_OK;
    if (!dst->nine || !src->nine) {
@@ -1101,9 +1416,13 @@ d3d9_blt(HANDLE handle, const D3DDDIARG_BLT *arg)
 static HRESULT APIENTRY
 d3d9_color_fill(HANDLE handle, const D3DDDIARG_COLORFILL *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = arg->hResource;
 
+   D3D9_FRAME("fill %p.%u (%ld,%ld-%ld,%ld) 0x%08x", (void *)resource, arg->SubResourceIndex,
+              arg->DstRect.left, arg->DstRect.top, arg->DstRect.right, arg->DstRect.bottom,
+              (unsigned)arg->Color);
    if (!device->nine || !resource || !resource->nine)
       return S_OK;
    D3D9_CHECK("color fill", entangled_nine_fill(device->nine, resource->nine, resource->kind,
@@ -1114,6 +1433,7 @@ d3d9_color_fill(HANDLE handle, const D3DDDIARG_COLORFILL *arg)
 static HRESULT APIENTRY
 d3d9_generate_mips(HANDLE handle, const D3DDDIARG_GENERATEMIPSUBLEVELS *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = arg->hResource;
 
@@ -1128,9 +1448,12 @@ d3d9_generate_mips(HANDLE handle, const D3DDDIARG_GENERATEMIPSUBLEVELS *arg)
 static HRESULT APIENTRY
 d3d9_set_render_target(HANDLE handle, const D3DDDIARG_SETRENDERTARGET *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = arg->hRenderTarget;
 
+   D3D9_FRAME("target %u: %p.%u%s", arg->RenderTargetIndex, (void *)resource,
+              arg->SubResourceIndex, resource && !resource->nine ? " (not Nine's)" : "");
    if (!device->nine)
       return S_OK;
    D3D9_CHECK("render target",
@@ -1143,9 +1466,12 @@ d3d9_set_render_target(HANDLE handle, const D3DDDIARG_SETRENDERTARGET *arg)
 static HRESULT APIENTRY
 d3d9_set_depth_stencil(HANDLE handle, const D3DDDIARG_SETDEPTHSTENCIL *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = arg->hZBuffer;
 
+   D3D9_FRAME("depth: %p%s", (void *)resource,
+              resource && !resource->nine ? " (not Nine's)" : "");
    if (!device->nine)
       return S_OK;
    D3D9_CHECK("depth buffer",
@@ -1159,6 +1485,12 @@ d3d9_clear(HANDLE handle, const D3DDDIARG_CLEAR *arg, UINT count, const RECT *re
 {
    struct d3d9_device *device = handle;
 
+   D3D9_HERE();
+   D3D9_FRAME("clear flags 0x%x colour 0x%08x, %u rects%s", arg->Flags,
+              (unsigned)arg->FillColor, count, count ? ":" : "");
+   for (UINT i = 0; i < count && i < 4; i++)
+      D3D9_FRAME("  (%ld,%ld-%ld,%ld)", rects[i].left, rects[i].top, rects[i].right,
+                 rects[i].bottom);
    if (!device->nine)
       return S_OK;
    /* RECT and D3DRECT are the same four LONGs. The low three flags are the
@@ -1173,6 +1505,7 @@ d3d9_set_render_state(HANDLE handle, const D3DDDIARG_RENDERSTATE *arg)
 {
    struct d3d9_device *device = handle;
 
+   D3D9_HERE();
    /* Nine refuses the states it does not know; the runtime sends some of its
     * own, and a refusal here would fail the program's call. */
    if (device->nine)
@@ -1185,6 +1518,7 @@ d3d9_set_render_state(HANDLE handle, const D3DDDIARG_RENDERSTATE *arg)
 static HRESULT APIENTRY
 d3d9_set_texture_stage_state(HANDLE handle, const D3DDDIARG_TEXTURESTAGESTATE *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    unsigned sampler = 0;
 
@@ -1217,6 +1551,7 @@ d3d9_set_texture_stage_state(HANDLE handle, const D3DDDIARG_TEXTURESTAGESTATE *a
 static HRESULT APIENTRY
 d3d9_set_texture(HANDLE handle, UINT stage, HANDLE texture)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = texture;
 
@@ -1231,6 +1566,7 @@ d3d9_set_texture(HANDLE handle, UINT stage, HANDLE texture)
 static HRESULT APIENTRY
 d3d9_set_viewport(HANDLE handle, const D3DDDIARG_VIEWPORTINFO *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    unsigned rect[4] = {arg->X, arg->Y, arg->Width, arg->Height};
 
@@ -1243,6 +1579,7 @@ d3d9_set_viewport(HANDLE handle, const D3DDDIARG_VIEWPORTINFO *arg)
 static HRESULT APIENTRY
 d3d9_set_z_range(HANDLE handle, const D3DDDIARG_ZRANGE *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    float range[2] = {arg->MinZ, arg->MaxZ};
 
@@ -1255,6 +1592,7 @@ d3d9_set_z_range(HANDLE handle, const D3DDDIARG_ZRANGE *arg)
 static HRESULT APIENTRY
 d3d9_set_scissor_rect(HANDLE handle, const RECT *rect)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1265,6 +1603,7 @@ d3d9_set_scissor_rect(HANDLE handle, const RECT *rect)
 static HRESULT APIENTRY
 d3d9_set_clip_plane(HANDLE handle, const D3DDDIARG_SETCLIPPLANE *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1275,6 +1614,7 @@ d3d9_set_clip_plane(HANDLE handle, const D3DDDIARG_SETCLIPPLANE *arg)
 static HRESULT APIENTRY
 d3d9_set_transform(HANDLE handle, const D3DDDIARG_SETTRANSFORM *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1286,6 +1626,7 @@ d3d9_set_transform(HANDLE handle, const D3DDDIARG_SETTRANSFORM *arg)
 static HRESULT APIENTRY
 d3d9_multiply_transform(HANDLE handle, const D3DDDIARG_MULTIPLYTRANSFORM *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1297,6 +1638,7 @@ d3d9_multiply_transform(HANDLE handle, const D3DDDIARG_MULTIPLYTRANSFORM *arg)
 static HRESULT APIENTRY
 d3d9_set_material(HANDLE handle, const D3DDDIARG_SETMATERIAL *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1308,6 +1650,7 @@ d3d9_set_material(HANDLE handle, const D3DDDIARG_SETMATERIAL *arg)
 static HRESULT APIENTRY
 d3d9_set_light(HANDLE handle, const D3DDDIARG_SETLIGHT *arg, const D3DDDI_LIGHT *light)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1326,6 +1669,7 @@ d3d9_set_light(HANDLE handle, const D3DDDIARG_SETLIGHT *arg, const D3DDDI_LIGHT 
 static HRESULT APIENTRY
 d3d9_destroy_light(HANDLE handle, const D3DDDIARG_DESTROYLIGHT *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (device->nine)
@@ -1370,6 +1714,7 @@ static HRESULT APIENTRY
 d3d9_create_vertex_shader_decl(HANDLE handle, D3DDDIARG_CREATEVERTEXSHADERDECL *arg,
                                const D3DDDIVERTEXELEMENT *elements)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_declaration *declaration;
    long result = S_OK;
@@ -1397,6 +1742,7 @@ d3d9_create_vertex_shader_decl(HANDLE handle, D3DDDIARG_CREATEVERTEXSHADERDECL *
 static HRESULT APIENTRY
 d3d9_set_vertex_shader_decl(HANDLE handle, HANDLE declaration_handle)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_declaration *declaration = declaration_handle;
 
@@ -1411,6 +1757,7 @@ d3d9_set_vertex_shader_decl(HANDLE handle, HANDLE declaration_handle)
 static HRESULT APIENTRY
 d3d9_delete_vertex_shader_decl(HANDLE handle, HANDLE declaration_handle)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_declaration *declaration = declaration_handle;
 
@@ -1427,6 +1774,7 @@ static HRESULT APIENTRY
 d3d9_create_vertex_shader_func(HANDLE handle, D3DDDIARG_CREATEVERTEXSHADERFUNC *arg,
                                const UINT *code)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    long result = S_OK;
 
@@ -1441,6 +1789,7 @@ d3d9_create_vertex_shader_func(HANDLE handle, D3DDDIARG_CREATEVERTEXSHADERFUNC *
 static HRESULT APIENTRY
 d3d9_set_vertex_shader_func(HANDLE handle, HANDLE shader)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    D3D9_TRACE("vertex shader %p", shader);
@@ -1452,6 +1801,7 @@ d3d9_set_vertex_shader_func(HANDLE handle, HANDLE shader)
 static HRESULT APIENTRY
 d3d9_create_pixel_shader(HANDLE handle, D3DDDIARG_CREATEPIXELSHADER *arg, const UINT *code)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    long result = S_OK;
 
@@ -1466,6 +1816,7 @@ d3d9_create_pixel_shader(HANDLE handle, D3DDDIARG_CREATEPIXELSHADER *arg, const 
 static HRESULT APIENTRY
 d3d9_set_pixel_shader(HANDLE handle, HANDLE shader)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    D3D9_TRACE("pixel shader %p", shader);
@@ -1478,6 +1829,7 @@ d3d9_set_pixel_shader(HANDLE handle, HANDLE shader)
 static HRESULT APIENTRY
 d3d9_delete_object(HANDLE handle, HANDLE object)
 {
+   D3D9_HERE();
    (void)handle;
    entangled_nine_release(object);
    return S_OK;
@@ -1487,6 +1839,7 @@ static HRESULT APIENTRY
 d3d9_set_vertex_shader_const(HANDLE handle, const D3DDDIARG_SETVERTEXSHADERCONST *arg,
                              const void *data)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1499,6 +1852,7 @@ static HRESULT APIENTRY
 d3d9_set_vertex_shader_const_i(HANDLE handle, const D3DDDIARG_SETVERTEXSHADERCONSTI *arg,
                                const INT *data)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1511,6 +1865,7 @@ static HRESULT APIENTRY
 d3d9_set_vertex_shader_const_b(HANDLE handle, const D3DDDIARG_SETVERTEXSHADERCONSTB *arg,
                                const BOOL *data)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1523,6 +1878,7 @@ static HRESULT APIENTRY
 d3d9_set_pixel_shader_const(HANDLE handle, const D3DDDIARG_SETPIXELSHADERCONST *arg,
                             const FLOAT *data)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1535,6 +1891,7 @@ static HRESULT APIENTRY
 d3d9_set_pixel_shader_const_i(HANDLE handle, const D3DDDIARG_SETPIXELSHADERCONSTI *arg,
                               const INT *data)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1547,6 +1904,7 @@ static HRESULT APIENTRY
 d3d9_set_pixel_shader_const_b(HANDLE handle, const D3DDDIARG_SETPIXELSHADERCONSTB *arg,
                               const BOOL *data)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1560,6 +1918,7 @@ d3d9_set_pixel_shader_const_b(HANDLE handle, const D3DDDIARG_SETPIXELSHADERCONST
 static HRESULT APIENTRY
 d3d9_set_stream_source(HANDLE handle, const D3DDDIARG_SETSTREAMSOURCE *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = arg->hVertexBuffer;
 
@@ -1588,6 +1947,7 @@ static HRESULT APIENTRY
 d3d9_set_stream_source_um(HANDLE handle, const D3DDDIARG_SETSTREAMSOURCEUM *arg,
                           const void *memory)
 {
+   D3D9_HERE();
    static volatile LONG said;
    struct d3d9_device *device = handle;
 
@@ -1606,6 +1966,7 @@ d3d9_set_stream_source_um(HANDLE handle, const D3DDDIARG_SETSTREAMSOURCEUM *arg,
 static HRESULT APIENTRY
 d3d9_set_stream_source_freq(HANDLE handle, const D3DDDIARG_SETSTREAMSOURCEFREQ *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    if (!device->nine)
@@ -1617,6 +1978,7 @@ d3d9_set_stream_source_freq(HANDLE handle, const D3DDDIARG_SETSTREAMSOURCEFREQ *
 static HRESULT APIENTRY
 d3d9_set_indices(HANDLE handle, const D3DDDIARG_SETINDICES *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = arg->hIndexBuffer;
 
@@ -1637,6 +1999,7 @@ d3d9_set_indices(HANDLE handle, const D3DDDIARG_SETINDICES *arg)
 static HRESULT APIENTRY
 d3d9_set_indices_um(HANDLE handle, UINT index_size, const void *memory)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    device->um_indices = memory;
@@ -1706,6 +2069,8 @@ d3d9_draw_primitive(HANDLE handle, const D3DDDIARG_DRAWPRIMITIVE *arg, const UIN
    struct d3d9_device *device = handle;
 
    (void)flag_buffer;
+   InterlockedIncrement(&count_draws);
+   D3D9_HERE();
    D3D9_TRACE("draw: type %u start %u count %u%s", (unsigned)arg->PrimitiveType, arg->VStart,
               arg->PrimitiveCount, device->um_vertices ? " (memory)" : "");
    if (!device->nine)
@@ -1725,6 +2090,8 @@ d3d9_draw_indexed_primitive(HANDLE handle, const D3DDDIARG_DRAWINDEXEDPRIMITIVE 
 {
    struct d3d9_device *device = handle;
 
+   InterlockedIncrement(&count_draws);
+   D3D9_HERE();
    if (!device->nine)
       return S_OK;
    if (device->um_vertices && device->um_indices)
@@ -1760,6 +2127,8 @@ d3d9_draw_primitive2(HANDLE handle, const D3DDDIARG_DRAWPRIMITIVE2 *arg)
    UINT stride = device->stream0_stride;
    long result;
 
+   InterlockedIncrement(&count_draws);
+   D3D9_HERE();
    D3D9_TRACE("draw2: type %u offset %u count %u stride %u%s", (unsigned)arg->PrimitiveType,
               arg->FirstVertexOffset, arg->PrimitiveCount, stride,
               device->um_vertices ? " (memory)" : "");
@@ -1792,6 +2161,8 @@ d3d9_draw_indexed_primitive2(HANDLE handle, const D3DDDIARG_DRAWINDEXEDPRIMITIVE
    long result;
 
    (void)flag_buffer;
+   InterlockedIncrement(&count_draws);
+   D3D9_HERE();
    D3D9_TRACE("draw indexed2: type %u base %d count %u stride %u%s",
               (unsigned)arg->PrimitiveType, arg->BaseVertexOffset, arg->PrimitiveCount, stride,
               device->um_vertices ? " (memory)" : "");
@@ -1814,6 +2185,7 @@ d3d9_draw_indexed_primitive2(HANDLE handle, const D3DDDIARG_DRAWINDEXEDPRIMITIVE
 static HRESULT APIENTRY
 d3d9_create_query(HANDLE handle, D3DDDIARG_CREATEQUERY *arg)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
    long result = S_OK;
 
@@ -1821,13 +2193,16 @@ d3d9_create_query(HANDLE handle, D3DDDIARG_CREATEQUERY *arg)
    if (!device->nine)
       return S_OK;
    arg->hQuery = entangled_nine_query_create(device->nine, (unsigned)arg->QueryType, &result);
+   D3D9_FRAME("query of type %u: %p", (unsigned)arg->QueryType, (void *)arg->hQuery);
    D3D9_CHECK("query", result);
 }
 
 static HRESULT APIENTRY
 d3d9_issue_query(HANDLE handle, const D3DDDIARG_ISSUEQUERY *arg)
 {
+   D3D9_HERE();
    (void)handle;
+   D3D9_FRAME("query %p %s", (void *)arg->hQuery, arg->Flags.Begin ? "begins" : "ends");
    if (!arg->hQuery)
       return S_OK;
    /* D3DISSUE_END is 1 and D3DISSUE_BEGIN 2. */
@@ -1837,11 +2212,16 @@ d3d9_issue_query(HANDLE handle, const D3DDDIARG_ISSUEQUERY *arg)
 static HRESULT APIENTRY
 d3d9_get_query_data(HANDLE handle, const D3DDDIARG_GETQUERYDATA *arg)
 {
+   D3D9_HERE();
+   long result;
+
    (void)handle;
    if (!arg->hQuery)
       return S_OK;
-   return (HRESULT)entangled_nine_query_data(arg->hQuery, arg->pData,
-                                             entangled_nine_query_size(arg->hQuery), 1);
+   result = entangled_nine_query_data(arg->hQuery, arg->pData,
+                                      entangled_nine_query_size(arg->hQuery), 1);
+   D3D9_FRAME("query %p data: 0x%08lx", (void *)arg->hQuery, (unsigned long)result);
+   return (HRESULT)result;
 }
 
 /* -------------------------------------------------------------- present */
@@ -1849,6 +2229,7 @@ d3d9_get_query_data(HANDLE handle, const D3DDDIARG_GETQUERYDATA *arg)
 static HRESULT APIENTRY
 d3d9_flush1(HANDLE handle, UINT flags)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    (void)flags;
@@ -1872,6 +2253,9 @@ d3d9_present1(HANDLE handle, const D3DDDIARG_PRESENT1 *arg)
    long result;
    HRESULT hr;
 
+   InterlockedIncrement(&count_presents);
+   D3D9_HERE();
+   D3D9_FRAME("present");
    if (!device->nine || !arg->SrcResources || !arg->phSrcResources)
       return S_OK;
    resource = arg->phSrcResources[0].hResource;
@@ -1916,6 +2300,7 @@ d3d9_present1(HANDLE handle, const D3DDDIARG_PRESENT1 *arg)
 static HRESULT APIENTRY
 d3d9_destroy_device(HANDLE handle)
 {
+   D3D9_HERE();
    struct d3d9_device *device = handle;
 
    entangled_nine_release(device->scratch_indices);
@@ -2012,9 +2397,26 @@ d3d9_create_device(HANDLE adapter, D3DDDIARG_CREATEDEVICE *arg)
    funcs->pfnVolBlt = NULL;
    funcs->pfnTexBlt = NULL;
    funcs->pfnBufBlt = NULL;
+   /* No asynchronous locks: with these three given, Windows 10's runtime
+    * plays the device's calls from a worker thread of its own and calls
+    * these from the program's thread at the same time, and nothing under
+    * this front (Nine, the threaded context, Zink) may be entered by two
+    * threads. Without them every call comes in order from one thread at a
+    * time. ENTANGLED_D3D9_ASYNC=1 gives them back, to work on that. */
+   {
+      char want[4] = "";
+
+      GetEnvironmentVariableA("ENTANGLED_D3D9_ASYNC", want, sizeof want);
+      if (want[0] != '1') {
+         funcs->pfnLockAsync = NULL;
+         funcs->pfnUnlockAsync = NULL;
+         funcs->pfnRename = NULL;
+      }
+   }
    arg->hDevice = device;
    d3d9_log("device %p: interface %u, version 0x%x, flags 0x%x", (void *)device,
             arg->Interface, arg->Version, arg->Flags.Value);
+   d3d9_sample_this_thread();
    {
       D3DDDICB_CREATECONTEXT create;
       HRESULT hr;
@@ -2046,6 +2448,7 @@ d3d9_create_device(HANDLE adapter, D3DDDIARG_CREATEDEVICE *arg)
 static HRESULT APIENTRY
 d3d9_close_adapter(HANDLE handle)
 {
+   D3D9_HERE();
    d3d9_log("adapter %p closed", handle);
    free(handle);
    return S_OK;

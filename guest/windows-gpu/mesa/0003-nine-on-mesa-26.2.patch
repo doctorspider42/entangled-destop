@@ -203,7 +203,7 @@ index 965f29db..e3cbe89a 100644
                      required_valid_region->width,
                      64,
 diff --git a/src/gallium/frontends/nine/device9.c b/src/gallium/frontends/nine/device9.c
-index 4fe9c07c..cc1a5562 100644
+index 4fe9c07c..47b45ed5 100644
 --- a/src/gallium/frontends/nine/device9.c
 +++ b/src/gallium/frontends/nine/device9.c
 @@ -125,20 +125,23 @@ NineDevice9_SetDefaultState( struct NineDevice9 *This, bool is_reset )
@@ -328,7 +328,17 @@ index 4fe9c07c..cc1a5562 100644
      nine_csmt_process(This);
  
      if (This->params.BehaviorFlags & D3DCREATE_FPU_PRESERVE)
-@@ -3116,7 +3126,7 @@ NineDevice9_DrawPrimitiveUP( struct NineDevice9 *This,
+@@ -1942,6 +1952,9 @@ NineDevice9_ColorFill( struct NineDevice9 *This,
+         h = surf->desc.Height;
+     }
+ 
++    /* An empty rectangle fills nothing. */
++    user_assert(w && h, D3D_OK);
++
+     if (surf->base.info.bind & PIPE_BIND_RENDER_TARGET) {
+         nine_context_clear_render_target(This, surf, color, x, y, w, h);
+     } else {
+@@ -3116,7 +3129,7 @@ NineDevice9_DrawPrimitiveUP( struct NineDevice9 *This,
                  D3DERR_INVALIDCALL);
      user_assert(PrimitiveCount, D3D_OK);
  
@@ -337,7 +347,7 @@ index 4fe9c07c..cc1a5562 100644
                    0,
                    (prim_count_to_vertex_count(PrimitiveType, PrimitiveCount)) * VertexStreamZeroStride,
                    1,
-@@ -3179,7 +3189,7 @@ NineDevice9_DrawIndexedPrimitiveUP( struct NineDevice9 *This,
+@@ -3179,7 +3192,7 @@ NineDevice9_DrawIndexedPrimitiveUP( struct NineDevice9 *This,
      base = MinVertexIndex * VertexStreamZeroStride;
      vbuf.is_user_buffer = false;
      vbuf.buffer.resource = NULL;
@@ -346,7 +356,7 @@ index 4fe9c07c..cc1a5562 100644
                    base,
                    NumVertices * VertexStreamZeroStride, /* XXX */
                    64,
-@@ -3191,7 +3201,7 @@ NineDevice9_DrawIndexedPrimitiveUP( struct NineDevice9 *This,
+@@ -3191,7 +3204,7 @@ NineDevice9_DrawIndexedPrimitiveUP( struct NineDevice9 *This,
      vbuf.buffer_offset -= base;
  
      unsigned index_offset = 0;
@@ -633,7 +643,7 @@ index cc70f6fd..3c1ff2f1 100644
  
      parse_shader(tx);
 diff --git a/src/gallium/frontends/nine/nine_state.c b/src/gallium/frontends/nine/nine_state.c
-index 623f1dc3..eaface38 100644
+index 623f1dc3..9773635a 100644
 --- a/src/gallium/frontends/nine/nine_state.c
 +++ b/src/gallium/frontends/nine/nine_state.c
 @@ -519,7 +519,7 @@ prepare_vs_constants_userbuf(struct NineDevice9 *device)
@@ -682,6 +692,15 @@ index 623f1dc3..eaface38 100644
      }
  
      fb->width = w;
+@@ -853,7 +853,7 @@ update_vertex_elements(struct NineDevice9 *device)
+     BOOL need_dummy_vbo = false;
+     struct cso_velems_state ve;
+     unsigned vtxbuf_mask;
+-    unsigned vtxbuf_holes_map[PIPE_MAX_ATTRIBS];
++    unsigned vtxbuf_holes_map[PIPE_MAX_ATTRIBS] = {0};
+ 
+     context->stream_usage_mask = 0;
+     memset(vdecl_index_map, -1, 16);
 @@ -969,7 +969,7 @@ update_vertex_buffers(struct NineDevice9 *device)
         memset(&vbuffer[i], 0, sizeof(vbuffer[i]) * (num_vertex_buffers - i));
  
@@ -797,7 +816,17 @@ index 623f1dc3..eaface38 100644
          if (Flags & D3DCLEAR_ZBUFFER) bufs |= PIPE_CLEAR_DEPTH;
          if (Flags & D3DCLEAR_STENCIL) bufs |= PIPE_CLEAR_STENCIL;
      }
-@@ -2350,7 +2354,7 @@ CSMT_ITEM_NO_WAIT(nine_context_clear_fb,
+@@ -2330,6 +2334,9 @@ CSMT_ITEM_NO_WAIT(nine_context_clear_fb,
+ 
+     if (rect.x1 >= context->pipe_data.fb.width || rect.y1 >= context->pipe_data.fb.height)
+         return;
++    /* A viewport or scissor that leaves nothing: nothing to clear either. */
++    if (rect.x2 <= rect.x1 || rect.y2 <= rect.y1)
++        return;
+ 
+     for (i = 0; i < device->caps.NumSimultaneousRTs; ++i) {
+         if (context->rt[i] && context->rt[i]->desc.Format != D3DFMT_NULL)
+@@ -2350,7 +2357,7 @@ CSMT_ITEM_NO_WAIT(nine_context_clear_fb,
           rect.x2 >= zsbuf_surf->desc.Width &&
           rect.y2 >= zsbuf_surf->desc.Height))) {
          DBG("Clear fast path\n");
@@ -806,7 +835,32 @@ index 623f1dc3..eaface38 100644
          return;
      }
  
-@@ -2430,7 +2434,6 @@ init_draw_info(struct pipe_draw_info *info,
+@@ -2383,6 +2390,9 @@ CSMT_ITEM_NO_WAIT(nine_context_clear_fb,
+             y2 = MIN3(y2, rect.y2, rt->desc.Height);
+ 
+             DBG("Clearing (%u..%u)x(%u..%u)\n", x1, x2, y1, y2);
++            /* Nothing left of it. */
++            if (x2 <= x1 || y2 <= y1)
++                continue;
+             pipe->clear_render_target(pipe, cbuf, &rgba,
+                                       x1, y1, x2 - x1, y2 - y1, false);
+         }
+@@ -2403,10 +2413,12 @@ CSMT_ITEM_NO_WAIT(nine_context_clear_fb,
+         if (pRects[r].y1 > pRects[r].y2) continue;
+ #endif
+ 
+-        x1 = MIN2(x1, rect.x1);
+-        y1 = MIN2(y1, rect.y1);
++        x1 = MAX2(x1, rect.x1);
++        y1 = MAX2(y1, rect.y1);
+         x2 = MIN3(x2, rect.x2, zsbuf_surf->desc.Width);
+         y2 = MIN3(y2, rect.y2, zsbuf_surf->desc.Height);
++        if (x2 <= x1 || y2 <= y1)
++            continue;
+ 
+         zsbuf = NineSurface9_GetSurface(zsbuf_surf, 0);
+         assert(zsbuf);
+@@ -2430,7 +2442,6 @@ init_draw_info(struct pipe_draw_info *info,
          info->instance_count = MAX2(dev->context.stream_freq[0] & 0x7FFFFF, 1);
      info->primitive_restart = false;
      info->has_user_indices = false;
@@ -814,16 +868,56 @@ index 623f1dc3..eaface38 100644
      info->index_bias_varies = false;
      info->increment_draw_id = false;
      info->was_line_loop = false;
-@@ -2534,7 +2537,7 @@ CSMT_ITEM_NO_WAIT(nine_context_draw_indexed_primitive_from_vtxbuf_idxbuf,
+@@ -2507,17 +2518,24 @@ CSMT_ITEM_NO_WAIT(nine_context_draw_indexed_primitive_from_vtxbuf_idxbuf,
+     struct nine_context *context = &device->context;
+     struct pipe_draw_info info;
+     struct pipe_draw_start_count_bias draw;
++    struct pipe_vertex_buffer stream0;
++    unsigned stream0_bound;
+ 
+     if (context->vs && context->vs->swvp_only && !context->swvp)
+         return;
+ 
+-    if (context->vtxstride[0] != vbuf_stride) {
+-        context->vtxstride[0] = vbuf_stride;
+-        /* force elements update for stride.
+-         * We don't need to restore the old value,
+-         * as the caller set its to 0 after the call */
+-        context->changed.group |= NINE_STATE_VDECL;
+-    }
++    context->vtxstride[0] = vbuf_stride;
++
++    /* Stream 0 is this buffer for the length of the draw, and the state
++     * update has to see it bound: the vertex elements are numbered by the
++     * streams that are, and an element of one that is not would take its
++     * buffer index from nowhere. */
++    stream0 = context->vtxbuf[0];
++    stream0_bound = context->vtxbuf_mask & 1;
++    context->vtxbuf[0] = *vbuf;
++    context->vtxbuf_mask |= 1;
++    context->changed.group |= NINE_STATE_VDECL;
++    context->changed.vtxbuf_dirty = true;
+ 
+     nine_update_state(device);
+ 
+@@ -2534,10 +2552,13 @@ CSMT_ITEM_NO_WAIT(nine_context_draw_indexed_primitive_from_vtxbuf_idxbuf,
      else
          info.index.user = user_ibuf;
  
 -    util_set_vertex_buffers(context->pipe, 1, false, vbuf);
-+    context->pipe->set_vertex_buffers(context->pipe, 1, vbuf);
-     context->changed.vtxbuf_dirty = true;
- 
+-    context->changed.vtxbuf_dirty = true;
+-
      context->pipe->draw_vbo(context->pipe, &info, 0, NULL, &draw, 1);
-@@ -3045,14 +3048,14 @@ nine_context_clear(struct NineDevice9 *device)
++
++    context->vtxbuf[0] = stream0;
++    if (!stream0_bound)
++        context->vtxbuf_mask &= ~1u;
++    context->changed.group |= NINE_STATE_VDECL;
++    context->changed.vtxbuf_dirty = true;
+ }
+ 
+ CSMT_ITEM_NO_WAIT(nine_context_resource_copy_region,
+@@ -3045,14 +3066,14 @@ nine_context_clear(struct NineDevice9 *device)
       * do not change on Reset.
       */
  
@@ -842,7 +936,7 @@ index 623f1dc3..eaface38 100644
                              NINE_MAX_SAMPLERS_PS, NULL);
  
      pipe->set_vertex_buffers(pipe, 0, NULL);
-@@ -3068,6 +3071,8 @@ nine_context_clear(struct NineDevice9 *device)
+@@ -3068,6 +3089,8 @@ nine_context_clear(struct NineDevice9 *device)
      pipe_resource_reference(&context->idxbuf, NULL);
      pipe_resource_reference(&context->pipe_data.cb_vs.buffer, NULL);
      pipe_resource_reference(&context->pipe_data.cb_ps.buffer, NULL);
@@ -851,7 +945,7 @@ index 623f1dc3..eaface38 100644
  
      for (i = 0; i < NINE_MAX_SAMPLERS; ++i) {
          context->texture[i].enabled = false;
-@@ -3244,7 +3249,7 @@ update_vertex_buffers_sw(struct NineDevice9 *device, int dummy_vbo_stream,
+@@ -3244,7 +3267,7 @@ update_vertex_buffers_sw(struct NineDevice9 *device, int dummy_vbo_stream,
              if (!device->driver_caps.user_sw_vbufs) {
                  vbuffer[j].buffer.resource = NULL;
                  vbuffer[j].is_user_buffer = false;
@@ -860,7 +954,7 @@ index 623f1dc3..eaface38 100644
                                0,
                                box.width,
                                16,
-@@ -3299,13 +3304,13 @@ update_vs_constants_sw(struct NineDevice9 *device)
+@@ -3299,13 +3322,13 @@ update_vs_constants_sw(struct NineDevice9 *device)
  
          buf = cb.user_buffer;
  
@@ -876,7 +970,7 @@ index 623f1dc3..eaface38 100644
          if (cb.buffer)
              pipe_resource_reference(&cb.buffer, NULL);
      }
-@@ -3318,7 +3323,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
+@@ -3318,7 +3341,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
          cb.buffer_size = 2048 * sizeof(float[4]);
          cb.user_buffer = state->vs_const_i;
  
@@ -885,7 +979,7 @@ index 623f1dc3..eaface38 100644
          if (cb.buffer)
              pipe_resource_reference(&cb.buffer, NULL);
      }
-@@ -3331,7 +3336,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
+@@ -3331,7 +3354,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
          cb.buffer_size = 512 * sizeof(float[4]);
          cb.user_buffer = state->vs_const_b;
  
@@ -894,7 +988,7 @@ index 623f1dc3..eaface38 100644
          if (cb.buffer)
              pipe_resource_reference(&cb.buffer, NULL);
      }
-@@ -3351,7 +3356,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
+@@ -3351,7 +3374,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
          cb.user_buffer = viewport_data;
  
          {
@@ -903,7 +997,7 @@ index 623f1dc3..eaface38 100644
                            0,
                            cb.buffer_size,
                            16,
-@@ -3362,7 +3367,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
+@@ -3362,7 +3385,7 @@ update_vs_constants_sw(struct NineDevice9 *device)
              cb.user_buffer = NULL;
          }
  
