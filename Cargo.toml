@@ -24,6 +24,7 @@ members = [
     "crates/pc-bios",
     "crates/ide",
     "crates/rtl8139",
+    "crates/gl-passthrough",
     "crates/virtio-console",
     "crates/virtio-block",
     "crates/virtio-net",
@@ -68,6 +69,7 @@ hda = { path = "crates/hda", version = "0.2.0" }
 pc-bios = { path = "crates/pc-bios", version = "0.2.0" }
 ide = { path = "crates/ide", version = "0.2.0" }
 rtl8139 = { path = "crates/rtl8139", version = "0.2.0" }
+gl-passthrough = { path = "crates/gl-passthrough", version = "0.2.0" }
 virtio-console = { path = "crates/virtio-console", version = "0.2.0" }
 virtio-net = { path = "crates/virtio-net", version = "0.2.0" }
 virtio-gpu = { path = "crates/virtio-gpu", version = "0.2.0" }

@@ -1761,6 +1761,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gl-passthrough"
+version = "0.2.0"
+dependencies = [
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "gl_generator"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
