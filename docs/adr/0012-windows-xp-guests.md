@@ -1,8 +1,10 @@
 # ADR-0012: Windows XP guests — the legacy PC this machine never was
 
-Status: **proposed** (2026-11-11); phase X0 done (2026-11-12): the untouched
-XP CD boots through a BIOS of our own to the XP kernel, which stops where it
-should without a disk controller (0x7B). Nothing is installed yet.
+Status: **proposed** (2026-11-11); phases X0 and X1 done (2026-11-12): the
+untouched XP CD boots through a BIOS of our own into text-mode Setup, which
+draws its screens, takes keys and sees the disk. Setup formats
+the disk and copies its files; GUI-mode Setup, after the restart, is not
+reached yet.
 Extends ADR-0008 (Windows guests), which reached Windows 10, 11 and 7 through
 UEFI, virtio and MSI. Branch: `winxp-guests`, cut from `windows-guests`.
 
@@ -151,7 +153,7 @@ indexes are bounded and go through `vm-memory`.
 | Phase | Contents | Acceptance (WHP first) |
 |---|---|---|
 | **X0 — the BIOS speaks** (done) | `mode = "bios"`, the BIOS of §1, the 8259's interrupt, the legacy ACPI tables | the XP CD's loader runs and starts the XP kernel |
-| **X1 — a screen and a CD** | VGA text mode, IDE + ATAPI | the XP CD boots to the blue "Windows XP Professional Setup" screen and takes keys |
+| **X1 — a screen and a CD** (done) | VGA text mode, IDE + ATAPI | the XP CD boots to the blue "Windows XP Professional Setup" screen and takes keys |
 | **X2 — Setup runs** | ATA disk, bus-master DMA, planar VGA | text-mode Setup formats and copies; GUI-mode Setup draws; the mouse moves |
 | **X3 — a desktop** | whatever the first boots stop on (ACPI, MSRs, timers), VBE modes | the installed system reaches the desktop, 10 boots without a stop, shutdown ends the run |
 | **X4 — network and sound** | level INTx + `_PRT`, RTL8139, AC'97 | the guest reaches the internet through usernet; a sound plays |
@@ -246,3 +248,66 @@ Not done: KVM (the legacy tables, the BIOS and the boot plan build there
 and the in-kernel 8259 needs nothing, but no BIOS guest has run on it); a
 snapshot of a BIOS machine (refused by name); `int 10h` beyond text mode;
 `int 13h` for floppies; the timer tick's midnight rollover.
+
+## Amendment, 2026-11-12: X1 — text-mode Setup, on an IDE controller and a VGA
+
+The same profile now reaches "Welcome to Setup." about a minute after
+start, in XP's own font; Enter shows the licence, F8 accepts it, and the
+partition screen lists "8190 MB Disk 0 at Id 0 on bus 0 on atapi [MBR]".
+What that took:
+
+**An IDE controller** (`crates/ide`, `machine_x86::ide_function`). Two
+channels at the fixed ISA ports on IRQ 14 and 15, the profile's `[[disk]]`s
+on the primary and its `[[optical]]` drives on the secondary, two of each
+at most. ATA disks are new; the ATAPI drive is `ahci::Atapi`, whose packet
+command set the controller reaches through the ATA PACKET protocol instead
+of an AHCI FIS, so §3's "split the packet layer" needed no change to that
+crate. A BIOS machine gets this controller *instead of* virtio-blk and the
+AHCI controller: its guest has a driver for neither, and one image must not
+sit behind two controllers.
+
+- **PIO only**, on the vCPU thread: no bus master, so no thread of its own
+  and no `Quiesce` gate to take. The identify data offers no DMA mode and a
+  command that asks for one is aborted. §3's bus-master DMA is still owed,
+  and is what phase X2's file copy will want.
+- The PCI function is an identity only (class `0101`, compatibility mode,
+  no BARs, no interrupt pin), with a vendor id no chipset driver claims, so
+  Windows binds its standard dual-channel driver by class. An Intel PIIX id
+  would have brought `intelide.sys` and its timing registers.
+- **The root bridge has to own the ports.** The first run with the
+  controller still ended in 0x7B, and the exit statistics said why without
+  a debugger: XP never touched `0x1f0`. `PCI0._CRS` named only the
+  configuration ports and the VGA range, and XP gives a PCI function no
+  port its bridge does not pass down. The legacy tables now give the bridge
+  the whole I/O space on both sides of `0xcf8`, as a PC's do.
+
+**A VGA register file** (`machine_x86::vga`). XP's `vga.sys` probes the
+graphics controller, programs every register, loads a font and moves the
+cursor through the CRT controller. The registers at `0x3c0..0x3df` are
+modelled; display memory is not. Text mode is drawn from what the registers
+say — geometry, cursor, the palette through the attribute controller and
+the DAC — over the character cells at `B800:0000`, which are plain guest
+RAM, and with the font the guest loaded, which lands in that same RAM at
+`A000:0000` while the sequencer selects plane 2 and is read back from
+there. That is honest for text and wrong for anything planar: the boot
+screen and GUI-mode Setup need the four planes and the write modes behind a
+trap (X2), and until then a graphics mode leaves the last text frame up.
+The presenter (`bios_text_present`) draws the BIOS's screen until the guest
+programs the CRT controller and the VGA's after.
+
+Keys reach Setup through the 8042 and XP's `i8042prt`, on IOAPIC pin 1: by
+then the HAL has masked the 8259s, and the BIOS no longer drains the
+controller because nothing calls the BIOS.
+
+**Further than X1 asked.** Driven over the control channel (Enter, F8,
+Enter, a format choice), Setup partitioned the 8 GiB disk, formatted it as
+NTFS — a full format, about five minutes — and copied its files: 95 % of
+the copy was done when the fifteen-minute run was stopped by its own
+timeout, at 1 500–1 800 port exits a second. So the text-mode half of X2
+works on PIO as it is. The restart into GUI-mode Setup has not been tried,
+and it will stop at the VGA: that is where the planar modes begin.
+
+Not done: KVM (builds; IRQ 14/15 are irqfds there; nothing run); bus-master
+DMA; a snapshot of a BIOS machine; the PCI identity of the VGA (XP's
+`VgaSave` finds it at the legacy ports; a PnP display driver will want a
+class-`0300` function); `[[disk]]`/`[[optical]]` beyond two each.

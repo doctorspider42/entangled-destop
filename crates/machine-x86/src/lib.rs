@@ -10,7 +10,9 @@ pub mod boot;
 pub mod bus;
 pub mod hda_function;
 pub mod i8042;
+pub mod ide_function;
 pub mod msi_cap;
+pub mod vga;
 
 /// The boot framebuffer (ADR-0008 §1): a PCI display with a linear
 /// framebuffer, for guests that draw where the firmware's GOP pointed.

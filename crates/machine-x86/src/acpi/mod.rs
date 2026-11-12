@@ -565,6 +565,16 @@ fn dsdt(vcpu_count: u32, mmio64_base: u64) -> Vec<u8> {
     // prefetchable BAR inside a window that is not. Left out for
     // [`NO_MMIO64`]: a 32-bit Windows XP stops with ACPI_BIOS_ERROR
     // (0xA5, 2) on a root bridge window it cannot address.
+    if mmio64_base == NO_MMIO64 {
+        // A BIOS-era machine's root bridge passes down every I/O port but
+        // the configuration ones, as a PC's does. Its IDE controller is a
+        // PCI function at the fixed ISA ports (0x1f0, 0x170, 0x3f6, 0x376),
+        // and Windows XP gives a PCI device no port its bridge does not
+        // own: with only the VGA range here the controller never started
+        // (stop 0x7B). The two ranges replace the VGA one, which they cover.
+        pci_resources[2] = aml::word_io(0x0000, 0x0cf7);
+        pci_resources.insert(3, aml::word_io(0x0d00, 0xffff));
+    }
     if mmio64_base != NO_MMIO64 {
         pci_resources.push(aml::qword_memory(
             mmio64_base,
@@ -795,6 +805,15 @@ mod tests {
         let legacy = AcpiTables::new(1, NO_MMIO64).unwrap();
         let default = AcpiTables::new(1, TEST_MMIO64_BASE).unwrap();
         assert!(find(&default, b"_PRT").is_none());
+        // The legacy bridge owns the I/O space on both sides of 0xcf8.
+        let io_window = |min: u16, max: u16| {
+            let mut bytes = vec![0x88, 0x0d, 0x00, 0x01];
+            bytes.extend_from_slice(&aml::word_io(min, max)[4..]);
+            bytes
+        };
+        assert!(find(&legacy, &io_window(0x0000, 0x0cf7)).is_some());
+        assert!(find(&legacy, &io_window(0x0d00, 0xffff)).is_some());
+        assert!(find(&default, &io_window(0x0000, 0x0cf7)).is_none());
         let prt = find(&legacy, b"_PRT").expect("a _PRT");
         // The first entry: device 1, INTA#, hard-wired to the first PCI IRQ.
         let entry = [0x0c, 0xff, 0xff, 0x01, 0x00];

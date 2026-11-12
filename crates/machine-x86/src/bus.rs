@@ -89,6 +89,13 @@ pub struct MachineBus {
     /// The BIOS behind the interrupt stubs of a `mode = "bios"` machine
     /// (ADR-0012). `None` leaves its two ports undecoded, as they were.
     bios: Option<Arc<Mutex<pc_bios::Bios>>>,
+    /// The IDE controller of a BIOS-era machine (ADR-0012), at the fixed
+    /// ports `0x1f0`/`0x3f6` and `0x170`/`0x376`. `None` leaves them
+    /// undecoded.
+    ide: Option<Arc<Mutex<ide::Controller>>>,
+    /// The VGA's registers on a BIOS-era machine (ADR-0012). `None` leaves
+    /// `0x3c0..0x3df` undecoded, as on every other machine.
+    vga: Option<Arc<Mutex<crate::vga::Vga>>>,
 }
 
 #[cfg(test)]
@@ -109,6 +116,8 @@ impl MachineBus {
             rtc_timer: None,
             keyboard: None,
             bios: None,
+            ide: None,
+            vga: None,
         }
     }
 
@@ -134,6 +143,25 @@ impl MachineBus {
     pub fn with_bios(mut self, bios: Arc<Mutex<pc_bios::Bios>>) -> Self {
         self.bios = Some(bios);
         self
+    }
+
+    /// Gives the machine an IDE controller (ADR-0012), already wired to its
+    /// two interrupts.
+    pub fn with_ide(mut self, ide: ide::Controller) -> Self {
+        self.ide = Some(Arc::new(Mutex::new(ide)));
+        self
+    }
+
+    /// Gives the machine a VGA register file (ADR-0012).
+    pub fn with_vga(mut self) -> Self {
+        self.vga = Some(Arc::new(Mutex::new(crate::vga::Vga::new())));
+        self
+    }
+
+    /// The machine's VGA, when it has one: what a presenter draws text mode
+    /// from.
+    pub fn vga(&self) -> Option<&Arc<Mutex<crate::vga::Vga>>> {
+        self.vga.as_ref()
     }
 
     /// The machine's BIOS, when it has one.
@@ -529,6 +557,15 @@ impl MachineBus {
         if let Some(pci) = &self.pci {
             pci.reset();
         }
+        if let Some(Ok(mut vga)) = self.vga.as_ref().map(|vga| vga.lock()) {
+            vga.reset();
+        }
+        if let Some(ide) = &self.ide {
+            match ide.lock() {
+                Ok(mut ide) => ide.reset(),
+                Err(_) => tracing::error!("the IDE lock is poisoned; the controller is not reset"),
+            }
+        }
         match self.serial.lock() {
             Ok(mut serial) => serial.reset(),
             Err(_) => tracing::error!("serial lock is poisoned; the UART is not reset"),
@@ -564,6 +601,26 @@ impl MachineBus {
 
 impl ExitHandler for MachineBus {
     fn io_out(&mut self, port: u16, data: &[u8]) {
+        if let Some(vga) = &self.vga {
+            if crate::vga::contains(port) {
+                if let Ok(mut vga) = vga.lock() {
+                    // `out dx, ax` on an index port writes the data port too.
+                    for (n, &byte) in data.iter().enumerate() {
+                        vga.write(port.wrapping_add(n as u16), byte);
+                    }
+                }
+                return;
+            }
+        }
+        if let Some(ide) = &self.ide {
+            if ide::Controller::contains(port) {
+                match ide.lock() {
+                    Ok(mut ide) => ide.io_write(port, data),
+                    Err(_) => tracing::error!("the IDE lock is poisoned; dropping guest write"),
+                }
+                return;
+            }
+        }
         if let Some(bios) = &self.bios {
             if pc_bios::Bios::contains(port) {
                 self.bios_write(bios, port, data);
@@ -634,6 +691,28 @@ impl ExitHandler for MachineBus {
     }
 
     fn io_in(&mut self, port: u16, data: &mut [u8]) {
+        if let Some(vga) = &self.vga {
+            if crate::vga::contains(port) {
+                match vga.lock() {
+                    Ok(mut vga) => {
+                        for (n, byte) in data.iter_mut().enumerate() {
+                            *byte = vga.read(port.wrapping_add(n as u16));
+                        }
+                    }
+                    Err(_) => data.fill(0xff),
+                }
+                return;
+            }
+        }
+        if let Some(ide) = &self.ide {
+            if ide::Controller::contains(port) {
+                match ide.lock() {
+                    Ok(mut ide) => ide.io_read(port, data),
+                    Err(_) => data.fill(0xff),
+                }
+                return;
+            }
+        }
         if let Some(bios) = &self.bios {
             if pc_bios::Bios::contains(port) {
                 match bios.lock() {

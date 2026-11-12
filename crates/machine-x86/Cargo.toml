@@ -20,6 +20,7 @@ virtio-core.workspace = true
 ahci.workspace = true
 hda.workspace = true
 pc-bios.workspace = true
+ide.workspace = true
 virtio-sound.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -1441,6 +1441,7 @@ dependencies = [
  "display",
  "ext4-view",
  "flate2",
+ "ide",
  "libc",
  "linux-boot",
  "machine-arm64",
@@ -2131,6 +2132,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ide"
+version = "0.2.0"
+dependencies = [
+ "ahci",
+ "tracing",
+ "virtio-core",
+]
+
+[[package]]
 name = "idea"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2483,6 +2493,7 @@ version = "0.2.0"
 dependencies = [
  "ahci",
  "hda",
+ "ide",
  "kvm-bindings",
  "kvm-ioctls",
  "pc-bios",

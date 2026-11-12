@@ -1,0 +1,458 @@
+//! The VGA's registers, and text mode read out of them (ADR-0012).
+//!
+//! A guest that boots through a BIOS expects a VGA: Windows XP's `vga.sys`
+//! probes the graphics controller before it believes there is a display,
+//! then programs every register for the mode it wants, loads its own font
+//! and moves the cursor through the CRT controller. This is the register
+//! file that answers it — the sequencer, CRT controller, graphics
+//! controller, attribute controller and DAC at `0x3c0..0x3df` — and what a
+//! presenter needs to draw **text mode** from it: the geometry, the cursor,
+//! the sixteen colours through the attribute palette and the DAC, and the
+//! font.
+//!
+//! # What is not here
+//!
+//! Display memory is not modelled. `0xa0000..0xbffff` is ordinary guest RAM:
+//! the character cells at `B800:0000` are read from it as they are, and a
+//! font the guest loads lands in it at `A000:0000`, where plane 2 would be
+//! mapped while the sequencer selects it — which is where
+//! [`Vga::text_mode`] says to read it back from. That is enough for text and
+//! wrong for everything planar: the 16-colour graphics modes Windows' boot
+//! screen and GUI-mode Setup draw in need the four planes and the write
+//! modes behind a trap, which is phase X2. A graphics mode is reported as
+//! "no text mode" and shows nothing.
+//!
+//! The guest is untrusted: every index is masked to its register file, and
+//! the geometry a presenter gets is clamped.
+
+/// The ports the VGA answers: the mono and colour CRT controller, the
+/// attribute controller through the DAC, and the two status ports.
+pub fn contains(port: u16) -> bool {
+    matches!(
+        port,
+        0x3b4 | 0x3b5 | 0x3ba | 0x3c0..=0x3cf | 0x3d4 | 0x3d5 | 0x3da
+    )
+}
+
+/// What a presenter needs to draw the text screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextMode {
+    pub columns: usize,
+    pub rows: usize,
+    /// Scan lines per character cell, 1..=32.
+    pub cell_height: usize,
+    /// Guest physical address of the first character cell.
+    pub cells_at: u64,
+    /// The cursor's cell and its first and last scan line, when it is on.
+    pub cursor: Option<Cursor>,
+    /// The sixteen colours, as B, G, R.
+    pub palette: [[u8; 3]; 16],
+    /// Whether attribute bit 7 means "blink" (the background then has three
+    /// bits) rather than a bright background.
+    pub blink: bool,
+    /// Where the guest's own font is in guest memory (256 glyphs of 32
+    /// bytes), once it has loaded one.
+    pub font_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cursor {
+    pub column: usize,
+    pub row: usize,
+    pub first_line: usize,
+    pub last_line: usize,
+}
+
+/// The register file.
+#[derive(Debug, Clone)]
+pub struct Vga {
+    misc: u8,
+    sequencer_index: u8,
+    sequencer: [u8; 8],
+    crtc_index: u8,
+    crtc: [u8; 32],
+    graphics_index: u8,
+    graphics: [u8; 16],
+    attribute_index: u8,
+    /// The attribute controller's flip-flop: the next write to `0x3c0` is
+    /// data, not an index.
+    attribute_data_next: bool,
+    attribute: [u8; 32],
+    dac_mask: u8,
+    dac_write_index: u8,
+    dac_read_index: u8,
+    /// Which of red, green, blue the next DAC data access is.
+    dac_component: u8,
+    dac: [[u8; 3]; 256],
+    /// Toggled on every read of the status register, so a guest waiting for
+    /// a retrace to start or to end sees both.
+    retrace: bool,
+    /// The guest has programmed the CRT controller: its registers, not the
+    /// BIOS data area, say where the cursor is.
+    programmed: bool,
+    /// The guest has written plane 2 through the sequencer: it loaded a font.
+    font_loaded: bool,
+}
+
+impl Default for Vga {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 6-bit DAC component to 8 bits.
+fn expand(component: u8) -> u8 {
+    let c = component & 0x3f;
+    c << 2 | c >> 4
+}
+
+impl Vga {
+    /// A VGA in the state a BIOS leaves it in: text mode 3.
+    pub fn new() -> Self {
+        let mut vga = Self {
+            // Colour emulation (the CRT controller at 0x3d4), RAM enabled.
+            misc: 0x67,
+            sequencer_index: 0,
+            sequencer: [0x03, 0x00, 0x03, 0x00, 0x02, 0, 0, 0],
+            crtc_index: 0,
+            crtc: [0; 32],
+            graphics_index: 0,
+            graphics: [0; 16],
+            attribute_index: 0,
+            attribute_data_next: false,
+            attribute: [0; 32],
+            dac_mask: 0xff,
+            dac_write_index: 0,
+            dac_read_index: 0,
+            dac_component: 0,
+            dac: [[0; 3]; 256],
+            retrace: false,
+            programmed: false,
+            font_loaded: false,
+        };
+        // 80x25 cells of 16 lines: 400 lines, the cursor on lines 13-14.
+        vga.crtc[0x01] = 79;
+        vga.crtc[0x07] = 0x1f;
+        vga.crtc[0x09] = 0x4f;
+        vga.crtc[0x0a] = 0x0d;
+        vga.crtc[0x0b] = 0x0e;
+        vga.crtc[0x12] = 0x8f;
+        // Text, odd/even addressing, memory at B8000.
+        vga.graphics[0x05] = 0x10;
+        vga.graphics[0x06] = 0x0e;
+        vga.graphics[0x08] = 0xff;
+        // The EGA palette, and blink on.
+        let palette = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d,
+            0x3e, 0x3f,
+        ];
+        vga.attribute[..16].copy_from_slice(&palette);
+        vga.attribute[0x10] = 0x0c;
+        vga.attribute[0x12] = 0x0f;
+        // The 64 EGA colours: two bits a component, the low one worth 1/3.
+        for (index, entry) in vga.dac.iter_mut().take(64).enumerate() {
+            let level = |high: usize, low: usize| {
+                (((index >> high) & 1) * 0x2a + ((index >> low) & 1) * 0x15) as u8
+            };
+            *entry = [level(2, 5), level(1, 4), level(0, 3)];
+        }
+        vga
+    }
+
+    /// Power-on (ADR-0005).
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// The CRT controller is at `0x3d4` in colour emulation and `0x3b4` in
+    /// mono; the other pair does not answer.
+    fn crtc_decoded(&self, port: u16) -> bool {
+        let colour = self.misc & 1 != 0;
+        matches!(port, 0x3d4 | 0x3d5 | 0x3da) == colour
+    }
+
+    /// A guest read of one port.
+    pub fn read(&mut self, port: u16) -> u8 {
+        match port {
+            0x3c0 => self.attribute_index,
+            0x3c1 => self.attribute[usize::from(self.attribute_index & 0x1f)],
+            // Input status 0: the switch sense bit a colour monitor sets.
+            0x3c2 => 0x10,
+            0x3c4 => self.sequencer_index,
+            0x3c5 => self.sequencer[usize::from(self.sequencer_index & 0x07)],
+            0x3c6 => self.dac_mask,
+            // DAC state: last access was a write (3) or a read (0).
+            0x3c7 => 0x03,
+            0x3c8 => self.dac_write_index,
+            0x3c9 => {
+                let value =
+                    self.dac[usize::from(self.dac_read_index)][usize::from(self.dac_component % 3)];
+                self.dac_component += 1;
+                if self.dac_component >= 3 {
+                    self.dac_component = 0;
+                    self.dac_read_index = self.dac_read_index.wrapping_add(1);
+                }
+                value
+            }
+            0x3ca => 0,
+            0x3cc => self.misc,
+            0x3ce => self.graphics_index,
+            0x3cf => self.graphics[usize::from(self.graphics_index & 0x0f)],
+            0x3b4 | 0x3d4 if self.crtc_decoded(port) => self.crtc_index,
+            0x3b5 | 0x3d5 if self.crtc_decoded(port) => {
+                self.crtc[usize::from(self.crtc_index & 0x1f)]
+            }
+            0x3ba | 0x3da if self.crtc_decoded(port) => {
+                // Reading the status resets the attribute flip-flop; bits 0
+                // and 3 are "in retrace".
+                self.attribute_data_next = false;
+                self.retrace = !self.retrace;
+                if self.retrace {
+                    0x09
+                } else {
+                    0x00
+                }
+            }
+            _ => 0xff,
+        }
+    }
+
+    /// A guest write of one port.
+    pub fn write(&mut self, port: u16, value: u8) {
+        match port {
+            0x3c0 => {
+                if self.attribute_data_next {
+                    self.attribute[usize::from(self.attribute_index & 0x1f)] = value;
+                } else {
+                    self.attribute_index = value;
+                }
+                self.attribute_data_next = !self.attribute_data_next;
+            }
+            0x3c2 => self.misc = value,
+            0x3c4 => self.sequencer_index = value,
+            0x3c5 => {
+                self.sequencer[usize::from(self.sequencer_index & 0x07)] = value;
+                // Plane 2 alone, addressed sequentially: a font load.
+                if self.sequencer[2] & 0x0f == 0x04 && self.sequencer[4] & 0x04 != 0 {
+                    self.font_loaded = true;
+                }
+            }
+            0x3c6 => self.dac_mask = value,
+            0x3c7 => {
+                self.dac_read_index = value;
+                self.dac_component = 0;
+            }
+            0x3c8 => {
+                self.dac_write_index = value;
+                self.dac_component = 0;
+            }
+            0x3c9 => {
+                self.dac[usize::from(self.dac_write_index)][usize::from(self.dac_component % 3)] =
+                    value & 0x3f;
+                self.dac_component += 1;
+                if self.dac_component >= 3 {
+                    self.dac_component = 0;
+                    self.dac_write_index = self.dac_write_index.wrapping_add(1);
+                }
+            }
+            0x3ce => self.graphics_index = value,
+            0x3cf => self.graphics[usize::from(self.graphics_index & 0x0f)] = value,
+            0x3b4 | 0x3d4 if self.crtc_decoded(port) => self.crtc_index = value,
+            0x3b5 | 0x3d5 if self.crtc_decoded(port) => {
+                let index = usize::from(self.crtc_index & 0x1f);
+                // Registers 0-7 are write-protected by bit 7 of register
+                // 0x11, except the line-compare bit of the overflow.
+                if index <= 7 && self.crtc[0x11] & 0x80 != 0 {
+                    if index == 7 {
+                        self.crtc[7] = (self.crtc[7] & !0x10) | (value & 0x10);
+                    }
+                } else {
+                    self.crtc[index] = value;
+                }
+                self.programmed = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the guest has programmed the display itself; until then the
+    /// BIOS's idea of the screen (its data area) is the one to draw.
+    pub fn programmed(&self) -> bool {
+        self.programmed
+    }
+
+    /// One of the sixteen colours a text attribute names, as B, G, R.
+    fn colour(&self, index: usize) -> [u8; 3] {
+        let mode = self.attribute[0x10];
+        let select = self.attribute[0x14];
+        let mut entry = self.attribute[index & 0x0f] & 0x3f;
+        if mode & 0x80 != 0 {
+            entry = (entry & 0x0f) | (select & 0x03) << 4;
+        }
+        let entry = (entry | (select & 0x0c) << 4) & self.dac_mask;
+        let [r, g, b] = self.dac[usize::from(entry)];
+        [expand(b), expand(g), expand(r)]
+    }
+
+    /// The text screen as the registers describe it, or `None` in a graphics
+    /// mode.
+    pub fn text_mode(&self) -> Option<TextMode> {
+        if self.graphics[0x06] & 1 != 0 || self.attribute[0x10] & 1 != 0 {
+            return None;
+        }
+        let cell_height = usize::from(self.crtc[0x09] & 0x1f) + 1;
+        let overflow = usize::from(self.crtc[0x07]);
+        let lines =
+            (usize::from(self.crtc[0x12]) | (overflow & 0x02) << 7 | (overflow & 0x40) << 3) + 1;
+        let columns = (usize::from(self.crtc[0x01]) + 1).clamp(1, 132);
+        let rows = (lines / cell_height).clamp(1, 60);
+        // The memory map select: where the cells are.
+        let base = match self.graphics[0x06] >> 2 & 3 {
+            0 | 1 => 0x000a_0000u64,
+            2 => 0x000b_0000,
+            _ => 0x000b_8000,
+        };
+        let start = usize::from(self.crtc[0x0c]) << 8 | usize::from(self.crtc[0x0d]);
+        let location = usize::from(self.crtc[0x0e]) << 8 | usize::from(self.crtc[0x0f]);
+        let cursor_off = self.crtc[0x0a] & 0x20 != 0;
+        let cursor = location
+            .checked_sub(start)
+            .filter(|cell| !cursor_off && *cell < columns * rows)
+            .map(|cell| Cursor {
+                column: cell % columns,
+                row: cell / columns,
+                first_line: usize::from(self.crtc[0x0a] & 0x1f),
+                last_line: usize::from(self.crtc[0x0b] & 0x1f),
+            });
+        let mut palette = [[0u8; 3]; 16];
+        for (index, entry) in palette.iter_mut().enumerate() {
+            *entry = self.colour(index);
+        }
+        Some(TextMode {
+            columns,
+            rows,
+            cell_height,
+            // The start address counts cells; a cell is two bytes.
+            cells_at: base + (start as u64 * 2).min(0x7fff),
+            cursor,
+            palette,
+            blink: self.attribute[0x10] & 0x08 != 0,
+            font_at: self.font_loaded.then_some(0x000a_0000),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_indexed(vga: &mut Vga, port: u16, index: u8, value: u8) {
+        vga.write(port, index);
+        vga.write(port + 1, value);
+    }
+
+    #[test]
+    fn the_power_on_state_is_text_mode_three() {
+        let vga = Vga::new();
+        let text = vga.text_mode().expect("text mode");
+        assert_eq!((text.columns, text.rows, text.cell_height), (80, 25, 16));
+        assert_eq!(text.cells_at, 0xb8000);
+        assert_eq!(text.font_at, None);
+        assert!(text.blink);
+        // Colour 1 is blue, colour 15 white, as B, G, R.
+        assert_eq!(text.palette[1], [0xaa, 0x00, 0x00]);
+        assert_eq!(text.palette[15], [0xff, 0xff, 0xff]);
+        assert_eq!(text.palette[6], [0x00, 0x55, 0xaa]);
+        assert!(!vga.programmed());
+    }
+
+    #[test]
+    fn the_graphics_controller_reads_back_what_a_probe_writes() {
+        // What a driver does before it believes in a VGA.
+        let mut vga = Vga::new();
+        for (index, value) in [(0x04u8, 0x03u8), (0x08, 0x55), (0x08, 0xaa)] {
+            write_indexed(&mut vga, 0x3ce, index, value);
+            assert_eq!(vga.read(0x3ce), index);
+            assert_eq!(vga.read(0x3cf), value);
+        }
+        write_indexed(&mut vga, 0x3c4, 0x04, 0x06);
+        assert_eq!(vga.read(0x3c5), 0x06);
+        assert_eq!(vga.read(0x3cc), 0x67);
+    }
+
+    #[test]
+    fn the_cursor_follows_the_crt_controller() {
+        let mut vga = Vga::new();
+        // Cell 80 * 3 + 7.
+        write_indexed(&mut vga, 0x3d4, 0x0e, 0);
+        write_indexed(&mut vga, 0x3d4, 0x0f, 247);
+        assert!(vga.programmed());
+        let cursor = vga.text_mode().unwrap().cursor.expect("a cursor");
+        assert_eq!((cursor.column, cursor.row), (7, 3));
+        assert_eq!((cursor.first_line, cursor.last_line), (13, 14));
+        // Bit 5 of the cursor start register turns it off.
+        write_indexed(&mut vga, 0x3d4, 0x0a, 0x20);
+        assert_eq!(vga.text_mode().unwrap().cursor, None);
+        // The mono ports do not answer in colour emulation.
+        assert_eq!(vga.read(0x3b5), 0xff);
+    }
+
+    #[test]
+    fn fifty_lines_and_a_loaded_font_are_reported() {
+        let mut vga = Vga::new();
+        // Unlock registers 0-7, then 8-line cells.
+        write_indexed(&mut vga, 0x3d4, 0x11, 0x00);
+        write_indexed(&mut vga, 0x3d4, 0x09, 0x47);
+        assert_eq!(vga.text_mode().unwrap().rows, 50);
+        // The font load: plane 2, sequential addressing.
+        write_indexed(&mut vga, 0x3c4, 0x02, 0x04);
+        write_indexed(&mut vga, 0x3c4, 0x04, 0x07);
+        write_indexed(&mut vga, 0x3c4, 0x02, 0x03);
+        write_indexed(&mut vga, 0x3c4, 0x04, 0x03);
+        assert_eq!(vga.text_mode().unwrap().font_at, Some(0xa0000));
+    }
+
+    #[test]
+    fn the_attribute_flip_flop_and_the_dac_take_their_sequences() {
+        let mut vga = Vga::new();
+        // Palette entry 1 becomes DAC colour 0x3f; the status read resets
+        // the flip-flop first.
+        vga.read(0x3da);
+        vga.write(0x3c0, 0x01);
+        vga.write(0x3c0, 0x3f);
+        assert_eq!(vga.text_mode().unwrap().palette[1], [0xff, 0xff, 0xff]);
+        // DAC colour 0x3f becomes pure red.
+        vga.write(0x3c8, 0x3f);
+        for component in [0x3f, 0x00, 0x00] {
+            vga.write(0x3c9, component);
+        }
+        assert_eq!(vga.text_mode().unwrap().palette[1], [0x00, 0x00, 0xff]);
+        vga.write(0x3c7, 0x3f);
+        assert_eq!(
+            [vga.read(0x3c9), vga.read(0x3c9), vga.read(0x3c9)],
+            [0x3f, 0, 0]
+        );
+    }
+
+    #[test]
+    fn a_graphics_mode_is_not_text_and_wild_registers_stay_in_bounds() {
+        let mut vga = Vga::new();
+        write_indexed(&mut vga, 0x3ce, 0x06, 0x05);
+        assert_eq!(vga.text_mode(), None);
+        let mut vga = Vga::new();
+        write_indexed(&mut vga, 0x3d4, 0x11, 0x00);
+        for index in 0..=0xffu8 {
+            write_indexed(&mut vga, 0x3d4, index, 0xff);
+            write_indexed(&mut vga, 0x3c4, index, 0xff);
+            write_indexed(&mut vga, 0x3ce, index, 0xff);
+        }
+        // The graphics controller now says "graphics": back to text.
+        write_indexed(&mut vga, 0x3ce, 0x06, 0x0e);
+        vga.read(0x3da);
+        vga.write(0x3c0, 0x10);
+        vga.write(0x3c0, 0x00);
+        let text = vga.text_mode().expect("text");
+        assert!(text.columns <= 132 && text.rows <= 60 && text.cell_height <= 32);
+        assert!(text.cells_at < 0xc0000);
+    }
+}

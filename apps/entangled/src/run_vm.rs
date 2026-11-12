@@ -69,7 +69,8 @@ fn attach_optical(
     cfg: &VmConfig,
     mem: &Arc<virtio_core::GuestMem>,
 ) -> Result<(), String> {
-    if cfg.optical.is_empty() {
+    // On a BIOS-era machine the discs are on the IDE controller.
+    if cfg.optical.is_empty() || cfg.boot.mode == control_api::BootMode::Bios {
         return Ok(());
     }
     let drives = cfg
@@ -466,7 +467,14 @@ fn build_devices(
     mouse_sink: &mut Option<virtio_input::InputHandle>,
 ) -> Result<BuiltDevices, String> {
     let mut devices: Vec<Box<dyn VirtioDevice>> = Vec::with_capacity(cfg.disks.len() + 5);
-    for disk in &cfg.disks {
+    // A BIOS-era machine's disks sit on its IDE controller (`build_ide`): a
+    // guest that needs a BIOS has no virtio driver, and one image must not
+    // be behind two controllers.
+    let virtio_disks: &[control_api::DiskSection] = match cfg.boot.mode {
+        control_api::BootMode::Bios => &[],
+        _ => &cfg.disks,
+    };
+    for disk in virtio_disks {
         let device = virtio_block::BlockDevice::open(&disk.path, disk.writable)
             .map_err(|e| format!("cannot attach disk {}: {e}", disk.path.display()))?;
         tracing::info!(
@@ -1749,6 +1757,7 @@ pub fn run_with(
             Some(
                 bios_text_present::Presenter::start(
                     mem,
+                    bus.vga().cloned(),
                     display_handle.clone(),
                     Arc::clone(&quiesce),
                     gpu_scanout,
@@ -2735,6 +2744,9 @@ mod host {
                         super::framebuffer_present::config_for(cfg),
                     )
                     .map_err(|e| e.to_string())?;
+                    if cfg.boot.mode == BootMode::Bios {
+                        pci.attach_ide().map_err(|e| e.to_string())?;
+                    }
                     super::attach_optical(&mut pci, cfg, &mem)?;
                     super::attach_hda(&mut pci, cfg, &mem)?;
                     let cmdline =
@@ -2759,6 +2771,21 @@ mod host {
         let bus = match &bios {
             Some(bios) => bus.with_bios(Arc::clone(bios)),
             None => bus,
+        };
+        let bus = match cfg.boot.mode {
+            BootMode::Bios => {
+                // IRQ 14 and 15: irqfds on the in-kernel interrupt
+                // controllers, which route them to the 8259 and the IOAPIC.
+                let line = |gsi: u8| {
+                    machine_x86::irqfd::IrqFdLine::new(&vm.fd_shared(), u32::from(gsi))
+                        .map(|line| Arc::new(line) as Arc<dyn virtio_core::interrupt::IrqLine>)
+                        .map_err(|e| format!("cannot wire IDE interrupt {gsi}: {e}"))
+                };
+                let mut ide = super::build_ide(cfg)?;
+                ide.connect(line(ide::PRIMARY_IRQ)?, line(ide::SECONDARY_IRQ)?);
+                bus.with_ide(ide).with_vga()
+            }
+            BootMode::DirectLinux | BootMode::Uefi => bus,
         };
         let bus = match &pflash {
             Some(flash) => bus.with_pflash(Arc::clone(flash)),
@@ -3117,6 +3144,9 @@ mod host {
                     if !synchronous {
                         pci.offload_kicks();
                     }
+                    if cfg.boot.mode == BootMode::Bios {
+                        pci.attach_ide().map_err(|e| e.to_string())?;
+                    }
                     super::attach_optical(&mut pci, cfg, &mem)?;
                     super::attach_hda(&mut pci, cfg, &mem)?;
                     let cmdline =
@@ -3137,6 +3167,22 @@ mod host {
         let bus = match &bios {
             Some(bios) => bus.with_bios(Arc::clone(bios)),
             None => bus,
+        };
+        let bus = match cfg.boot.mode {
+            BootMode::Bios => {
+                // IRQ 14 and 15 are IOAPIC pins like every other ISA line.
+                let line = |pin: u8| {
+                    irqchip
+                        .ioapic()
+                        .line(pin)
+                        .map(|line| line as Arc<dyn virtio_core::interrupt::IrqLine>)
+                        .map_err(|e| format!("cannot wire IDE interrupt {pin}: {e}"))
+                };
+                let mut ide = super::build_ide(cfg)?;
+                ide.connect(line(ide::PRIMARY_IRQ)?, line(ide::SECONDARY_IRQ)?);
+                bus.with_ide(ide).with_vga()
+            }
+            BootMode::DirectLinux | BootMode::Uefi => bus,
         };
         let bus = match &pflash {
             Some(flash) => bus.with_pflash(Arc::clone(flash)),
@@ -3282,6 +3328,38 @@ mod host {
             }
         }
     }
+}
+
+/// The IDE controller of a `mode = "bios"` machine (ADR-0012): the profile's
+/// disks on the primary channel and its optical drives on the secondary,
+/// master first. Two of each is all the cables hold.
+fn build_ide(cfg: &VmConfig) -> Result<ide::Controller, String> {
+    if cfg.disks.len() > 2 || cfg.optical.len() > 2 {
+        return Err(format!(
+            "mode = \"bios\" puts disks and discs on an IDE controller, which holds \
+             two of each; this profile has {} [[disk]] and {} [[optical]]",
+            cfg.disks.len(),
+            cfg.optical.len()
+        ));
+    }
+    let mut disks = cfg.disks.iter().enumerate().map(|(n, disk)| {
+        ide::Disk::open(&disk.path, disk.writable, &format!("ENTANGLED-HD{n}"))
+            .map(ide::Drive::Disk)
+            .map_err(|e| format!("cannot attach disk {}: {e}", disk.path.display()))
+    });
+    let mut discs = cfg.optical.iter().enumerate().map(|(n, drive)| {
+        ahci::Atapi::open(&drive.path, &format!("ENTANGLED-OPT{n}"))
+            .map(ide::Drive::Atapi)
+            .map_err(|e| format!("cannot open optical drive {}: {e}", drive.path.display()))
+    });
+    let primary = [disks.next().transpose()?, disks.next().transpose()?];
+    let secondary = [discs.next().transpose()?, discs.next().transpose()?];
+    tracing::info!(
+        disks = cfg.disks.len(),
+        discs = cfg.optical.len(),
+        "attaching the IDE controller's drives"
+    );
+    Ok(ide::Controller::new(primary, secondary))
 }
 
 /// The BIOS of a `mode = "bios"` machine (ADR-0012).

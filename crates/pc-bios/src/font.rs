@@ -78,17 +78,93 @@ const PALETTE: [[u8; 3]; 16] = [
     [0xff, 0xff, 0xff],
 ];
 
+/// Bytes of a font laid out as a VGA keeps it in plane 2: 256 glyphs of 32
+/// rows, of which a mode uses the first `cell height`.
+pub const GLYPH_PLANE_BYTES: usize = 256 * 32;
+
 /// The glyphs of all 256 codes, built once by whoever draws.
-pub struct Font(Box<[[u8; 16]; 256]>);
+pub struct Font {
+    glyphs: Box<[[u8; 16]; 256]>,
+    plane: Vec<u8>,
+}
 
 impl Default for Font {
     fn default() -> Self {
         let mut glyphs = Box::new([[0u8; 16]; 256]);
+        let mut plane = vec![0u8; GLYPH_PLANE_BYTES];
         for (code, slot) in glyphs.iter_mut().enumerate() {
             *slot = glyph(code as u8);
+            plane[code * 32..code * 32 + 16].copy_from_slice(slot);
         }
-        Self(glyphs)
+        Self { glyphs, plane }
     }
+}
+
+impl Font {
+    /// The font in plane-2 layout ([`GLYPH_PLANE_BYTES`]), for
+    /// [`render_frame`].
+    pub fn plane(&self) -> &[u8] {
+        &self.plane
+    }
+}
+
+/// One text screen of any geometry, as a VGA describes it.
+pub struct TextFrame<'a> {
+    /// A character and an attribute per cell, row by row.
+    pub cells: &'a [u8],
+    pub columns: usize,
+    pub rows: usize,
+    /// Scan lines per cell; at most 32.
+    pub cell_height: usize,
+    /// The font in plane-2 layout: 32 bytes a glyph.
+    pub glyphs: &'a [u8],
+    /// The sixteen colours, as B, G, R.
+    pub palette: &'a [[u8; 3]; 16],
+    /// Attribute bit 7 is blink, so the background has three bits.
+    pub blink: bool,
+    /// The cursor: column, row, first and last scan line.
+    pub cursor: Option<(usize, usize, usize, usize)>,
+}
+
+/// Draws `frame` as BGRA into `out`; returns the picture's width and height.
+/// Geometry beyond what a VGA can show is clamped, and cells or glyphs the
+/// slices do not hold draw blank.
+pub fn render_frame(frame: &TextFrame<'_>, out: &mut Vec<u8>) -> (u32, u32) {
+    let columns = frame.columns.clamp(1, 132);
+    let rows = frame.rows.clamp(1, 60);
+    let cell_height = frame.cell_height.clamp(1, 32);
+    let (width, height) = (columns * 8, rows * cell_height);
+    let stride = width * 4;
+    out.clear();
+    out.resize(stride * height, 0);
+    for pixel in out.chunks_exact_mut(4) {
+        pixel[3] = 0xff;
+    }
+    for (index, cell) in frame.cells.chunks_exact(2).take(columns * rows).enumerate() {
+        let (col, row) = (index % columns, index / columns);
+        let glyph = usize::from(cell[0]) * 32;
+        let fg = frame.palette[usize::from(cell[1] & 0x0f)];
+        let background = if frame.blink { 0x07 } else { 0x0f };
+        let bg = frame.palette[usize::from(cell[1] >> 4 & background)];
+        let cursor = frame
+            .cursor
+            .filter(|&(c, r, _, _)| (c, r) == (col, row))
+            .map(|(_, _, first, last)| first..=last);
+        for y in 0..cell_height {
+            let in_cursor = cursor.as_ref().is_some_and(|lines| lines.contains(&y));
+            let bits = if in_cursor {
+                0xff
+            } else {
+                frame.glyphs.get(glyph + y).copied().unwrap_or(0)
+            };
+            let at = (row * cell_height + y) * stride + col * 8 * 4;
+            for x in 0..8 {
+                let colour = if bits & (0x80 >> x) != 0 { fg } else { bg };
+                out[at + x * 4..at + x * 4 + 3].copy_from_slice(&colour);
+            }
+        }
+    }
+    (width as u32, height as u32)
 }
 
 /// Draws one page of text memory as [`WIDTH`]x[`HEIGHT`] BGRA into `out`.
@@ -104,7 +180,7 @@ pub fn render(font: &Font, cells: &[u8], cursor: Option<(usize, usize)>, out: &m
     }
     for (index, cell) in cells.chunks_exact(2).take(COLUMNS * ROWS).enumerate() {
         let (col, row) = (index % COLUMNS, index / COLUMNS);
-        let glyph = &font.0[usize::from(cell[0])];
+        let glyph = &font.glyphs[usize::from(cell[0])];
         let fg = PALETTE[usize::from(cell[1] & 0x0f)];
         // Bit 7 is blink on a VGA; drawn as the plain background colour.
         let bg = PALETTE[usize::from((cell[1] >> 4) & 0x07)];
@@ -146,6 +222,57 @@ mod tests {
             );
         }
         assert_eq!(glyph(b' '), [0; 16]);
+    }
+
+    #[test]
+    fn a_frame_of_any_geometry_is_drawn_with_its_own_font_and_palette() {
+        // Two columns of one 8-line row; glyph 1 is a solid top line.
+        let mut glyphs = vec![0u8; GLYPH_PLANE_BYTES];
+        glyphs[32] = 0xff;
+        let mut palette = [[0u8; 3]; 16];
+        palette[2] = [1, 2, 3];
+        palette[9] = [7, 8, 9];
+        let mut out = Vec::new();
+        let frame = TextFrame {
+            cells: &[1, 0x92, 0, 0x92],
+            columns: 2,
+            rows: 1,
+            cell_height: 8,
+            glyphs: &glyphs,
+            palette: &palette,
+            blink: false,
+            cursor: Some((1, 0, 6, 7)),
+        };
+        assert_eq!(render_frame(&frame, &mut out), (16, 8));
+        // The glyph's top line in the foreground, the next in the bright
+        // background (no blink: four background bits).
+        assert_eq!(&out[..4], &[1, 2, 3, 0xff]);
+        assert_eq!(&out[16 * 4..16 * 4 + 4], &[7, 8, 9, 0xff]);
+        // The cursor fills lines 6-7 of the second cell.
+        let at = (6 * 16 + 8) * 4;
+        assert_eq!(&out[at..at + 3], &[1, 2, 3]);
+        // With blink the background keeps three bits: colour 1, black here.
+        let mut blinking = Vec::new();
+        render_frame(
+            &TextFrame {
+                blink: true,
+                ..frame
+            },
+            &mut blinking,
+        );
+        assert_eq!(&blinking[16 * 4..16 * 4 + 3], &[0, 0, 0]);
+        // A frame with no cells and wild geometry draws blank, in bounds.
+        let wild = TextFrame {
+            cells: &[],
+            columns: 9999,
+            rows: 9999,
+            cell_height: 9999,
+            glyphs: &[],
+            palette: &palette,
+            blink: false,
+            cursor: Some((5000, 5000, 0, 9999)),
+        };
+        assert_eq!(render_frame(&wild, &mut out), (132 * 8, 60 * 32));
     }
 
     #[test]

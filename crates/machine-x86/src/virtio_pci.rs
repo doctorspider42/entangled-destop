@@ -304,6 +304,10 @@ pub struct VirtioPciBus {
     /// The AHCI controller with the VM's optical drives (ADR-0008 §4), after
     /// the virtio functions and the framebuffer.
     ahci: Option<AhciSlot>,
+    /// The IDE controller's PCI device number, when the VM has one
+    /// (ADR-0012). Only its configuration space is here: its ports are fixed
+    /// ones the machine bus decodes.
+    ide: Option<u8>,
     /// The HD Audio controller (ADR-0008, sound for Windows guests), last.
     hda: Option<HdaSlot>,
     /// The MSI sink the virtio functions use, kept for functions attached
@@ -406,6 +410,7 @@ impl VirtioPciBus {
             host_wake: None,
             framebuffer: None,
             ahci: None,
+            ide: None,
             hda: None,
             msi: None,
         }
@@ -508,6 +513,7 @@ impl VirtioPciBus {
             host_wake: None,
             framebuffer: None,
             ahci: None,
+            ide: None,
             hda: None,
             msi: msi.clone(),
         };
@@ -679,6 +685,7 @@ impl VirtioPciBus {
             host_wake: None,
             framebuffer: None,
             ahci: None,
+            ide: None,
             hda: None,
             msi: msi.clone(),
         };
@@ -890,6 +897,29 @@ impl VirtioPciBus {
         Ok(())
     }
 
+    /// Puts the IDE controller's PCI function on the bus (ADR-0012): the
+    /// identity a guest finds the controller by. The controller itself lives
+    /// on the machine bus, at its fixed ports.
+    pub fn attach_ide(&mut self) -> Result<(), VirtioPciAttachError> {
+        let owner = self.next_owner();
+        let bus_error = |source| VirtioPciAttachError::Bus {
+            slot: owner,
+            source,
+        };
+        let device_number = self
+            .root
+            .lock()
+            .map_err(|_| bus_error(PciError::BusFull))?
+            .attach(crate::ide_function::config_space(), owner)
+            .map_err(bus_error)?;
+        tracing::info!(
+            address = format_args!("00:{device_number:02x}.0"),
+            "attached the IDE controller"
+        );
+        self.ide = Some(device_number);
+        Ok(())
+    }
+
     /// The AHCI controller, when the VM has one.
     pub fn ahci(&self) -> Option<&AhciSlot> {
         self.ahci.as_ref()
@@ -902,6 +932,7 @@ impl VirtioPciBus {
         self.slots.len()
             + usize::from(standalone_framebuffer)
             + usize::from(self.ahci.is_some())
+            + usize::from(self.ide.is_some())
             + usize::from(self.hda.is_some())
     }
 
