@@ -1450,6 +1450,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "pc-bios",
  "png",
+ "rtl8139",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -2497,9 +2498,11 @@ dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
  "pc-bios",
+ "rtl8139",
  "thiserror 2.0.20",
  "tracing",
  "virtio-core",
+ "virtio-net",
  "virtio-sound",
  "vm-memory 0.17.2",
  "vmm-core",
@@ -3730,6 +3733,16 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rtl8139"
+version = "0.2.0"
+dependencies = [
+ "tracing",
+ "virtio-core",
+ "virtio-net",
+ "vm-memory 0.17.2",
 ]
 
 [[package]]

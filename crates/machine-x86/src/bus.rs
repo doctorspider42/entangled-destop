@@ -793,6 +793,12 @@ impl ExitHandler for MachineBus {
                 pci.io_write(port, data);
                 return;
             }
+            // A function with an I/O BAR (the RTL8139), wherever the guest
+            // put it.
+            if let Some((nic, offset)) = pci.nic_port(port) {
+                nic.write(offset, data);
+                return;
+            }
         }
         if let Some(platform) = &self.platform {
             if FirmwarePlatform::contains(port) {
@@ -900,6 +906,10 @@ impl ExitHandler for MachineBus {
         if let Some(pci) = &self.pci {
             if VirtioPciBus::claims_port(port) {
                 pci.io_read(port, data);
+                return;
+            }
+            if let Some((nic, offset)) = pci.nic_port(port) {
+                nic.read(offset, data);
                 return;
             }
         }

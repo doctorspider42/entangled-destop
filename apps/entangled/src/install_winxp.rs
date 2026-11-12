@@ -285,6 +285,7 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
         args.memory_mib.min(3072)
     };
 
+    let net = install::net_plan(&args.network, &args.interface)?;
     let installed = VmConfig {
         architecture: Default::default(),
         name: name.clone(),
@@ -303,8 +304,8 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
         cdrom: None,
         // The CD stays in the drive: XP asks for it when a component is added.
         optical: vec![OpticalSection { path: iso }],
-        // No network card XP has a driver for yet.
-        network: None,
+        // An RTL8139, which XP has a driver for in the box.
+        network: net.machine_section(&name, &target),
         display: DisplaySection {
             width: DESKTOP.0,
             height: DESKTOP.1,

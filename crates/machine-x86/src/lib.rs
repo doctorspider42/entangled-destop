@@ -36,6 +36,7 @@ pub mod platform;
 /// the latch `vmm_core::ExitHandler::reset_requested` reports.
 pub mod reset;
 pub mod rtc;
+pub mod rtl8139_function;
 pub mod serial;
 pub mod shm;
 pub mod state;

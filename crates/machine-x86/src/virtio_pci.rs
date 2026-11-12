@@ -308,6 +308,8 @@ pub struct VirtioPciBus {
     /// (ADR-0012). Only its configuration space is here: its ports are fixed
     /// ones the machine bus decodes.
     ide: Option<u8>,
+    /// The RTL8139 network card, when the VM has one (ADR-0012).
+    nic: Option<crate::rtl8139_function::NicSlot>,
     /// The HD Audio controller (ADR-0008, sound for Windows guests), last.
     hda: Option<HdaSlot>,
     /// The MSI sink the virtio functions use, kept for functions attached
@@ -411,6 +413,7 @@ impl VirtioPciBus {
             framebuffer: None,
             ahci: None,
             ide: None,
+            nic: None,
             hda: None,
             msi: None,
         }
@@ -514,6 +517,7 @@ impl VirtioPciBus {
             framebuffer: None,
             ahci: None,
             ide: None,
+            nic: None,
             hda: None,
             msi: msi.clone(),
         };
@@ -686,6 +690,7 @@ impl VirtioPciBus {
             framebuffer: None,
             ahci: None,
             ide: None,
+            nic: None,
             hda: None,
             msi: msi.clone(),
         };
@@ -961,6 +966,81 @@ impl VirtioPciBus {
         Ok(())
     }
 
+    /// The interrupt the next non-virtio function's `INTA#` is wired to:
+    /// what `\_SB.PCI0._PRT` says for the device number it will get. `None`
+    /// when the bus has no line left for another function.
+    pub fn next_function_irq(&self) -> Option<u32> {
+        layout::virtio_irq(self.next_owner())
+    }
+
+    /// Puts an RTL8139 network card on the bus (ADR-0012): its registers in
+    /// an I/O BAR and, the same registers, in a memory BAR, and `INTA#` on
+    /// `irq` — which must be [`Self::next_function_irq`], taken before this
+    /// call.
+    pub fn attach_rtl8139(
+        &mut self,
+        card: Arc<rtl8139::Rtl8139>,
+        irq: u32,
+        keep: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<(), VirtioPciAttachError> {
+        let owner = self.next_owner();
+        let bus_error = |source| VirtioPciAttachError::Bus {
+            slot: owner,
+            source,
+        };
+        if owner as u64 >= layout::PCI_MMIO_SLOTS {
+            return Err(bus_error(PciError::BusFull));
+        }
+        let memory = u32::try_from(layout::pci_bar_slot(owner as u64))
+            .map_err(|_| bus_error(PciError::BusFull))?;
+        // One 256-port window per function, from 0xc000.
+        let ports = 0xc000 + (owner as u16) * 0x100;
+        let space =
+            crate::rtl8139_function::config_space(ports, memory, irq as u8).map_err(bus_error)?;
+        let device_number = self
+            .root
+            .lock()
+            .map_err(|_| bus_error(PciError::BusFull))?
+            .attach(space, owner)
+            .map_err(bus_error)?;
+        tracing::info!(
+            address = format_args!("00:{device_number:02x}.0"),
+            ports = format_args!("{ports:#x}"),
+            memory = format_args!("{memory:#x}"),
+            irq,
+            "attached the RTL8139 network card"
+        );
+        self.nic = Some(crate::rtl8139_function::NicSlot {
+            card,
+            owner,
+            _keep: keep,
+        });
+        Ok(())
+    }
+
+    /// The network card's register for I/O `port`, if the port is in the
+    /// window its I/O BAR decodes now.
+    pub fn nic_port(&self, port: u16) -> Option<(&rtl8139::Rtl8139, u16)> {
+        let nic = self.nic.as_ref()?;
+        let (base, size) = self
+            .root
+            .lock()
+            .ok()?
+            .config_of(nic.owner)?
+            .io_bar_window(crate::rtl8139_function::IO_BAR)?;
+        let offset = port.checked_sub(base).filter(|offset| *offset < size)?;
+        Some((nic.card.as_ref(), offset))
+    }
+
+    /// The network card's register for memory address `addr`, if that is in
+    /// its memory BAR.
+    fn locate_nic(&self, addr: u64) -> Option<(&rtl8139::Rtl8139, u16)> {
+        let nic = self.nic.as_ref()?;
+        let (owner, bar, offset) = self.root.lock().ok()?.locate_mmio(addr)?;
+        (owner == nic.owner && bar == crate::rtl8139_function::MEMORY_BAR)
+            .then_some((nic.card.as_ref(), offset as u16))
+    }
+
     /// The AHCI controller, when the VM has one.
     pub fn ahci(&self) -> Option<&AhciSlot> {
         self.ahci.as_ref()
@@ -974,6 +1054,7 @@ impl VirtioPciBus {
             + usize::from(standalone_framebuffer)
             + usize::from(self.ahci.is_some())
             + usize::from(self.ide.is_some())
+            + usize::from(self.nic.is_some())
             + usize::from(self.hda.is_some())
     }
 
@@ -1363,6 +1444,9 @@ impl VirtioPciBus {
         }
         if let Some(ahci) = &self.ahci {
             ahci.device.reset();
+        }
+        if let Some(nic) = &self.nic {
+            nic.card.reset();
         }
         if let Some(hda) = &self.hda {
             hda.device.reset();
@@ -1995,6 +2079,10 @@ impl VirtioPciBus {
             ahci.mmio_read(offset, data);
             return;
         }
+        if let Some((nic, offset)) = self.locate_nic(addr) {
+            nic.read(offset, data);
+            return;
+        }
         if let Some((hda, offset)) = self.locate_hda(addr) {
             hda.mmio_read(offset, data);
             return;
@@ -2027,6 +2115,10 @@ impl VirtioPciBus {
         }
         if let Some((ahci, offset)) = self.locate_ahci(addr) {
             ahci.mmio_write(offset, data);
+            return;
+        }
+        if let Some((nic, offset)) = self.locate_nic(addr) {
+            nic.write(offset, data);
             return;
         }
         if let Some((hda, offset)) = self.locate_hda(addr) {

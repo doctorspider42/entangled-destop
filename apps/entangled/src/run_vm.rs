@@ -448,6 +448,44 @@ struct BuiltDevices {
     gpu_scanout: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// The guest agent's port, when the profile has one.
     agent_port: Option<virtio_console::PortHandle>,
+    /// The network backend of a BIOS machine, for its RTL8139.
+    legacy_net: Option<LegacyNet>,
+}
+
+/// A network backend and the card's address, for a card that is not
+/// virtio-net.
+type LegacyNet = (Arc<dyn virtio_net::NetBackend>, virtio_net::MacAddr);
+
+/// Puts the RTL8139 of a BIOS machine on the bus (ADR-0012), with its
+/// receive worker running behind the pause gate. `line` makes the interrupt
+/// line for a global system interrupt, and may give back something to keep
+/// alive with the card (the hook that re-raises a level interrupt).
+fn attach_legacy_nic(
+    pci: &mut machine_x86::virtio_pci::VirtioPciBus,
+    (backend, mac): LegacyNet,
+    mem: &Arc<virtio_core::GuestMem>,
+    quiesce: &Arc<virtio_core::Quiesce>,
+    line: impl FnOnce(u32) -> Result<Arc<dyn virtio_core::interrupt::IrqLine>, String>,
+    hook: impl FnOnce(
+        u32,
+        &Arc<rtl8139::Rtl8139>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, String>,
+) -> Result<(), String> {
+    let irq = pci
+        .next_function_irq()
+        .ok_or("the PCI bus has no interrupt line left for the network card")?;
+    let card = Arc::new(rtl8139::Rtl8139::new(
+        Arc::clone(mem),
+        backend,
+        mac,
+        line(irq)?,
+    ));
+    card.set_quiesce(Arc::clone(quiesce));
+    card.start()
+        .map_err(|e| format!("cannot start the network card's receive thread: {e}"))?;
+    let keep = hook(irq, &card)?;
+    pci.attach_rtl8139(card, irq, keep)
+        .map_err(|e| e.to_string())
 }
 
 /// One virtio-blk device per `[[disk]]` entry, the configured network backend,
@@ -502,6 +540,10 @@ fn build_devices(
 
     // virtio-net from the [network] section (MVP-505, WHP-1704).
     let mut net_cmdline = None;
+    // On a BIOS machine the network card is an RTL8139 (ADR-0012): the
+    // backend is kept for it instead of going into a virtio-net device.
+    let bios = cfg.boot.mode == control_api::BootMode::Bios;
+    let mut legacy_net: Option<LegacyNet> = None;
     if let Some(net) = &cfg.network {
         // The profile's own MAC (every installed machine has one, and the
         // config already validated it), else the name-derived address every
@@ -520,8 +562,12 @@ fn build_devices(
                     let interface = net.require_interface().map_err(|e| e.to_string())?;
                     let backend = virtio_net::TapBackend::open(interface)
                         .map_err(|e| format!("cannot open TAP '{interface}': {e}"))?;
-                    tracing::info!(interface, mac = %mac, "attaching virtio-net device (tap)");
-                    devices.push(Box::new(virtio_net::NetDevice::new(backend, mac)));
+                    if bios {
+                        legacy_net = Some((Arc::new(backend), mac));
+                    } else {
+                        tracing::info!(interface, mac = %mac, "attaching virtio-net device (tap)");
+                        devices.push(Box::new(virtio_net::NetDevice::new(backend, mac)));
+                    }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -540,7 +586,8 @@ fn build_devices(
                 tracing::info!(
                     segment = backend.name(),
                     mac = %mac,
-                    "attaching virtio-net device (user-mode NAT: DHCP, DNS, NTP, TCP and UDP)"
+                    card = if bios { "rtl8139" } else { "virtio-net" },
+                    "attaching the network card (user-mode NAT: DHCP, DNS, NTP, TCP and UDP)"
                 );
                 net_cmdline = Some(backend.static_ip_cmdline());
                 // The profile's port forwards. One that cannot listen (a port
@@ -570,7 +617,11 @@ fn build_devices(
                         ),
                     }
                 }
-                devices.push(Box::new(virtio_net::NetDevice::new(backend, mac)));
+                if bios {
+                    legacy_net = Some((Arc::new(backend), mac));
+                } else {
+                    devices.push(Box::new(virtio_net::NetDevice::new(backend, mac)));
+                }
             }
         }
     }
@@ -966,6 +1017,7 @@ fn build_devices(
     Ok(BuiltDevices {
         devices,
         net_cmdline,
+        legacy_net,
         shares_scanout,
         gpu_scanout,
         agent_port,
@@ -1796,6 +1848,7 @@ pub fn run_with(
         out,
         devices: built.devices,
         net_cmdline: built.net_cmdline,
+        legacy_net: built.legacy_net,
         pflash: pflash.clone(),
         lifecycle: Arc::clone(&lifecycle),
         restore: restore.as_deref(),
@@ -2143,6 +2196,8 @@ mod host_api {
         /// Extra clause for a direct-Linux command line (the usernet `ip=`
         /// clause today); `None` when the network backend wants nothing.
         pub net_cmdline: Option<String>,
+        /// The network backend of a BIOS machine, for its RTL8139.
+        pub legacy_net: Option<super::LegacyNet>,
         pub pflash: Option<Arc<Mutex<Pflash>>>,
         /// The pause/reset seam (ADR-0005). Each host attaches the assembled
         /// machine to it and hands it to its `spawn_vcpus`.
@@ -2753,6 +2808,7 @@ mod host {
             out,
             devices,
             net_cmdline,
+            mut legacy_net,
             pflash,
             lifecycle,
             restore,
@@ -2846,6 +2902,27 @@ mod host {
                     .map_err(|e| e.to_string())?;
                     if cfg.boot.mode == BootMode::Bios {
                         pci.attach_ide().map_err(|e| e.to_string())?;
+                        if let Some(net) = legacy_net.take() {
+                            // An irqfd on the in-kernel IOAPIC. Level
+                            // semantics there need a resample fd, which is
+                            // not wired: an interrupt raised while one is
+                            // in service waits for the next event.
+                            super::attach_legacy_nic(
+                                &mut pci,
+                                net,
+                                &mem,
+                                &quiesce,
+                                |gsi| {
+                                    machine_x86::irqfd::IrqFdLine::new(&vm.fd_shared(), gsi)
+                                        .map(|line| {
+                                            Arc::new(line)
+                                                as Arc<dyn virtio_core::interrupt::IrqLine>
+                                        })
+                                        .map_err(|e| e.to_string())
+                                },
+                                |_, _| Ok(None),
+                            )?;
+                        }
                     }
                     super::attach_optical(&mut pci, cfg, &mem)?;
                     super::attach_hda(&mut pci, cfg, &mem)?;
@@ -3141,6 +3218,7 @@ mod host {
             out,
             devices,
             net_cmdline,
+            mut legacy_net,
             pflash,
             lifecycle,
             restore,
@@ -3250,6 +3328,35 @@ mod host {
                     }
                     if cfg.boot.mode == BootMode::Bios {
                         pci.attach_ide().map_err(|e| e.to_string())?;
+                        if let Some(net) = legacy_net.take() {
+                            // An IOAPIC pin, and the pin's EOI: the card's
+                            // interrupt is level-triggered, so it is raised
+                            // again when the guest finishes one with a cause
+                            // still pending.
+                            super::attach_legacy_nic(
+                                &mut pci,
+                                net,
+                                &mem,
+                                &quiesce,
+                                |gsi| {
+                                    irqchip
+                                        .ioapic()
+                                        .line(gsi as u8)
+                                        .map(|line| {
+                                            line as Arc<dyn virtio_core::interrupt::IrqLine>
+                                        })
+                                        .map_err(|e| e.to_string())
+                                },
+                                |gsi, card| {
+                                    let relay = machine_x86::rtl8139_function::EoiRelay::new(card);
+                                    irqchip
+                                        .ioapic()
+                                        .listen(gsi as u8, relay.listener())
+                                        .map_err(|e| e.to_string())?;
+                                    Ok(Some(relay as Arc<dyn std::any::Any + Send + Sync>))
+                                },
+                            )?;
+                        }
                     }
                     super::attach_optical(&mut pci, cfg, &mem)?;
                     super::attach_hda(&mut pci, cfg, &mem)?;
