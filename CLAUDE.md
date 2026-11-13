@@ -40,6 +40,16 @@ on the GPU — `viogpu3d` carrying Venus, `d3d10umd` on Zink; phases W0–W5).
 Nine's state machine behind the WDDM DDI — so a game needs no switch; phases
 N0–N4, all done: Portal 2 plays a level full screen with no switch, on the
 host's plane; WPF programs draw).
+[docs/adr/0012-windows-xp-guests.md](docs/adr/0012-windows-xp-guests.md)
+(proposed: Windows XP guests need the legacy PC this machine never was — a
+BIOS, real VGA, PCI IDE, level-triggered INTx, a PS/2 mouse; phases X0–X5:
+`boot.mode = "bios"` with a BIOS of our own, and `entangled install windows`
+installs the XP CD unattended to a desktop with a network, on WHP).
+[docs/adr/0013-windows-xp-3d.md](docs/adr/0013-windows-xp-3d.md)
+(proposed: 3D for XP guests — an XPDM display driver of our own, an OpenGL
+ICD that passes the guest's GL calls to the host's OpenGL, Direct3D through
+a wrapper on top; phases G0–G5; G0–G2 done: OpenGL 1.1 draws on the host's
+GPU, Windows hosts only).
 
 ## Build and test
 
@@ -120,6 +130,10 @@ kernel and initramfs artifacts, and self-skips without them.
 | `crates/virtio-balloon` | free page reporting only: pages the guest reports free are discarded on the host (`reclaim_memory = true`) | — |
 | `crates/virtio-input` | keyboard + absolute pointer devices | EPIC 9 |
 | `crates/virtio-sound` | virtio-snd playback: control/event/TX queues, PCM lifecycle, host sinks behind `AudioSink` (null/recording everywhere, ALSA dlopen'd on Linux, WASAPI on Windows) | EPIC 21, GAME-2102 |
+| `crates/pc-bios` | A PC BIOS served by the host: a ROM of interrupt stubs assembled in Rust, and the `int 10h/13h/15h/16h/1Ah` services behind them, for `boot.mode = "bios"` | ADR-0012 |
+| `crates/ide` | Dual-channel IDE controller, PIO only: ATA disks and ATAPI drives (the AHCI crate's packet set) at the fixed ISA ports, for BIOS-era guests | ADR-0012 |
+| `crates/rtl8139` | Realtek RTL8139 network card on virtio-net's `NetBackend`, for guests with no virtio-net driver (Windows XP's in-box driver) | ADR-0012 |
+| `crates/gl-passthrough` | A guest's OpenGL 1.1 command stream run on the host's OpenGL: the wire format, every size check, the executor and its WGL contexts; `guest/winxp/opengl/gen.py` generates the plain calls for both ends | ADR-0013 |
 | `crates/hda` | Intel HD Audio controller + one-output codec for Windows guests (in-box driver), playing into virtio-sound's `AudioSink` | ADR-0008 |
 | `crates/ahci` | AHCI controller with ATAPI drives (`[[optical]]`), so Windows PE sees the untouched ISO | ADR-0008 |
 | `crates/display` | winit window, wgpu renderer, host input capture | EPIC 7 |

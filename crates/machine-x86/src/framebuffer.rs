@@ -94,6 +94,72 @@ mod regs {
     /// DISPI: index `n` at `0x500 + 2n`, 16 bits each.
     pub const DISPI: u64 = 0x500;
     pub const DISPI_END: u64 = DISPI + 2 * super::dispi::COUNT as u64;
+    /// The accelerator's registers (ADR-0013), 32 bits each.
+    pub const ACCEL: u64 = 0x600;
+    pub const ACCEL_END: u64 = ACCEL + 4 * super::accel::COUNT as u64;
+    /// One byte, write-only: a character of the guest drivers' log. A line
+    /// feed ends a line, which the host then logs (ADR-0013).
+    pub const LOG: u64 = 0x700;
+}
+
+/// The accelerator's registers: how a guest driver hands the host a buffer
+/// of commands (ADR-0013). The buffer lives at the top of VRAM — memory both
+/// sides already share — so the registers only say where, and when.
+pub mod accel {
+    /// Reads [`MAGIC`] when the host has an accelerator, 0 when not.
+    pub const ID: usize = 0;
+    /// Offset in VRAM of the command area.
+    pub const COMMANDS: usize = 1;
+    /// Its size in bytes.
+    pub const COMMANDS_BYTES: usize = 2;
+    /// Offset in VRAM of the response area.
+    pub const RESPONSE: usize = 3;
+    /// Its size in bytes.
+    pub const RESPONSE_BYTES: usize = 4;
+    /// Write: run this many bytes of the command area, now; the write
+    /// returns when they have run. Read: bytes of response they produced.
+    pub const RUN: usize = 5;
+    pub const COUNT: usize = 6;
+
+    /// "ENGL".
+    pub const MAGIC: u32 = 0x4c47_4e45;
+    /// The top of VRAM set aside: commands, then the response.
+    pub const AREA_BYTES: u64 = 4 << 20;
+    pub const RESPONSE_AREA_BYTES: u64 = 1 << 20;
+    /// VRAM smaller than this has no room to set aside.
+    pub const MIN_VRAM_BYTES: u64 = 16 << 20;
+}
+
+/// What runs the buffers a guest driver hands over through the accelerator
+/// registers. The device knows nothing of what is in them.
+pub trait Accelerator: Send + Sync {
+    /// Runs `commands` to completion.
+    fn run(&self, commands: &[u8]) -> Accelerated;
+    /// The guest was reset: forget everything it had set up.
+    fn reset(&self);
+}
+
+/// What a buffer produced.
+#[derive(Debug, Default)]
+pub struct Accelerated {
+    /// Bytes for the guest's driver; cut to the response area's size.
+    pub response: Vec<u8>,
+    /// Pictures to put on the guest's screen.
+    pub blits: Vec<Blit>,
+}
+
+/// `width`x`height` pixels of B, G, R, X, top row first, for the place
+/// (`x`, `y`) on the guest's screen.
+#[derive(Debug)]
+pub struct Blit {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    /// Where on the screen it may land: `[left, top, right, bottom]` each,
+    /// right and bottom exclusive. Empty means anywhere.
+    pub clip: Vec<[i32; 4]>,
 }
 
 /// The DISPI register indices and the bits that mean something.
@@ -140,6 +206,10 @@ pub struct FramebufferConfig {
     /// Part of the virtio-gpu function rather than a function of its own
     /// (the module docs' "virtio-vga").
     pub on_virtio_gpu: bool,
+    /// Put VRAM at this address, below 4 GiB, instead of in the 64-bit
+    /// aperture: for a 32-bit guest that reaches it through the BIOS's VBE
+    /// (ADR-0012), which can name no address above.
+    pub low_vram_base: Option<u64>,
 }
 
 impl Default for FramebufferConfig {
@@ -148,6 +218,7 @@ impl Default for FramebufferConfig {
             vram_bytes: DEFAULT_VRAM_BYTES,
             edid: None,
             on_virtio_gpu: false,
+            low_vram_base: None,
         }
     }
 }
@@ -210,6 +281,11 @@ pub struct Framebuffer {
     /// Bumped on every register write that can change what is shown, so a
     /// presenter can tell "the guest set a mode" from "the guest drew".
     generation: AtomicU64,
+    accelerator: std::sync::OnceLock<Arc<dyn Accelerator>>,
+    /// Bytes of response the last buffer produced.
+    accel_response: std::sync::atomic::AtomicU32,
+    /// The line of guest log being written.
+    log: Mutex<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Framebuffer {
@@ -249,7 +325,138 @@ impl Framebuffer {
             vram,
             vram_bytes: config.vram_bytes,
             generation: AtomicU64::new(0),
+            accelerator: std::sync::OnceLock::new(),
+            accel_response: std::sync::atomic::AtomicU32::new(0),
+            log: Mutex::new(Vec::new()),
         })
+    }
+
+    /// One character of the guest drivers' log. Lines are cut at 200 bytes
+    /// and logged with their unprintable bytes replaced: the text is the
+    /// guest's.
+    fn log_byte(&self, byte: u8) {
+        const LINE: usize = 200;
+        let mut line = self
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if byte != b'\n' {
+            line.push(if byte.is_ascii_graphic() || byte == b' ' {
+                byte
+            } else {
+                b'?'
+            });
+        }
+        if byte == b'\n' || line.len() >= LINE {
+            tracing::info!(target: "guest_driver", "{}", String::from_utf8_lossy(&line));
+            line.clear();
+        }
+    }
+
+    /// Gives the device an accelerator (ADR-0013); `false` if it has one, or
+    /// its VRAM is too small to set a transfer area aside.
+    pub fn set_accelerator(&self, accelerator: Arc<dyn Accelerator>) -> bool {
+        self.vram_bytes >= accel::MIN_VRAM_BYTES && self.accelerator.set(accelerator).is_ok()
+    }
+
+    fn read_accel(&self, index: usize) -> u32 {
+        if self.accelerator.get().is_none() {
+            return 0;
+        }
+        let area = self.vram_bytes - accel::AREA_BYTES;
+        let commands = accel::AREA_BYTES - accel::RESPONSE_AREA_BYTES;
+        let value = match index {
+            accel::ID => return accel::MAGIC,
+            accel::COMMANDS => area,
+            accel::COMMANDS_BYTES => commands,
+            accel::RESPONSE => area + commands,
+            accel::RESPONSE_BYTES => accel::RESPONSE_AREA_BYTES,
+            accel::RUN => return self.accel_response.load(Ordering::Acquire),
+            _ => 0,
+        };
+        u32::try_from(value).unwrap_or(0)
+    }
+
+    /// Runs `bytes` bytes of the command area and leaves the response in the
+    /// response area. On the vCPU thread: the guest's driver is waiting.
+    fn run_accel(&self, bytes: u32) {
+        let Some(accelerator) = self.accelerator.get() else {
+            return;
+        };
+        self.accel_response.store(0, Ordering::Release);
+        let area = self.vram_bytes - accel::AREA_BYTES;
+        let capacity = accel::AREA_BYTES - accel::RESPONSE_AREA_BYTES;
+        let bytes = u64::from(bytes).min(capacity);
+        // A copy, so the guest cannot change a command after it was checked.
+        let mut commands = vec![0u8; bytes as usize];
+        if self.vram.read(area, &mut commands).is_err() {
+            return;
+        }
+        let outcome = accelerator.run(&commands);
+        for blit in &outcome.blits {
+            self.blit(blit);
+        }
+        let kept = outcome
+            .response
+            .len()
+            .min(accel::RESPONSE_AREA_BYTES as usize);
+        let response = &outcome.response[..kept];
+        if self.vram.write(area + capacity, response).is_ok() {
+            self.accel_response
+                .store(response.len() as u32, Ordering::Release);
+        }
+    }
+
+    /// Puts a picture on the guest's screen, clipped to the mode it shows
+    /// and to the picture's own clip rectangles.
+    fn blit(&self, blit: &Blit) {
+        let Some(mode) = self.scanout() else {
+            return;
+        };
+        let row = blit.width as usize * 4;
+        if row == 0 || blit.pixels.len() != row * blit.height as usize {
+            return;
+        }
+        let screen = [0, 0, i64::from(mode.width), i64::from(mode.height)];
+        if blit.clip.is_empty() {
+            self.blit_within(blit, &mode, screen);
+        }
+        for clip in &blit.clip {
+            let [left, top, right, bottom] = clip.map(i64::from);
+            self.blit_within(
+                blit,
+                &mode,
+                [
+                    left.max(0),
+                    top.max(0),
+                    right.min(screen[2]),
+                    bottom.min(screen[3]),
+                ],
+            );
+        }
+    }
+
+    /// The part of `blit` inside `[left, top, right, bottom)`, which is
+    /// inside the screen.
+    fn blit_within(&self, blit: &Blit, mode: &ScanoutMode, within: [i64; 4]) {
+        let row = blit.width as usize * 4;
+        let left = i64::from(blit.x).max(within[0]);
+        let right = (i64::from(blit.x) + i64::from(blit.width)).min(within[2]);
+        if left >= right {
+            return;
+        }
+        let skip = (left - i64::from(blit.x)) as usize * 4;
+        let take = (right - left) as usize * 4;
+        for (line, pixels) in blit.pixels.chunks_exact(row).enumerate() {
+            let y = i64::from(blit.y) + line as i64;
+            if y < within[1] || y >= within[3] {
+                continue;
+            }
+            let at = mode.offset + y as u64 * u64::from(mode.stride) + left as u64 * 4;
+            if self.vram.write(at, &pixels[skip..skip + take]).is_err() {
+                return;
+            }
+        }
     }
 
     /// The function's configuration space: VRAM in a 64-bit prefetchable BAR
@@ -324,6 +531,10 @@ impl Framebuffer {
     /// Power-on (ADR-0005): the registers back to "disabled", VRAM cleared.
     pub fn reset(&self) {
         *self.lock() = Dispi::power_on(self.vram_bytes);
+        if let Some(accelerator) = self.accelerator.get() {
+            accelerator.reset();
+        }
+        self.accel_response.store(0, Ordering::Release);
         self.clear_vram();
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
@@ -332,6 +543,31 @@ impl Framebuffer {
         if let Err(error) = self.vram.fill(0, self.vram_bytes, 0) {
             tracing::warn!(%error, "could not clear the framebuffer's VRAM");
         }
+    }
+
+    /// Sets a mode as the BIOS's VBE does on a guest's behalf: `width` x
+    /// `height` at `bpp`, with the linear framebuffer on.
+    pub fn set_mode(&self, width: u16, height: u16, bpp: u16, clear: bool) {
+        let register = |index: usize| regs::DISPI + 2 * index as u64;
+        let mut enable = dispi::ENABLED | dispi::LFB_ENABLED;
+        if !clear {
+            enable |= dispi::NOCLEARMEM;
+        }
+        for (index, value) in [
+            (dispi::ENABLE, 0),
+            (dispi::XRES, width),
+            (dispi::YRES, height),
+            (dispi::BPP, bpp),
+            (dispi::VIRT_WIDTH, width),
+            (dispi::ENABLE, enable),
+        ] {
+            self.mmio_write(register(index), &value.to_le_bytes());
+        }
+    }
+
+    /// Turns the framebuffer off: the VGA has the screen again.
+    pub fn disable(&self) {
+        self.mmio_write(regs::DISPI + 2 * dispi::ENABLE as u64, &0u16.to_le_bytes());
     }
 
     /// Guest read inside the register BAR. Unclaimed offsets read zero.
@@ -345,6 +581,13 @@ impl Framebuffer {
             for (i, byte) in data.iter_mut().enumerate() {
                 let at = offset as usize + i;
                 *byte = edid.get(at).copied().unwrap_or(0);
+            }
+            return;
+        }
+        if offset >= regs::ACCEL && end <= regs::ACCEL_END {
+            if data.len() == 4 && offset % 4 == 0 {
+                let value = self.read_accel(((offset - regs::ACCEL) / 4) as usize);
+                data.copy_from_slice(&value.to_le_bytes());
             }
             return;
         }
@@ -373,6 +616,18 @@ impl Framebuffer {
     /// writes do anything; everything else (the VGA ports, the EDID, stray
     /// bytes) is absorbed.
     pub fn mmio_write(&self, offset: u64, data: &[u8]) {
+        if offset == regs::LOG {
+            if let [byte] = data {
+                self.log_byte(*byte);
+            }
+            return;
+        }
+        if offset == regs::ACCEL + 4 * accel::RUN as u64 {
+            if let Ok(bytes) = <[u8; 4]>::try_from(data) {
+                self.run_accel(u32::from_le_bytes(bytes));
+            }
+            return;
+        }
         if !(regs::DISPI..regs::DISPI_END).contains(&offset) {
             return;
         }
@@ -551,6 +806,158 @@ mod tests {
         write(fb, dispi::VIRT_WIDTH, width);
         write(fb, dispi::VIRT_HEIGHT, height);
         write(fb, dispi::ENABLE, dispi::ENABLED | dispi::LFB_ENABLED);
+    }
+
+    /// Answers every buffer with its length, and one 2x2 picture at the
+    /// place the buffer's first two bytes name.
+    struct Echo(Mutex<Vec<Vec<u8>>>, AtomicU64);
+
+    impl Accelerator for Echo {
+        fn run(&self, commands: &[u8]) -> Accelerated {
+            self.0.lock().unwrap().push(commands.to_vec());
+            let at = |i: usize| i32::from(commands.get(i).copied().unwrap_or(0) as i8);
+            Accelerated {
+                response: (commands.len() as u32).to_le_bytes().to_vec(),
+                blits: vec![Blit {
+                    x: at(0),
+                    y: at(1),
+                    width: 2,
+                    height: 2,
+                    pixels: (1..=16).collect(),
+                    // A third byte asks for the right column only.
+                    clip: match commands.get(2) {
+                        Some(1) => vec![[at(0) + 1, -5, 4000, 4000]],
+                        _ => Vec::new(),
+                    },
+                }],
+            }
+        }
+        fn reset(&self) {
+            self.1.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn accelerated() -> (Framebuffer, Arc<Vram>, Arc<Echo>) {
+        let bytes = accel::MIN_VRAM_BYTES;
+        let vram = Arc::new(Vram(Mutex::new(vec![0; bytes as usize])));
+        let config = FramebufferConfig {
+            vram_bytes: bytes,
+            ..FramebufferConfig::default()
+        };
+        let backing: Arc<dyn ShmBacking> = vram.clone();
+        let fb = Framebuffer::new(&config, backing).unwrap();
+        let echo = Arc::new(Echo(Mutex::new(Vec::new()), AtomicU64::new(0)));
+        assert!(fb.set_accelerator(echo.clone()));
+        (fb, vram, echo)
+    }
+
+    fn accel_read(fb: &Framebuffer, index: usize) -> u32 {
+        let mut data = [0u8; 4];
+        fb.mmio_read(regs::ACCEL + 4 * index as u64, &mut data);
+        u32::from_le_bytes(data)
+    }
+
+    fn accel_run(fb: &Framebuffer, bytes: u32) {
+        fb.mmio_write(regs::ACCEL + 4 * accel::RUN as u64, &bytes.to_le_bytes());
+    }
+
+    #[test]
+    fn a_device_without_an_accelerator_says_so() {
+        let (fb, _) = device();
+        assert_eq!(accel_read(&fb, accel::ID), 0);
+        assert_eq!(accel_read(&fb, accel::COMMANDS), 0);
+        // Nothing to run them: the write is absorbed.
+        accel_run(&fb, 64);
+        assert_eq!(accel_read(&fb, accel::RUN), 0);
+        // And 4 MiB of VRAM has no room for the transfer area.
+        struct Never;
+        impl Accelerator for Never {
+            fn run(&self, _: &[u8]) -> Accelerated {
+                unreachable!()
+            }
+            fn reset(&self) {}
+        }
+        assert!(!fb.set_accelerator(Arc::new(Never)));
+    }
+
+    #[test]
+    fn a_buffer_at_the_top_of_vram_is_run_and_answered() {
+        let (fb, vram, echo) = accelerated();
+        assert_eq!(accel_read(&fb, accel::ID), accel::MAGIC);
+        let commands = u64::from(accel_read(&fb, accel::COMMANDS));
+        let response = u64::from(accel_read(&fb, accel::RESPONSE));
+        assert_eq!(commands, (12 << 20));
+        assert_eq!(accel_read(&fb, accel::COMMANDS_BYTES), 3 << 20);
+        assert_eq!(response, 15 << 20);
+        assert_eq!(accel_read(&fb, accel::RESPONSE_BYTES), 1 << 20);
+
+        set_mode(&fb, 640, 480);
+        vram.write(commands, &[3, 1, 9, 9, 9]).unwrap();
+        accel_run(&fb, 5);
+        assert_eq!(echo.0.lock().unwrap()[0], [3, 1, 9, 9, 9]);
+        // The answer: its length in the register, its bytes in the area.
+        assert_eq!(accel_read(&fb, accel::RUN), 4);
+        let mut answer = [0u8; 4];
+        vram.read(response, &mut answer).unwrap();
+        assert_eq!(u32::from_le_bytes(answer), 5);
+        // The picture, at (3, 1) of a 640-wide screen.
+        let mut row = [0u8; 8];
+        vram.read((640 + 3) * 4, &mut row).unwrap();
+        assert_eq!(row, [1, 2, 3, 4, 5, 6, 7, 8]);
+        vram.read((2 * 640 + 3) * 4, &mut row).unwrap();
+        assert_eq!(row, [9, 10, 11, 12, 13, 14, 15, 16]);
+    }
+
+    #[test]
+    fn a_length_past_the_command_area_is_cut_to_it() {
+        let (fb, _, echo) = accelerated();
+        accel_run(&fb, u32::MAX);
+        assert_eq!(echo.0.lock().unwrap()[0].len(), 3 << 20);
+    }
+
+    #[test]
+    fn pictures_are_clipped_to_the_screen() {
+        let (fb, vram, _) = accelerated();
+        let commands = u64::from(accel_read(&fb, accel::COMMANDS));
+        set_mode(&fb, 640, 480);
+        // At (-1, -1): only the picture's last pixel lands, at (0, 0).
+        vram.write(commands, &[0xff, 0xff]).unwrap();
+        accel_run(&fb, 2);
+        let mut pixels = [0u8; 8];
+        vram.read(0, &mut pixels).unwrap();
+        assert_eq!(pixels, [13, 14, 15, 16, 0, 0, 0, 0]);
+        // With no mode set there is no screen to put it on.
+        let (fb, vram, _) = accelerated();
+        accel_run(&fb, 2);
+        let mut pixels = [0u8; 8];
+        vram.read(0, &mut pixels).unwrap();
+        assert_eq!(pixels, [0; 8]);
+    }
+
+    #[test]
+    fn pictures_keep_to_their_clip_rectangles() {
+        let (fb, vram, _) = accelerated();
+        let commands = u64::from(accel_read(&fb, accel::COMMANDS));
+        set_mode(&fb, 640, 480);
+        // At (3, 1), right column only: (4, 1) and (4, 2) are written,
+        // (3, 1) and (3, 2) are not.
+        vram.write(commands, &[3, 1, 1]).unwrap();
+        accel_run(&fb, 3);
+        let mut row = [0u8; 8];
+        vram.read((640 + 3) * 4, &mut row).unwrap();
+        assert_eq!(row, [0, 0, 0, 0, 5, 6, 7, 8]);
+        vram.read((2 * 640 + 3) * 4, &mut row).unwrap();
+        assert_eq!(row, [0, 0, 0, 0, 13, 14, 15, 16]);
+    }
+
+    #[test]
+    fn a_reset_reaches_the_accelerator() {
+        let (fb, _, echo) = accelerated();
+        accel_run(&fb, 1);
+        assert_eq!(accel_read(&fb, accel::RUN), 4);
+        fb.reset();
+        assert_eq!(echo.1.load(Ordering::Acquire), 1);
+        assert_eq!(accel_read(&fb, accel::RUN), 0);
     }
 
     #[test]

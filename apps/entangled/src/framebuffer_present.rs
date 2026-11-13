@@ -54,6 +54,10 @@ pub(super) fn config_for(cfg: &VmConfig) -> Option<FramebufferConfig> {
     Some(FramebufferConfig {
         edid,
         on_virtio_gpu,
+        // A BIOS machine's guest is 32-bit and reaches VRAM through VBE:
+        // inside the root bridge's window below 4 GiB, clear of the
+        // register slots at its start.
+        low_vram_base: (cfg.boot.mode == control_api::BootMode::Bios).then_some(0xc800_0000),
         ..FramebufferConfig::default()
     })
 }
@@ -140,6 +144,9 @@ fn run(
             continue;
         }
         let Some(mode) = device.scanout() else {
+            // Nothing to show (the VGA has the screen, on a BIOS machine):
+            // whatever comes next is sent whole.
+            frame.mode = None;
             continue;
         };
         if let Err(error) = frame.present(device, display, mode) {

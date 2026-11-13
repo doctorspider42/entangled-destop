@@ -339,10 +339,7 @@ impl Task {
     /// Reboots the VM in place (ADR-0005): the same machine reset the guest's
     /// own Restart performs, not a stop followed by a start.
     pub fn reset(&self) -> bool {
-        if !self.send_control("reset") {
-            return false;
-        }
-        true
+        self.send_control("reset")
     }
 
     /// Writes the whole machine to its snapshot file and stops it (ADR-0006).

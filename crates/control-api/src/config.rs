@@ -290,6 +290,10 @@ pub enum BootMode {
     /// Boot a UEFI firmware image, which then finds its own bootloader
     /// (EPIC 18, [ADR-0003](../../docs/adr/0003-uefi-firmware.md)).
     Uefi,
+    /// Boot the way a PC did before UEFI: a BIOS, served by the host, loads
+    /// the boot sector of a disc or a disk (ADR-0012). For guests with no EFI
+    /// loader, Windows XP first of all.
+    Bios,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -319,6 +323,11 @@ pub struct BootSection {
     /// through this path (see `machine_x86::pflash`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nvram: Option<PathBuf>,
+    /// `bios` only: a floppy image in drive A:, readable through the BIOS
+    /// and nothing else (ADR-0012). What Windows XP's Setup reads its answer
+    /// file, `WINNT.SIF`, from. The machine never boots from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floppy: Option<PathBuf>,
     /// Kernel command line. Meaningless in `uefi` mode — the firmware and the
     /// guest bootloader own the command line there.
     #[serde(default)]
@@ -354,6 +363,7 @@ impl Default for BootSection {
             initramfs: None,
             firmware: None,
             nvram: None,
+            floppy: None,
             cmdline: String::new(),
         }
     }
@@ -1277,6 +1287,13 @@ impl VmConfig {
                 self.display.refresh_hz
             ));
         }
+        if self.boot.floppy.is_some() && self.boot.mode != BootMode::Bios {
+            return err(
+                "boot.floppy is only valid for mode = \"bios\": only a BIOS \
+                 reads a floppy here"
+                    .into(),
+            );
+        }
         if !self.optical.is_empty() {
             if self.optical.len() > MAX_OPTICAL {
                 return err(format!(
@@ -1284,10 +1301,10 @@ impl VmConfig {
                     self.optical.len()
                 ));
             }
-            if self.transport != VirtioTransport::Pci || self.boot.mode != BootMode::Uefi {
-                return err("[[optical]] drives sit on a PCI AHCI controller the UEFI \
+            if self.transport != VirtioTransport::Pci || self.boot.mode == BootMode::DirectLinux {
+                return err("[[optical]] drives sit on a PCI AHCI controller the \
                      firmware boots from: they need transport = \"pci\" and \
-                     boot.mode = \"uefi\""
+                     boot.mode = \"uefi\" or \"bios\""
                     .into());
             }
         }
@@ -1302,10 +1319,17 @@ impl VmConfig {
                      renderers for the plain virtio-gpu adapter. Drop them, or use that one"
                 ));
             }
-            if self.transport != VirtioTransport::Pci || self.boot.mode != BootMode::Uefi {
+            // A BIOS machine takes the plain framebuffer: its BIOS offers it
+            // through VBE (ADR-0012). virtio-vga needs a virtio-gpu driver.
+            let bios_framebuffer =
+                self.boot.mode == BootMode::Bios && adapter == DisplayAdapter::Framebuffer;
+            if self.transport != VirtioTransport::Pci
+                || !(self.boot.mode == BootMode::Uefi || bios_framebuffer)
+            {
                 return err(format!(
-                    "display.adapter = \"{adapter}\" is a PCI device the UEFI firmware \
-                     drives: it needs transport = \"pci\" and boot.mode = \"uefi\""
+                    "display.adapter = \"{adapter}\" is a PCI device the firmware \
+                     drives: it needs transport = \"pci\" and boot.mode = \"uefi\" \
+                     (or, for \"framebuffer\", \"bios\")"
                 ));
             }
         }
@@ -1445,6 +1469,28 @@ impl VmConfig {
                          virtio-mmio driver, so {media} would be invisible to it and the \
                          boot would end at \"No bootable option or device was found\""
                     ));
+                }
+            }
+            BootMode::Bios => {
+                if self.boot.kernel.is_some() || self.boot.initramfs.is_some() {
+                    return err("boot.kernel/boot.initramfs are only valid for mode = \
+                         \"direct-linux\"; in bios mode the BIOS loads a boot sector"
+                        .into());
+                }
+                if self.boot.firmware.is_some() || self.boot.nvram.is_some() {
+                    return err("boot.firmware/boot.nvram are only valid for mode = \
+                         \"uefi\"; the BIOS of mode = \"bios\" is built in"
+                        .into());
+                }
+                if !self.transport.is_pci() {
+                    return err("mode = \"bios\" needs transport = \"pci\": a PC with a \
+                         BIOS has a PCI bus, and its guests look for their devices there"
+                        .into());
+                }
+                if self.disks.is_empty() && self.optical.is_empty() {
+                    return err("mode = \"bios\" has nothing to boot: add a [[disk]] or \
+                         an [[optical]] drive"
+                        .into());
                 }
             }
         }

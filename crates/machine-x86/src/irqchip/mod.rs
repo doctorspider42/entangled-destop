@@ -84,11 +84,62 @@ pub enum IrqChipError {
 pub struct UserspaceIrqChip {
     ioapic: Arc<IoApic>,
     pit: Arc<Pit>,
-    pic: Mutex<Pic8259>,
+    pic: Arc<PicOutput>,
     /// Field order matters for teardown: `_timer` is declared after `pit` and
     /// `ioapic` but dropped *before* them, which is the direction we want — the
     /// thread that triggers the interrupt line stops before the line goes away.
     _timer: PitTimer,
+}
+
+/// The 8259 pair and its `INTR` line.
+struct PicOutput {
+    chips: Mutex<Pic8259>,
+    /// Whether the pair delivers at all ([`UserspaceIrqChip::enable_legacy_interrupts`]).
+    enabled: std::sync::atomic::AtomicBool,
+    /// `INTR`, kept beside the chips so reading it takes no lock.
+    intr: std::sync::atomic::AtomicBool,
+    delivery: Arc<dyn InterruptDelivery>,
+}
+
+impl PicOutput {
+    /// Recomputes `INTR` from the chips; returns it.
+    fn refresh(&self, chips: &Pic8259) -> bool {
+        use std::sync::atomic::Ordering;
+        let on = self.enabled.load(Ordering::Acquire) && chips.pending();
+        self.intr.store(on, Ordering::Release);
+        on
+    }
+
+    /// An edge on `irq` from a device thread: latch it, and if that raises
+    /// `INTR`, get the boot CPU to look.
+    fn pulse(&self, irq: u8) {
+        if !self.enabled.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let raised = match self.chips.lock() {
+            Ok(mut chips) => {
+                chips.pulse(irq);
+                self.refresh(&chips)
+            }
+            Err(_) => false,
+        };
+        if raised {
+            self.delivery.kick(0);
+        }
+    }
+}
+
+/// The 8254's output: IOAPIC pin 2 and 8259 IRQ 0.
+struct TimerLine {
+    ioapic: Arc<self::ioapic::IoApicLine>,
+    pic: Arc<PicOutput>,
+}
+
+impl virtio_core::interrupt::IrqLine for TimerLine {
+    fn trigger(&self) -> Result<(), virtio_core::interrupt::InterruptError> {
+        self.pic.pulse(0);
+        self.ioapic.trigger()
+    }
 }
 
 impl UserspaceIrqChip {
@@ -101,8 +152,23 @@ impl UserspaceIrqChip {
         delivery: Arc<dyn InterruptDelivery>,
         vcpu_count: u32,
     ) -> Result<Arc<Self>, IrqChipError> {
-        let ioapic = IoApic::new(delivery, u8::try_from(vcpu_count).unwrap_or(u8::MAX));
-        let pit = Pit::new(ioapic.line(TIMER_PIN)?);
+        let ioapic = IoApic::new(
+            Arc::clone(&delivery),
+            u8::try_from(vcpu_count).unwrap_or(u8::MAX),
+        );
+        let pic = Arc::new(PicOutput {
+            chips: Mutex::new(Pic8259::new()),
+            enabled: std::sync::atomic::AtomicBool::new(false),
+            intr: std::sync::atomic::AtomicBool::new(false),
+            delivery,
+        });
+        // The 8254's output is wired to both controllers, as on a PC: the
+        // IOAPIC's pin 2, and the 8259's IRQ 0 for a guest that has not left
+        // legacy mode yet (a no-op unless the machine enabled it).
+        let pit = Pit::new(Arc::new(TimerLine {
+            ioapic: ioapic.line(TIMER_PIN)?,
+            pic: Arc::clone(&pic),
+        }));
         // The 8254 re-injects the IRQ 0 edges the guest missed, one per EOI
         // (`pit`'s "Lost-tick re-injection"), so pin 2 reports them back.
         let listener: Arc<dyn EoiListener> = pit.clone();
@@ -111,7 +177,7 @@ impl UserspaceIrqChip {
         Ok(Arc::new(Self {
             ioapic,
             pit,
-            pic: Mutex::new(Pic8259::new()),
+            pic,
             _timer: timer,
         }))
     }
@@ -195,6 +261,32 @@ impl UserspaceIrqChip {
         Ok(self.ioapic.line(pin)?)
     }
 
+    /// Lets the 8259 pair deliver (ADR-0012): from here on the 8254's edges
+    /// are IRQ 0 requests, and what the guest unmasks reaches the boot CPU
+    /// through [`Self::ext_interrupt_pending`] and
+    /// [`Self::ext_interrupt_ack`]. For a machine that boots through a BIOS;
+    /// every other machine leaves the pair inert.
+    pub fn enable_legacy_interrupts(&self) {
+        self.pic
+            .enabled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The 8259 pair's `INTR` output. One atomic load: the run loop asks
+    /// before every entry into the guest.
+    pub fn ext_interrupt_pending(&self) -> bool {
+        self.pic.intr.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The acknowledge cycle: the vector of the interrupt the boot CPU takes
+    /// now, or `None` when the request is gone.
+    pub fn ext_interrupt_ack(&self) -> Option<u8> {
+        let mut pic = self.pic.chips.lock().ok()?;
+        let vector = pic.acknowledge();
+        self.pic.refresh(&pic);
+        vector
+    }
+
     /// Machine reset (ADR-0005): all three chips back to power-on.
     ///
     /// The order matters in one direction only — the IOAPIC is masked first, so
@@ -204,8 +296,11 @@ impl UserspaceIrqChip {
     pub fn reset(&self) {
         self.ioapic.reset();
         self.pit.reset();
-        match self.pic.lock() {
-            Ok(mut pic) => pic.reset(),
+        match self.pic.chips.lock() {
+            Ok(mut pic) => {
+                pic.reset();
+                self.pic.refresh(&pic);
+            }
             Err(_) => tracing::error!("8259 lock is poisoned; the PIC keeps its old state"),
         }
     }
@@ -213,7 +308,7 @@ impl UserspaceIrqChip {
     /// All three chips, for a snapshot (ADR-0006).
     pub fn save_state(&self) -> crate::state::SavedIrqChip {
         crate::state::SavedIrqChip {
-            pic: match self.pic.lock() {
+            pic: match self.pic.chips.lock() {
                 Ok(pic) => pic.save_state(),
                 Err(_) => {
                     tracing::error!("8259 lock is poisoned; saving a power-on PIC");
@@ -234,8 +329,12 @@ impl UserspaceIrqChip {
     ) -> Result<(), crate::state::StateError> {
         self.ioapic.load_state(&state.ioapic)?;
         self.pit.load_state(&state.pit)?;
-        match self.pic.lock() {
-            Ok(mut pic) => pic.load_state(&state.pic),
+        match self.pic.chips.lock() {
+            Ok(mut pic) => {
+                let loaded = pic.load_state(&state.pic);
+                self.pic.refresh(&pic);
+                loaded
+            }
             Err(_) => Err(crate::state::StateError::Poisoned("the 8259 pair")),
         }
     }
@@ -264,11 +363,14 @@ impl UserspaceIrqChip {
             }
             return;
         }
-        match self.pic.lock() {
+        match self.pic.chips.lock() {
             Ok(mut pic) => {
                 for &byte in data {
                     pic.io_write(port, byte);
                 }
+                // A new mask or an EOI can uncover a waiting request. This
+                // is the vCPU thread, about to re-enter the guest: no kick.
+                self.pic.refresh(&pic);
             }
             Err(_) => tracing::error!(
                 port = format_args!("{port:#x}"),
@@ -284,7 +386,7 @@ impl UserspaceIrqChip {
             }
             return;
         }
-        match self.pic.lock() {
+        match self.pic.chips.lock() {
             Ok(pic) => {
                 for byte in data.iter_mut() {
                     *byte = pic.io_read(port);

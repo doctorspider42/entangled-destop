@@ -1441,13 +1441,17 @@ dependencies = [
  "display",
  "ext4-view",
  "flate2",
+ "gl-passthrough",
+ "ide",
  "libc",
  "linux-boot",
  "machine-arm64",
  "machine-x86",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
+ "pc-bios",
  "png",
+ "rtl8139",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -1621,6 +1625,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
+
+[[package]]
 name = "foreign-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1749,6 +1759,14 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+]
+
+[[package]]
+name = "gl-passthrough"
+version = "0.2.0"
+dependencies = [
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]
@@ -2124,6 +2142,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ide"
+version = "0.2.0"
+dependencies = [
+ "ahci",
+ "tracing",
+ "virtio-core",
+]
+
+[[package]]
 name = "idea"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2476,11 +2503,15 @@ version = "0.2.0"
 dependencies = [
  "ahci",
  "hda",
+ "ide",
  "kvm-bindings",
  "kvm-ioctls",
+ "pc-bios",
+ "rtl8139",
  "thiserror 2.0.20",
  "tracing",
  "virtio-core",
+ "virtio-net",
  "virtio-sound",
  "vm-memory 0.17.2",
  "vmm-core",
@@ -3205,6 +3236,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pc-bios"
+version = "0.2.0"
+dependencies = [
+ "font8x8",
+ "thiserror 2.0.20",
+ "tracing",
+ "virtio-core",
+ "vm-memory 0.17.2",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3700,6 +3742,16 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rtl8139"
+version = "0.2.0"
+dependencies = [
+ "tracing",
+ "virtio-core",
+ "virtio-net",
+ "vm-memory 0.17.2",
 ]
 
 [[package]]

@@ -1,0 +1,22 @@
+[package]
+name = "pc-bios"
+description = "A PC BIOS whose services run in the host: a ROM of interrupt stubs and the int 10h/13h/15h/16h/1Ah handlers behind them (ADR-0012)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+virtio-core.workspace = true
+vm-memory.workspace = true
+# The 8x8 glyphs the text screen and the ROM font tables are made from.
+font8x8 = "0.3"
+
+[dev-dependencies]
+vm-memory = { workspace = true, features = ["backend-mmap"] }
+
+[lints]
+workspace = true

@@ -32,6 +32,8 @@
 
 pub use crate::run_options::{RunOptions, ScreenshotRequest};
 
+#[path = "bios_text_present.rs"]
+mod bios_text_present;
 #[path = "clipboard_bridge.rs"]
 mod clipboard_bridge;
 #[path = "framebuffer_present.rs"]
@@ -67,7 +69,8 @@ fn attach_optical(
     cfg: &VmConfig,
     mem: &Arc<virtio_core::GuestMem>,
 ) -> Result<(), String> {
-    if cfg.optical.is_empty() {
+    // On a BIOS-era machine the discs are on the IDE controller.
+    if cfg.optical.is_empty() || cfg.boot.mode == control_api::BootMode::Bios {
         return Ok(());
     }
     let drives = cfg
@@ -445,6 +448,44 @@ struct BuiltDevices {
     gpu_scanout: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// The guest agent's port, when the profile has one.
     agent_port: Option<virtio_console::PortHandle>,
+    /// The network backend of a BIOS machine, for its RTL8139.
+    legacy_net: Option<LegacyNet>,
+}
+
+/// A network backend and the card's address, for a card that is not
+/// virtio-net.
+type LegacyNet = (Arc<dyn virtio_net::NetBackend>, virtio_net::MacAddr);
+
+/// Puts the RTL8139 of a BIOS machine on the bus (ADR-0012), with its
+/// receive worker running behind the pause gate. `line` makes the interrupt
+/// line for a global system interrupt, and may give back something to keep
+/// alive with the card (the hook that re-raises a level interrupt).
+fn attach_legacy_nic(
+    pci: &mut machine_x86::virtio_pci::VirtioPciBus,
+    (backend, mac): LegacyNet,
+    mem: &Arc<virtio_core::GuestMem>,
+    quiesce: &Arc<virtio_core::Quiesce>,
+    line: impl FnOnce(u32) -> Result<Arc<dyn virtio_core::interrupt::IrqLine>, String>,
+    hook: impl FnOnce(
+        u32,
+        &Arc<rtl8139::Rtl8139>,
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, String>,
+) -> Result<(), String> {
+    let irq = pci
+        .next_function_irq()
+        .ok_or("the PCI bus has no interrupt line left for the network card")?;
+    let card = Arc::new(rtl8139::Rtl8139::new(
+        Arc::clone(mem),
+        backend,
+        mac,
+        line(irq)?,
+    ));
+    card.set_quiesce(Arc::clone(quiesce));
+    card.start()
+        .map_err(|e| format!("cannot start the network card's receive thread: {e}"))?;
+    let keep = hook(irq, &card)?;
+    pci.attach_rtl8139(card, irq, keep)
+        .map_err(|e| e.to_string())
 }
 
 /// One virtio-blk device per `[[disk]]` entry, the configured network backend,
@@ -464,7 +505,14 @@ fn build_devices(
     mouse_sink: &mut Option<virtio_input::InputHandle>,
 ) -> Result<BuiltDevices, String> {
     let mut devices: Vec<Box<dyn VirtioDevice>> = Vec::with_capacity(cfg.disks.len() + 5);
-    for disk in &cfg.disks {
+    // A BIOS-era machine's disks sit on its IDE controller (`build_ide`): a
+    // guest that needs a BIOS has no virtio driver, and one image must not
+    // be behind two controllers.
+    let virtio_disks: &[control_api::DiskSection] = match cfg.boot.mode {
+        control_api::BootMode::Bios => &[],
+        _ => &cfg.disks,
+    };
+    for disk in virtio_disks {
         let device = virtio_block::BlockDevice::open(&disk.path, disk.writable)
             .map_err(|e| format!("cannot attach disk {}: {e}", disk.path.display()))?;
         tracing::info!(
@@ -492,6 +540,10 @@ fn build_devices(
 
     // virtio-net from the [network] section (MVP-505, WHP-1704).
     let mut net_cmdline = None;
+    // On a BIOS machine the network card is an RTL8139 (ADR-0012): the
+    // backend is kept for it instead of going into a virtio-net device.
+    let bios = cfg.boot.mode == control_api::BootMode::Bios;
+    let mut legacy_net: Option<LegacyNet> = None;
     if let Some(net) = &cfg.network {
         // The profile's own MAC (every installed machine has one, and the
         // config already validated it), else the name-derived address every
@@ -510,8 +562,12 @@ fn build_devices(
                     let interface = net.require_interface().map_err(|e| e.to_string())?;
                     let backend = virtio_net::TapBackend::open(interface)
                         .map_err(|e| format!("cannot open TAP '{interface}': {e}"))?;
-                    tracing::info!(interface, mac = %mac, "attaching virtio-net device (tap)");
-                    devices.push(Box::new(virtio_net::NetDevice::new(backend, mac)));
+                    if bios {
+                        legacy_net = Some((Arc::new(backend), mac));
+                    } else {
+                        tracing::info!(interface, mac = %mac, "attaching virtio-net device (tap)");
+                        devices.push(Box::new(virtio_net::NetDevice::new(backend, mac)));
+                    }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -530,7 +586,8 @@ fn build_devices(
                 tracing::info!(
                     segment = backend.name(),
                     mac = %mac,
-                    "attaching virtio-net device (user-mode NAT: DHCP, DNS, NTP, TCP and UDP)"
+                    card = if bios { "rtl8139" } else { "virtio-net" },
+                    "attaching the network card (user-mode NAT: DHCP, DNS, NTP, TCP and UDP)"
                 );
                 net_cmdline = Some(backend.static_ip_cmdline());
                 // The profile's port forwards. One that cannot listen (a port
@@ -560,7 +617,11 @@ fn build_devices(
                         ),
                     }
                 }
-                devices.push(Box::new(virtio_net::NetDevice::new(backend, mac)));
+                if bios {
+                    legacy_net = Some((Arc::new(backend), mac));
+                } else {
+                    devices.push(Box::new(virtio_net::NetDevice::new(backend, mac)));
+                }
             }
         }
     }
@@ -946,9 +1007,17 @@ fn build_devices(
         devices.push(Box::new(console));
     }
 
+    // A BIOS-era guest has a driver for no virtio device (ADR-0012), and to
+    // its Setup each would be one more unknown device to ask about. None is
+    // put on the bus; the handles made above stay valid and never become
+    // active, which is the state the PS/2 keyboard and mouse take over from.
+    if cfg.boot.mode == control_api::BootMode::Bios {
+        devices.clear();
+    }
     Ok(BuiltDevices {
         devices,
         net_cmdline,
+        legacy_net,
         shares_scanout,
         gpu_scanout,
         agent_port,
@@ -1091,6 +1160,72 @@ pub const CONTROL_PREFIX: &str = control_api::control::PREFIX;
 /// second, each delivery under a pause-gate pass like the input pump's — a
 /// paused VM's event ring is not written (ADR-0005), and what waits keeps
 /// waiting until it resumes.
+/// The host pointer as a PS/2 mouse (ADR-0012).
+///
+/// The window reports where the pointer *is*, on the tablet's axes; a PS/2
+/// mouse reports how far it *moved*. This keeps the last position, in guest
+/// pixels, and hands the 8042 the difference. The guest applies its own
+/// acceleration to that, so its cursor drifts from the host's: an absolute
+/// pointer needs a guest driver, which a guest this old does not have yet.
+#[derive(Default)]
+struct Ps2Pointer {
+    /// The tablet axes as last reported.
+    x: u32,
+    y: u32,
+    /// The position last sent, in guest pixels.
+    sent: Option<(i32, i32)>,
+    buttons: u8,
+    sent_buttons: u8,
+}
+
+impl Ps2Pointer {
+    fn feed(
+        &mut self,
+        events: &[virtio_input::InputEvent],
+        ps2: &Mutex<machine_x86::i8042::I8042>,
+        (width, height): (u32, u32),
+    ) {
+        const BTN_LEFT: u16 = 0x110;
+        for event in events {
+            match (event.event_type, event.code) {
+                (virtio_input::ev::ABS, 0) => self.x = event.value,
+                (virtio_input::ev::ABS, 1) => self.y = event.value,
+                (virtio_input::ev::KEY, code @ BTN_LEFT..=0x112) => {
+                    let bit = 1u8 << (code - BTN_LEFT);
+                    if event.value != 0 {
+                        self.buttons |= bit;
+                    } else {
+                        self.buttons &= !bit;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if events.is_empty() {
+            return;
+        }
+        let scale = |value: u32, size: u32| {
+            (u64::from(value.min(virtio_input::ABS_AXIS_MAX)) * u64::from(size)
+                / u64::from(virtio_input::ABS_AXIS_MAX)) as i32
+        };
+        let now = (scale(self.x, width), scale(self.y, height));
+        let (dx, dy) = match self.sent {
+            Some((x, y)) => (now.0 - x, now.1 - y),
+            None => (0, 0),
+        };
+        if dx == 0 && dy == 0 && self.buttons == self.sent_buttons && self.sent.is_some() {
+            return;
+        }
+        if let Ok(mut ps2) = ps2.lock() {
+            if ps2.mouse_active() {
+                ps2.mouse_move(dx, dy, self.buttons);
+                self.sent_buttons = self.buttons;
+            }
+        }
+        self.sent = Some(now);
+    }
+}
+
 /// The host's keys: to the virtio keyboard once the guest drives it, else to
 /// the 8042 (ADR-0008 §5) — Windows' recovery environment, and anything else
 /// that runs before `vioinput`. Never both, so nothing is typed twice.
@@ -1702,7 +1837,7 @@ pub fn run_with(
                 format!("cannot open the UEFI variable store: {e}")
             })?)))
         }
-        (control_api::BootMode::DirectLinux, _) | (_, None) => None,
+        (control_api::BootMode::DirectLinux | control_api::BootMode::Bios, _) | (_, None) => None,
     };
 
     // Everything hypervisor-shaped happens in here; see the module docs for
@@ -1713,6 +1848,7 @@ pub fn run_with(
         out,
         devices: built.devices,
         net_cmdline: built.net_cmdline,
+        legacy_net: built.legacy_net,
         pflash: pflash.clone(),
         lifecycle: Arc::clone(&lifecycle),
         restore: restore.as_deref(),
@@ -1730,10 +1866,72 @@ pub fn run_with(
                 display_handle.clone(),
                 Arc::clone(&quiesce),
                 cfg.display.refresh_hz,
-                gpu_scanout,
+                gpu_scanout.clone(),
             )
             .map_err(|e| format!("cannot start the framebuffer presenter: {e}"))?,
         ),
+        None => None,
+    };
+    // A BIOS machine starts in VGA text mode, which is guest RAM with no
+    // device behind it yet (ADR-0012): a thread draws it.
+    // The BIOS sets the VGA's standard modes for a loader that asks it to.
+    if let (Some(bios), Some(modes)) = (bus.bios(), bus.vga_bios_modes()) {
+        if let Ok(mut bios) = bios.lock() {
+            bios.set_video_modes(Box::new(modes));
+        }
+    }
+    // A PC BIOS enables every PCI device during POST; ours has no POST to
+    // do it in, so the bus starts that way.
+    if let (Some(_), Some(pci)) = (bus.bios(), bus.pci_shared()) {
+        pci.firmware_enables_decoding();
+    }
+    // The BIOS offers the linear framebuffer through VBE, when the machine
+    // has one beside its VGA.
+    if let (Some(bios), Some(pci)) = (bus.bios(), bus.pci_shared()) {
+        if pci.framebuffer().is_some() {
+            if let Ok(mut bios) = bios.lock() {
+                bios.set_vbe(Box::new(machine_x86::vbe::FramebufferVbe::new(Arc::clone(
+                    &pci,
+                ))));
+            }
+        }
+    }
+    // And OpenGL: a BIOS machine's guest has no virtio-gpu to draw 3D
+    // through, so its display driver hands OpenGL calls to the host's
+    // (ADR-0013). A host with no usable OpenGL simply offers none.
+    #[cfg(windows)]
+    if bus.bios().is_some() {
+        if let Some(fb) = bus.pci().and_then(|pci| pci.framebuffer()) {
+            match gl_passthrough::GlThread::start() {
+                Ok(gl) => {
+                    if fb.device.set_accelerator(Arc::new(GlAccelerator(gl))) {
+                        tracing::info!("OpenGL passthrough offered to the guest");
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "no OpenGL passthrough"),
+            }
+        }
+    }
+    let _bios_text_presenter = match bus.bios() {
+        Some(bios) => {
+            let mem = match bios.lock() {
+                Ok(bios) => Arc::clone(bios.memory()),
+                Err(_) => return Err("the BIOS lock is poisoned".into()),
+            };
+            Some(
+                bios_text_present::Presenter::start(
+                    mem,
+                    bus.vga().cloned(),
+                    bus.pci()
+                        .and_then(|pci| pci.framebuffer())
+                        .map(|fb| Arc::clone(&fb.device)),
+                    display_handle.clone(),
+                    Arc::clone(&quiesce),
+                    gpu_scanout,
+                )
+                .map_err(|e| format!("cannot start the text screen presenter: {e}"))?,
+            )
+        }
         None => None,
     };
 
@@ -1832,6 +2030,8 @@ pub fn run_with(
             let pump_requests = Arc::clone(&requests);
             let pump_quiesce = Arc::clone(&quiesce);
             let pump_ps2 = bus.keyboard();
+            let pump_display = display_handle.clone();
+            let mut ps2_pointer = Ps2Pointer::default();
             let pump_snapshot = snapshot.clone();
             let pump = std::thread::spawn(move || {
                 while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
@@ -1873,6 +2073,11 @@ pub fn run_with(
                     }
                     if let Err(e) = tablet_sink.push(&pointer) {
                         tracing::warn!(error = %e, "pointer event delivery failed");
+                    }
+                    // A guest with no virtio-input driver gets the pointer
+                    // as a PS/2 mouse, if the machine has one (ADR-0012).
+                    if let Some(ps2) = pump_ps2.as_ref().filter(|_| !tablet_sink.is_active()) {
+                        ps2_pointer.feed(&pointer, ps2, pump_display.resolution());
                     }
                     // Relative deltas are additive. Never run these through the
                     // tablet's last-position-wins coalescer.
@@ -2012,6 +2217,8 @@ mod host_api {
         /// Extra clause for a direct-Linux command line (the usernet `ip=`
         /// clause today); `None` when the network backend wants nothing.
         pub net_cmdline: Option<String>,
+        /// The network backend of a BIOS machine, for its RTL8139.
+        pub legacy_net: Option<super::LegacyNet>,
         pub pflash: Option<Arc<Mutex<Pflash>>>,
         /// The pause/reset seam (ADR-0005). Each host attaches the assembled
         /// machine to it and hands it to its `spawn_vcpus`.
@@ -2045,6 +2252,14 @@ mod host_api {
         /// guest cannot have changed it, and the architectural reset state the
         /// vCPU is put back into already points its first fetch at it.
         ResetVector,
+        /// A BIOS served by the host (ADR-0012). Its ROM at the reset vector
+        /// is a host mapping like the one above; what it keeps in guest RAM
+        /// (the stubs at `F000:1000`, the interrupt vectors, the BIOS data
+        /// area, an empty text screen) is written again here.
+        Bios {
+            bios: Arc<Mutex<pc_bios::Bios>>,
+            vcpus: u32,
+        },
     }
 
     /// Where a vCPU starts, and in which of the three start-of-day states.
@@ -2092,6 +2307,21 @@ mod host_api {
                 argument: 0,
                 kind: BootEntryKind::ResetVector,
             }),
+            BootPlan::Bios { bios, vcpus } => {
+                bios.lock()
+                    .map_err(|_| "the BIOS lock is poisoned".to_string())?
+                    .install()
+                    .map_err(|e| e.to_string())?;
+                // A guest old enough to want a BIOS reads the RSDT, not the
+                // XSDT every other guest here follows, and cannot address a
+                // PCI window above 4 GiB.
+                machine_x86::acpi::write_legacy(mem, *vcpus).map_err(|e| e.to_string())?;
+                Ok(BootEntry {
+                    entry: machine_x86::layout::RESET_VECTOR,
+                    argument: 0,
+                    kind: BootEntryKind::ResetVector,
+                })
+            }
         }
     }
 
@@ -2279,6 +2509,11 @@ mod host_api {
             // the file cannot carry (a Venus context's host Vulkan objects,
             // stage 5a.3) refuses the whole snapshot, by name, rather than
             // letting it be written without that state.
+            if self.cfg.boot.mode == control_api::BootMode::Bios {
+                return Err("cannot snapshot this VM: the BIOS of a mode = \"bios\" \
+                            machine has no saved state yet (ADR-0012)"
+                    .into());
+            }
             let refusals = self.bus.snapshot_refusals();
             if !refusals.is_empty() {
                 return Err(format!("cannot snapshot this VM: {}", refusals.join("; ")));
@@ -2594,6 +2829,7 @@ mod host {
             out,
             devices,
             net_cmdline,
+            mut legacy_net,
             pflash,
             lifecycle,
             restore,
@@ -2685,6 +2921,30 @@ mod host {
                         super::framebuffer_present::config_for(cfg),
                     )
                     .map_err(|e| e.to_string())?;
+                    if cfg.boot.mode == BootMode::Bios {
+                        pci.attach_ide().map_err(|e| e.to_string())?;
+                        if let Some(net) = legacy_net.take() {
+                            // An irqfd on the in-kernel IOAPIC. Level
+                            // semantics there need a resample fd, which is
+                            // not wired: an interrupt raised while one is
+                            // in service waits for the next event.
+                            super::attach_legacy_nic(
+                                &mut pci,
+                                net,
+                                &mem,
+                                &quiesce,
+                                |gsi| {
+                                    machine_x86::irqfd::IrqFdLine::new(&vm.fd_shared(), gsi)
+                                        .map(|line| {
+                                            Arc::new(line)
+                                                as Arc<dyn virtio_core::interrupt::IrqLine>
+                                        })
+                                        .map_err(|e| e.to_string())
+                                },
+                                |_, _| Ok(None),
+                            )?;
+                        }
+                    }
                     super::attach_optical(&mut pci, cfg, &mem)?;
                     super::attach_hda(&mut pci, cfg, &mem)?;
                     let cmdline =
@@ -2697,9 +2957,37 @@ mod host {
         // anything else (EPIC 18); a direct-Linux guest must not suddenly find them
         // where there were none. The PCI configuration ports are the real bus's when
         // the pci transport is in use, and the firmware stub's otherwise.
+        let bios = match cfg.boot.mode {
+            BootMode::Bios => Some(super::build_bios(cfg, &mem, machine.memory_mib << 20)?),
+            BootMode::DirectLinux | BootMode::Uefi => None,
+        };
         let bus = match cfg.boot.mode {
             BootMode::DirectLinux => bus,
-            BootMode::Uefi => bus.with_firmware_platform(),
+            // A BIOS guest expects the same RTC and host bridge a firmware does.
+            BootMode::Uefi | BootMode::Bios => bus.with_firmware_platform(),
+        };
+        let bus = match &bios {
+            Some(bios) => bus.with_bios(Arc::clone(bios)),
+            None => bus,
+        };
+        let bus = match cfg.boot.mode {
+            BootMode::Bios => {
+                // IRQ 14 and 15: irqfds on the in-kernel interrupt
+                // controllers, which route them to the 8259 and the IOAPIC.
+                let line = |gsi: u8| {
+                    machine_x86::irqfd::IrqFdLine::new(&vm.fd_shared(), u32::from(gsi))
+                        .map(|line| Arc::new(line) as Arc<dyn virtio_core::interrupt::IrqLine>)
+                        .map_err(|e| format!("cannot wire IDE interrupt {gsi}: {e}"))
+                };
+                let mut ide = super::build_ide(cfg)?;
+                ide.connect(line(ide::PRIMARY_IRQ)?, line(ide::SECONDARY_IRQ)?);
+                // No planar modes on this host yet: taking a piece of a
+                // KVM memory slot away needs the slot split at creation.
+                bus.with_ide(ide)
+                    .with_vga(None)
+                    .with_mouse(line(machine_x86::i8042::MOUSE_IRQ as u8)?)
+            }
+            BootMode::DirectLinux | BootMode::Uefi => bus,
         };
         let bus = match &pflash {
             Some(flash) => bus.with_pflash(Arc::clone(flash)),
@@ -2755,6 +3043,20 @@ mod host {
                 mem_size,
             },
             BootMode::Uefi => uefi_plan(&mut vm, cfg, mem_size)?,
+            BootMode::Bios => {
+                let bios = bios
+                    .clone()
+                    .ok_or_else(|| "mode = \"bios\" without a BIOS".to_string())?;
+                // The first instruction after reset is fetched through a CS
+                // base of 0xffff_0000: the ROM is mapped there, read-only,
+                // and copied into the F segment by `load_boot`.
+                vm.map_rom(pc_bios::rom::RESET_ALIAS, &pc_bios::rom::image())
+                    .map_err(|e| e.to_string())?;
+                BootPlan::Bios {
+                    bios,
+                    vcpus: cfg.vcpus,
+                }
+            }
         };
         // The pause gate goes in before anything can activate a device: a
         // restore re-activates every virtio slot, and a device that started a
@@ -2937,6 +3239,7 @@ mod host {
             out,
             devices,
             net_cmdline,
+            mut legacy_net,
             pflash,
             lifecycle,
             restore,
@@ -2987,6 +3290,11 @@ mod host {
         // 8259/8254/IOAPIC live in this process (WHP-1703).
         let irqchip =
             UserspaceIrqChip::new(vm.interrupt_delivery(), cfg.vcpus).map_err(|e| e.to_string())?;
+        // A BIOS guest lives on the 8259s until its kernel programs the
+        // IOAPIC (ADR-0012); every other guest keeps them inert.
+        if cfg.boot.mode == BootMode::Bios {
+            irqchip.enable_legacy_interrupts();
+        }
         let serial = SerialConsole::with_trigger(irqchip.serial_line(), out);
 
         let mem = Arc::new(vm.memory().clone());
@@ -3039,6 +3347,38 @@ mod host {
                     if !synchronous {
                         pci.offload_kicks();
                     }
+                    if cfg.boot.mode == BootMode::Bios {
+                        pci.attach_ide().map_err(|e| e.to_string())?;
+                        if let Some(net) = legacy_net.take() {
+                            // An IOAPIC pin, and the pin's EOI: the card's
+                            // interrupt is level-triggered, so it is raised
+                            // again when the guest finishes one with a cause
+                            // still pending.
+                            super::attach_legacy_nic(
+                                &mut pci,
+                                net,
+                                &mem,
+                                &quiesce,
+                                |gsi| {
+                                    irqchip
+                                        .ioapic()
+                                        .line(gsi as u8)
+                                        .map(|line| {
+                                            line as Arc<dyn virtio_core::interrupt::IrqLine>
+                                        })
+                                        .map_err(|e| e.to_string())
+                                },
+                                |gsi, card| {
+                                    let relay = machine_x86::rtl8139_function::EoiRelay::new(card);
+                                    irqchip
+                                        .ioapic()
+                                        .listen(gsi as u8, relay.listener())
+                                        .map_err(|e| e.to_string())?;
+                                    Ok(Some(relay as Arc<dyn std::any::Any + Send + Sync>))
+                                },
+                            )?;
+                        }
+                    }
                     super::attach_optical(&mut pci, cfg, &mem)?;
                     super::attach_hda(&mut pci, cfg, &mem)?;
                     let cmdline =
@@ -3047,9 +3387,41 @@ mod host {
                 }
             }
         };
+        let bios = match cfg.boot.mode {
+            BootMode::Bios => Some(super::build_bios(cfg, &mem, machine.memory_mib << 20)?),
+            BootMode::DirectLinux | BootMode::Uefi => None,
+        };
         let bus = match cfg.boot.mode {
             BootMode::DirectLinux => bus,
-            BootMode::Uefi => bus.with_firmware_platform(),
+            // A BIOS guest expects the same RTC and host bridge a firmware does.
+            BootMode::Uefi | BootMode::Bios => bus.with_firmware_platform(),
+        };
+        let bus = match &bios {
+            Some(bios) => bus.with_bios(Arc::clone(bios)),
+            None => bus,
+        };
+        let bus = match cfg.boot.mode {
+            BootMode::Bios => {
+                // IRQ 14 and 15 are IOAPIC pins like every other ISA line.
+                let line = |pin: u8| {
+                    irqchip
+                        .ioapic()
+                        .line(pin)
+                        .map(|line| line as Arc<dyn virtio_core::interrupt::IrqLine>)
+                        .map_err(|e| format!("cannot wire IDE interrupt {pin}: {e}"))
+                };
+                let mut ide = super::build_ide(cfg)?;
+                ide.connect(line(ide::PRIMARY_IRQ)?, line(ide::SECONDARY_IRQ)?);
+                // The VGA's window is RAM in text mode and trapped in the
+                // planar ones.
+                let window = vm
+                    .ram_trap(0x000a_0000, 0x0002_0000)
+                    .map_err(|e| e.to_string())?;
+                bus.with_ide(ide)
+                    .with_vga(Some(window))
+                    .with_mouse(line(machine_x86::i8042::MOUSE_IRQ as u8)?)
+            }
+            BootMode::DirectLinux | BootMode::Uefi => bus,
         };
         let bus = match &pflash {
             Some(flash) => bus.with_pflash(Arc::clone(flash)),
@@ -3073,6 +3445,20 @@ mod host {
                 mem_size,
             },
             BootMode::Uefi => uefi_plan(&mut vm, cfg, mem_size)?,
+            BootMode::Bios => {
+                let bios = bios
+                    .clone()
+                    .ok_or_else(|| "mode = \"bios\" without a BIOS".to_string())?;
+                // The first instruction after reset is fetched through a CS
+                // base of 0xffff_0000: the ROM is mapped there, read-only,
+                // and copied into the F segment by `load_boot`.
+                vm.map_rom(pc_bios::rom::RESET_ALIAS, &pc_bios::rom::image())
+                    .map_err(|e| e.to_string())?;
+                BootPlan::Bios {
+                    bios,
+                    vcpus: cfg.vcpus,
+                }
+            }
         };
         // Before anything can activate a device; see the KVM path.
         bus.set_quiesce(Arc::clone(&quiesce));
@@ -3183,6 +3569,83 @@ mod host {
     }
 }
 
+/// The IDE controller of a `mode = "bios"` machine (ADR-0012): the profile's
+/// disks on the primary channel and its optical drives on the secondary,
+/// master first. Two of each is all the cables hold.
+fn build_ide(cfg: &VmConfig) -> Result<ide::Controller, String> {
+    if cfg.disks.len() > 2 || cfg.optical.len() > 2 {
+        return Err(format!(
+            "mode = \"bios\" puts disks and discs on an IDE controller, which holds \
+             two of each; this profile has {} [[disk]] and {} [[optical]]",
+            cfg.disks.len(),
+            cfg.optical.len()
+        ));
+    }
+    let mut disks = cfg.disks.iter().enumerate().map(|(n, disk)| {
+        ide::Disk::open(&disk.path, disk.writable, &format!("ENTANGLED-HD{n}"))
+            .map(ide::Drive::Disk)
+            .map_err(|e| format!("cannot attach disk {}: {e}", disk.path.display()))
+    });
+    let mut discs = cfg.optical.iter().enumerate().map(|(n, drive)| {
+        ahci::Atapi::open(&drive.path, &format!("ENTANGLED-OPT{n}"))
+            .map(ide::Drive::Atapi)
+            .map_err(|e| format!("cannot open optical drive {}: {e}", drive.path.display()))
+    });
+    let primary = [disks.next().transpose()?, disks.next().transpose()?];
+    let secondary = [discs.next().transpose()?, discs.next().transpose()?];
+    tracing::info!(
+        disks = cfg.disks.len(),
+        discs = cfg.optical.len(),
+        "attaching the IDE controller's drives"
+    );
+    Ok(ide::Controller::new(primary, secondary))
+}
+
+/// The BIOS of a `mode = "bios"` machine (ADR-0012).
+///
+/// Its drives are the profile's `[[disk]]`s and `[[optical]]` drives, opened
+/// here a second time: `int 13h` reads the image files directly and goes
+/// through no controller. A disk is writable to the BIOS exactly when it is to
+/// the guest.
+fn build_bios(
+    cfg: &VmConfig,
+    mem: &Arc<virtio_core::GuestMem>,
+    mem_size: u64,
+) -> Result<Arc<Mutex<pc_bios::Bios>>, String> {
+    let open = |path: &Path, kind, writable| {
+        pc_bios::Drive::open(path, kind, writable)
+            .map_err(|e| format!("the BIOS cannot open {}: {e}", path.display()))
+    };
+    let disks = cfg
+        .disks
+        .iter()
+        .map(|disk| open(&disk.path, pc_bios::DriveKind::Disk, disk.writable))
+        .collect::<Result<Vec<_>, _>>()?;
+    let opticals = cfg
+        .optical
+        .iter()
+        .map(|drive| open(&drive.path, pc_bios::DriveKind::Optical, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    let memory_map = machine_x86::e820_map(mem_size)
+        .into_iter()
+        .map(|entry| pc_bios::MemoryRange {
+            base: entry.addr,
+            len: entry.size,
+            kind: entry.kind as u32,
+        })
+        .collect();
+    tracing::info!(
+        disks = disks.len(),
+        opticals = opticals.len(),
+        "the machine boots through the built-in BIOS"
+    );
+    let mut bios = pc_bios::Bios::new(Arc::clone(mem), memory_map, disks, opticals);
+    if let Some(floppy) = &cfg.boot.floppy {
+        bios.add_floppy(open(floppy, pc_bios::DriveKind::Floppy, false)?);
+    }
+    Ok(Arc::new(Mutex::new(bios)))
+}
+
 /// A reset-vector image *is* its own flash and is mapped over the same window
 /// as the pflash device; carrying both is a configuration contradiction, and
 /// the same one on both hosts.
@@ -3211,6 +3674,36 @@ fn extend_cmdline(configured: &str, clauses: &str) -> String {
         return clauses.to_string();
     }
     format!("{configured} {clauses}")
+}
+
+/// The host's OpenGL as the boot framebuffer's accelerator (ADR-0013).
+#[cfg(windows)]
+struct GlAccelerator(gl_passthrough::GlThread);
+
+#[cfg(windows)]
+impl machine_x86::framebuffer::Accelerator for GlAccelerator {
+    fn run(&self, commands: &[u8]) -> machine_x86::framebuffer::Accelerated {
+        let outcome = self.0.run(gl_passthrough::words_of(commands));
+        machine_x86::framebuffer::Accelerated {
+            response: outcome.response,
+            blits: outcome
+                .presents
+                .into_iter()
+                .map(|p| machine_x86::framebuffer::Blit {
+                    x: p.x,
+                    y: p.y,
+                    width: p.width,
+                    height: p.height,
+                    pixels: p.pixels,
+                    clip: p.clip,
+                })
+                .collect(),
+        }
+    }
+
+    fn reset(&self) {
+        self.0.reset();
+    }
 }
 
 #[cfg(test)]

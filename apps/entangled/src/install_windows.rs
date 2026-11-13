@@ -93,8 +93,8 @@ const MIN_MEMORY_MIB: u64 = 2048;
 /// Memory when `--memory-mib` is left at its Linux default.
 const DEFAULT_MEMORY_MIB: u64 = 4096;
 /// `--size` and `--memory-mib` as clap fills them in when not given.
-const CLAP_DEFAULT_SIZE: &str = "16G";
-const CLAP_DEFAULT_MEMORY_MIB: u64 = 1536;
+pub(crate) const CLAP_DEFAULT_SIZE: &str = "16G";
+pub(crate) const CLAP_DEFAULT_MEMORY_MIB: u64 = 1536;
 
 /// What the boot loader on a Windows disc prints on the firmware console
 /// (which is ttyS0 as much as the screen) before it times out and boots the
@@ -118,6 +118,15 @@ impl WimImage {
 }
 
 pub fn run(args: &InstallArgs) -> Result<(), String> {
+    // A Windows XP CD installs through a different machine altogether
+    // (ADR-0012): a BIOS, an IDE controller, an answer file on a floppy.
+    if args
+        .iso
+        .as_deref()
+        .is_some_and(crate::install_winxp::is_xp_disc)
+    {
+        return crate::install_winxp::run(args);
+    }
     if args.auto
         || args.preseed.is_some()
         || args.autoinstall.is_some()
@@ -388,7 +397,7 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
 }
 
 /// Writes `cfg` to `path`, never over an existing file.
-fn write_profile(path: &Path, cfg: &VmConfig) -> Result<(), String> {
+pub(crate) fn write_profile(path: &Path, cfg: &VmConfig) -> Result<(), String> {
     let text = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -1000,7 +1009,7 @@ fn answer_file(
 
 /// A product key as the answer file wants it: five groups of five letters
 /// and digits, upper case.
-fn product_key(key: &str) -> Result<String, String> {
+pub(crate) fn product_key(key: &str) -> Result<String, String> {
     let key = key.trim().to_ascii_uppercase();
     let groups: Vec<&str> = key.split('-').collect();
     let valid = groups.len() == 5
@@ -1026,7 +1035,7 @@ fn xml_escape(text: &str) -> String {
 
 /// A NetBIOS computer name from the VM name: letters, digits and `-`, at most
 /// 15, not only digits.
-fn computer_name(vm: &str) -> String {
+pub(crate) fn computer_name(vm: &str) -> String {
     let name: String = vm
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })

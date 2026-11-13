@@ -544,31 +544,48 @@ fn dsdt(vcpu_count: u32, mmio64_base: u64) -> Vec<u8> {
     let mut pci0 = aml::name("_HID", &aml::eisa_id("PNP0A03"));
     pci0.extend_from_slice(&aml::name("_ADR", &aml::integer(0)));
     pci0.extend_from_slice(&aml::name("_UID", &aml::integer(0)));
-    pci0.extend_from_slice(&aml::name(
-        "_CRS",
-        &aml::resource_template(&[
-            aml::word_bus_number(0, 0),
-            aml::io_port(crate::platform::PCI_CONFIG_ADDRESS, 8),
-            // The legacy VGA ranges, ports 0x3b0-0x3df and memory
-            // 0xa0000-0xbffff (ADR-0008): a VGA-class function is entitled
-            // to them, and Windows gives a full WDDM driver of one (the 3D
-            // virtio-gpu driver) code 12, "not enough free resources", when
-            // the root bridge does not pass them down. Nothing decodes them;
-            // BasicDisplay and the display-only driver never asked.
-            aml::word_io(0x03b0, 0x03df),
-            aml::dword_memory(0x000a_0000, 0x0002_0000),
-            aml::dword_memory(
-                layout::PCI_MMIO_HOLE_BASE as u32,
-                layout::PCI_MMIO_HOLE_SIZE as u32,
-            ),
-            // The 64-bit aperture (EPIC 20): where a shared-memory BAR lives.
-            // Prefetchable, because the BAR is, and Linux refuses to claim a
-            // prefetchable BAR inside a window that is not.
-            aml::qword_memory(mmio64_base, layout::PCI_MMIO64_SIZE, true),
-        ]),
-    ));
-    sb.extend_from_slice(&aml::device("PCI0", &pci0));
-
+    let mut pci_resources = vec![
+        aml::word_bus_number(0, 0),
+        aml::io_port(crate::platform::PCI_CONFIG_ADDRESS, 8),
+        // The legacy VGA ranges, ports 0x3b0-0x3df and memory
+        // 0xa0000-0xbffff (ADR-0008): a VGA-class function is entitled
+        // to them, and Windows gives a full WDDM driver of one (the 3D
+        // virtio-gpu driver) code 12, "not enough free resources", when
+        // the root bridge does not pass them down. Nothing decodes them;
+        // BasicDisplay and the display-only driver never asked.
+        aml::word_io(0x03b0, 0x03df),
+        aml::dword_memory(0x000a_0000, 0x0002_0000),
+        aml::dword_memory(
+            layout::PCI_MMIO_HOLE_BASE as u32,
+            layout::PCI_MMIO_HOLE_SIZE as u32,
+        ),
+    ];
+    // The 64-bit aperture (EPIC 20): where a shared-memory BAR lives.
+    // Prefetchable, because the BAR is, and Linux refuses to claim a
+    // prefetchable BAR inside a window that is not. Left out for
+    // [`NO_MMIO64`]: a 32-bit Windows XP stops with ACPI_BIOS_ERROR
+    // (0xA5, 2) on a root bridge window it cannot address.
+    if mmio64_base == NO_MMIO64 {
+        // A BIOS-era machine's root bridge passes down every I/O port but
+        // the configuration ones, as a PC's does. Its IDE controller is a
+        // PCI function at the fixed ISA ports (0x1f0, 0x170, 0x3f6, 0x376),
+        // and Windows XP gives a PCI device no port its bridge does not
+        // own: with only the VGA range here the controller never started
+        // (stop 0x7B). The two ranges replace the VGA one, which they cover.
+        pci_resources[2] = aml::word_io(0x0000, 0x0cf7);
+        pci_resources.insert(3, aml::word_io(0x0d00, 0xffff));
+    }
+    if mmio64_base != NO_MMIO64 {
+        pci_resources.push(aml::qword_memory(
+            mmio64_base,
+            layout::PCI_MMIO64_SIZE,
+            true,
+        ));
+    }
+    pci0.extend_from_slice(&aml::name("_CRS", &aml::resource_template(&pci_resources)));
+    if mmio64_base == NO_MMIO64 {
+        pci0.extend_from_slice(&aml::name("_PRT", &legacy_prt()));
+    }
     // The 8042 keyboard controller (`crate::i8042`, ADR-0008 §5): Windows
     // enumerates a PS/2 keyboard only through this device.
     let mut ps2 = aml::name("_HID", &aml::eisa_id("PNP0303"));
@@ -580,18 +597,86 @@ fn dsdt(vcpu_count: u32, mmio64_base: u64) -> Vec<u8> {
             aml::irq_no_flags(crate::i8042::KEYBOARD_IRQ as u8),
         ]),
     ));
-    sb.extend_from_slice(&aml::device("PS2K", &ps2));
+    // Where the keyboard hangs. Beside the root bridge for every machine so
+    // far; *under* it for a BIOS-era one (ADR-0012), as on a real board,
+    // where it sits behind the PCI-ISA bridge. Windows XP reserves a
+    // device's interrupt when it enumerates it, and its ACPI driver can
+    // route interrupts only once the root bridge has started; a keyboard
+    // that is the bridge's sibling is enumerated before that, and the
+    // reservation goes through a null pointer (stop 0x7E in `acpi.sys`).
+    // A child is enumerated after its parent starts.
+    let ps2k = aml::device("PS2K", &ps2);
+    if mmio64_base == NO_MMIO64 {
+        pci0.extend_from_slice(&ps2k);
+        // The PS/2 mouse on the controller's second port: only the
+        // interrupt is its own. A BIOS-era guest has no other pointer.
+        let mut mouse = aml::name("_HID", &aml::eisa_id("PNP0F13"));
+        mouse.extend_from_slice(&aml::name(
+            "_CRS",
+            &aml::resource_template(&[aml::irq_no_flags(crate::i8042::MOUSE_IRQ as u8)]),
+        ));
+        pci0.extend_from_slice(&aml::device("PS2M", &mouse));
+        sb.extend_from_slice(&aml::device("PCI0", &pci0));
+    } else {
+        sb.extend_from_slice(&aml::device("PCI0", &pci0));
+        sb.extend_from_slice(&ps2k);
+    }
 
+    // Processors. An `ACPI0007` device is ACPI 3.0's way of declaring one,
+    // and Windows XP predates it: it lists each as an unknown device with
+    // no driver. A BIOS-era machine declares them the old way, as
+    // `Processor` objects under `\_PR`, with the id its MADT entry carries.
+    let mut pr = Vec::new();
     for cpu in 0..vcpu_count {
-        let mut processor = aml::name("_HID", &aml::string("ACPI0007"));
-        processor.extend_from_slice(&aml::name("_UID", &aml::integer(u64::from(cpu))));
-        sb.extend_from_slice(&aml::device(&cpu_name(cpu), &processor));
+        if mmio64_base == NO_MMIO64 {
+            // ProcessorOp, PkgLength, name, processor id, no P_BLK.
+            let mut object = aml::name_seg(&cpu_name(cpu)).to_vec();
+            object.push(cpu as u8);
+            object.extend_from_slice(&[0, 0, 0, 0, 0]);
+            pr.extend_from_slice(&[0x5b, 0x83]);
+            pr.extend_from_slice(&aml::pkg_length(object.len()));
+            pr.extend_from_slice(&object);
+        } else {
+            let mut processor = aml::name("_HID", &aml::string("ACPI0007"));
+            processor.extend_from_slice(&aml::name("_UID", &aml::integer(u64::from(cpu))));
+            sb.extend_from_slice(&aml::device(&cpu_name(cpu), &processor));
+        }
     }
 
     body.extend_from_slice(&aml::scope(&aml::root_name("_SB"), &sb));
+    if !pr.is_empty() {
+        body.extend_from_slice(&aml::scope(&aml::root_name("_PR"), &pr));
+    }
 
     // Revision 2 or higher tells the interpreter integers are 64-bit.
     sdt(b"DSDT", 2, &body)
+}
+
+/// `_PRT` for a BIOS-era machine (ADR-0012): which interrupt each PCI
+/// device's `INTA#` is wired to.
+///
+/// The wiring is the bus's own: device `n + 1` holds slot `n`, and its pin
+/// goes to [`layout::virtio_irq`]`(n)`, the same number the function reports
+/// in `interrupt_line`. Every guest before Windows XP found that register
+/// enough. XP's ACPI driver takes the routing interface from the PCI driver
+/// only when the root bridge has a `_PRT`, and without it the first PCI
+/// function with an interrupt pin sends it through a null pointer (stop
+/// 0x7E in `acpi.sys`). Each entry is hard-wired: source 0, and the global
+/// system interrupt as the index.
+fn legacy_prt() -> Vec<u8> {
+    let entries: Vec<Vec<u8>> = (0..31u32)
+        .filter_map(|slot| {
+            let gsi = layout::virtio_irq(slot as usize)?;
+            Some(aml::package(&[
+                // Device `slot + 1`, any function.
+                aml::dword(((slot + 1) << 16) | 0xffff),
+                aml::integer(0), // INTA#
+                aml::integer(0), // hard-wired, no link device
+                aml::integer(u64::from(gsi)),
+            ]))
+        })
+        .collect();
+    aml::package(&entries)
 }
 
 /// `C000`.. — the AML name of the processor device for `cpu`. Four characters,
@@ -634,9 +719,211 @@ pub fn write<M: vm_memory::GuestMemory>(mem: &M, vcpu_count: u32) -> Result<u64,
     Ok(tables.rsdp_address())
 }
 
+/// The `mmio64_base` of a machine whose PCI root bridge has no window above
+/// 4 GiB (ADR-0012).
+pub const NO_MMIO64: u64 = 0;
+
+/// [`write`] for a machine that boots through a BIOS (ADR-0012): the same
+/// tables without the root bridge's 64-bit window, plus an RSDT.
+///
+/// Both are for a guest of the BIOS era. Windows XP follows the RSDT and
+/// knows no XSDT ([`write_rsdt`]), and being 32-bit it refuses a `_CRS` that
+/// names memory it cannot address. The machine calls this after [`write`],
+/// over the same region; the tables land at the same addresses.
+pub fn write_legacy<M: vm_memory::GuestMemory>(mem: &M, vcpu_count: u32) -> Result<u64, AcpiError> {
+    use vm_memory::{Bytes, GuestAddress};
+    let tables = AcpiTables::new(vcpu_count, NO_MMIO64)?;
+    mem.write_slice(tables.blob(), GuestAddress(tables.base_address()))
+        .map_err(|e| AcpiError::GuestMemory(e.to_string()))?;
+    write_rsdt(mem)?;
+    Ok(tables.rsdp_address())
+}
+
+/// Where [`write_rsdt`] puts the RSDT: half-way into the tables' region,
+/// far past anything [`write`] lays out.
+const RSDT_OFFSET: u64 = layout::ACPI_TABLES_SIZE / 2;
+
+/// Adds an RSDT to the tables [`write`] published, for a guest that predates
+/// the XSDT (ADR-0012).
+///
+/// The tables are XSDT-only, which every guest so far reads. Windows XP's
+/// loader does not: it follows the RSDP's 32-bit `RsdtAddress`, finds 0, and
+/// takes whatever is at physical address 4 for a table length. So a machine
+/// that boots through a BIOS calls this after [`write`]: the RSDT lists the
+/// XSDT's tables with 32-bit pointers, and the RSDP in guest memory gets its
+/// address and new checksums. Every other machine keeps the RSDP it had.
+pub fn write_rsdt<M: vm_memory::GuestMemory>(mem: &M) -> Result<u64, AcpiError> {
+    use vm_memory::{Bytes, GuestAddress};
+    let memory = |e: vm_memory::GuestMemoryError| AcpiError::GuestMemory(e.to_string());
+
+    let rsdp_at = layout::ACPI_RSDP_START;
+    let mut rsdp = [0u8; RSDP_LEN];
+    mem.read_slice(&mut rsdp, GuestAddress(rsdp_at))
+        .map_err(memory)?;
+    let u64_at = |bytes: &[u8], at: usize| {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&bytes[at..at + 8]);
+        u64::from_le_bytes(raw)
+    };
+    let xsdt_at = u64_at(&rsdp, 24);
+    let mut header = [0u8; SDT_HEADER_LEN];
+    mem.read_slice(&mut header, GuestAddress(xsdt_at))
+        .map_err(memory)?;
+    // These are tables this module wrote a moment ago, not guest input, but
+    // the length is still read out of guest memory: bound it by the region.
+    let xsdt_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    if &rsdp[..8] != b"RSD PTR " || &header[..4] != b"XSDT" || xsdt_len > RSDT_OFFSET as usize {
+        return Err(AcpiError::GuestMemory(
+            "no ACPI tables to add an RSDT to: call acpi::write first".into(),
+        ));
+    }
+    let mut entries = vec![0u8; xsdt_len.saturating_sub(SDT_HEADER_LEN)];
+    mem.read_slice(&mut entries, GuestAddress(xsdt_at + SDT_HEADER_LEN as u64))
+        .map_err(memory)?;
+    let mut body = Vec::with_capacity(entries.len() / 2);
+    for entry in entries.chunks_exact(8) {
+        // Every table sits below 1 MiB, so the pointers fit.
+        body.extend_from_slice(&(u64_at(entry, 0) as u32).to_le_bytes());
+    }
+    let rsdt = sdt(b"RSDT", 1, &body);
+    let rsdt_at = layout::ACPI_TABLES_START + RSDT_OFFSET;
+    mem.write_slice(&rsdt, GuestAddress(rsdt_at))
+        .map_err(memory)?;
+
+    rsdp[16..20].copy_from_slice(&(rsdt_at as u32).to_le_bytes());
+    rsdp[8] = 0;
+    rsdp[32] = 0;
+    rsdp[8] = checksum(&rsdp[..20]).wrapping_neg();
+    rsdp[32] = checksum(&rsdp).wrapping_neg();
+    mem.write_slice(&rsdp, GuestAddress(rsdp_at))
+        .map_err(memory)?;
+    tracing::info!(
+        rsdt = format_args!("{rsdt_at:#x}"),
+        tables = body.len() / 4,
+        "published an RSDT beside the XSDT"
+    );
+    Ok(rsdt_at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A BIOS machine's root bridge names no memory above 4 GiB.
+    #[test]
+    fn the_legacy_tables_have_no_64_bit_window() {
+        let with = AcpiTables::new(1, TEST_MMIO64_BASE).unwrap();
+        let without = AcpiTables::new(1, NO_MMIO64).unwrap();
+        // A QWord address space descriptor is 0x8a with a 43-byte body.
+        let has_qword =
+            |tables: &AcpiTables| tables.blob().windows(3).any(|w| w == [0x8a, 0x2b, 0x00]);
+        assert!(has_qword(&with));
+        assert!(!has_qword(&without));
+    }
+
+    /// A BIOS machine declares its processors as `Processor` objects, which
+    /// Windows XP knows; every other machine as `ACPI0007` devices.
+    #[test]
+    fn the_legacy_tables_declare_processors_the_old_way() {
+        let count = |tables: &AcpiTables, needle: &[u8]| {
+            tables
+                .blob()
+                .windows(needle.len())
+                .filter(|w| *w == needle)
+                .count()
+        };
+        let modern = AcpiTables::new(2, TEST_MMIO64_BASE).unwrap();
+        let legacy = AcpiTables::new(2, NO_MMIO64).unwrap();
+        assert_eq!(count(&modern, b"ACPI0007"), 2);
+        assert_eq!(count(&legacy, b"ACPI0007"), 0);
+        // ProcessorOp, PkgLength 11, "C001", id 1, no P_BLK.
+        let second = [0x5b, 0x83, 0x0b, b'C', b'0', b'0', b'1', 1, 0, 0, 0, 0, 0];
+        assert_eq!(count(&legacy, &second), 1);
+        assert_eq!(count(&modern, &second), 0);
+    }
+
+    /// A BIOS machine's root bridge routes its devices' interrupts, and the
+    /// keyboard is its child; every other machine's tables have neither.
+    #[test]
+    fn the_legacy_root_bridge_has_a_prt_and_the_keyboard_under_it() {
+        let find = |tables: &AcpiTables, name: &[u8]| {
+            tables.blob().windows(name.len()).position(|w| w == name)
+        };
+        let legacy = AcpiTables::new(1, NO_MMIO64).unwrap();
+        let default = AcpiTables::new(1, TEST_MMIO64_BASE).unwrap();
+        assert!(find(&default, b"_PRT").is_none());
+        assert!(find(&legacy, b"PS2M").is_some());
+        assert!(find(&default, b"PS2M").is_none());
+        // The legacy bridge owns the I/O space on both sides of 0xcf8.
+        let io_window = |min: u16, max: u16| {
+            let mut bytes = vec![0x88, 0x0d, 0x00, 0x01];
+            bytes.extend_from_slice(&aml::word_io(min, max)[4..]);
+            bytes
+        };
+        assert!(find(&legacy, &io_window(0x0000, 0x0cf7)).is_some());
+        assert!(find(&legacy, &io_window(0x0d00, 0xffff)).is_some());
+        assert!(find(&default, &io_window(0x0000, 0x0cf7)).is_none());
+        let prt = find(&legacy, b"_PRT").expect("a _PRT");
+        // The first entry: device 1, INTA#, hard-wired to the first PCI IRQ.
+        let entry = [0x0c, 0xff, 0xff, 0x01, 0x00];
+        let first = legacy.blob()[prt..]
+            .windows(entry.len())
+            .position(|w| w == entry)
+            .expect("an entry for device 1");
+        assert!(first < 16, "the entry opens the package");
+        // PCI0's package length covers PS2K only in the legacy tables: the
+        // keyboard comes before the first processor either way, so compare
+        // where PCI0's body ends through the next sibling's position.
+        let (pci0, ps2k) = (
+            find(&legacy, b"PCI0").unwrap(),
+            find(&legacy, b"PS2K").unwrap(),
+        );
+        let pkg_len = |tables: &AcpiTables, at: usize| {
+            // DeviceOp (5b 82) PkgLength NameSeg: the length sits between.
+            let lead = tables.blob()[at - 2];
+            let low = tables.blob()[at - 1];
+            (usize::from(lead & 0x0f)) | (usize::from(low) << 4)
+        };
+        assert!(pci0 + pkg_len(&legacy, pci0) > ps2k, "PS2K inside PCI0");
+        let (pci0, ps2k) = (
+            find(&default, b"PCI0").unwrap(),
+            find(&default, b"PS2K").unwrap(),
+        );
+        assert!(pci0 + pkg_len(&default, pci0) < ps2k, "PS2K beside PCI0");
+    }
+
+    /// The RSDT a BIOS machine adds lists the XSDT's tables, and the RSDP
+    /// that points at it still checksums.
+    #[test]
+    fn an_rsdt_can_be_added_beside_the_xsdt() {
+        use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+        let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 2 << 20)]).unwrap();
+        // Without tables there is nothing to add to.
+        assert!(write_rsdt(&mem).is_err());
+        write(&mem, 2).unwrap();
+        let tables = AcpiTables::new(2, layout::pci_mmio64_base_above((2 << 20) - 1)).unwrap();
+        let rsdt_at = write_rsdt(&mem).unwrap();
+
+        let mut rsdp = [0u8; RSDP_LEN];
+        mem.read_slice(&mut rsdp, GuestAddress(tables.rsdp_address()))
+            .unwrap();
+        assert_eq!(u64::from(u32_at(&rsdp, 16)), rsdt_at);
+        assert_eq!(u64_at(&rsdp, 24), tables.xsdt_address());
+        assert_eq!(checksum(&rsdp[..20]), 0);
+        assert_eq!(checksum(&rsdp), 0);
+
+        let mut rsdt = [0u8; SDT_HEADER_LEN + 8];
+        mem.read_slice(&mut rsdt, GuestAddress(rsdt_at)).unwrap();
+        assert_valid_sdt(&rsdt, b"RSDT", 1);
+        assert_eq!(
+            u64::from(u32_at(&rsdt, SDT_HEADER_LEN)),
+            tables.fadt_address()
+        );
+        assert_eq!(
+            u64::from(u32_at(&rsdt, SDT_HEADER_LEN + 4)),
+            tables.madt_address()
+        );
+    }
 
     /// The 64-bit aperture base of a guest small enough to have no high RAM —
     /// 4 GiB, which is what `pci_mmio64_base` returns for every guest below the

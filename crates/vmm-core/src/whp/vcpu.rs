@@ -39,12 +39,15 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::System::Hypervisor::{
     WHvCancelRunVirtualProcessor, WHvDeleteVirtualProcessor, WHvGetVirtualProcessorRegisters,
-    WHvRegisterPendingInterruption, WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled,
-    WHvRunVpExitReasonInvalidVpRegisterValue, WHvRunVpExitReasonMemoryAccess,
-    WHvRunVpExitReasonNone, WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonX64ApicEoi,
-    WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess,
-    WHvRunVpExitReasonX64MsrAccess, WHvSetVirtualProcessorRegisters, WHvX64RegisterApicBase,
-    WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
+    WHvRegisterInterruptState, WHvRegisterPendingEvent, WHvRegisterPendingInterruption,
+    WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
+    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonNone,
+    WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonX64ApicEoi,
+    WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64InterruptWindow,
+    WHvRunVpExitReasonX64IoPortAccess, WHvRunVpExitReasonX64MsrAccess,
+    WHvSetVirtualProcessorRegisters, WHvX64RegisterApicBase,
+    WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRax, WHvX64RegisterRbx,
+    WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRflags, WHvX64RegisterRip,
     WHvX64RegisterTsc, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
     WHV_RUN_VP_EXIT_CONTEXT,
 };
@@ -279,19 +282,64 @@ impl WhpVcpu {
     /// bugcheck before the boot display is up shows nothing on screen, and the
     /// kernel then sits in `HalReturnToFirmware` trying to reboot.
     fn trace_bugcheck(&self, rip: u64) {
+        use crate::hv::VcpuRegisters as _;
         let read = |gva: u64, buf: &mut [u8]| self.read_gva(gva, buf);
-        let Some(base) = super::guest_symbols::image_base(&read, rip) else {
-            return;
-        };
-        let Some(data) = super::guest_symbols::export_address(&read, base, "KiBugCheckData") else {
+        // The kernel is the image that exports the data. A bugchecked kernel
+        // may be sitting in the HAL (a 32-bit Windows waits there for the
+        // power button), so the images the stack returns into are tried too.
+        let mut candidates = vec![rip];
+        // Only for a guest that is in kernel space: looking for an image
+        // under every stack slot costs thousands of translations, and a
+        // loader sampled at every timer kick would never run.
+        if rip < 0x8000_0000 {
+            candidates.clear();
+        } else if let Ok(r) = self.get_registers() {
+            let mut stack = [0u8; 512];
+            if self.read_gva(r.rsp, &mut stack).is_some() {
+                candidates.extend(
+                    stack
+                        .chunks_exact(4)
+                        .map(|slot| {
+                            u64::from(u32::from_le_bytes(slot.try_into().unwrap_or([0; 4])))
+                        })
+                        .filter(|value| *value >= 0x8000_0000),
+                );
+            }
+        }
+        let mut tried = Vec::new();
+        let mut found = None;
+        for address in candidates {
+            let Some(base) = super::guest_symbols::image_base(&read, address) else {
+                continue;
+            };
+            if tried.contains(&base) {
+                continue;
+            }
+            tried.push(base);
+            if let Some(data) = super::guest_symbols::export_address(&read, base, "KiBugCheckData")
+            {
+                found = Some((base, data));
+                break;
+            }
+        }
+        let Some((base, data)) = found else {
             return;
         };
         let mut raw = [0u8; 40];
         if self.read_gva(data, &mut raw).is_none() {
             return;
         }
-        let word =
-            |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+        // Five machine words: 32-bit ones in a 32-bit kernel.
+        let narrow = super::guest_symbols::is_pe32(&read, base);
+        let word = |i: usize| {
+            if narrow {
+                u64::from(u32::from_le_bytes(
+                    raw[i * 4..i * 4 + 4].try_into().unwrap_or([0; 4]),
+                ))
+            } else {
+                u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]))
+            }
+        };
         eprintln!(
             "vp{} bugcheck code={:#x} p1={:#x} p2={:#x} p3={:#x} p4={:#x}",
             self.index,
@@ -301,6 +349,19 @@ impl WhpVcpu {
             word(3),
             word(4)
         );
+        // What the parameters point at: for the exception stops (0x7E, 0x8E,
+        // 0x1E) that is the faulting code, the exception record and the
+        // context record, which is all a missing debugger would have shown.
+        for (n, value) in (1..=4).map(|n| (n, word(n))) {
+            if value >= 0x8000_0000 {
+                eprintln!(
+                    "vp{} bugcheck p{n} in image@{:#x}",
+                    self.index,
+                    super::guest_symbols::image_base(&read, value).unwrap_or(0)
+                );
+                self.trace_bytes("bugcheck-data", value.wrapping_sub(32), 128);
+            }
+        }
     }
 
     /// `module+export+off` for `rip`, when it is inside a PE image.
@@ -518,6 +579,10 @@ impl WhpVcpu {
         // them apart is what identified WHP's own INIT/SIPI handling (see
         // `WhpPartition`'s SMP notes).
         let trace_exits = std::env::var_os(TRACE_EXITS_ENV).is_some();
+        // `$ENTANGLED_WHP_SAMPLE_PAUSE`: the same sample, taken only when the
+        // VM is paused. The full trace slows a guest enough to change what it
+        // does; this costs nothing until someone asks.
+        let sample_pause = std::env::var_os(SAMPLE_PAUSE_ENV).is_some();
         // Cloned rather than borrowed: the lifecycle checkpoint below needs
         // `&mut self`, and a borrow of the partition living across the loop
         // would make that impossible.
@@ -534,15 +599,33 @@ impl WhpVcpu {
         // every few seconds. Cheap enough to leave the guest's speed alone,
         // unlike the full trace, so it is what a performance comparison uses.
         let mut stats = std::env::var_os(EXIT_STATS_ENV).map(|_| ExitStats::new(self.index));
+        // Whether WHP has been asked to say when this VP can take an 8259
+        // interrupt (`offer_ext_interrupt`).
+        let mut window_requested = false;
 
         while running.load(Ordering::Acquire) {
             if let Some(lifecycle) = lifecycle {
                 if lifecycle.attention() {
+                    if sample_pause {
+                        use crate::hv::VcpuRegisters as _;
+                        if let Ok(regs) = self.get_registers() {
+                            eprintln!(
+                                "vp{} stopped at rip={:#x} rflags={:#x}",
+                                self.index, regs.rip, regs.rflags
+                            );
+                            self.trace_sample(regs.rip);
+                        }
+                    }
                     let index = self.index;
                     if lifecycle.checkpoint(index, self) == Checkpoint::Stopped {
                         return Ok(RunOutcome::Stopped);
                     }
                 }
+            }
+            // The 8259's INTR line reaches the boot CPU only (the other
+            // processors' LINT0 is not wired on a PC either).
+            if self.index == 0 && handler.ext_interrupt_pending() {
+                self.offer_ext_interrupt(handler, &mut window_requested)?;
             }
             // Snapshot the interrupt epoch *before* entering the guest: an
             // injection that lands between `hlt` executing and the exit being
@@ -659,6 +742,12 @@ impl WhpVcpu {
                 // Kicked by `WHvCancelRunVirtualProcessor`, or an internal
                 // reschedule: re-check the stop flag and continue.
                 WHvRunVpExitReasonCanceled | WHvRunVpExitReasonNone => continue,
+                // The VP can take an external interrupt now; the top of the
+                // loop offers it the 8259's.
+                WHvRunVpExitReasonX64InterruptWindow => {
+                    window_requested = false;
+                    continue;
+                }
                 reason => {
                     return Err(self.fail(format!(
                         "unhandled WHP exit reason {} at rip {:#x}",
@@ -791,7 +880,7 @@ impl WhpVcpu {
 
         if info.is_write {
             let bytes = io.Rax.to_le_bytes();
-            handler.io_out(io.PortNumber, &bytes[..info.access_size]);
+            handler.io_out_from(io.PortNumber, &bytes[..info.access_size], self);
         } else {
             let mut data = [0u8; 4];
             handler.io_in(io.PortNumber, &mut data[..info.access_size]);
@@ -874,6 +963,59 @@ impl WhpVcpu {
         let mut values = Aligned16([zeroed_value(); 1]);
         values.0[0].Reg64 = PENDING_GP_FAULT;
         self.set_raw(&[WHvRegisterPendingInterruption], &values.0)
+    }
+
+    /// Hands the 8259's pending interrupt to this VP, or asks WHP to say
+    /// when it can take one.
+    ///
+    /// WHP emulates the local APIC and knows nothing of an 8259, so its
+    /// `INTR` line is ours to deliver: when the VP is interruptible (`IF`
+    /// set, no interrupt shadow, nothing else pending) the controller is
+    /// acknowledged and its vector goes in as a pending external-interrupt
+    /// event; otherwise the VP is told to exit with
+    /// `WHvRunVpExitReasonX64InterruptWindow` as soon as it is.
+    fn offer_ext_interrupt(
+        &mut self,
+        handler: &mut dyn ExitHandler,
+        window_requested: &mut bool,
+    ) -> Result<(), VmmError> {
+        let names = [
+            WHvX64RegisterRflags,
+            WHvRegisterInterruptState,
+            WHvRegisterPendingInterruption,
+            WHvRegisterPendingEvent,
+        ];
+        let mut values = Aligned16([zeroed_value(); 4]);
+        self.get_raw(&names, &mut values.0)?;
+        // SAFETY: all four are integer registers; `Reg64` is the arm that
+        // holds RFLAGS and the low 64 bits of the three state registers,
+        // whose bit 0 is "interrupt shadow" / "pending" respectively.
+        let (rflags, shadow, interruption, event) = unsafe {
+            (
+                values.0[0].Reg64,
+                values.0[1].Reg64,
+                values.0[2].Reg64,
+                values.0[3].Reg64,
+            )
+        };
+        const RFLAGS_IF: u64 = 1 << 9;
+        let deliverable =
+            rflags & RFLAGS_IF != 0 && shadow & 1 == 0 && interruption & 1 == 0 && event & 1 == 0;
+        let mut value = Aligned16([zeroed_value(); 1]);
+        if deliverable {
+            let Some(vector) = handler.ext_interrupt_ack() else {
+                return Ok(());
+            };
+            value.0[0].Reg64 = PENDING_EXT_INT | u64::from(vector) << 8;
+            self.set_raw(&[WHvRegisterPendingEvent], &value.0)
+        } else if !*window_requested {
+            value.0[0].Reg64 = NOTIFY_INTERRUPT_WINDOW;
+            self.set_raw(&[WHvX64RegisterDeliverabilityNotifications], &value.0)?;
+            *window_requested = true;
+            Ok(())
+        } else {
+            Ok(())
+        }
     }
 
     /// This VP's TSC, for the emulated reference counter.
@@ -1129,8 +1271,27 @@ fn park(
     }
 }
 
+impl crate::hv::GuestCpu for WhpVcpu {
+    fn paging(&self) -> Option<crate::hv::GuestPaging> {
+        use windows::Win32::System::Hypervisor::{
+            WHvX64RegisterCr0, WHvX64RegisterCr3, WHvX64RegisterCr4,
+        };
+        let names = [WHvX64RegisterCr0, WHvX64RegisterCr3, WHvX64RegisterCr4];
+        let mut values = Aligned16([zeroed_value(); 3]);
+        self.get_raw(&names, &mut values.0).ok()?;
+        // SAFETY: the three control registers are 64-bit integers, which is
+        // the `Reg64` arm of the value union.
+        let (cr0, cr3, cr4) = unsafe { (values.0[0].Reg64, values.0[1].Reg64, values.0[2].Reg64) };
+        Some(crate::hv::GuestPaging { cr0, cr3, cr4 })
+    }
+}
+
 /// Environment variable that turns on per-exit tracing in the run loop.
 pub const TRACE_EXITS_ENV: &str = "ENTANGLED_WHP_TRACE_EXITS";
+
+/// Environment variable that prints one sample of each vCPU (registers, code,
+/// stack, a Windows kernel's stop code) when the VM is paused.
+pub const SAMPLE_PAUSE_ENV: &str = "ENTANGLED_WHP_SAMPLE_PAUSE";
 
 /// What an exit was *about*, for the trace: the port, the guest physical
 /// address, or the `cpuid` leaf. A RIP alone tells which instruction looped;
@@ -1258,6 +1419,15 @@ fn trace_detail(exit: &WHV_RUN_VP_EXIT_CONTEXT) -> String {
 /// code 0: pending (bit 0), a hardware exception (type 3 in bits 1-3), with an
 /// error code (bit 4), vector 13 in bits 16-31, and the code in the high half.
 const PENDING_GP_FAULT: u64 = 1 | 3 << 1 | 1 << 4 | 13 << 16;
+
+/// `WHvRegisterPendingEvent` as a `WHV_X64_PENDING_EXT_INT_EVENT`: pending
+/// (bit 0), event type 5 (`WHvX64PendingEventExtInt`) in bits 1-3; the vector
+/// goes in bits 8-15.
+const PENDING_EXT_INT: u64 = 1 | 5 << 1;
+
+/// `WHvX64RegisterDeliverabilityNotifications`: bit 1 is
+/// `InterruptNotification`.
+const NOTIFY_INTERRUPT_WINDOW: u64 = 1 << 1;
 
 /// `WHV_MEMORY_ACCESS_INFO::AccessType`: 0 read, 1 write, 2 execute.
 const MEMORY_ACCESS_EXECUTE: u32 = 2;

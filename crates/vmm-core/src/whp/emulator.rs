@@ -127,17 +127,23 @@ unsafe extern "system" fn memory_callback(
     // indexes anything here: `read_slice`/`write_slice` are vm-memory's checked
     // accessors, and an address outside every RAM region falls through to the
     // device bus exactly as the non-emulated exit path would take it.
+    //
+    // Unless the machine has taken that RAM from the guest (`hv::RamTrap`):
+    // the host still has the pages, so the checked access would succeed, and
+    // the device that trapped the range would never hear of it.
     let gpa = GuestAddress(access.GpaAddress);
+    let trapped = ctx.handler.ram_is_trapped(access.GpaAddress);
     if access.Direction == DIRECTION_READ {
-        if ctx
-            .memory
-            .read_slice(&mut access.Data[..size], gpa)
-            .is_err()
+        if trapped
+            || ctx
+                .memory
+                .read_slice(&mut access.Data[..size], gpa)
+                .is_err()
         {
             ctx.handler
                 .mmio_read(access.GpaAddress, &mut access.Data[..size]);
         }
-    } else if ctx.memory.write_slice(&access.Data[..size], gpa).is_err() {
+    } else if trapped || ctx.memory.write_slice(&access.Data[..size], gpa).is_err() {
         ctx.handler
             .mmio_write(access.GpaAddress, &access.Data[..size]);
     }
