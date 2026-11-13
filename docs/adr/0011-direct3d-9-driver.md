@@ -499,3 +499,14 @@ such install failed at `wddm-on.cmd` ("error 2"): the first-logon script
 copied `entangled_d3d10.dll` by name and left its 32-bit twin on the disc,
 and the INF names it. It copies by pattern now, and a test holds every WDDM
 file to a pattern. Not done on the fresh guest: a game (no Steam there).
+
+**Half an hour in a level (2026-11-13).** Portal 2 full screen at 1920x1080,
+a jump every 20 seconds, 30 minutes: no crash, no lost device, and the
+desktop came back. The frame rate fell from 43 to 30 over the run, in two
+steps, and that was the host: a new game process had 30 as well, and so had
+a freshly booted VM (the host GPU was 65% busy with other programs by then).
+So no leak was found, but the run does not prove there is none: it wants
+repeating on a quiet host. Seen once in that session and not again:
+`consent.exe` (the UAC prompt) took an access violation inside
+`entangled_d3d10.dll` (+0xe6b44, under `d3d11.dll`); the prompt still came
+up and elevated.
