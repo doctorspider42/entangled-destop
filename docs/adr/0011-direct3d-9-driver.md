@@ -225,3 +225,265 @@ runtime's minimum list.
 
 Not done here: a run of the workflow (the build step is rewritten and has
 not run), and the 12 MB DLLs through `install windows`.
+
+### N2 (2026-11-12): a picture
+
+`d3d9-test.exe` and its 32-bit build draw, in a window DWM composes: a
+square turning about its axis, lit by a directional light and textured from
+a managed 64×64 texture with mips, out of a vertex buffer; a
+`D3DFVF_XYZRHW` triangle with a colour at each corner from `DrawPrimitiveUP`
+and another out of a vertex buffer; a clip-space triangle; and the square
+four more times with lighting and the texture on and off. The frame is
+cleared, drawn by Nine on Zink on Venus, read back and handed to the kernel
+driver, which copies it onto DWM's redirection surface when the runtime
+presents (`0007-a-present-between-held-frames.patch`, escape 0x904).
+
+What the device's functions do now, across the seam: resources (render
+targets, depth, textures, vertex and index buffers, system-memory ones
+kept as plain memory), `Lock`/`Unlock` and their asynchronous forms and
+rename, `TexBlt1`/`BufBlt1`/`Blt`/`ColorFill`/`GenerateMipSubLevels`, render
+target and depth, `Clear`, render, sampler and texture-stage states,
+textures, viewport and depth range, scissor, clip planes, transforms,
+material and lights, declarations, both kinds of shader and their
+constants, streams and indices, the six draws, queries, `Flush1` and
+`Present1`.
+
+**What the runtime does, which decides the driver's shape.**
+
+- *It writes the fixed-function shaders itself.* A program that sets no
+  shader still reaches the driver with a `vs_2_0` and a `ps_2_0` (their
+  comment says `$FF`), remade as the lighting and texture states change.
+  Nine's own fixed-function code runs for one case only: vertices the
+  declaration calls `POSITIONT`, for which the runtime sets no vertex
+  shader.
+- *Its `vs_2_0` uses `ifc`*, which the shader model's documents give to 2.x;
+  Nine's table said so too and is widened.
+- *Vertex and index buffers arrive as system memory* (`pSysMem`). A
+  program's own are announced by `Lock` with `NotifyOnly`, and copied into
+  Nine's buffer at the unlock; the runtime's own dynamic ones (where it
+  puts the vertices of a `Draw…UP`) are written with no word to the driver,
+  so a draw from one of those is drawn from memory.
+- *`DrawPrimitive2` and `DrawIndexedPrimitive2` are "out of the runtime's
+  buffer, addressed in bytes"*, not "already transformed", whatever the DDI's
+  document says: a clip-space `DrawPrimitiveUP` with a vertex shader bound
+  comes through them. What a vertex is comes from the declaration alone.
+- *The DDI's texture-stage numbering includes the sampler states* (13
+  `ADDRESSU` to 31 `DMAPOFFSET`); the front sorts them back apart.
+
+**Three things in Nine and Zink.**
+
+- Zink in Mesa 26.2 does not serve a constant buffer given as a pointer
+  (`user_buffer`): the shader reads something else, and the process dies
+  later on the dangling buffer. Nine gave its fixed-function constants
+  that way; they are uploaded now, like a program's. This was the last
+  one found — the pre-transformed triangles drew nowhere — by putting the
+  viewport into the shader as immediates, then the constants into a real
+  buffer, one switch at a time.
+- Zink has no `set_clip_state`; Nine's call is guarded. User clip planes
+  are therefore not applied yet (N3: lowered into the vertex shader).
+- A Nine device without a swap chain needs a software screen for its
+  reference paths all the same: softpipe on the null winsys.
+
+**Bring-up switches**, all environment variables read by the DLL:
+`ENTANGLED_D3D9=1` (serve this process — still required for anything but
+the test program), `ENTANGLED_D3D9_TRACE=1` (the first 400 draw-related
+calls), `ENTANGLED_D3D9_SHADERS=1` (shader bytecode), `ENTANGLED_D3D9_LOG`
+(a file to log into as well). A fault anywhere in the process is reported
+by module and offset with its callers (unwound on x64).
+
+Not done, and N3's: the caps are still N0's table rather than Nine's;
+state blocks of a pure device (`StateSet`), `VolBlt1`, `DepthFill`,
+`ValidateDevice`, `UpdateWInfo`; blits back to system memory
+(`GetRenderTargetData`); streams other than 0 out of memory; user clip
+planes; lost devices. `Present1` is a read-back and a copy per frame —
+N4's overlay plane replaces it. Seen once and not understood: the 64-bit
+test dying on a null pointer in a system DLL when keys were typed at it
+mid-run; the report will name the module next time.
+
+### N3 (2026-11-12): a game
+
+Portal 2, started with no launch option and nothing in its environment,
+comes up on the driver: the menu with its film behind it, and from
+"Continue game" a level, drawn right — lit, textured, the portal's view
+through the glass — and walked about in. Every program is served now
+(`ENTANGLED_D3D9=0` in a program's environment tells it there is no driver).
+It runs at 12–14 frames a second in a 1280×720 window: `Present1` reads the
+frame back and copies it through the guest's CPU, and Nine's context is not
+threaded. Both are N4's.
+
+What stood between the test program and the game, in the order met:
+
+- **An indexed draw from memory in Nine** ran its state update with stream 0
+  unbound; a vertex element took its buffer index from an uninitialised map
+  and the array of vertex buffers was cleared past its end. In the 32-bit
+  build that is a changed stack cookie, which ends the process with a
+  fast-fail no exception handler sees — the DLL carries its own
+  `__report_gsfailure` to say where.
+- **The runtime's worker thread.** With `pfnLockAsync`, `pfnUnlockAsync` and
+  `pfnRename` given, Windows 10's d3d9.dll plays the device's calls from a
+  thread of its own (two 768 KB command buffers, swapped) and calls those
+  three from the program's thread meanwhile. Nothing under the front may be
+  entered by two threads; the threaded context's queue was corrupted and its
+  worker spun on a call number that does not exist, while the program's
+  thread waited for it a second at a time, for ever. The three are not
+  given, and every call arrives in order from one thread at a time
+  (`ENTANGLED_D3D9_ASYNC=1` gives them back, for the day they are made safe).
+- **The format list.** A game takes formats for granted that N0's list did
+  not have and does not look at the refusal (a texture handle of -1, used).
+  The list is now what Nine on Zink does on a desktop GPU: volumes, 10- and
+  16-bit and float targets, bump maps, the block-compressed ones with ATI1
+  and ATI2, depth formats as textures, INTZ and NULL. `VolBlt1` is real.
+- **Buffers freed under queued draws.** Since Mesa 26 a draw in a threaded
+  context's queue holds no reference to its index or vertex buffers — a
+  frontend releases those through the context (`resource_release`) — and
+  Nine drops them the old way. Zink's thread drew from a freed index buffer.
+  Nine asks for a plain context now; porting its releases is N4's, with the
+  thread.
+- **An empty render area.** `Clear` and `ColorFill` with a rectangle the
+  viewport leaves nothing of are skipped. Twice more, before the runtime's
+  worker thread was gone, Zink began a rendering with an empty area from
+  somewhere else and our host refused it (the ring is fatal, the game loses
+  its device); not seen since, not explained.
+
+**How it was found** — the driver's own instruments, all still in it:
+a ring of the last device functions called and (`ENTANGLED_D3D9_RING=1`) of
+what they were told, printed by the crash report with the registers, the
+faulting instruction's bytes and the stack's words by module and nearest
+export; a sampler (`ENTANGLED_D3D9_SAMPLE=1`) that says every five seconds
+where each thread that calls the driver is, what handle it waits on, and
+once, the runtime's code before its return addresses (the guest's build of
+d3d9.dll is not the host's); `ENTANGLED_D3D9_TRACE=2` for where drawing goes.
+Windows' Application event log (event 1000) names the module and offset of a
+death no handler saw.
+
+Not done: user clip planes (Zink has no `set_clip_state`), state blocks of
+a pure device, blits back to system memory, lost devices, `DepthFill`,
+`ValidateDevice`; the caps are still N0's table.
+
+### N4, begun (2026-11-12): where the time goes, and the whole screen
+
+Measured in the level, in a 1280×720 window (the driver says it itself every
+120 presents, `pace:` in its log): 86 ms a frame, 11.5 a second. Of that:
+
+- **27 ms inside the kernel's present**, whatever the game's vertical sync
+  setting. Not the copy (a memcpy of 3.7 MB) and not the read-back from the
+  GPU (1.2 ms) or the hand-over to the kernel driver (0.7 ms): a present
+  into a window waits for DWM to take the frame and show it, about three of
+  the guest's 120 Hz refreshes. The menu's 35 ms is the same wait. A window
+  cannot be made faster than DWM here; the answer is the whole screen.
+- **57 ms in 318 draws**, 0.18 ms each, every one made in turn on the
+  program's thread: Nine's context is not threaded (N3), and neither is the
+  runtime's (N3). Not yet profiled further.
+
+**The whole screen did not work** (it does since the next entry), and it is how a game starts when
+nobody has told it otherwise: Portal 2 with `-fullscreen`, and the test
+program with `full`, both die inside d3d9.dll — the game at its first
+`SetRenderTarget` of the back buffer, the test at its first `Present`. What
+is known:
+
+- The runtime makes the same resources as for a window: one back buffer of
+  one surface (flags `RenderTarget | NotLockable`, no `Primary`, no source
+  id), and calls neither `pfnOpenResource` nor `pfnSetDisplayMode`. The
+  kernel is asked meanwhile for a shared primary and a shadow surface
+  (`GetStandardAllocationDriverData` types 1 and 2) and gives them.
+- The present goes down the runtime's flip (`DdFlipLH`, by its own error
+  strings), which takes the surface to show from the *second* surface of
+  the chain; that surface's link to a driver resource is NULL, and the
+  runtime reads through it. The first frame is drawn all the same: the
+  device's own render target points at the resource directly.
+- Windows' "fullscreen optimizations" are not it
+  (`__COMPAT_LAYER=DISABLEDXMAXIMIZEDWINDOWEDMODE` changes nothing), and the
+  runtime's table of last errors is empty.
+- So the runtime expected a chain of two — a front buffer it would have had
+  from somewhere — and what decides that is in its surface-creation code
+  ("Failed to create driver primary surface chain", "Failed to create dummy
+  primary surface" are its sentences there), not yet read.
+
+- The test program's variants narrow it: with two back buffers the runtime
+  makes two resources of one surface each; presented by a copy
+  (`fullcopy`) the back buffer is in another pool and the death is
+  elsewhere in the runtime. In no variant is a front buffer made through
+  the driver. The runtime's own count of the chain for
+  `D3DSWAPEFFECT_DISCARD` is two (front and back), made through one of its
+  internal functions, and only the backs reach `pfnCreateResource2`.
+
+Until then a game must be started in a window (`-windowed`, or its own
+setting), which Portal 2 remembers once set.
+
+Instruments added on the way: `ENTANGLED_D3D9_CALLS=1` (the first thousand
+device functions called, placeholders included), the `pace:` line, and the
+test program's `full` argument. The guest's d3d9.dll is not the host's
+build (functions sit 0xb0 lower); a guest file can be had by copying it
+behind a marker (`copy /b marker + file`) and finding the marker in the raw
+disk image with the VM off, though a fragmented copy is useless — matching
+the faulting instruction's bytes in the host's build finds the function.
+
+### N4 (2026-11-13): the whole screen, on the host's plane
+
+**Why the runtime made no front buffer.** Read out of d3d9.dll with traps
+(`ENTANGLED_D3D9_BREAK=1`): a flag on the runtime's adapter skips the whole
+primary chain, and it is set when the driver's format list holds no 16-bit
+display format. The list had only the 32-bit ones. With `D3DFMT_R5G6B5`
+given `FORMATOP_DISPLAYMODE` the runtime does what the DDK describes: it
+opens the screen's shared primary (`pfnOpenResource`) as the front buffer,
+makes the back buffers with `Primary | MatchGdiPrimary`, and presents by a
+flip (its swap effect for `DISCARD` in the whole screen is `FLIP`). The
+opened primary has nothing of Nine's until something draws to it
+(`d3d9_realize`).
+
+**A present of the whole screen does not go through the kernel at all.** The
+frame is copied on the GPU into memory the host can see and the Venus driver
+has the host show it on the overlay plane (`entangled_nine_show`, the entry
+ADR-0010's desktop uses; the lease is escape 0x901, renewed twice a second).
+1.1 ms a frame at 1920x1080, against 72 ms for a present into a window of
+that size.
+
+**A window that covers the screen takes the plane as well** ("full screen in
+a window", which is how Steam starts Portal 2): the driver looks at the
+foreground window at each present, and says so to the desktop's driver in a
+section both map (`Local\EntangledPlaneClaim`: a tick count and the
+process). DWM's driver stands aside while the claim is under 700 ms old and
+keeps the primary's pixels current about once a second. Alt+Tab gives the
+plane back at the next present.
+
+**Where the rest of the time was.**
+
+- A dynamic buffer in the runtime's memory was copied whole into Nine's at
+  every unlock, and the copy waited for the GPU: 28% of a frame in
+  `util_queue_fence_wait`. Such a buffer is drawn from memory while it is
+  only stream 0 or the indices, and is copied (with the lock's own
+  no-overwrite or discard promise) only once it is bound as another stream.
+- The driver has a sampling profiler now (`ENTANGLED_D3D9_PROFILE=1`), which
+  is how that was found. What is left in the level is the game's own waits
+  (31-42% in client.dll and server.dll).
+
+Portal 2 at 1920x1080, no launch option: the menu at 220 frames a second,
+the level at 43 (it was 11 in a window). Leaving the game by Alt+Tab and
+coming back works (the device is destroyed and made again), and so does
+starting it through Steam.
+
+**Two things found on the way.**
+
+- Mesa's barrier on Windows (no pthread one) is destroyed by the last thread
+  to arrive while the others are still taking its mutex back; every device
+  destroyed died in ntdll. A count of the threads inside, waited for in
+  `util_barrier_destroy` (0003).
+- `Blt` between the runtime's memory and video memory was a placeholder.
+  `UpdateSurface` goes that way, and WPF puts every glyph and bitmap on the
+  screen with it: PowerShell ISE drew its panes and no text. Both directions
+  are done (`entangled_nine_upload`, `entangled_nine_download`), unstretched.
+
+**32-bit programs have a Direct3D 10 driver too.** The INF named the
+Direct3D 9 DLL in all four 32-bit slots, so a 32-bit Direct3D 10 or 11
+program found no driver. `entangled_d3d10_x86.dll` is the same d3d10umd from
+the x86 build directory; `driver\d3d11-test.c` passes in both sizes at
+feature level 10_0. The name is read when the adapter starts: a changed
+registry value needs a reboot.
+
+**Still not done:** a present into a window that does not cover the screen
+waits for DWM as before; state blocks of a pure device, `DepthFill`,
+`ValidateDevice`, a stretched copy with system memory; the caps are written
+by hand; user clip planes ride on Nine's emulation, unverified. And outside
+this ADR: the Direct3D 10 driver stops at feature level 10_0 and refuses a
+flip-model swap chain (`E_INVALIDARG`; programs fall back to the copying
+one), so a Direct3D 11 game that needs 11_0 still wants DXVK (ADR-0009).

@@ -25,6 +25,7 @@ _libd3d9umd_nine = static_library(
   ['d3d9_nine.c'],
   include_directories : [
     inc_d3d9, inc_include, inc_src, inc_gallium, inc_gallium_aux, inc_gallium_drivers,
+    inc_gallium_winsys,
     include_directories('../../frontends/nine'),
   ],
   dependencies : [idep_nir_headers, idep_mesautil],
@@ -36,11 +37,11 @@ libgallium_d3d9 = shared_library(
   vs_module_defs : 'entangled_d3d9.def',
   include_directories : [
     inc_include, inc_src, inc_gallium, inc_gallium_aux, inc_gallium_winsys,
-    inc_gallium_winsys_sw, inc_gallium_drivers,
+    inc_gallium_winsys_sw, inc_gallium_drivers, inc_virtio,
   ],
   link_whole : [_libd3d9umd_nine, libnine_st],
   link_with : [
-    libgallium, libwswddm
+    libgallium, libwswddm, libws_null
   ],
   dependencies : [
     dep_ws2_32, idep_nir, driver_swrast, driver_zink, idep_xmlconfig, idep_mesautil,

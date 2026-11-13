@@ -38,17 +38,18 @@ on the GPU — `viogpu3d` carrying Venus, `d3d10umd` on Zink; phases W0–W5).
 [docs/adr/0011-direct3d-9-driver.md](docs/adr/0011-direct3d-9-driver.md)
 (proposed: a real Direct3D 9 user-mode driver, x64 and x86, from Gallium
 Nine's state machine behind the WDDM DDI — so a game needs no switch; phases
-N0–N4; N0 and N1 done, nothing drawn yet).
+N0–N4, all done: Portal 2 plays a level full screen with no switch, on the
+host's plane; WPF programs draw).
 [docs/adr/0012-windows-xp-guests.md](docs/adr/0012-windows-xp-guests.md)
 (proposed: Windows XP guests need the legacy PC this machine never was — a
-BIOS, real VGA, PCI IDE, level-triggered INTx, a PS/2 mouse; phases X0–X5;
-X0 and X1 done: `boot.mode = "bios"`, a BIOS of our own, an IDE
-controller and a VGA register file take the XP CD into text-mode Setup;
-branch `winxp-guests`).
+BIOS, real VGA, PCI IDE, level-triggered INTx, a PS/2 mouse; phases X0–X5:
+`boot.mode = "bios"` with a BIOS of our own, and `entangled install windows`
+installs the XP CD unattended to a desktop with a network, on WHP).
 [docs/adr/0013-windows-xp-3d.md](docs/adr/0013-windows-xp-3d.md)
 (proposed: 3D for XP guests — an XPDM display driver of our own, an OpenGL
 ICD that passes the guest's GL calls to the host's OpenGL, Direct3D through
-a wrapper on top; phases G0–G5, nothing implemented).
+a wrapper on top; phases G0–G5; G0–G2 done: OpenGL 1.1 draws on the host's
+GPU, Windows hosts only).
 
 ## Build and test
 

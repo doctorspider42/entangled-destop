@@ -161,6 +161,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'building entangled_d3d9.dll failed' }
           Copy-Item C:\mesa-d3d10-build\src\gallium\targets\d3d9umd\entangled_d3d9.dll C:\drv
           Copy-Item C:\mesa-d3d-x86\src\gallium\targets\d3d9umd\entangled_d3d9.dll C:\drv\entangled_d3d9_x86.dll
+          Copy-Item C:\mesa-d3d-x86\src\gallium\targets\d3d10umd\entangled_d3d10.dll C:\drv\entangled_d3d10_x86.dll
 
       - name: Test-sign under a certificate whose key is then destroyed
         shell: pwsh
@@ -178,7 +179,7 @@ jobs:
           foreach ($f in 'entangled-gpu.inf', 'entangled-gpu.sys', 'entangled-gpu.cat', 'gpu-test.exe',
                          'entangled-display.inf', 'entangled-display.sys', 'entangled-display.cat',
                          'entangled-wddm.inf', 'entangled-wddm.sys', 'entangled-wddm.cat', 'entangled_d3d10.dll',
-                         'entangled_d3d9.dll', 'entangled_d3d9_x86.dll',
+                         'entangled_d3d9.dll', 'entangled_d3d9_x86.dll', 'entangled_d3d10_x86.dll',
                          'LICENSE-viogpudo.txt') {
             Copy-Item "C:\drv\$f" $pkg
           }

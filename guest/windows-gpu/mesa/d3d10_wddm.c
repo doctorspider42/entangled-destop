@@ -132,6 +132,10 @@ d3d10_wddm_exception(EXCEPTION_POINTERS *info)
                      ? (void *)info->ExceptionRecord->ExceptionInformation[1]
                      : NULL);
 
+#ifdef _WIN64
+#define D3D10_WDDM_SP(c) ((c)->Rsp)
+#define D3D10_WDDM_AX(c) ((c)->Rax)
+#define D3D10_WDDM_CX(c) ((c)->Rcx)
    context = *info->ContextRecord;
    for (unsigned frame = 0; frame < 24 && context.Rip; frame++) {
       DWORD64 image_base = 0;
@@ -167,13 +171,20 @@ d3d10_wddm_exception(EXCEPTION_POINTERS *info)
          context.Rsp += 8;
       }
    }
+#else
+   /* 32-bit code has no unwind tables: the words of the stack below say it. */
+#define D3D10_WDDM_SP(c) ((c)->Esp)
+#define D3D10_WDDM_AX(c) ((c)->Eax)
+#define D3D10_WDDM_CX(c) ((c)->Ecx)
+   (void)context;
+#endif
    /* When the fault is a jump or a return to somewhere that is not code, the
     * unwind above has nothing to go on. The stack still holds the return
     * addresses of the callers: every word on it that points into a module. */
    {
       NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
-      DWORD64 *word = (DWORD64 *)info->ContextRecord->Rsp;
-      DWORD64 *end = (DWORD64 *)tib->StackBase;
+      ULONG_PTR *word = (ULONG_PTR *)D3D10_WDDM_SP(info->ContextRecord);
+      ULONG_PTR *end = (ULONG_PTR *)tib->StackBase;
       unsigned shown = 0;
 
       /* A return to a bad address leaves that address just below the stack
@@ -181,8 +192,8 @@ d3d10_wddm_exception(EXCEPTION_POINTERS *info)
       d3d10_wddm_log("  rsp[-1] %llx rsp[0] %llx rsp[1] %llx rax %llx rcx %llx",
                      (unsigned long long)word[-1], (unsigned long long)word[0],
                      (unsigned long long)word[1],
-                     (unsigned long long)info->ContextRecord->Rax,
-                     (unsigned long long)info->ContextRecord->Rcx);
+                     (unsigned long long)D3D10_WDDM_AX(info->ContextRecord),
+                     (unsigned long long)D3D10_WDDM_CX(info->ContextRecord));
       for (unsigned i = 0; word + i < end && i < 600 && shown < 40; i++) {
          HMODULE module = NULL;
          char name[MAX_PATH] = "?";
@@ -770,6 +781,34 @@ d3d10_wddm_overlay(struct d3d10_wddm_screen *ws, struct pipe_context *pipe,
 #endif
 }
 
+/* Whether another process has the host's plane: a Direct3D 9 game whose
+ * window covers the whole screen shows its frames there itself, and says so
+ * in a section both drivers map - a tick count it renews at every present,
+ * and its process. A claim older than 700 ms is no claim (the game went, or
+ * lost the foreground). */
+static bool
+d3d10_wddm_plane_claimed(void)
+{
+   static volatile LONG *claim;
+   static bool looked;
+
+   if (!looked) {
+      SECURITY_DESCRIPTOR descriptor;
+      SECURITY_ATTRIBUTES attributes = { sizeof attributes, &descriptor, FALSE };
+      HANDLE section;
+
+      InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION);
+      SetSecurityDescriptorDacl(&descriptor, TRUE, NULL, FALSE);
+      section = CreateFileMappingA(INVALID_HANDLE_VALUE, &attributes, PAGE_READWRITE, 0, 16,
+                                   "Local\\EntangledPlaneClaim");
+      if (section)
+         claim = MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 16);
+      looked = true;
+   }
+   return claim && claim[1] && (DWORD)claim[1] != GetCurrentProcessId() &&
+          GetTickCount() - (DWORD)claim[0] < 700;
+}
+
 static void
 d3d10_wddm_flush_frontbuffer(struct pipe_screen *screen,
                              struct pipe_context *pipe,
@@ -783,6 +822,22 @@ d3d10_wddm_flush_frontbuffer(struct pipe_screen *screen,
    if (!shared) {
       ws->flush_frontbuffer(screen, pipe, res, level, layer,
                             winsys_drawable_handle, nboxes, sub_box);
+      return;
+   }
+   if (d3d10_wddm_plane_claimed()) {
+      /* A game has the plane, over everything this frame holds: nothing to
+       * show the host. The allocation still gets its pixels now and then,
+       * for the primary underneath. */
+      static volatile LONG kept;
+      LONG now = (LONG)GetTickCount();
+
+      shared->dirty = false;
+      if ((ULONG)(now - kept) >= 900) {
+         kept = now;
+         d3d10_wddm_readback(ws, pipe, res, shared);
+      }
+      ws->winsys->displaytarget_display(ws->winsys, shared->dt,
+                                        winsys_drawable_handle, nboxes, sub_box);
       return;
    }
    /* A present: the host shows the frame from the GPU's own copy of it, or

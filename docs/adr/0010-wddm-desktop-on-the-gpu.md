@@ -449,7 +449,9 @@ of an id it never made, once), and not in the last runs. Not understood.
 
 1. the cost of a window the size of the screen under the desktop's plane
    (a video, a DXVK game), and with it whether a full-screen window should
-   take the plane;
+   take the plane (a Direct3D 9 game's does since ADR-0011's N4: it claims
+   the plane and this driver stands aside, `d3d10_wddm_plane_claimed`; a
+   DXVK or Direct3D 10 one does not yet);
 2. shared surfaces on the GPU instead of through the kernel driver's copy,
    and a blt-model present, which still copies between allocations that are
    not mapped (so does nothing);
