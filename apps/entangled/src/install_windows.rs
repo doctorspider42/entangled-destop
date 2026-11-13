@@ -724,9 +724,14 @@ const WDDM_DRIVER_FILES: &[&str] = &[
 ];
 
 /// The Direct3D 9 user-mode driver of the WDDM driver, for 64-bit and 32-bit
-/// programs: both or neither, and only beside the WDDM driver. A package
-/// from before ADR-0011 has neither, and its INF names neither.
-const WDDM_D3D9_FILES: &[&str] = &["entangled_d3d9.dll", "entangled_d3d9_x86.dll"];
+/// programs, and the 32-bit twin of the Direct3D 10 one: all or none, and
+/// only beside the WDDM driver. A package from before ADR-0011 has none, and
+/// its INF names none.
+const WDDM_D3D9_FILES: &[&str] = &[
+    "entangled_d3d9.dll",
+    "entangled_d3d9_x86.dll",
+    "entangled_d3d10_x86.dll",
+];
 
 /// The optional folders of our own package and the DLLs each must hold:
 /// `opengl` from `guest/windows-gpu/mesa/build-zink.cmd`, `dxvk` from a DXVK

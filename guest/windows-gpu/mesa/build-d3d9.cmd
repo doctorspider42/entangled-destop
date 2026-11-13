@@ -6,6 +6,10 @@ rem (..\d3d9), over Zink. The tree is the one prepare-d3d10.ps1 makes.
 rem
 rem   %MESA_BUILD%\src\gallium\targets\d3d9umd\entangled_d3d9.dll      x64
 rem   %MESA_BUILD32%\src\gallium\targets\d3d9umd\entangled_d3d9.dll    x86
+rem   %MESA_BUILD32%\src\gallium\targets\d3d10umd\entangled_d3d10.dll  x86
+rem
+rem The last is the Direct3D 10 driver's 32-bit twin, which the x86 build
+rem directory makes from the same objects.
 rem
 rem The x64 one shares build-d3d10.cmd's build directory (the same Gallium
 rem and Zink objects); the x86 one is a build of its own, since most Direct3D
@@ -57,7 +61,7 @@ if not exist "%MESA_BUILD32%\build.ninja" (
   python -m mesonbuild.mesonmain setup "%MESA_BUILD32%" --cross-file "%HERE%x86-windows.ini" %OPTIONS%
   if errorlevel 1 exit /b 1
 )
-ninja -C "%MESA_BUILD32%" src/gallium/targets/d3d9umd/entangled_d3d9.dll 2>&1
+ninja -C "%MESA_BUILD32%" src/gallium/targets/d3d9umd/entangled_d3d9.dll src/gallium/targets/d3d10umd/entangled_d3d10.dll 2>&1
 if errorlevel 1 exit /b 1
 endlocal
 exit /b 0

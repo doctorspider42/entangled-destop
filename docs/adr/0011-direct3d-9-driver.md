@@ -375,7 +375,7 @@ Measured in the level, in a 1280×720 window (the driver says it itself every
   program's thread: Nine's context is not threaded (N3), and neither is the
   runtime's (N3). Not yet profiled further.
 
-**The whole screen does not work yet**, and it is how a game starts when
+**The whole screen did not work** (it does since the next entry), and it is how a game starts when
 nobody has told it otherwise: Portal 2 with `-fullscreen`, and the test
 program with `full`, both die inside d3d9.dll — the game at its first
 `SetRenderTarget` of the back buffer, the test at its first `Present`. What
@@ -417,3 +417,73 @@ build (functions sit 0xb0 lower); a guest file can be had by copying it
 behind a marker (`copy /b marker + file`) and finding the marker in the raw
 disk image with the VM off, though a fragmented copy is useless — matching
 the faulting instruction's bytes in the host's build finds the function.
+
+### N4 (2026-11-13): the whole screen, on the host's plane
+
+**Why the runtime made no front buffer.** Read out of d3d9.dll with traps
+(`ENTANGLED_D3D9_BREAK=1`): a flag on the runtime's adapter skips the whole
+primary chain, and it is set when the driver's format list holds no 16-bit
+display format. The list had only the 32-bit ones. With `D3DFMT_R5G6B5`
+given `FORMATOP_DISPLAYMODE` the runtime does what the DDK describes: it
+opens the screen's shared primary (`pfnOpenResource`) as the front buffer,
+makes the back buffers with `Primary | MatchGdiPrimary`, and presents by a
+flip (its swap effect for `DISCARD` in the whole screen is `FLIP`). The
+opened primary has nothing of Nine's until something draws to it
+(`d3d9_realize`).
+
+**A present of the whole screen does not go through the kernel at all.** The
+frame is copied on the GPU into memory the host can see and the Venus driver
+has the host show it on the overlay plane (`entangled_nine_show`, the entry
+ADR-0010's desktop uses; the lease is escape 0x901, renewed twice a second).
+1.1 ms a frame at 1920x1080, against 72 ms for a present into a window of
+that size.
+
+**A window that covers the screen takes the plane as well** ("full screen in
+a window", which is how Steam starts Portal 2): the driver looks at the
+foreground window at each present, and says so to the desktop's driver in a
+section both map (`Local\EntangledPlaneClaim`: a tick count and the
+process). DWM's driver stands aside while the claim is under 700 ms old and
+keeps the primary's pixels current about once a second. Alt+Tab gives the
+plane back at the next present.
+
+**Where the rest of the time was.**
+
+- A dynamic buffer in the runtime's memory was copied whole into Nine's at
+  every unlock, and the copy waited for the GPU: 28% of a frame in
+  `util_queue_fence_wait`. Such a buffer is drawn from memory while it is
+  only stream 0 or the indices, and is copied (with the lock's own
+  no-overwrite or discard promise) only once it is bound as another stream.
+- The driver has a sampling profiler now (`ENTANGLED_D3D9_PROFILE=1`), which
+  is how that was found. What is left in the level is the game's own waits
+  (31-42% in client.dll and server.dll).
+
+Portal 2 at 1920x1080, no launch option: the menu at 220 frames a second,
+the level at 43 (it was 11 in a window). Leaving the game by Alt+Tab and
+coming back works (the device is destroyed and made again), and so does
+starting it through Steam.
+
+**Two things found on the way.**
+
+- Mesa's barrier on Windows (no pthread one) is destroyed by the last thread
+  to arrive while the others are still taking its mutex back; every device
+  destroyed died in ntdll. A count of the threads inside, waited for in
+  `util_barrier_destroy` (0003).
+- `Blt` between the runtime's memory and video memory was a placeholder.
+  `UpdateSurface` goes that way, and WPF puts every glyph and bitmap on the
+  screen with it: PowerShell ISE drew its panes and no text. Both directions
+  are done (`entangled_nine_upload`, `entangled_nine_download`), unstretched.
+
+**32-bit programs have a Direct3D 10 driver too.** The INF named the
+Direct3D 9 DLL in all four 32-bit slots, so a 32-bit Direct3D 10 or 11
+program found no driver. `entangled_d3d10_x86.dll` is the same d3d10umd from
+the x86 build directory; `driver\d3d11-test.c` passes in both sizes at
+feature level 10_0. The name is read when the adapter starts: a changed
+registry value needs a reboot.
+
+**Still not done:** a present into a window that does not cover the screen
+waits for DWM as before; state blocks of a pure device, `DepthFill`,
+`ValidateDevice`, a stretched copy with system memory; the caps are written
+by hand; user clip planes ride on Nine's emulation, unverified. And outside
+this ADR: the Direct3D 10 driver stops at feature level 10_0 and refuses a
+flip-model swap chain (`E_INVALIDARG`; programs fall back to the copying
+one), so a Direct3D 11 game that needs 11_0 still wants DXVK (ADR-0009).

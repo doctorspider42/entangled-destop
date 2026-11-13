@@ -132,6 +132,10 @@ d3d10_wddm_exception(EXCEPTION_POINTERS *info)
                      ? (void *)info->ExceptionRecord->ExceptionInformation[1]
                      : NULL);
 
+#ifdef _WIN64
+#define D3D10_WDDM_SP(c) ((c)->Rsp)
+#define D3D10_WDDM_AX(c) ((c)->Rax)
+#define D3D10_WDDM_CX(c) ((c)->Rcx)
    context = *info->ContextRecord;
    for (unsigned frame = 0; frame < 24 && context.Rip; frame++) {
       DWORD64 image_base = 0;
@@ -167,13 +171,20 @@ d3d10_wddm_exception(EXCEPTION_POINTERS *info)
          context.Rsp += 8;
       }
    }
+#else
+   /* 32-bit code has no unwind tables: the words of the stack below say it. */
+#define D3D10_WDDM_SP(c) ((c)->Esp)
+#define D3D10_WDDM_AX(c) ((c)->Eax)
+#define D3D10_WDDM_CX(c) ((c)->Ecx)
+   (void)context;
+#endif
    /* When the fault is a jump or a return to somewhere that is not code, the
     * unwind above has nothing to go on. The stack still holds the return
     * addresses of the callers: every word on it that points into a module. */
    {
       NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
-      DWORD64 *word = (DWORD64 *)info->ContextRecord->Rsp;
-      DWORD64 *end = (DWORD64 *)tib->StackBase;
+      ULONG_PTR *word = (ULONG_PTR *)D3D10_WDDM_SP(info->ContextRecord);
+      ULONG_PTR *end = (ULONG_PTR *)tib->StackBase;
       unsigned shown = 0;
 
       /* A return to a bad address leaves that address just below the stack
@@ -181,8 +192,8 @@ d3d10_wddm_exception(EXCEPTION_POINTERS *info)
       d3d10_wddm_log("  rsp[-1] %llx rsp[0] %llx rsp[1] %llx rax %llx rcx %llx",
                      (unsigned long long)word[-1], (unsigned long long)word[0],
                      (unsigned long long)word[1],
-                     (unsigned long long)info->ContextRecord->Rax,
-                     (unsigned long long)info->ContextRecord->Rcx);
+                     (unsigned long long)D3D10_WDDM_AX(info->ContextRecord),
+                     (unsigned long long)D3D10_WDDM_CX(info->ContextRecord));
       for (unsigned i = 0; word + i < end && i < 600 && shown < 40; i++) {
          HMODULE module = NULL;
          char name[MAX_PATH] = "?";
