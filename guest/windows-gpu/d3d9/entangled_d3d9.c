@@ -828,9 +828,191 @@ d3d9_sampler(void *unused)
    return 0;
 }
 
+/* The profile: two tables of places and how often the thread was there. */
+struct d3d9_hits {
+   ULONG_PTR key;
+   unsigned count;
+};
+
+static void
+d3d9_hit(struct d3d9_hits *table, unsigned size, ULONG_PTR key)
+{
+   for (unsigned i = 0; i < size; i++) {
+      if (table[i].key == key || !table[i].count) {
+         table[i].key = key;
+         table[i].count++;
+         return;
+      }
+   }
+}
+
+static void
+d3d9_top(const char *what, struct d3d9_hits *table, unsigned size, unsigned total, BOOL ours)
+{
+   ULONG_PTR base = (ULONG_PTR)crash_module;
+
+   for (unsigned shown = 0; shown < 22; shown++) {
+      unsigned best = 0;
+      char where[140];
+
+      for (unsigned i = 1; i < size; i++) {
+         if (table[i].count > table[best].count)
+            best = i;
+      }
+      if (!table[best].count)
+         break;
+      if (ours) {
+         d3d9_log("profile %s: %4.1f%% +0x%Ix", what, 100.0 * table[best].count / total,
+                  (size_t)(table[best].key - base));
+      } else {
+         d3d9_where((const void *)table[best].key, where, sizeof where);
+         d3d9_log("profile %s: %4.1f%% %s", what, 100.0 * table[best].count / total, where);
+      }
+      table[best].count = 0;
+   }
+   memset(table, 0, size * sizeof *table);
+}
+
+static DWORD WINAPI
+d3d9_profiler(void *unused)
+{
+   static struct d3d9_hits at[512], via[512], via2[512], caller[512];
+   static ULONG_PTR words[96];
+   /* The modules a wait goes through, which say nothing about who waits. */
+   static const char *const plumbing[] = {"ntdll.dll", "KERNELBASE.dll", "KERNEL32.DLL",
+                                          "win32u.dll", "wow64cpu.dll"};
+   ULONG_PTR low[5], high[5];
+   ULONG_PTR base = (ULONG_PTR)crash_module, top;
+   IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+   unsigned samples = 0;
+
+   (void)unused;
+   top = base + nt->OptionalHeader.SizeOfImage;
+   for (unsigned i = 0; i < 5; i++) {
+      const BYTE *module = (const BYTE *)GetModuleHandleA(plumbing[i]);
+
+      low[i] = high[i] = 0;
+      if (module) {
+         const IMAGE_NT_HEADERS *h =
+            (const IMAGE_NT_HEADERS *)(module + ((const IMAGE_DOS_HEADER *)module)->e_lfanew);
+
+         low[i] = (ULONG_PTR)module;
+         high[i] = low[i] + h->OptionalHeader.SizeOfImage;
+      }
+   }
+   for (;;) {
+      DWORD id = (DWORD)ddi_threads[0];
+      HANDLE thread;
+      CONTEXT context;
+      SIZE_T got = 0;
+      ULONG_PTR pc, sp;
+
+      Sleep(2);
+      /* The thread that draws is the one that called last among the few. */
+      for (unsigned i = 1; i < 8; i++) {
+         if (ddi_threads[i])
+            id = (DWORD)ddi_threads[i];
+      }
+      thread = id ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, id) : NULL;
+      if (!thread)
+         continue;
+      memset(&context, 0, sizeof context);
+      context.ContextFlags = CONTEXT_CONTROL;
+      if (SuspendThread(thread) == (DWORD)-1 || !GetThreadContext(thread, &context)) {
+         ResumeThread(thread);
+         CloseHandle(thread);
+         continue;
+      }
+#if defined(_WIN64)
+      pc = context.Rip;
+      sp = context.Rsp;
+#else
+      pc = context.Eip;
+      sp = context.Esp;
+#endif
+      ReadProcessMemory(GetCurrentProcess(), (const void *)sp, words, sizeof words, &got);
+      ResumeThread(thread);
+      CloseHandle(thread);
+      /* Where it is: in this DLL to 64 bytes, elsewhere to a page. */
+      if (pc >= base && pc < top) {
+         d3d9_hit(at, 512, pc & ~(ULONG_PTR)63);
+      } else {
+         d3d9_hit(at, 512, pc & ~(ULONG_PTR)4095);
+         /* Who called: the first word that points into a module that is not
+          * plumbing. In this DLL, that place and the next one up. */
+         for (SIZE_T i = 0; i < got / sizeof words[0]; i++) {
+            HMODULE module = NULL;
+            BOOL skip = words[i] < 0x10000;
+
+            for (unsigned k = 0; k < 5 && !skip; k++)
+               skip = words[i] >= low[k] && words[i] < high[k];
+            if (skip)
+               continue;
+            if (words[i] >= base && words[i] < top) {
+               d3d9_hit(via, 512, words[i] & ~(ULONG_PTR)63);
+               for (SIZE_T j = i + 1; j < got / sizeof words[0]; j++) {
+                  if (words[j] >= base && words[j] < top &&
+                      (words[j] & ~(ULONG_PTR)63) != (words[i] & ~(ULONG_PTR)63)) {
+                     d3d9_hit(via2, 512, words[j] & ~(ULONG_PTR)63);
+                     break;
+                  }
+               }
+               break;
+            }
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                      GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)words[i], &module) &&
+                module) {
+               d3d9_hit(caller, 512, words[i] & ~(ULONG_PTR)4095);
+               break;
+            }
+         }
+      }
+      if (++samples == 4000) {
+         d3d9_log("profile: 4000 samples of thread %lu", (unsigned long)id);
+         d3d9_top("via2", via2, 512, samples, TRUE);
+         d3d9_top("caller", caller, 512, samples, FALSE);
+         for (unsigned pass = 0; pass < 2; pass++) {
+            /* This DLL's places as offsets (for the map), the others by name. */
+            struct d3d9_hits ours[512], others[512];
+            struct d3d9_hits *table = pass ? via : at;
+            unsigned n = 0, m = 0;
+
+            memset(ours, 0, sizeof ours);
+            memset(others, 0, sizeof others);
+            for (unsigned i = 0; i < 512; i++) {
+               if (!table[i].count)
+                  continue;
+               if (table[i].key >= base && table[i].key < top)
+                  ours[n++] = table[i];
+               else
+                  others[m++] = table[i];
+            }
+            d3d9_top(pass ? "via" : "in", ours, 512, samples, TRUE);
+            if (!pass)
+               d3d9_top("in", others, 512, samples, FALSE);
+            memset(table, 0, sizeof at);
+         }
+         samples = 0;
+      }
+   }
+   return 0;
+}
+
 static void
 d3d9_sample_this_thread(void)
 {
+   char profile[4] = "";
+
+   GetEnvironmentVariableA("ENTANGLED_D3D9_PROFILE", profile, sizeof profile);
+   if (profile[0] == '1' && InterlockedExchange(&sample_on, 1) == 0) {
+      HANDLE thread = CreateThread(NULL, 0, d3d9_profiler, NULL, 0, NULL);
+
+      d3d9_here();
+      if (thread)
+         CloseHandle(thread);
+      return;
+   }
    char want[4] = "";
 
    if (sample_on)
@@ -1275,6 +1457,13 @@ struct d3d9_resource {
     * date when the runtime says it wrote (a lock that only notifies). */
    struct d3d9_sysmem *sysmem;
    UINT notified_offset, notified_size;
+   /* What the lock promised about the range (D3DLOCK_NOOVERWRITE, _DISCARD),
+    * for the copy into Nine's buffer to promise too. */
+   UINT notified_flags;
+   /* A dynamic buffer is drawn straight from the runtime's memory while it is
+    * only ever stream 0 or the indices; once a draw needs Nine's copy (it
+    * was bound as another stream), the copy is kept. */
+   BOOL copied;
    /* A render target the runtime may present has an allocation of the kernel
     * driver's: a present is a copy from it, and it is what DWM is shown. */
    D3DKMT_HANDLE allocation;
@@ -1763,6 +1952,8 @@ d3d9_lock(HANDLE handle, D3DDDIARG_LOCK *arg)
    if (resource->sysmem || arg->Flags.NotifyOnly) {
       resource->notified_offset = whole ? 0 : box[0];
       resource->notified_size = whole ? resource->width : box[2] - box[0];
+      resource->notified_flags = (arg->Flags.NoOverwrite ? 0x1000 : 0) |
+                                 (arg->Flags.Discard ? 0x2000 : 0);
       return S_OK;
    }
    if (!device->nine || !resource->nine) {
@@ -1809,12 +2000,15 @@ d3d9_unlock(HANDLE handle, const D3DDDIARG_UNLOCK *arg)
       void *data = NULL;
       long result;
 
+      /* Not a dynamic one no draw reads Nine's copy of. */
+      if (resource->flags.Dynamic && !resource->copied)
+         return S_OK;
       if (!size)
          return S_OK;
       box[0] = offset;
       box[2] = offset + size;
-      result = entangled_nine_lock(device->nine, resource->nine, resource->kind, 1, 0, box, 0,
-                                   &data, &pitch, &slice_pitch);
+      result = entangled_nine_lock(device->nine, resource->nine, resource->kind, 1, 0, box,
+                                   resource->notified_flags, &data, &pitch, &slice_pitch);
       if (result >= 0 && data) {
          memcpy(data, (const char *)resource->sysmem[0].memory + offset, size);
          result = entangled_nine_unlock(device->nine, resource->nine, resource->kind, 1, 0);
@@ -2557,6 +2751,21 @@ d3d9_set_stream_source(HANDLE handle, const D3DDDIARG_SETSTREAMSOURCE *arg)
    }
    if (!device->nine)
       return S_OK;
+   if (resource && resource->sysmem && resource->flags.Dynamic && !resource->copied &&
+       resource->nine) {
+      /* A dynamic buffer as another stream than 0: this draw, and those after
+       * it, read Nine's copy, which has been left behind until now. */
+      unsigned pitch, slice_pitch;
+      void *data = NULL;
+
+      resource->copied = TRUE;
+      if (entangled_nine_lock(device->nine, resource->nine, resource->kind, 1, 0, NULL,
+                              0x2000 /* D3DLOCK_DISCARD */, &data, &pitch, &slice_pitch) >= 0 &&
+          data) {
+         memcpy(data, resource->sysmem[0].memory, resource->width);
+         entangled_nine_unlock(device->nine, resource->nine, resource->kind, 1, 0);
+      }
+   }
    D3D9_CHECK("stream", entangled_nine_stream(device->nine, arg->Stream,
                                               resource ? resource->nine : NULL, arg->Offset,
                                               arg->Stride));
