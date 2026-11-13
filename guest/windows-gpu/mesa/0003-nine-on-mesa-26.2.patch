@@ -1273,3 +1273,60 @@ index 980c297a..84adcc8c 100644
  if with_platform_windows
    if with_opengl
      subdir('frontends/wgl')
+diff --git a/src/util/u_thread.c b/src/util/u_thread.c
+index d1cf0858..4d22ef0d 100644
+--- a/src/util/u_thread.c
++++ b/src/util/u_thread.c
+@@ -220,6 +220,7 @@ void util_barrier_init(util_barrier *barrier, unsigned count)
+    barrier->count = count;
+    barrier->waiters = 0;
+    barrier->sequence = 0;
++   barrier->inside = 0;
+    (void) mtx_init(&barrier->mutex, mtx_plain);
+    cnd_init(&barrier->condvar);
+ }
+@@ -227,6 +228,15 @@ void util_barrier_init(util_barrier *barrier, unsigned count)
+ void util_barrier_destroy(util_barrier *barrier)
+ {
+    assert(barrier->waiters == 0);
++   /* The threads that were woken are still taking the mutex back: let them
++    * out before it goes. */
++   mtx_lock(&barrier->mutex);
++   while (barrier->inside) {
++      mtx_unlock(&barrier->mutex);
++      thrd_yield();
++      mtx_lock(&barrier->mutex);
++   }
++   mtx_unlock(&barrier->mutex);
+    mtx_destroy(&barrier->mutex);
+    cnd_destroy(&barrier->condvar);
+ }
+@@ -237,6 +247,7 @@ bool util_barrier_wait(util_barrier *barrier)
+ 
+    assert(barrier->waiters < barrier->count);
+    barrier->waiters++;
++   barrier->inside++;
+ 
+    if (barrier->waiters < barrier->count) {
+       uint64_t sequence = barrier->sequence;
+@@ -250,6 +261,7 @@ bool util_barrier_wait(util_barrier *barrier)
+       cnd_broadcast(&barrier->condvar);
+    }
+ 
++   barrier->inside--;
+    mtx_unlock(&barrier->mutex);
+ 
+    return true;
+diff --git a/src/util/u_thread.h b/src/util/u_thread.h
+index 57ebdc51..fc3bc538 100644
+--- a/src/util/u_thread.h
++++ b/src/util/u_thread.h
+@@ -126,6 +126,8 @@ typedef struct {
+    unsigned count;
+    unsigned waiters;
+    uint64_t sequence;
++   /* Threads between the lock and the unlock of util_barrier_wait. */
++   unsigned inside;
+    mtx_t mutex;
+    cnd_t condvar;
+ } util_barrier;
