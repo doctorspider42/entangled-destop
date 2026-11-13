@@ -2213,8 +2213,44 @@ d3d9_blt(HANDLE handle, const D3DDDIARG_BLT *arg)
    if (!device->nine || !dst || !src)
       return S_OK;
    if (!dst->nine || !src->nine) {
-      if (InterlockedIncrement(&said) <= 3)
-         d3d9_log("Blt with system memory (%s): not done", src->nine ? "to it" : "from it");
+      /* One side is the runtime's memory: UpdateSurface (from it) or
+       * GetRenderTargetData (to it), neither of which stretches. */
+      LONG width = arg->SrcRect.right - arg->SrcRect.left;
+      LONG height = arg->SrcRect.bottom - arg->SrcRect.top;
+      const struct d3d9_sysmem *memory = NULL;
+      long result = E_NOTIMPL;
+
+      if (!dst->nine && !src->nine)
+         return S_OK;
+      if (src->nine && dst->sysmem && arg->DstSubResourceIndex < dst->surfaces)
+         memory = &dst->sysmem[arg->DstSubResourceIndex];
+      else if (dst->nine && src->sysmem && arg->SrcSubResourceIndex < src->surfaces)
+         memory = &src->sysmem[arg->SrcSubResourceIndex];
+      if (memory && memory->memory && width > 0 && height > 0 &&
+          width == arg->DstRect.right - arg->DstRect.left &&
+          height == arg->DstRect.bottom - arg->DstRect.top && arg->SrcRect.left >= 0 &&
+          arg->SrcRect.top >= 0 && arg->DstRect.left >= 0 && arg->DstRect.top >= 0) {
+         if (src->nine) {
+            if ((UINT)arg->DstRect.right <= memory->width &&
+                (UINT)arg->DstRect.bottom <= memory->height)
+               result = entangled_nine_download(device->nine, src->nine, src->kind, src->levels,
+                                                arg->SrcSubResourceIndex,
+                                                (const long *)&arg->SrcRect, memory->memory,
+                                                memory->pitch, arg->DstRect.left,
+                                                arg->DstRect.top);
+         } else if ((UINT)arg->SrcRect.right <= memory->width &&
+                    (UINT)arg->SrcRect.bottom <= memory->height) {
+            result = entangled_nine_upload(device->nine, dst->nine, dst->kind, dst->levels,
+                                           arg->DstSubResourceIndex, arg->DstRect.left,
+                                           arg->DstRect.top, memory->memory, memory->pitch,
+                                           (const long *)&arg->SrcRect);
+         }
+      }
+      if (result < 0 && InterlockedIncrement(&said) <= 3)
+         d3d9_log("Blt with system memory (%s) (%ld,%ld-%ld,%ld) to (%ld,%ld-%ld,%ld): 0x%08lx",
+                  src->nine ? "to it" : "from it", arg->SrcRect.left, arg->SrcRect.top,
+                  arg->SrcRect.right, arg->SrcRect.bottom, arg->DstRect.left, arg->DstRect.top,
+                  arg->DstRect.right, arg->DstRect.bottom, result);
       return S_OK;
    }
    D3D9_CHECK("blt", entangled_nine_blit(device->nine, src->nine, src->kind, src->levels,

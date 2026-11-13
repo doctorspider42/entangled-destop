@@ -133,6 +133,13 @@ entangled_nine_upload(struct entangled_nine *nine, void *object, enum entangled_
                       unsigned levels, unsigned sub, unsigned x, unsigned y, const void *pixels,
                       unsigned pitch, const long *rect);
 
+/* The other way: `rect` of a part of a resource into memory of the runtime's
+ * at (`x`, `y`). */
+long
+entangled_nine_download(struct entangled_nine *nine, void *object, enum entangled_nine_kind kind,
+                        unsigned levels, unsigned sub, const long *rect, void *pixels,
+                        unsigned pitch, unsigned x, unsigned y);
+
 /* Render targets by resource part (a texture level can be one). */
 long
 entangled_nine_set_target(struct entangled_nine *nine, unsigned index, void *object,

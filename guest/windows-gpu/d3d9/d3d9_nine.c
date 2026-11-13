@@ -526,6 +526,33 @@ entangled_nine_upload(struct entangled_nine *nine, void *object, enum entangled_
 }
 
 long
+entangled_nine_download(struct entangled_nine *nine, void *object, enum entangled_nine_kind kind,
+                        unsigned levels, unsigned sub, const long *rect, void *pixels,
+                        unsigned pitch, unsigned x, unsigned y)
+{
+   struct NineSurface9 *surface = entangled_nine_part(object, kind, levels, sub);
+   D3DLOCKED_RECT locked;
+   RECT src;
+   HRESULT hr;
+
+   (void)nine;
+   if (!surface)
+      return E_INVALIDARG;
+   src.left = rect[0];
+   src.top = rect[1];
+   src.right = rect[2];
+   src.bottom = rect[3];
+   hr = NineSurface9_LockRect(surface, &locked, &src, D3DLOCK_READONLY);
+   if (SUCCEEDED(hr)) {
+      util_copy_rect(pixels, surface->base.info.format, pitch, x, y, rect[2] - rect[0],
+                     rect[3] - rect[1], locked.pBits, locked.Pitch, 0, 0);
+      hr = NineSurface9_UnlockRect(surface);
+   }
+   NineUnknown_Release(NineUnknown(surface));
+   return hr;
+}
+
+long
 entangled_nine_set_target(struct entangled_nine *nine, unsigned index, void *object,
                           enum entangled_nine_kind kind, unsigned levels, unsigned sub)
 {
