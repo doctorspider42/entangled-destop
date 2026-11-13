@@ -15,6 +15,7 @@
 #include "indexbuffer9.h"
 #include "pixelshader9.h"
 #include "query9.h"
+#include "stateblock9.h"
 #include "surface9.h"
 #include "texture9.h"
 #include "vertexbuffer9.h"
@@ -880,4 +881,42 @@ unsigned
 entangled_nine_query_size(void *query)
 {
    return NineQuery9_GetDataSize(query);
+}
+
+/* ---- state blocks ------------------------------------------------------- */
+
+void *
+entangled_nine_state_block_create(struct entangled_nine *nine, unsigned type, long *result)
+{
+   IDirect3DStateBlock9 *block = NULL;
+
+   *result = NineDevice9_CreateStateBlock(nine->device, (D3DSTATEBLOCKTYPE)type, &block);
+   return SUCCEEDED(*result) ? block : NULL;
+}
+
+long
+entangled_nine_state_block_begin(struct entangled_nine *nine)
+{
+   return NineDevice9_BeginStateBlock(nine->device);
+}
+
+void *
+entangled_nine_state_block_end(struct entangled_nine *nine, long *result)
+{
+   IDirect3DStateBlock9 *block = NULL;
+
+   *result = NineDevice9_EndStateBlock(nine->device, &block);
+   return SUCCEEDED(*result) ? block : NULL;
+}
+
+long
+entangled_nine_state_block_capture(void *block)
+{
+   return NineStateBlock9_Capture(block);
+}
+
+long
+entangled_nine_state_block_apply(void *block)
+{
+   return NineStateBlock9_Apply(block);
 }

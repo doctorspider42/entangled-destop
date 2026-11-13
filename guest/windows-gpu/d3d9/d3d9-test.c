@@ -4,6 +4,9 @@
  * (ADR-0011, phase N0), and how far a device gets.
  *
  * usage: d3d9-test [frames]     (prints to stdout; exit code 0 = a device)
+ *        d3d9-test pure         a pure device: its state blocks are the
+ *                               driver's, and are checked by what a clear
+ *                               reaches (exit code 0 = they hold)
  */
 #include <windows.h>
 
@@ -330,6 +333,95 @@ struct kmt_mode_list {
 __declspec(dllimport) LONG APIENTRY D3DKMTOpenAdapterFromHdc(struct kmt_open_from_hdc *);
 __declspec(dllimport) LONG APIENTRY D3DKMTGetDisplayModeList(struct kmt_mode_list *);
 
+/* The colour of one pixel of the back buffer, read through system memory. */
+static D3DCOLOR
+pixel_at(IDirect3DDevice9 *device, IDirect3DSurface9 *target, IDirect3DSurface9 *copy, int x,
+         int y)
+{
+   D3DLOCKED_RECT locked;
+   D3DCOLOR colour = 0xdeadbeef;
+
+   if (FAILED(IDirect3DDevice9_GetRenderTargetData(device, target, copy)))
+      return colour;
+   if (SUCCEEDED(IDirect3DSurface9_LockRect(copy, &locked, NULL, D3DLOCK_READONLY))) {
+      colour = *(const D3DCOLOR *)((const char *)locked.pBits + y * locked.Pitch + x * 4) &
+               0xffffff;
+      IDirect3DSurface9_UnlockRect(copy);
+   }
+   return colour;
+}
+
+/* State blocks of a pure device. The scissor test is the state: a clear
+ * honours it, so the pixel right of the scissor rectangle says whether the
+ * test was on. Created (off), recorded (on), applied both ways, captured. */
+static int
+pure_state_blocks(IDirect3DDevice9 *device)
+{
+   IDirect3DStateBlock9 *off = NULL, *on = NULL;
+   IDirect3DSurface9 *target = NULL, *copy = NULL;
+   D3DSURFACE_DESC desc;
+   RECT left;
+   D3DCOLOR a, b, c, d, e;
+   HRESULT hr;
+   int ok;
+
+   hr = IDirect3DDevice9_GetRenderTarget(device, 0, &target);
+   if (FAILED(hr))
+      return 0;
+   IDirect3DSurface9_GetDesc(target, &desc);
+   hr = IDirect3DDevice9_CreateOffscreenPlainSurface(device, desc.Width, desc.Height,
+                                                     desc.Format, D3DPOOL_SYSTEMMEM, &copy,
+                                                     NULL);
+   printf("system memory copy: 0x%08lx\n", (unsigned long)hr);
+   if (FAILED(hr))
+      return 0;
+   SetRect(&left, 0, 0, (LONG)desc.Width / 2, (LONG)desc.Height);
+   IDirect3DDevice9_SetScissorRect(device, &left);
+   IDirect3DDevice9_SetRenderState(device, D3DRS_SCISSORTESTENABLE, FALSE);
+   hr = IDirect3DDevice9_CreateStateBlock(device, D3DSBT_ALL, &off);
+   printf("state block created: 0x%08lx\n", (unsigned long)hr);
+   hr = IDirect3DDevice9_BeginStateBlock(device);
+   IDirect3DDevice9_SetRenderState(device, D3DRS_SCISSORTESTENABLE, TRUE);
+   if (SUCCEEDED(hr))
+      hr = IDirect3DDevice9_EndStateBlock(device, &on);
+   printf("state block recorded: 0x%08lx\n", (unsigned long)hr);
+   if (!off || !on)
+      return 0;
+
+   int x = (int)desc.Width * 3 / 4, y = (int)desc.Height / 2, lx = (int)desc.Width / 4;
+
+   /* Recording applied nothing: the whole target goes red. */
+   IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0xff0000, 1.0f, 0);
+   a = pixel_at(device, target, copy, x, y);
+   /* The recorded block: the test is on, green stops at the middle. */
+   hr = IDirect3DStateBlock9_Apply(on);
+   IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0x00ff00, 1.0f, 0);
+   b = pixel_at(device, target, copy, x, y);
+   c = pixel_at(device, target, copy, lx, y);
+   /* The created block: off again, blue everywhere. */
+   IDirect3DStateBlock9_Apply(off);
+   IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0x0000ff, 1.0f, 0);
+   d = pixel_at(device, target, copy, x, y);
+   /* Captured with the test on, the created block now turns it on. */
+   IDirect3DDevice9_SetRenderState(device, D3DRS_SCISSORTESTENABLE, TRUE);
+   IDirect3DStateBlock9_Capture(off);
+   IDirect3DDevice9_SetRenderState(device, D3DRS_SCISSORTESTENABLE, FALSE);
+   IDirect3DStateBlock9_Apply(off);
+   IDirect3DDevice9_Clear(device, 0, NULL, D3DCLEAR_TARGET, 0xffffff, 1.0f, 0);
+   e = pixel_at(device, target, copy, x, y);
+   ok = a == 0xff0000 && b == 0xff0000 && c == 0x00ff00 && d == 0x0000ff && e == 0x0000ff;
+   printf("state blocks: apply 0x%08lx; %06lx %06lx %06lx %06lx %06lx (wanted ff0000 ff0000 "
+          "00ff00 0000ff 0000ff): %s\n",
+          (unsigned long)hr, (unsigned long)a, (unsigned long)b, (unsigned long)c,
+          (unsigned long)d, (unsigned long)e, ok ? "PASS" : "FAIL");
+   IDirect3DDevice9_SetRenderState(device, D3DRS_SCISSORTESTENABLE, FALSE);
+   IDirect3DStateBlock9_Release(on);
+   IDirect3DStateBlock9_Release(off);
+   IDirect3DSurface9_Release(copy);
+   IDirect3DSurface9_Release(target);
+   return ok;
+}
+
 static void
 print_modes(void)
 {
@@ -379,6 +471,7 @@ int
 main(int argc, char **argv)
 {
    int frames = argc > 1 ? atoi(argv[1]) : 60;
+   int pure = argc > 1 && strcmp(argv[1], "pure") == 0;
    D3DADAPTER_IDENTIFIER9 id;
    D3DPRESENT_PARAMETERS pp;
    IDirect3DDevice9 *device = NULL;
@@ -453,9 +546,12 @@ main(int argc, char **argv)
    pp.AutoDepthStencilFormat = D3DFMT_D24S8;
    pp.hDeviceWindow = window;
    hr = IDirect3D9_CreateDevice(d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window,
-                                D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &device);
-   printf("device (hardware vertex processing): 0x%08lx\n", (unsigned long)hr);
-   if (FAILED(hr)) {
+                                D3DCREATE_HARDWARE_VERTEXPROCESSING |
+                                   (pure ? D3DCREATE_PUREDEVICE : 0),
+                                &pp, &device);
+   printf("device (hardware vertex processing%s): 0x%08lx\n", pure ? ", pure" : "",
+          (unsigned long)hr);
+   if (FAILED(hr) && !pure) {
       hr = IDirect3D9_CreateDevice(d3d, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window,
                                    D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &device);
       printf("device (software vertex processing): 0x%08lx\n", (unsigned long)hr);
@@ -472,6 +568,15 @@ main(int argc, char **argv)
           (unsigned long)IDirect3DDevice9_TestCooperativeLevel(device),
           (void *)GetForegroundWindow(), (void *)window);
    fflush(stdout);
+   if (pure) {
+      int ok = pure_state_blocks(device);
+
+      IDirect3DDevice9_Present(device, NULL, NULL, NULL, NULL);
+      IDirect3DDevice9_Release(device);
+      IDirect3D9_Release(d3d);
+      printf("done\n");
+      return ok ? 0 : 1;
+   }
    memset(&scene, 0, sizeof scene);
    scene.made = scene_make(device, &scene);
    for (int frame = 0; frame < frames; frame++) {

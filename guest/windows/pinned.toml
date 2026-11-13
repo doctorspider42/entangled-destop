@@ -50,10 +50,10 @@ bytes = 2191360
 # Mesa (MIT), DXVK (zlib) and the LunarG Vulkan runtime ride along with
 # their licences. `install windows --gpu3d auto`.
 [gpu3d]
-version = "gpu3d-7"
+version = "gpu3d-9"
 base_url = "https://github.com/doctorspider42/entangled-destop/releases/download"
-tag = "gpu3d-7"
-source = "https://github.com/doctorspider42/entangled-destop/tree/cebf51d695a68fdb648f62b10a53a044ceb84672/guest/windows-gpu"
+tag = "gpu3d-9"
+source = "https://github.com/doctorspider42/entangled-destop/tree/6fcc8e6f0080a1500867e95816ccc338e1bf1903/guest/windows-gpu"
 
 [[gpu3d.assets]]
 name = "d3d10core.dll"
@@ -97,82 +97,82 @@ bytes = 5877774
 
 [[gpu3d.assets]]
 name = "entangled-display.cat"
-sha256 = "de14d55b0f050fa15ae01ee592171f323e1bbc806e73555c37f018f50be6a9bd"
+sha256 = "e3f8dd39cb787798da07214e411648e375b9d7705a360d3ccb2a9f9727c01817"
 bytes = 2640
 
 [[gpu3d.assets]]
 name = "entangled-display.inf"
-sha256 = "194ddae0eeb1fc130806385357065b090af1c834158385559246ef88b622d82a"
-bytes = 2611
+sha256 = "8312b63e16a63ee41f29977e5a3f6ec5d9d0af421a5acdb90c0899d002a69f4c"
+bytes = 2612
 
 [[gpu3d.assets]]
 name = "entangled-display.sys"
-sha256 = "ab4e1d1c276a06597786d639954d173eadb85936f3d4adf83c22713c67350b76"
+sha256 = "916cc471546de9df7b8441e56c79860ca95cffc8514307c150bf2dac279be6a6"
 bytes = 68488
 
 [[gpu3d.assets]]
 name = "entangled-gpu.cat"
-sha256 = "4d289b5fcee44187a480bf34a1696395eb614ab416d451d45b8880fdb4c71168"
+sha256 = "0431f43ec3f33bd0fd5b127af033320ac1b299467b4e9580a36593770214072b"
 bytes = 2608
 
 [[gpu3d.assets]]
 name = "entangled-gpu.cer"
-sha256 = "9d9e0cec0953d0dee1313b7760fce6792cbb550a1a7c5e298200ee031606be4e"
+sha256 = "8fb3b528a52165329d269aca4e0baa59b013f320113c8f4abcc1e81fef36ea65"
 bytes = 782
 
 [[gpu3d.assets]]
 name = "entangled-gpu.inf"
-sha256 = "0402a08a3ac3022b15f04d981ce9d07976edd4239a8ac55f372bf518fd327576"
-bytes = 2367
+sha256 = "36a89cb6c7a748bbdbbdc2afc037cd6d7be74692a637d5b5796b40dd41eb128b"
+bytes = 2369
 
 [[gpu3d.assets]]
 name = "entangled-gpu.sys"
-sha256 = "ef75f761ede24f7b65a32cc77c1bd297518c052af6118101e9de8e0f7149da71"
+sha256 = "3beaae6d5bb34ec915f19c1644b7bcc805de46e292526f30916e66a9dc8600cf"
 bytes = 22408
 
 [[gpu3d.assets]]
 name = "entangled-wddm.cat"
-sha256 = "7209c0c2ae7f7b357305aed93538bdb4f08f6a35d2a6beac4b624eacbad5e3cb"
+sha256 = "40878755365ac6684d25468290dbfe5185e8b1462749ba500a56827a2f58c555"
 bytes = 4480
 
 [[gpu3d.assets]]
 name = "entangled-wddm.inf"
-sha256 = "2d63d7d6964f89847ee703e28673932393100ddfd121af8905d6248d3207bdd6"
+sha256 = "34fafb53af59826dec721752fedafb282ee719465788e833270063a42b149fb1"
 bytes = 4049
 
 [[gpu3d.assets]]
 name = "entangled-wddm.sys"
-sha256 = "0b777f8a3fa1c7ba2e54350ed93c0faa093a453ce3cb1bc762b21842f72fef33"
+sha256 = "8e590b6223303e56ae879eeb7808f4e04b7556e21976d80cb4c02b550ace0161"
 bytes = 77192
 
 [[gpu3d.assets]]
 name = "entangled_d3d10.dll"
-sha256 = "4ad9f00043eaa5026b4b20007299ad4b806890756a02b9105b1600ad7455d5c2"
+sha256 = "b1220845b3be63cec4b566a898db6f8db2918129d0d5dd0e2af0c71c6a6513e9"
 bytes = 12637184
 
 [[gpu3d.assets]]
 name = "entangled_d3d10_x86.dll"
-sha256 = "a79fe915e70c5af47c16e78b5fc9dcccfd2cfeeeb8c42cc2c7d70ed8a4a8f4bb"
-bytes = 12270592
+sha256 = "a66ed60f1f287c57fa068e3f9c933a0bd3cb641ed6c2dcd64580d78e5a220070"
+bytes = 12271104
 
 [[gpu3d.assets]]
 name = "entangled_d3d9.dll"
-sha256 = "743f37a837f7c4ea59b88a6eaf7040951f7c3d057d82bab4bf504aea12d80ab4"
-bytes = 13166592
+sha256 = "d26433cd447445b53b7f3cb1a3676b24ec67a82baefe45971d71d220b3f1fa00"
+bytes = 13169664
 
 [[gpu3d.assets]]
 name = "entangled_d3d9_x86.dll"
-sha256 = "c04300d32721def9063865fa5552739ea028dbe566fbb32f82ae94cd5dc85c39"
-bytes = 12758016
+sha256 = "ce50d92fae62ac8298bec54c54eb5c9a139cdea75a261f6741e4645a895291f5"
+bytes = 12761600
 
 [[gpu3d.assets]]
 name = "gpu-test.exe"
-sha256 = "f697525bb1d3b41783ba8eea746e3494a27c574892770b1f52adc192cf4b8457"
+sha256 = "2f9dcab59ab473b04538a3e3d8b5db73d2b6cb9f8fda8954390817c9442fb220"
 bytes = 139776
 
 [[gpu3d.assets]]
 name = "libgallium_wgl.dll"
-sha256 = "6c25238eaee5ca5ea557054e6f7b7ab2b7cb016e729b0a4719dbb884860d4cfb"
+sha256 = "83c644b24f0c63cf12aaff48417891843249c067000a716dbbe2db7a521e324f"
 bytes = 18369536
 
 [[gpu3d.assets]]
@@ -192,17 +192,17 @@ bytes = 1287
 
 [[gpu3d.assets]]
 name = "opengl32.dll"
-sha256 = "329c0469e6df6a310b2b359c56f9eca675f0db8c760ea9a6b1cee52457a61e19"
+sha256 = "a4133b3fcacc7b07ff00d4dea0a11e91efce4e5b7c876cd2bf116f6debb215b4"
 bytes = 138240
 
 [[gpu3d.assets]]
 name = "vulkan_virtio.dll"
-sha256 = "f5fd78d2dec581e63bdcb15de008e4ec2125dd6caabc168facf480c33cc4e2ce"
+sha256 = "bf8c72db867cf279b660fd8a10ca09fdbee0b604058ff48f24bac94046052960"
 bytes = 1549312
 
 [[gpu3d.assets]]
 name = "vulkan_virtio_x86.dll"
-sha256 = "6b4f536cc9024f33d57087b863cf72cd3dae706ad55a8dca5e0abaddd7a848b0"
+sha256 = "7606e81fb2f8fc5ae9940d76187eb089c2f01a3074b5fe0ca7099fd2179c2c3f"
 bytes = 1378304
 
 [[gpu3d.assets]]

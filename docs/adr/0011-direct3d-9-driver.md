@@ -499,3 +499,35 @@ such install failed at `wddm-on.cmd` ("error 2"): the first-logon script
 copied `entangled_d3d10.dll` by name and left its 32-bit twin on the disc,
 and the INF names it. It copies by pattern now, and a test holds every WDDM
 file to a pattern. Not done on the fresh guest: a game (no Steam there).
+
+**Half an hour in a level (2026-11-13).** Portal 2 full screen at 1920x1080,
+a jump every 20 seconds, 30 minutes: no crash, no lost device, and the
+desktop came back. The frame rate fell from 43 to 30 over the run, in two
+steps, and that was the host: a new game process had 30 as well, and so had
+a freshly booted VM (the host GPU was 65% busy with other programs by then).
+So no leak was found, but the run does not prove there is none: it wants
+repeating on a quiet host. Seen once in that session and not again:
+`consent.exe` (the UAC prompt) took an access violation inside
+`entangled_d3d10.dll` (+0xe6b44, under `d3d11.dll`); the prompt still came
+up and elevated.
+
+**Placeholders that had an answer to give (2026-11-13).** A pure device's
+state blocks are Nine's own (`pfnStateSet`: created, recorded, applied,
+captured, deleted; `d3d9-test pure` checks them by what a clear reaches
+under a scissor test the blocks turn on and off, and passes in 64 and 32
+bits). `ValidateDevice` says one pass, `ReclaimResources` that nothing was
+discarded, `CheckDirectFlipSupport` and `CheckMultiPlaneOverlaySupport` no,
+`CheckCounterInfo` and `GetInfo` zeros and not what was in the caller's
+buffer, `ResolveSharedResource` flushes. Still placeholders: `DepthFill`
+(DirectDraw's; no Direct3D 9 call reaches it), patches, the video, overlay
+and content-protection entries the caps do not offer, and a stretched copy
+with system memory. A state block applied by Nine does not tell the front
+what it bound: a stream the front draws from the program's memory and a
+block that rebinds it have not been tried together.
+
+**The UAC prompt's crash was the Direct3D 10 driver's.** The frames were
+`DestroyDevice` -> `zink_bind_fs_state` -> `bind_gfx_stage`: the runtime
+destroys a shader that is still bound when it tears a device down, d3d10umd
+deleted it, and Zink reads the shader it is replacing at the next bind.
+llvmpipe, which d3d10umd was written for, does not. The front now remembers
+what the context has bound and unbinds a shader before deleting it (0002).

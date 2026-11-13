@@ -907,7 +907,7 @@ keeps viogpudo and its ~40 fps.
 **Not verified.** The workflow has not run with the new step (it runs on a
 push to main; the kit it assembles from NuGet has to hold `displib.lib`), so
 `guest/windows/pinned.toml` still pins `gpu3d-5`, which has no display
-driver (since 2026-11-13 it pins `gpu3d-7`, which has it, and the WDDM
+driver (since 2026-11-13 it pins `gpu3d-9`, which has it, and the WDDM
 driver with its Direct3D 9 and 10 drivers in both sizes).
 `owngpu-bind.ps1`'s display branch was installed in the guest and ran
 at startup, but never met a display on viogpudo: the first install was the
