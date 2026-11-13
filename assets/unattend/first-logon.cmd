@@ -93,6 +93,20 @@ if exist "%g%\entangled-gpu.cer" (
 "%g%\VulkanRT-Installer.exe" /S
 mkdir "%dir%\owngpu" 2>nul
 copy /y "%g%\entangled-gpu.*" "%dir%\owngpu\" >nul
+rem Our display driver, when the package has it (ADR-0008, the vsync
+rem amendment): viogpudo with a refresh rate and a vsync, so the desktop
+rem composes at the display's rate. owngpu-bind.ps1 puts it on the display.
+if exist "%g%\entangled-display.inf" copy /y "%g%\entangled-display.*" "%dir%\owngpu\" >nul
+rem Opt-in (ADR-0010): the WDDM driver that has DWM compose on the host GPU.
+rem Only copied here; wddm-on.cmd installs it, wddm-off.cmd goes back.
+if exist "%g%\entangled-wddm.inf" (
+  mkdir "%dir%\wddm" 2>nul
+  copy /y "%g%\entangled-wddm.*" "%dir%\wddm\" >nul
+  copy /y "%g%\entangled_d3d10*.dll" "%dir%\wddm\" >nul
+  if exist "%g%\entangled_d3d9.dll" copy /y "%g%\entangled_d3d9*.dll" "%dir%\wddm\" >nul
+  copy /y "%disc%\entangled\wddm-on.cmd" "%dir%\" >nul
+  copy /y "%disc%\entangled\wddm-off.cmd" "%dir%\" >nul
+)
 copy /y "%g%\gpu-test.exe" "%dir%\" >nul
 copy /y "%disc%\entangled\owngpu-bind.ps1" "%dir%\" >nul
 rem owngpu-bind.ps1 says why it runs at every startup and logon.
@@ -103,8 +117,15 @@ copy /y "%g%\vulkan_virtio.dll" "%dir%\" >nul
 rem OpenGL (Zink) and Direct3D 9-11 (DXVK) over that Vulkan, when the package
 rem has them: DLLs a program takes from beside its .exe (copy them there).
 if exist "%g%\opengl\opengl32.dll" xcopy /y /i /q "%g%\opengl" "%dir%\opengl" >nul
-if exist "%g%\dxvk\d3d11.dll" xcopy /y /i /q "%g%\dxvk" "%dir%\dxvk" >nul
+if exist "%g%\dxvk\d3d11.dll" xcopy /y /i /q /e "%g%\dxvk" "%dir%\dxvk" >nul
 powershell -NoProfile -Command "$j = Join-Path '%dir%' 'entangled_icd.json'; @{file_format_version='1.0.0'; ICD=@{library_path=(Join-Path '%dir%' 'vulkan_virtio.dll'); api_version='1.3.0'}} | ConvertTo-Json | Set-Content -Encoding ASCII $j; $k = 'HKLM:\SOFTWARE\Khronos\Vulkan\Drivers'; New-Item -Force $k | Out-Null; New-ItemProperty -Force -Path $k -Name $j -PropertyType DWord -Value 0 | Out-Null"
+rem The same driver for 32-bit programs, when the package has it: their
+rem Vulkan loader reads the WOW6432Node list. Without it a 32-bit game has no
+rem graphics driver here at all, and leaves without a word.
+if exist "%g%\x86\vulkan_virtio.dll" (
+  xcopy /y /i /q "%g%\x86" "%dir%\x86" >nul
+  powershell -NoProfile -Command "$j = Join-Path '%dir%\x86' 'entangled_icd.json'; @{file_format_version='1.0.0'; ICD=@{library_path=(Join-Path '%dir%\x86' 'vulkan_virtio.dll'); api_version='1.3.0'}} | ConvertTo-Json | Set-Content -Encoding ASCII $j; $k = 'HKLM:\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers'; New-Item -Force $k | Out-Null; New-ItemProperty -Force -Path $k -Name $j -PropertyType DWord -Value 0 | Out-Null"
+)
 call :edge
 exit /b 0
 

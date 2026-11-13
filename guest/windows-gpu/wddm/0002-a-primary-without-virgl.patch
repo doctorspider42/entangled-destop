@@ -1,0 +1,522 @@
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index 7cb9a89..f35309a 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -68,6 +68,14 @@ class VioGpuAdapter : IVioGpuPCI
+     VioGpuIdr ctxIdr;
+     CtrlQueue ctrlQueue;
+ 
++    // Entangled: a host whose renderer serves no virgl capset (ours on Windows
++    // serves Venus only) has no virgl contexts and no 3D resources. The driver
++    // then keeps every allocation as a 2D resource over the guest's own pages
++    // and copies a present itself: a software-composed desktop.
++    BOOLEAN IsVirglHost(void) const
++    {
++        return (m_supportedCapsetIDs & ((1ull << 1) | (1ull << 2))) != 0;
++    }
+     VioGpuMemSegment frameSegment;
+ 
+     UINT64 m_u64HostFeatures;
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index 515c4c4..e87cbb2 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -13,9 +13,21 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_OPTIO
+     m_Id = m_adapter->resourceIdr.GetId();
+     memcpy(&m_options, options, sizeof(VIOGPU_RESOURCE_OPTIONS));
+ 
+-    // m_adapter->ctrlQueue.CreateResource(m_Id, m_options.format, m_options.width, m_options.height);
+-    m_adapter->ctrlQueue.CreateResource3D(m_Id, options);
+-
++    m_pMapMdl = NULL;
++    m_pMapVa = NULL;
++    ExInitializeFastMutex(&m_mapLock);
++    if (m_adapter->IsVirglHost())
++    {
++        m_adapter->ctrlQueue.CreateResource3D(m_Id, options);
++    }
++    else
++    {
++        // A 2D resource is four bytes a pixel, blue first: what Windows'
++        // X8R8G8B8 and A8R8G8B8 surfaces are. The host is told there is no
++        // alpha either way: a primary Windows asked for as A8R8G8B8 carries
++        // zeroes there, and a scanout with alpha zero shows nothing.
++        m_adapter->ctrlQueue.CreateResource(m_Id, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM, m_options.width, m_options.height);
++    }
+     m_pMDL = NULL;
+     m_pageCount = 0;
+     m_pageOffset = 0;
+@@ -30,6 +42,14 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_OPTIO
+ VioGpuAllocation::~VioGpuAllocation(void)
+ {
+     DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s res_id=%d\n", __FUNCTION__, m_Id));
++    if (m_pMapVa != NULL)
++    {
++        MmUnmapLockedPages(m_pMapVa, m_pMapMdl);
++    }
++    if (m_pMapMdl != NULL)
++    {
++        IoFreeMdl(m_pMapMdl);
++    }
+     m_adapter->ctrlQueue.DestroyResource(m_Id);
+     m_adapter->resourceIdr.PutId(m_Id);
+ 
+@@ -54,6 +74,34 @@ void VioGpuAllocation::AttachBacking(MDL *pMDL, size_t pageCount, size_t pageOff
+     }
+ 
+     m_adapter->ctrlQueue.AttachBacking(m_Id, ents, (UINT)pageCount);
++
++    if (!m_adapter->IsVirglHost())
++    {
++        // The same pages, in kernel address space. Windows keeps them locked
++        // for as long as the allocation sits in the aperture.
++        ExAcquireFastMutex(&m_mapLock);
++        m_pMapMdl = IoAllocateMdl(NULL, (ULONG)(pageCount * PAGE_SIZE), FALSE, FALSE, NULL);
++        if (m_pMapMdl != NULL)
++        {
++            RtlCopyMemory(MmGetMdlPfnArray(m_pMapMdl),
++                          MmGetMdlPfnArray(pMDL) + pageOffset,
++                          pageCount * sizeof(PFN_NUMBER));
++            m_pMapMdl->MdlFlags |= MDL_PAGES_LOCKED;
++            m_pMapVa = MmMapLockedPagesSpecifyCache(m_pMapMdl,
++                                                    KernelMode,
++                                                    MmCached,
++                                                    NULL,
++                                                    FALSE,
++                                                    NormalPagePriority | MdlMappingNoExecute);
++            if (m_pMapVa == NULL)
++            {
++                DbgPrint(TRACE_LEVEL_ERROR, ("%s res_id=%d cannot map %d pages\n", __FUNCTION__, m_Id, (int)pageCount));
++                IoFreeMdl(m_pMapMdl);
++                m_pMapMdl = NULL;
++            }
++        }
++        ExReleaseFastMutex(&m_mapLock);
++    }
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+ }
+ 
+@@ -61,10 +109,21 @@ void VioGpuAllocation::DetachBacking()
+ {
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d\n", __FUNCTION__, m_Id));
+ 
++    ExAcquireFastMutex(&m_mapLock);
++    if (m_pMapVa != NULL)
++    {
++        MmUnmapLockedPages(m_pMapVa, m_pMapMdl);
++        m_pMapVa = NULL;
++    }
++    if (m_pMapMdl != NULL)
++    {
++        IoFreeMdl(m_pMapMdl);
++        m_pMapMdl = NULL;
++    }
++    ExReleaseFastMutex(&m_mapLock);
+     m_pMDL = NULL;
+     m_pageCount = 0;
+     m_pageOffset = 0;
+-
+     m_adapter->ctrlQueue.DetachBacking(m_Id);
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+ }
+@@ -127,11 +186,119 @@ void VioGpuAllocation::FlushToScreen(UINT scan_id)
+     box.depth = 1;
+ 
+     m_adapter->ctrlQueue.SetScanout(scan_id, m_Id, m_options.width, m_options.height, 0, 0);
++    if (!m_adapter->IsVirglHost())
++    {
++        // A 2D resource shows what was last transferred: all of it, once, when
++        // it becomes the scanout.
++        ExAcquireFastMutex(&m_mapLock);
++        if (m_pMapVa != NULL && m_pageCount * PAGE_SIZE >= (SIZE_T)m_options.width * m_options.height * 4)
++        {
++            const ULONG *pixels = (const ULONG *)m_pMapVa;
++            SIZE_T middle = ((SIZE_T)m_options.height / 2) * m_options.width + m_options.width / 2;
++            DbgPrint(TRACE_LEVEL_INFORMATION,
++                     ("%s res_id=%d first=%08x middle=%08x last=%08x\n",
++                      __FUNCTION__,
++                      m_Id,
++                      pixels[0],
++                      pixels[middle],
++                      pixels[(SIZE_T)m_options.width * m_options.height - 1]));
++        }
++        else
++        {
++            DbgPrint(TRACE_LEVEL_INFORMATION, ("%s res_id=%d is not mapped\n", __FUNCTION__, m_Id));
++        }
++        ExReleaseFastMutex(&m_mapLock);
++        m_adapter->ctrlQueue.TransferToHost2D(m_Id, 0, m_options.width, m_options.height, 0, 0);
++    }
+     m_adapter->ctrlQueue.ResFlush(m_Id, m_options.width, m_options.height, 0, 0);
+-
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s res_id=%d\n", __FUNCTION__, m_Id));
+ }
+ 
++// Entangled (no virgl): a present, done here instead of on the host. Both
++// surfaces are four bytes a pixel with no padding between rows. The rectangle
++// is clipped to both; a surface that is not mapped (not in the aperture) is
++// left alone - the next present repaints it.
++void VioGpuAllocation::CopyFrom(VioGpuAllocation *src, LONG dstX, LONG dstY, LONG srcX, LONG srcY, LONG width, LONG height)
++{
++    PAGED_CODE();
++
++    if (dstX < 0)
++    {
++        width += dstX;
++        srcX -= dstX;
++        dstX = 0;
++    }
++    if (dstY < 0)
++    {
++        height += dstY;
++        srcY -= dstY;
++        dstY = 0;
++    }
++    if (srcX < 0)
++    {
++        width += srcX;
++        dstX -= srcX;
++        srcX = 0;
++    }
++    if (srcY < 0)
++    {
++        height += srcY;
++        dstY -= srcY;
++        srcY = 0;
++    }
++    width = min(width, (LONG)m_options.width - dstX);
++    width = min(width, (LONG)src->m_options.width - srcX);
++    height = min(height, (LONG)m_options.height - dstY);
++    height = min(height, (LONG)src->m_options.height - srcY);
++    if (width <= 0 || height <= 0)
++    {
++        return;
++    }
++
++    BOOLEAN copied = FALSE;
++    if (src != this)
++    {
++        // Always in address order, so two presents the other way round cannot
++        // deadlock.
++        VioGpuAllocation *first = (ULONG_PTR)this < (ULONG_PTR)src ? this : src;
++        VioGpuAllocation *second = first == this ? src : this;
++        ExAcquireFastMutex(&first->m_mapLock);
++        ExAcquireFastMutex(&second->m_mapLock);
++        SIZE_T dstPitch = (SIZE_T)m_options.width * 4;
++        SIZE_T srcPitch = (SIZE_T)src->m_options.width * 4;
++        if (m_pMapVa != NULL && src->m_pMapVa != NULL &&
++            (SIZE_T)(dstY + height) * dstPitch <= m_pageCount * PAGE_SIZE &&
++            (SIZE_T)(srcY + height) * srcPitch <= src->m_pageCount * PAGE_SIZE)
++        {
++            PBYTE to = (PBYTE)m_pMapVa + (SIZE_T)dstY * dstPitch + (SIZE_T)dstX * 4;
++            PBYTE from = (PBYTE)src->m_pMapVa + (SIZE_T)srcY * srcPitch + (SIZE_T)srcX * 4;
++            for (LONG row = 0; row < height; row++)
++            {
++                RtlCopyMemory(to, from, (SIZE_T)width * 4);
++                to += dstPitch;
++                from += srcPitch;
++            }
++            copied = TRUE;
++        }
++        ExReleaseFastMutex(&second->m_mapLock);
++        ExReleaseFastMutex(&first->m_mapLock);
++    }
++    if (!copied)
++    {
++        return;
++    }
++    m_adapter->ctrlQueue.TransferToHost2D(m_Id,
++                                          (ULONG)(((ULONGLONG)dstY * m_options.width + dstX) * 4),
++                                          (UINT)width,
++                                          (UINT)height,
++                                          (UINT)dstX,
++                                          (UINT)dstY);
++    if (m_adapter->vidpn.IsSource(this))
++    {
++        m_adapter->ctrlQueue.ResFlush(m_Id, (UINT)width, (UINT)height, (UINT)dstX, (UINT)dstY);
++    }
++}
++
+ NTSTATUS VioGpuAllocation::GetStandardAllocationDriverData(DXGKARG_GETSTANDARDALLOCATIONDRIVERDATA *pStandardAllocation)
+ {
+     PAGED_CODE();
+diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
+index e38e8e2..dbad614 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.h
++++ b/viogpu/viogpu3d/viogpu_allocation.h
+@@ -44,7 +44,9 @@ class VioGpuAllocation
+     void DetachBacking();
+ 
+     void FlushToScreen(UINT scan_id);
+-
++    // Entangled (no virgl): copies a rectangle of another allocation's pixels
++    // into this one in guest memory and sends it to the host.
++    void CopyFrom(VioGpuAllocation *src, LONG dstX, LONG dstY, LONG srcX, LONG srcY, LONG width, LONG height);
+     static NTSTATUS GetStandardAllocationDriverData(DXGKARG_GETSTANDARDALLOCATIONDRIVERDATA *pStandardAllocation);
+     static NTSTATUS DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_CREATEALLOCATION *pCreateAllocation);
+ 
+@@ -67,6 +69,11 @@ class VioGpuAllocation
+ 
+     size_t m_DxPhysicalAddress;
+ 
++    // Entangled (no virgl): the backing pages mapped into the kernel, so a
++    // present can be copied by the driver; guarded by m_mapLock.
++    MDL *m_pMapMdl;
++    PVOID m_pMapVa;
++    FAST_MUTEX m_mapLock;
+     KEVENT m_busyNotification;
+     volatile LONG m_busy;
+ };
+\ No newline at end of file
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index d06eb5a..fe87fbe 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -22,6 +22,13 @@ VioGpuCommand::VioGpuCommand(VioGpuAdapter *adapter)
+     m_allocations = NULL;
+     m_allocationsLength = 0;
+ 
++    m_bltSrc = NULL;
++    m_bltDst = NULL;
++    m_bltDx = 0;
++    m_bltDy = 0;
++    m_bltRects = NULL;
++    m_bltCount = 0;
++
+     list_entry.Blink = NULL;
+     list_entry.Flink = NULL;
+ };
+@@ -43,9 +50,65 @@ void VioGpuCommand::PrepareSubmit(const DXGKARG_SUBMITCOMMAND *pSubmitCommand)
+ 
+ PAGED_CODE_SEG_BEGIN
+ 
++// Entangled (no virgl): the rectangles of a present, kept until the command
++// runs. More than the cap become their bounding box.
++#define ENTANGLED_MAX_BLT_RECTS 256
++
++void VioGpuCommand::SetBlt(VioGpuAllocation *src, VioGpuAllocation *dst, LONG dx, LONG dy, const RECT *rects, UINT count)
++{
++    PAGED_CODE();
++    if (count == 0 || rects == NULL)
++    {
++        return;
++    }
++    UINT kept = count > ENTANGLED_MAX_BLT_RECTS ? 1 : count;
++    m_bltRects = new (NonPagedPoolNx) RECT[kept];
++    if (m_bltRects == NULL)
++    {
++        return;
++    }
++    if (kept == count)
++    {
++        RtlCopyMemory(m_bltRects, rects, kept * sizeof(RECT));
++    }
++    else
++    {
++        RECT box = rects[0];
++        for (UINT i = 1; i < count; i++)
++        {
++            box.left = min(box.left, rects[i].left);
++            box.top = min(box.top, rects[i].top);
++            box.right = max(box.right, rects[i].right);
++            box.bottom = max(box.bottom, rects[i].bottom);
++        }
++        m_bltRects[0] = box;
++    }
++    m_bltCount = kept;
++    m_bltSrc = src;
++    m_bltDst = dst;
++    m_bltDx = dx;
++    m_bltDy = dy;
++}
++
+ void VioGpuCommand::Run()
+ {
+     PAGED_CODE();
++    if (m_bltRects != NULL)
++    {
++        for (UINT i = 0; i < m_bltCount; i++)
++        {
++            const RECT *rect = &m_bltRects[i];
++            m_bltDst->CopyFrom(m_bltSrc,
++                               rect->left,
++                               rect->top,
++                               rect->left + m_bltDx,
++                               rect->top + m_bltDy,
++                               rect->right - rect->left,
++                               rect->bottom - rect->top);
++        }
++        delete[] m_bltRects;
++        m_bltRects = NULL;
++    }
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s", __FUNCTION__));
+ 
+     while (m_pCommand < m_pEnd)
+diff --git a/viogpu/viogpu3d/viogpu_command.h b/viogpu/viogpu3d/viogpu_command.h
+index 553ac17..7539de8 100644
+--- a/viogpu/viogpu3d/viogpu_command.h
++++ b/viogpu/viogpu3d/viogpu_command.h
+@@ -26,9 +26,10 @@ class VioGpuCommand
+     }
+ 
+     void AttachAllocations(DXGK_ALLOCATIONLIST *allocationList, UINT allocationListLength);
++    // Entangled (no virgl): a present to copy when this command runs.
++    void SetBlt(VioGpuAllocation *src, VioGpuAllocation *dst, LONG dx, LONG dy, const RECT *rects, UINT count);
+ 
+     LIST_ENTRY list_entry;
+-
+   private:
+     VioGpuAdapter *m_pAdapter;
+     VioGpuCommander *m_pCommander;
+@@ -42,8 +43,14 @@ class VioGpuCommand
+ 
+     VioGpuAllocation **m_allocations;
+     UINT m_allocationsLength;
+-};
+ 
++    VioGpuAllocation *m_bltSrc;
++    VioGpuAllocation *m_bltDst;
++    LONG m_bltDx;
++    LONG m_bltDy;
++    RECT *m_bltRects;
++    UINT m_bltCount;
++};
+ class VioGpuCommander
+ {
+   public:
+diff --git a/viogpu/viogpu3d/viogpu_device.cpp b/viogpu/viogpu3d/viogpu_device.cpp
+index 8c8e0da..799412f 100644
+--- a/viogpu/viogpu3d/viogpu_device.cpp
++++ b/viogpu/viogpu3d/viogpu_device.cpp
+@@ -12,7 +12,10 @@ VioGpuDevice::VioGpuDevice(VioGpuAdapter *pAdapter)
+ 
+     m_pAdapter = pAdapter;
+     m_id = pAdapter->ctxIdr.GetId();
+-    pAdapter->ctrlQueue.CreateCtx(m_id, 0);
++    if (pAdapter->IsVirglHost())
++    {
++        pAdapter->ctrlQueue.CreateCtx(m_id, 0);
++    }
+ }
+ 
+ VioGpuDevice::~VioGpuDevice()
+@@ -20,7 +23,10 @@ VioGpuDevice::~VioGpuDevice()
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--> %s", __FUNCTION__));
+ 
+-    m_pAdapter->ctrlQueue.DestroyCtx(m_id);
++    if (m_pAdapter->IsVirglHost())
++    {
++        m_pAdapter->ctrlQueue.DestroyCtx(m_id);
++    }
+     m_pAdapter->ctxIdr.PutId(m_id);
+ }
+ 
+@@ -33,9 +39,11 @@ NTSTATUS VioGpuDevice::Init(VIOGPU_CTX_INIT_REQ *pOptions)
+ 
+     context_init |= pOptions->CapsetID;
+ 
+-    m_pAdapter->ctrlQueue.DestroyCtx(m_id); // Destroy old viogpu context
+-    m_pAdapter->ctrlQueue.CreateCtx(m_id, context_init);
+-
++    if (m_pAdapter->IsVirglHost())
++    {
++        m_pAdapter->ctrlQueue.DestroyCtx(m_id); // Destroy old viogpu context
++        m_pAdapter->ctrlQueue.CreateCtx(m_id, context_init);
++    }
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -219,7 +227,22 @@ NTSTATUS VioGpuDevice::Present(_Inout_ DXGKARG_PRESENT *pPresent)
+ 
+     if (pPresent->Flags.Blt)
+     {
+-        if (pPresent->pDmaBuffer && dst && src)
++        if (pPresent->pDmaBuffer && dst && src && !m_pAdapter->IsVirglHost())
++        {
++            // Entangled (no virgl): nothing for the host in the DMA buffer;
++            // the copy is described on the command and done when it runs.
++            VIOGPU_COMMAND_HDR *cmd_hdr = (VIOGPU_COMMAND_HDR *)pPresent->pDmaBuffer;
++            cmd_hdr->type = VIOGPU_CMD_NOP;
++            cmd_hdr->size = 0;
++            pPresent->pDmaBuffer = (char *)pPresent->pDmaBuffer + sizeof(VIOGPU_COMMAND_HDR);
++            cmd->SetBlt(src,
++                        dst,
++                        pPresent->SrcRect.left - pPresent->DstRect.left,
++                        pPresent->SrcRect.top - pPresent->DstRect.top,
++                        pPresent->pDstSubRects,
++                        pPresent->SubRectCnt);
++        }
++        else if (pPresent->pDmaBuffer && dst && src)
+         {
+             GenerateBltPresent(pPresent, src, dst);
+         }
+@@ -328,10 +351,14 @@ NTSTATUS VioGpuDevice::OpenAllocation(_In_ CONST DXGKARG_OPENALLOCATION *pOpenAl
+ CtrlQueue *VioGpuDevice::GetCtrlQueue()
+ {
+     PAGED_CODE();
+-
+     return &m_pAdapter->ctrlQueue;
+ }
+ 
++BOOLEAN VioGpuDevice::IsVirglHost()
++{
++    PAGED_CODE();
++    return m_pAdapter->IsVirglHost();
++}
+ VioGpuDeviceAllocation::VioGpuDeviceAllocation(VioGpuDevice *device, VioGpuAllocation *allocation)
+ {
+     PAGED_CODE();
+@@ -342,7 +369,10 @@ VioGpuDeviceAllocation::VioGpuDeviceAllocation(VioGpuDevice *device, VioGpuAlloc
+     m_pAllocation = allocation;
+     m_pDevice = device;
+ 
+-    m_pDevice->GetCtrlQueue()->CtxResource(true, m_pDevice->GetId(), m_pAllocation->GetId());
++    if (m_pDevice->IsVirglHost())
++    {
++        m_pDevice->GetCtrlQueue()->CtxResource(true, m_pDevice->GetId(), m_pAllocation->GetId());
++    }
+ }
+ 
+ VioGpuDeviceAllocation::~VioGpuDeviceAllocation()
+@@ -351,7 +381,10 @@ VioGpuDeviceAllocation::~VioGpuDeviceAllocation()
+     DbgPrint(TRACE_LEVEL_VERBOSE,
+              ("<---> %s res_id=%d ctx_id=%d\n", __FUNCTION__, m_pAllocation->GetId(), m_pDevice->GetId()));
+ 
+-    m_pDevice->GetCtrlQueue()->CtxResource(false, m_pDevice->GetId(), m_pAllocation->GetId());
++    if (m_pDevice->IsVirglHost())
++    {
++        m_pDevice->GetCtrlQueue()->CtxResource(false, m_pDevice->GetId(), m_pAllocation->GetId());
++    }
+ }
+ 
+ VioGpuAllocation *VioGpuDeviceAllocation::GetAllocation()
+diff --git a/viogpu/viogpu3d/viogpu_device.h b/viogpu/viogpu3d/viogpu_device.h
+index 644b8bc..f83c7db 100644
+--- a/viogpu/viogpu3d/viogpu_device.h
++++ b/viogpu/viogpu3d/viogpu_device.h
+@@ -26,7 +26,7 @@ class VioGpuDevice
+     }
+ 
+     CtrlQueue *GetCtrlQueue();
+-
++    BOOLEAN IsVirglHost();
+   private:
+     VioGpuAdapter *m_pAdapter;
+     ULONG m_id;
+diff --git a/viogpu/viogpu3d/viogpu_vidpn.h b/viogpu/viogpu3d/viogpu_vidpn.h
+index 8246328..cf8b1d4 100644
+--- a/viogpu/viogpu3d/viogpu_vidpn.h
++++ b/viogpu/viogpu3d/viogpu_vidpn.h
+@@ -65,7 +65,10 @@ class VioGpuVidPN
+ 
+     BOOLEAN GpuObjectAttach(UINT res_id, VioGpuObj *obj);
+     PBYTE GetEdidData(UINT Idx);
+-
++    BOOLEAN IsSource(const VioGpuAllocation *allocation) const
++    {
++        return m_sourceRes == allocation;
++    }
+     PBYTE GetCTA861Data(void);
+     void SetVideoModeInfo(UINT Idx, PVIOGPU_DISP_MODE pModeInfo);
+     BOOLEAN GetDisplayInfo(void);

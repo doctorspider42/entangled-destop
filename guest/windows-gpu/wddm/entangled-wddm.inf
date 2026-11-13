@@ -1,0 +1,102 @@
+; entangled-wddm: the WDDM driver for the display function (ADR-0010), built
+; from the viogpu3d of virtio-win PR 943 (BSD-3-Clause), with its Direct3D
+; user-mode driver (Mesa's d3d10umd on Zink over Venus): DWM composes on the
+; host GPU.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %Entangled%
+CatalogFile = entangled-wddm.cat
+DriverVer   = 11/11/2026,0.2.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%Entangled% = Entangled, NTamd64.10.0...16299
+
+; The display function, as entangled-display names it. The description starts
+; with "Entangled" so owngpu-bind.ps1 leaves the function alone.
+[Entangled.NTamd64.10.0...16299]
+%DeviceDesc% = EntangledWddm, PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+entangled-wddm.sys  = 1
+entangled_d3d10.dll = 1
+entangled_d3d9.dll  = 1
+entangled_d3d9_x86.dll = 1
+entangled_d3d10_x86.dll = 1
+
+[EntangledWddm.NT]
+Include      = msdv.inf
+FeatureScore = F9
+CopyFiles    = EntangledWddm.CopyFiles, EntangledWddm.UserMode
+AddReg       = EntangledWddm.Settings
+DelReg       = EntangledWddm.Gone
+
+; What a development build left behind: the start-once gate's value, which a
+; driver built with the gate reads as "do not start".
+[EntangledWddm.Gone]
+HKR,, StartOnce
+
+[EntangledWddm.CopyFiles]
+entangled-wddm.sys
+
+; The Direct3D 10 user-mode driver (Mesa's d3d10umd; ADR-0010 phase W3') and
+; the Direct3D 9 one (ADR-0011), each for 64-bit and for 32-bit programs.
+[EntangledWddm.UserMode]
+entangled_d3d10.dll
+entangled_d3d9.dll
+entangled_d3d9_x86.dll
+entangled_d3d10_x86.dll
+
+; Upstream's settings. The driver claims preemption and does none, so the
+; scheduler's preemption is turned off for the whole guest, and a GPU timeout
+; is ignored rather than recovered from (TdrDebugMode 1): both upstream's, both
+; machine-wide, both to be revisited before this is anyone's default (ADR-0010).
+[EntangledWddm.Settings]
+HKR,, HWCursor,          0x00010001, 0
+HKR,, FlexResolution,    0x00010001, 1
+HKR,, UsePhysicalMemory, 0x00010001, 0
+; The Direct3D user-mode driver, for every runtime that asks (Direct3D 9, 10,
+; 11 and 12 slots; 9 and 10 are served, 11 through 10's). Without the entry Windows stops the
+; adapter straight after it starts (code 43), and without a driver that loads
+; DWM crashes and Windows takes the adapter away (ADR-0010, W0 and W0').
+HKR,, UserModeDriverName, 0x00010000, %13%\entangled_d3d9.dll, %13%\entangled_d3d10.dll, %13%\entangled_d3d10.dll, %13%\entangled_d3d10.dll
+; The same four slots for 32-bit programs, from the 32-bit builds.
+HKR,, UserModeDriverNameWow, 0x00010000, %13%\entangled_d3d9_x86.dll, %13%\entangled_d3d10_x86.dll, %13%\entangled_d3d10_x86.dll, %13%\entangled_d3d10_x86.dll
+HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler", EnablePreemption, 0x00010001, 0
+HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers", TdrDebugMode, 0x00010001, 1
+
+; MSI on: upstream turns it off, and this machine has no _PRT for the
+; line-based fallback (code 12, as ADR-0009 found for viogpu3d's package).
+[EntangledWddm.NT.HW]
+AddReg = EntangledWddm.MsiReg
+
+[EntangledWddm.MsiReg]
+HKR, "Interrupt Management",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 1
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, 0x00010001, 4
+
+[EntangledWddm.NT.Services]
+AddService = EntangledWddm, 0x00000002, EntangledWddm.Service
+
+[EntangledWddm.Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 0
+ServiceBinary = %13%\entangled-wddm.sys
+
+[Strings]
+Entangled   = "Entangled Desktop"
+DeviceDesc  = "Entangled GPU (virtio-gpu, WDDM)"
+ServiceDesc = "Entangled GPU (WDDM)"
+DiskName    = "Entangled WDDM driver"

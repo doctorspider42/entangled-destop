@@ -1,0 +1,2347 @@
+diff --git a/src/gallium/auxiliary/gdikmt/gdikmt.h b/src/gallium/auxiliary/gdikmt/gdikmt.h
+new file mode 100644
+index 0000000..432f34f
+--- /dev/null
++++ b/src/gallium/auxiliary/gdikmt/gdikmt.h
+@@ -0,0 +1,103 @@
++// Helper to iteract with windows kernel-mode drivers
++// Required because of difference between D3DKMT**** functions and callbacks used in umd
++
++#ifndef gdikmt_h
++#define gdikmt_h
++
++#include <windows.h>
++#include <winternl.h>
++#include <d3dkmthk.h>
++#include "pipe/p_state.h"
++
++typedef unsigned char boolean;
++
++struct gdikmt_render {
++   UINT CommandLength;
++   UINT CommandOffset;
++   UINT AllocationCount;
++   UINT PatchLocationCount;
++   
++   UINT NewCommandBufferSize;
++   UINT NewAllocationListSize;
++   UINT NewPatchLocationListSize;
++   
++   boolean ResizeCommandBuffer;
++   boolean ResizeAllocationList;
++   boolean ResizePatchLocationList;
++
++   HANDLE CompletionEvent;
++};
++
++struct gdikmt_createallocation {
++  VOID *pPrivateDriverData;
++  UINT PrivateDriverDataSize;
++  HANDLE hResource;
++  UINT NumAllocations;
++  D3DDDI_ALLOCATIONINFO  *pAllocationInfo;
++};
++
++struct gdikmt_openallocation {
++   D3DKMT_HANDLE hGlobalHandle;
++   UINT NumAllocations;
++   
++   VOID *pPrivateDriverData;
++   UINT PrivateDriverDataSize;
++   
++   VOID *pTotalBuffer;
++   UINT TotalBufferSize;
++
++   D3DDDI_OPENALLOCATIONINFO *pOpenAllocation;
++
++   UINT PrivateRuntimeSize;
++};
++
++
++struct gdikmt_context {
++   struct gdikmt_device *device;
++   
++   void *pCommandBuffer;
++   D3DDDI_ALLOCATIONLIST *pAllocationList;
++   D3DDDI_PATCHLOCATIONLIST *pPatchLocationList;
++
++   UINT CommandBufferSize;
++   UINT AllocationListSize;
++   UINT PatchLocationListSize;
++
++   void (*destroy)(struct gdikmt_context* device);
++   NTSTATUS (*render)(struct gdikmt_context* device, struct gdikmt_render *options);
++};
++
++struct gdikmt_device {
++   void (*destroy)(struct gdikmt_device* device);
++
++   NTSTATUS (*queryAdapterInfo)(
++    struct gdikmt_device*   device,
++    KMTQUERYADAPTERINFOTYPE Type,
++    VOID*                   pPrivateDriverData,
++    UINT                    PrivateDriverDataSize
++   );
++
++   NTSTATUS (*escape)(
++    struct gdikmt_device*   device,
++    VOID*                   pPrivateDriverData,
++    UINT                    PrivateDriverDataSize
++   );
++
++   NTSTATUS (*createContext)(struct gdikmt_device* device, struct gdikmt_context** out_ctx);
++
++   NTSTATUS (*createAllocation)(struct gdikmt_device* device, struct gdikmt_createallocation *options);
++   NTSTATUS (*destroyAllocation)(struct gdikmt_device* device, HANDLE hResource, D3DKMT_HANDLE hAllocation);
++   NTSTATUS (*lockAllocation)(struct gdikmt_device* device, D3DKMT_HANDLE hAllocation, D3DDDICB_LOCKFLAGS flags, void **out_ptr);
++   /* Entangled: the end of a lockAllocation. Optional (NULL where a lock is kept). */
++   NTSTATUS (*unlockAllocation)(struct gdikmt_device* device, D3DKMT_HANDLE hAllocation);
++   NTSTATUS (*queryAllocation)(struct gdikmt_device* device, struct gdikmt_openallocation* options);
++   NTSTATUS (*openAllocation)(struct gdikmt_device* device, struct gdikmt_openallocation* options);
++
++   NTSTATUS (*present)(struct gdikmt_context* ctx, D3DKMT_HANDLE hSrcAllocation, void *winsys_drawable_handle, struct pipe_box *sub_box);
++   NTSTATUS (*setDisplayMode)(struct gdikmt_device* device, D3DKMT_HANDLE hSrcAllocation);
++};
++
++
++struct gdikmt_device *gdikmt_create_from_hdc(HDC hDC);
++
++#endif
+\ No newline at end of file
+diff --git a/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c b/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
+new file mode 100644
+index 0000000..4c985a3
+--- /dev/null
++++ b/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
+@@ -0,0 +1,428 @@
++#include <string.h>
++#include "gdikmt/gdikmt.h"
++#include "util/u_debug.h"
++#include "util/u_memory.h"
++#include "gdikmt.h"
++
++#include <d3dkmthk.h>
++#include <d3dukmdt.h>
++#include <winnt.h>
++#include <winternl.h>
++
++struct d3dkmt_callbacks {
++   PFND3DKMT_QUERYADAPTERINFO queryAdapterInfo;
++   PFND3DKMT_ESCAPE escape;
++   PFND3DKMT_RENDER render;
++   PFND3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 signalSynchronizationObject2;
++   PFND3DKMT_CREATECONTEXT createContext;
++   PFND3DKMT_DESTROYCONTEXT destroyContext;
++   PFND3DKMT_CREATEALLOCATION createAllocation;
++   PFND3DKMT_DESTROYALLOCATION destroyAllocation;
++   PFND3DKMT_LOCK lock;
++   PFND3DKMT_QUERYRESOURCEINFO queryResourceInfo;
++   PFND3DKMT_OPENRESOURCE openResource;
++   PFND3DKMT_CREATEDEVICE createDevice;
++   PFND3DKMT_DESTROYDEVICE destroyDevice;
++   PFND3DKMT_OPENADAPTERFROMHDC openAdapterFromHdc;
++   PFND3DKMT_CLOSEADAPTER closeAdapter;
++};
++
++void
++gdikmt_load_callbacks(HINSTANCE gdi32lib, struct d3dkmt_callbacks *cb)
++{
++   cb->queryAdapterInfo = (PFND3DKMT_QUERYADAPTERINFO)GetProcAddress(
++      gdi32lib, "D3DKMTQueryAdapterInfo");
++   cb->escape = (PFND3DKMT_ESCAPE)GetProcAddress(gdi32lib, "D3DKMTEscape");
++   cb->render = (PFND3DKMT_RENDER)GetProcAddress(gdi32lib, "D3DKMTRender");
++   cb->signalSynchronizationObject2 =
++      (PFND3DKMT_SIGNALSYNCHRONIZATIONOBJECT2)GetProcAddress(
++         gdi32lib, "D3DKMTSignalSynchronizationObject2");
++   cb->createContext =
++      (PFND3DKMT_CREATECONTEXT)GetProcAddress(gdi32lib, "D3DKMTCreateContext");
++   cb->destroyContext = (PFND3DKMT_DESTROYCONTEXT)GetProcAddress(
++      gdi32lib, "D3DKMTDestroyContext");
++   cb->createAllocation = (PFND3DKMT_CREATEALLOCATION)GetProcAddress(
++      gdi32lib, "D3DKMTCreateAllocation");
++   cb->destroyAllocation = (PFND3DKMT_DESTROYALLOCATION)GetProcAddress(
++      gdi32lib, "D3DKMTDestroyAllocation");
++   cb->lock = (PFND3DKMT_LOCK)GetProcAddress(gdi32lib, "D3DKMTLock");
++   cb->queryResourceInfo = (PFND3DKMT_QUERYRESOURCEINFO)GetProcAddress(
++      gdi32lib, "D3DKMTQueryResourceInfo");
++   cb->openResource =
++      (PFND3DKMT_OPENRESOURCE)GetProcAddress(gdi32lib, "D3DKMTOpenResource");
++   cb->createDevice =
++      (PFND3DKMT_CREATEDEVICE)GetProcAddress(gdi32lib, "D3DKMTCreateDevice");
++   cb->destroyDevice =
++      (PFND3DKMT_DESTROYDEVICE)GetProcAddress(gdi32lib, "D3DKMTDestroyDevice");
++   cb->openAdapterFromHdc = (PFND3DKMT_OPENADAPTERFROMHDC)GetProcAddress(
++      gdi32lib, "D3DKMTOpenAdapterFromHdc");
++   cb->closeAdapter =
++      (PFND3DKMT_CLOSEADAPTER)GetProcAddress(gdi32lib, "D3DKMTCloseAdapter");
++}
++
++struct gdikmt_context_d3dkmt {
++   struct gdikmt_context base;
++
++   D3DKMT_HANDLE hContext;
++};
++
++static inline struct gdikmt_context_d3dkmt *
++gdikmt_context_d3dkmt(struct gdikmt_context *iws)
++{
++   return (struct gdikmt_context_d3dkmt *)iws;
++}
++
++struct gdikmt_device_d3dkmt {
++   struct gdikmt_device base;
++
++   D3DKMT_HANDLE hAdapter;
++   D3DKMT_HANDLE hDevice;
++
++   HINSTANCE gdi32lib;
++   struct d3dkmt_callbacks cb;
++};
++
++static inline struct gdikmt_device_d3dkmt *
++gdikmt_device_d3dkmt(struct gdikmt_device *iws)
++{
++   return (struct gdikmt_device_d3dkmt *)iws;
++}
++
++NTSTATUS
++gdikmt_d3dkmt_queryadapterinfo(struct gdikmt_device *_device,
++                               KMTQUERYADAPTERINFOTYPE Type,
++                               VOID *pPrivateDriverData,
++                               UINT PrivateDriverDataSize)
++{
++   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_device);
++
++   D3DKMT_QUERYADAPTERINFO queryAdapterInfo;
++   memset(&queryAdapterInfo, 0, sizeof(queryAdapterInfo));
++   queryAdapterInfo.hAdapter = device->hAdapter;
++   queryAdapterInfo.Type = Type;
++   queryAdapterInfo.pPrivateDriverData = pPrivateDriverData;
++   queryAdapterInfo.PrivateDriverDataSize = PrivateDriverDataSize;
++
++   return device->cb.queryAdapterInfo(&queryAdapterInfo);
++}
++
++NTSTATUS
++gdikmt_d3dkmt_escape(struct gdikmt_device *_device, VOID *pPrivateDriverData,
++                     UINT PrivateDriverDataSize)
++{
++   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_device);
++
++   D3DKMT_ESCAPE escape;
++   memset(&escape, 0, sizeof(escape));
++   escape.hAdapter = device->hAdapter;
++   escape.hDevice = device->hDevice;
++   escape.pPrivateDriverData = pPrivateDriverData;
++   escape.PrivateDriverDataSize = PrivateDriverDataSize;
++
++   return device->cb.escape(&escape);
++}
++
++NTSTATUS
++gdikmt_d3dkmt_render(struct gdikmt_context *_ctx, struct gdikmt_render *options)
++{
++   struct gdikmt_context_d3dkmt *ctx = gdikmt_context_d3dkmt(_ctx);
++   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_ctx->device);
++
++   D3DKMT_RENDER render;
++   memset(&render, 0, sizeof(render));
++   render.hContext = ctx->hContext;
++
++   render.CommandOffset = options->CommandOffset;
++   render.CommandLength = options->CommandLength;
++   render.AllocationCount = options->AllocationCount;
++   render.PatchLocationCount = options->PatchLocationCount;
++
++   render.NewCommandBufferSize = options->NewCommandBufferSize;
++   render.NewAllocationListSize = options->NewAllocationListSize;
++   render.NewPatchLocationListSize = options->NewPatchLocationListSize;
++
++   render.Flags.ResizeCommandBuffer = options->ResizeCommandBuffer;
++   render.Flags.ResizeAllocationList = options->ResizeAllocationList;
++   render.Flags.ResizePatchLocationList = options->ResizePatchLocationList;
++
++   NTSTATUS Status = device->cb.render(&render);
++
++   if (options->CompletionEvent) {
++      D3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 signalEvent;
++      memset(&signalEvent, 0, sizeof(signalEvent));
++      signalEvent.hContext = ctx->hContext;
++      signalEvent.ObjectCount = 0;
++      signalEvent.BroadcastContextCount = 0;
++      signalEvent.Flags.EnqueueCpuEvent = TRUE;
++      signalEvent.CpuEventHandle = options->CompletionEvent;
++      device->cb.signalSynchronizationObject2(&signalEvent);
++   }
++
++   ctx->base.pCommandBuffer = render.pNewCommandBuffer;
++   ctx->base.pAllocationList = render.pNewAllocationList;
++   ctx->base.pPatchLocationList = render.pNewPatchLocationList;
++
++   ctx->base.CommandBufferSize = render.NewCommandBufferSize;
++   ctx->base.AllocationListSize = render.NewAllocationListSize;
++   ctx->base.PatchLocationListSize = render.NewPatchLocationListSize;
++
++   return Status;
++}
++
++void
++gdikmt_d3dkmt_destroycontext(struct gdikmt_context *_ctx)
++{
++   struct gdikmt_context_d3dkmt *ctx = gdikmt_context_d3dkmt(_ctx);
++   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_ctx->device);
++
++   D3DKMT_DESTROYCONTEXT destroyContext;
++   memset(&destroyContext, 0, sizeof(destroyContext));
++   destroyContext.hContext = ctx->hContext;
++   device->cb.destroyContext(&destroyContext);
++
++   FREE(ctx);
++
++   return;
++}
++
++NTSTATUS
++gdikmt_d3dkmt_createcontext(struct gdikmt_device *_device,
++                            struct gdikmt_context **out_ctx)
++{
++   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_device);
++
++   struct gdikmt_context_d3dkmt *ctx = CALLOC_STRUCT(gdikmt_context_d3dkmt);
++   if (!ctx) {
++      return STATUS_NO_MEMORY;
++   }
++   ctx->base.device = _device;
++
++   D3DKMT_CREATECONTEXT createContext;
++   memset(&createContext, 0, sizeof(createContext));
++   createContext.hDevice = device->hDevice;
++   NTSTATUS Status = device->cb.createContext(&createContext);
++
++   if (NT_SUCCESS(Status)) {
++      ctx->hContext = createContext.hContext;
++
++      ctx->base.pCommandBuffer = createContext.pCommandBuffer;
++      ctx->base.pAllocationList = createContext.pAllocationList;
++      ctx->base.pPatchLocationList = createContext.pPatchLocationList;
++
++      ctx->base.CommandBufferSize = createContext.CommandBufferSize;
++      ctx->base.AllocationListSize = createContext.AllocationListSize;
++      ctx->base.PatchLocationListSize = createContext.PatchLocationListSize;
++
++      ctx->base.destroy = gdikmt_d3dkmt_destroycontext;
++      ctx->base.render = gdikmt_d3dkmt_render;
++
++      *out_ctx = &ctx->base;
++   }
++
++   return Status;
++}
++
++NTSTATUS
++gdikmt_d3dkmt_createallocation(struct gdikmt_device *_device,
++                               struct gdikmt_createallocation *options)
++{
++   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_device);
++
++   D3DKMT_CREATEALLOCATION createAllocation;
++   memset(&createAllocation, 0, sizeof(createAllocation));
++   createAllocation.hDevice = device->hDevice;
++   createAllocation.NumAllocations = options->NumAllocations;
++   createAllocation.pAllocationInfo = options->pAllocationInfo;
++
++   createAllocation.Flags.CreateResource = TRUE;
++   createAllocation.pPrivateDriverData = options->pPrivateDriverData;
++   createAllocation.PrivateDriverDataSize = options->PrivateDriverDataSize;
++
++   NTSTATUS Status = device->cb.createAllocation(&createAllocation);
++
++   options->hResource = (HANDLE)createAllocation.hResource;
++
++   return Status;
++}
++
++NTSTATUS
++gdikmt_d3dkmt_lockallocation(struct gdikmt_device *_device,
++                             D3DKMT_HANDLE hAllocation,
++                             D3DDDICB_LOCKFLAGS flags, void **out_ptr)
++{
++   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_device);
++
++   D3DKMT_LOCK lock;
++   memset(&lock, 0, sizeof(lock));
++   lock.hDevice = device->hDevice;
++   lock.Flags = flags;
++   lock.Flags.LockEntire = TRUE;
++   lock.hAllocation = hAllocation;
++   NTSTATUS Status = device->cb.lock(&lock);
++
++   *out_ptr = lock.pData;
++
++   return Status;
++}
++
++NTSTATUS
++gdikmt_d3dkmt_destroyallocation(struct gdikmt_device *_device, HANDLE hResource,
++                                D3DKMT_HANDLE hAllocation)
++{
++   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_device);
++
++   D3DKMT_DESTROYALLOCATION destroyAllocation;
++   memset(&destroyAllocation, 0, sizeof(destroyAllocation));
++   destroyAllocation.hDevice = device->hDevice;
++
++   if (hResource != NULL) {
++      destroyAllocation.hResource = (D3DKMT_HANDLE)hResource;
++   } else {
++      D3DKMT_HANDLE handles[1];
++      handles[0] = hAllocation;
++      destroyAllocation.phAllocationList = handles;
++      destroyAllocation.AllocationCount = 1;
++   }
++
++   return device->cb.destroyAllocation(&destroyAllocation);
++}
++
++NTSTATUS
++gdikmt_d3dddi_queryallocation(struct gdikmt_device *_device,
++                              struct gdikmt_openallocation *openAllocation)
++{
++   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_device);
++
++   D3DKMT_QUERYRESOURCEINFO queryResource;
++   memset(&queryResource, 0, sizeof(queryResource));
++   queryResource.hDevice = device->hDevice;
++   queryResource.hGlobalShare = openAllocation->hGlobalHandle;
++
++   NTSTATUS Status = device->cb.queryResourceInfo(&queryResource);
++
++   openAllocation->PrivateDriverDataSize =
++      queryResource.ResourcePrivateDriverDataSize;
++   openAllocation->TotalBufferSize = queryResource.TotalPrivateDriverDataSize;
++   openAllocation->NumAllocations = queryResource.NumAllocations;
++   openAllocation->PrivateRuntimeSize = queryResource.PrivateRuntimeDataSize;
++
++   return Status;
++}
++
++NTSTATUS
++gdikmt_d3dddi_openallocation(struct gdikmt_device *_device,
++                             struct gdikmt_openallocation *openAllocation)
++{
++   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_device);
++
++   void *privateRuntimeData = malloc(openAllocation->PrivateRuntimeSize);
++
++   D3DKMT_OPENRESOURCE openResource;
++   memset(&openResource, 0, sizeof(openResource));
++   openResource.hDevice = device->hDevice;
++   openResource.hGlobalShare = openAllocation->hGlobalHandle;
++   openResource.NumAllocations = openAllocation->NumAllocations;
++   openResource.pOpenAllocationInfo = openAllocation->pOpenAllocation;
++   openResource.pResourcePrivateDriverData = openAllocation->pPrivateDriverData;
++   openResource.ResourcePrivateDriverDataSize =
++      openAllocation->PrivateDriverDataSize;
++   openResource.pTotalPrivateDriverDataBuffer = openAllocation->pTotalBuffer;
++   openResource.TotalPrivateDriverDataBufferSize =
++      openAllocation->TotalBufferSize;
++   openResource.PrivateRuntimeDataSize = openAllocation->PrivateRuntimeSize;
++   openResource.pPrivateRuntimeData = privateRuntimeData;
++
++   NTSTATUS Status = device->cb.openResource(&openResource);
++
++   free(privateRuntimeData);
++
++   return Status;
++}
++
++NTSTATUS
++gdikmt_d3dkmt_present(struct gdikmt_context *_ctx, D3DKMT_HANDLE hSrcAllocation,
++                      void *winsys_drawable_handle, struct pipe_box *sub_box)
++{
++   /* STUB */
++   return 0;
++};
++
++NTSTATUS
++gdikmt_d3dkmt_setdisplaymode(struct gdikmt_device *ctx,
++                             D3DKMT_HANDLE hSrcAllocation)
++{
++   /* STUB */
++   return 0;
++};
++
++void
++gdikmt_d3dkmt_destroy(struct gdikmt_device *_device)
++{
++   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_device);
++
++   D3DKMT_DESTROYDEVICE destroyDevice;
++   destroyDevice.hDevice = device->hDevice;
++   device->cb.destroyDevice(&destroyDevice);
++
++   D3DKMT_CLOSEADAPTER closeAdapter;
++   closeAdapter.hAdapter = device->hAdapter;
++   device->cb.closeAdapter(&closeAdapter);
++
++   FreeLibrary(device->gdi32lib);
++
++   FREE(device);
++}
++
++struct gdikmt_device *
++gdikmt_create_from_hdc(HDC hDC)
++{
++   struct gdikmt_device_d3dkmt *device = CALLOC_STRUCT(gdikmt_device_d3dkmt);
++   if (!device)
++      return NULL;
++
++   device->gdi32lib = LoadLibraryA("GDI32.dll");
++   gdikmt_load_callbacks(device->gdi32lib, &device->cb);
++
++   D3DKMT_OPENADAPTERFROMHDC openFromHdc;
++   NTSTATUS Status;
++   openFromHdc.hDc = hDC;
++   Status = device->cb.openAdapterFromHdc(&openFromHdc);
++   if (!NT_SUCCESS(Status)) {
++      _debug_printf(
++         "Failed to open device(D3DKMTOpenAdapterFromHdc) with status code: %lx\n",
++         Status);
++      return NULL;
++   }
++   device->hAdapter = openFromHdc.hAdapter;
++
++   D3DKMT_CREATEDEVICE createDevice;
++   memset(&createDevice, 0, sizeof(createDevice));
++   createDevice.hAdapter = device->hAdapter;
++
++   Status = device->cb.createDevice(&createDevice);
++
++   if (!NT_SUCCESS(Status)) {
++      printf("Failed to create D3DKMTCreateDevice with status code: %lx\n",
++             Status);
++      FREE(device);
++      return NULL;
++   }
++   device->hDevice = createDevice.hDevice;
++
++   device->base.destroy = gdikmt_d3dkmt_destroy;
++   device->base.queryAdapterInfo = gdikmt_d3dkmt_queryadapterinfo;
++   device->base.escape = gdikmt_d3dkmt_escape;
++
++   device->base.createContext = gdikmt_d3dkmt_createcontext;
++
++   device->base.createAllocation = gdikmt_d3dkmt_createallocation;
++   device->base.destroyAllocation = gdikmt_d3dkmt_destroyallocation;
++   device->base.lockAllocation = gdikmt_d3dkmt_lockallocation;
++   device->base.queryAllocation = gdikmt_d3dddi_queryallocation;
++   device->base.openAllocation = gdikmt_d3dddi_openallocation;
++
++   device->base.present = gdikmt_d3dkmt_present;
++   device->base.setDisplayMode = gdikmt_d3dkmt_setdisplaymode;
++
++   return &device->base;
++};
+\ No newline at end of file
+diff --git a/src/gallium/auxiliary/meson.build b/src/gallium/auxiliary/meson.build
+index e4815f8..63a5842 100644
+--- a/src/gallium/auxiliary/meson.build
++++ b/src/gallium/auxiliary/meson.build
+@@ -272,6 +272,12 @@ if with_gfx_compute
+     'util/u_tests.c',
+   )
+ 
++if with_platform_windows
++  files_libgallium += files(
++    'gdikmt/gdikmt.h',
++    'gdikmt/gdikmt_d3dkmt.c',
++  )
++endif
+   files_libgallium += custom_target(
+     'draw_nir_lower_opcodes.c',
+     input : 'draw/draw_nir_lower_opcodes.py',
+diff --git a/src/gallium/drivers/zink/zink_bo.c b/src/gallium/drivers/zink/zink_bo.c
+index a2bbc8e..950fe83 100644
+--- a/src/gallium/drivers/zink/zink_bo.c
++++ b/src/gallium/drivers/zink/zink_bo.c
+@@ -1369,7 +1369,12 @@ zink_bo_init(struct zink_screen *screen)
+    /* Create managers. */
+    pb_cache_init(&screen->pb.bo_cache, screen->info.mem_props.memoryTypeCount,
+                  500000, 1.5f, 0,
+-                 total_mem / 8, offsetof(struct zink_bo, cache_entry), screen,
++                 /* Entangled: a Venus context's host-visible memory is a
++                  * share of the host's (1 GiB), not what the heaps add up
++                  * to, and every freed staging buffer waits here: an eighth
++                  * of all heaps is most of that share. */
++                 MIN2(total_mem / 8, 64ull << 20),
++                 offsetof(struct zink_bo, cache_entry), screen,
+                  (void*)bo_destroy, (void*)bo_can_reclaim);
+ 
+    if (!pb_slabs_init(&screen->pb.bo_slabs,
+diff --git a/src/gallium/drivers/zink/zink_public.h b/src/gallium/drivers/zink/zink_public.h
+index c2fe873..3a48a2a 100644
+--- a/src/gallium/drivers/zink/zink_public.h
++++ b/src/gallium/drivers/zink/zink_public.h
+@@ -36,4 +36,16 @@ struct pipe_screen *
+ zink_drm_create_screen(int fd, const struct pipe_screen_config *config, struct renderonly *ro);
+ struct pipe_screen *
+ zink_win32_create_screen(uint64_t adapter_luid);
++
++/* Entangled (ADR-0010): copies level 0 of the 2D texture `tex` into the
++ * buffer `buf`, rows packed, on the GPU, and names the Vulkan device and the
++ * VkDeviceMemory behind `buf` - what a presenter outside Gallium shows once
++ * the context has been flushed and its fence has signalled. False if the
++ * buffer does not own a whole VkDeviceMemory. */
++struct pipe_context;
++struct pipe_resource;
++bool
++zink_entangled_frame(struct pipe_context *pctx, struct pipe_resource *buf,
++                     struct pipe_resource *tex, void **device,
++                     uint64_t *memory);
+ #endif
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index af3035d..be008b8 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -2539,6 +2539,36 @@ zink_transfer_copy_bufimage(struct zink_context *ctx,
+    zink_copy_image_buffer(ctx, dst, src, x, 0, 0, trans->base.b.level, &trans->base.b.box, trans->base.b.usage);
+ }
+ 
++bool
++zink_entangled_frame(struct pipe_context *pctx, struct pipe_resource *pbuf,
++                     struct pipe_resource *ptex, void **device,
++                     uint64_t *memory)
++{
++   struct zink_context *ctx = zink_context(pctx);
++   struct zink_resource *buf = zink_resource(pbuf);
++   struct zink_resource *tex = zink_resource(ptex);
++   struct pipe_box box;
++
++   /* A slab entry shares its memory with others: not a frame of its own. */
++   if (!buf->obj->bo->mem || zink_bo_get_offset(buf->obj->bo))
++      return false;
++   u_box_2d(0, 0, ptex->width0, ptex->height0, &box);
++   box.width = pbuf->width0;
++   box.x = 0;
++   {
++      /* The copy's box is the texture's; the barrier on the buffer reads
++       * x and width as a byte range, as a transfer's does. */
++      struct pipe_box image = box;
++
++      image.width = ptex->width0;
++      zink_resource_buffer_transfer_dst_barrier(ctx, buf, 0, pbuf->width0);
++      zink_copy_image_buffer(ctx, buf, tex, 0, 0, 0, 0, &image, 0);
++   }
++   *device = (void *)zink_screen(pctx->screen)->dev;
++   *memory = (uint64_t)(uintptr_t)buf->obj->bo->mem;
++   return true;
++}
++
+ ALWAYS_INLINE static void
+ align_offset_size(const VkDeviceSize alignment, VkDeviceSize *offset, VkDeviceSize *size, VkDeviceSize obj_size)
+ {
+diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
+index 63104c0..3847cb3 100644
+--- a/src/gallium/frontends/d3d10umd/Adapter.cpp
++++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
+@@ -40,10 +40,6 @@
+ #include "util/u_memory.h"
+ 
+ 
+-EXTERN_C struct pipe_screen *
+-d3d10_create_screen(void);
+-
+-
+ static HRESULT APIENTRY CloseAdapter(D3D10DDI_HADAPTER hAdapter);
+ 
+ static unsigned long numAdapters = 0;
+@@ -78,19 +74,15 @@ OpenAdapterCommon(__inout D3D10DDIARG_OPENADAPTER *pOpenData)   // IN
+       return E_OUTOFMEMORY;
+    }
+ 
+-   pAdaptor->screen = d3d10_create_screen();
+-   if (!pAdaptor->screen) {
+-      free(pAdaptor);
+-      --numAdapters;
+-      return E_OUTOFMEMORY;
+-   }
+-
+    pOpenData->hAdapter.pDrvPrivate = pAdaptor;
+ 
+    pOpenData->pAdapterFuncs->pfnCalcPrivateDeviceSize = CalcPrivateDeviceSize;
+    pOpenData->pAdapterFuncs->pfnCreateDevice = CreateDevice;
+    pOpenData->pAdapterFuncs->pfnCloseAdapter = CloseAdapter;
+ 
++   pAdaptor->AdapterCallbacks = *pOpenData->pAdapterCallbacks;
++   pAdaptor->hRTAdapter = pOpenData->hRTAdapter.handle;
++
+    return S_OK;
+ }
+ 
+@@ -259,8 +251,6 @@ CloseAdapter(D3D10DDI_HADAPTER hAdapter)  // IN
+    LOG_ENTRYPOINT();
+ 
+    Adapter *pAdapter = CastAdapter(hAdapter);
+-   struct pipe_screen *screen = pAdapter->screen;
+-   screen->destroy(screen);
+    free(pAdapter);
+ 
+    --numAdapters;
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+index 80e8a4e..dfb2243 100644
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -47,7 +47,10 @@
+ #include "util/u_sampler.h"
+ #include "util/u_framebuffer.h"
+ 
++#include "gdikmt/gdikmt.h"
+ 
++EXTERN_C struct pipe_screen *
++d3d10_create_screen(gdikmt_device *device);
+ static void APIENTRY DestroyDevice(D3D10DDI_HDEVICE hDevice);
+ static void APIENTRY RelocateDeviceFuncs(D3D10DDI_HDEVICE hDevice,
+                                 __in struct D3D10DDI_DEVICEFUNCS *pDeviceFunctions);
+@@ -62,6 +65,7 @@ static void APIENTRY CheckMultisampleQualityLevels(D3D10DDI_HDEVICE hDevice,
+                                           __out UINT *pNumQualityLevels);
+ static void APIENTRY SetTextFilterSize(D3D10DDI_HDEVICE hDevice, UINT Width, UINT Height);
+ 
++EXTERN_C bool use_old_tex_ops = false;
+ 
+ /*
+  * ----------------------------------------------------------------------
+@@ -130,8 +134,23 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+    Device *pDevice = CastDevice(pCreateData->hDrvDevice);
+    memset(pDevice, 0, sizeof *pDevice);
+ 
+-   struct pipe_screen *screen = pAdapter->screen;
++   pDevice->device.hRTAdapter = (HANDLE)pAdapter->hRTAdapter;
++   pDevice->device.hRTDevice = (HANDLE)pCreateData->hRTDevice.handle;
++
++   pDevice->device.KTCallbacks = *pCreateData->pKTCallbacks;
++   pDevice->device.pAdapterCallbacks = &pAdapter->AdapterCallbacks;
++   pDevice->device.pDXGIBaseCallbacks = pCreateData->DXGIBaseDDI.pDXGIBaseCallbacks;
++
++   gdikmt_d3dddi_fill_basefuncs(&pDevice->device);
++
++   pDevice->hRTCoreLayer = pCreateData->hRTCoreLayer;
++   pDevice->UMCallbacks = *pCreateData->pUMCallbacks;
++
++   mtx_init(&pDevice->CreateResourceMtx, mtx_plain);
++
++   struct pipe_screen *screen = d3d10_create_screen(&pDevice->device.base);
+    struct pipe_context *pipe = screen->context_create(screen, NULL, 0);
++   pDevice->screen = screen;
+    pDevice->pipe = pipe;
+    pDevice->cso = cso_create_context(pipe, CSO_NO_VBUF);
+ 
+@@ -144,12 +163,6 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+    pDevice->max_dual_source_render_targets =
+          screen->caps.max_dual_source_render_targets;
+ 
+-   pDevice->hRTCoreLayer = pCreateData->hRTCoreLayer;
+-   pDevice->hDevice = (HANDLE)pCreateData->hRTDevice.handle;
+-   pDevice->KTCallbacks = *pCreateData->pKTCallbacks;
+-   pDevice->UMCallbacks = *pCreateData->pUMCallbacks;
+-   pDevice->pDXGIBaseCallbacks = pCreateData->DXGIBaseDDI.pDXGIBaseCallbacks;
+-
+    pDevice->draw_so_target = NULL;
+ 
+    if (0) {
+@@ -157,6 +170,13 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+    }
+ 
+    st_debug_parse();
++   
++   // HACK: Use old texture operations if on virgl - and on zink, whose
++   // shaders go through tgsi_to_nir, which has no SAMPLE* opcodes at all
++   if(strncmp(screen->get_name(screen), "virgl", 5) == 0 ||
++      strncmp(screen->get_name(screen), "zink", 4) == 0) {
++      use_old_tex_ops = true;
++   }
+ 
+    /*
+     * Fill in the D3D10 DDI functions
+@@ -294,14 +314,7 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+    pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions->pfnBlt =
+       _Blt;
+ 
+-   if (0) {
+-      return S_OK;
+-   } else {
+-      // Tell DXGI to not use the shared resource presentation path when
+-      // communicating with DWM:
+-      // http://msdn.microsoft.com/en-us/library/windows/hardware/ff569887(v=vs.85).aspx
+-      return DXGI_STATUS_NO_REDIRECTION;
+-   }
++   return S_OK;
+ }
+ 
+ 
+@@ -362,9 +375,10 @@ DestroyDevice(D3D10DDI_HDEVICE hDevice)   // IN
+                            PIPE_MAX_SHADER_SAMPLER_VIEWS, 0, sampler_views);
+ 
+    pipe->destroy(pipe);
+-}
+-
++   pDevice->screen->destroy(pDevice->screen);
+ 
++   mtx_destroy(&pDevice->CreateResourceMtx);
++}
+ /*
+  * ----------------------------------------------------------------------
+  *
+diff --git a/src/gallium/frontends/d3d10umd/DxgiFns.cpp b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
+index ea61523..5720c88 100644
+--- a/src/gallium/frontends/d3d10umd/DxgiFns.cpp
++++ b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
+@@ -30,7 +30,11 @@
+  *    DXGI related functions.
+  */
+ 
++#include <stdint.h>
++#include <windows.h>
+ #include <stdio.h>
++#include <winerror.h>
++#include <winnt.h>
+ 
+ #include "DxgiFns.h"
+ #include "Format.h"
+@@ -38,9 +42,11 @@
+ 
+ #include "Debug.h"
+ 
++#include "frontend/winsys_handle.h"
++#include "pipe/p_defines.h"
++#include "pipe/p_state.h"
+ #include "util/format/u_format.h"
+ 
+-
+ /*
+  * ----------------------------------------------------------------------
+  *
+@@ -51,7 +57,6 @@
+  *
+  * ----------------------------------------------------------------------
+  */
+-
+ HRESULT APIENTRY
+ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
+ {
+@@ -114,7 +119,24 @@ _GetGammaCaps( DXGI_DDI_ARG_GET_GAMMA_CONTROL_CAPS *GetCaps )
+ HRESULT APIENTRY
+ _SetDisplayMode( DXGI_DDI_ARG_SETDISPLAYMODE *SetDisplayMode )
+ {
+-   LOG_UNSUPPORTED_ENTRYPOINT();
++   LOG_ENTRYPOINT();
++   
++   Device* device = CastDevice(SetDisplayMode->hDevice);
++   Resource *res = CastResource(SetDisplayMode->hResource);
++
++   if(!device->screen->resource_get_handle) {
++      LOG_UNSUPPORTED_ENTRYPOINT();
++      return S_OK;
++   }
++
++   struct winsys_handle handle;
++   handle.type = WINSYS_HANDLE_TYPE_D3DKMT_ALLOC;
++   if(!device->screen->resource_get_handle(device->screen, NULL, res->resource, &handle, 0)) {
++      LOG_UNSUPPORTED_ENTRYPOINT();
++      return S_OK;
++   };
++
++   device->device.base.setDisplayMode(&device->device.base, (D3DKMT_HANDLE)handle.handle);
+ 
+    return S_OK;
+ }
+@@ -172,71 +194,25 @@ _QueryResourceResidency( DXGI_DDI_ARG_QUERYRESOURCERESIDENCY *QueryResourceResid
+  */
+ 
+ HRESULT APIENTRY
+-_RotateResourceIdentities( DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES *RotateResourceIdentities )
++_RotateResourceIdentities(DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES *RotateResourceIdentities )
+ {
+    LOG_ENTRYPOINT();
+ 
+    if (RotateResourceIdentities->Resources <= 1) {
+       return S_OK;
+    }
++   UINT NumResources = RotateResourceIdentities->Resources;
++   const DXGI_DDI_HRESOURCE *hResources = RotateResourceIdentities->pResources;
+ 
+-   struct pipe_context *pipe = CastPipeDevice(RotateResourceIdentities->hDevice);
+-   struct pipe_screen *screen = pipe->screen;
+-
+-   struct pipe_resource *resource0 = CastPipeResource(RotateResourceIdentities->pResources[0]);
+-
+-   assert(resource0);
+-   LOG_UNSUPPORTED(resource0->last_level);
+-
+-   /*
+-    * XXX: Copying is not very efficient, but it is much simpler than the
+-    * alternative of recreating all views.
+-    */
+-
+-   struct pipe_resource *temp_resource;
+-   temp_resource = screen->resource_create(screen, resource0);
+-   assert(temp_resource);
+-   if (!temp_resource) {
+-      return E_OUTOFMEMORY;
+-   }
++   struct pipe_resource *firstResource = CastPipeResource(hResources[0]);
+ 
+-   struct pipe_box src_box;
+-   src_box.x = 0;
+-   src_box.y = 0;
+-   src_box.z = 0;
+-   src_box.width  = resource0->width0;
+-   src_box.height = resource0->height0;
+-   src_box.depth  = resource0->depth0;
+-
+-   for (UINT i = 0; i < RotateResourceIdentities->Resources + 1; ++i) {
+-      struct pipe_resource *src_resource;
+-      struct pipe_resource *dst_resource;
+-
+-      if (i < RotateResourceIdentities->Resources) {
+-         src_resource = CastPipeResource(RotateResourceIdentities->pResources[i]);
+-      } else {
+-         src_resource = temp_resource;
+-      }
+-
+-      if (i > 0) {
+-         dst_resource = CastPipeResource(RotateResourceIdentities->pResources[i - 1]);
+-      } else {
+-         dst_resource = temp_resource;
+-      }
+-
+-      assert(dst_resource);
+-      assert(src_resource);
+-
+-      pipe->resource_copy_region(pipe,
+-                                 dst_resource,
+-                                 0, // dst_level
+-                                 0, 0, 0, // dst_x,y,z
+-                                 src_resource,
+-                                 0, // src_level
+-                                 &src_box);
++   for (UINT i = 0; i < (NumResources - 1); ++i) {
++      Resource* resource = CastResource(hResources[i]);
++      resource->resource = CastPipeResource(hResources[i + 1]);
+    }
+ 
+-   pipe_resource_reference(&temp_resource, NULL);
++   Resource *lastResource = CastResource(hResources[NumResources - 1]);
++   lastResource->resource = firstResource;
+ 
+    return S_OK;
+ }
+diff --git a/src/gallium/frontends/d3d10umd/Format.cpp b/src/gallium/frontends/d3d10umd/Format.cpp
+index 57076f2..5ae78b8 100644
+--- a/src/gallium/frontends/d3d10umd/Format.cpp
++++ b/src/gallium/frontends/d3d10umd/Format.cpp
+@@ -276,6 +276,166 @@ FormatTranslate(DXGI_FORMAT Format, BOOL depth)
+ }
+ 
+ 
++DXGI_FORMAT
++FormatDeTranslate(enum pipe_format Format)
++{
++   switch (Format) {
++
++   case PIPE_FORMAT_NONE:
++      return DXGI_FORMAT_UNKNOWN;
++
++   case PIPE_FORMAT_R32G32B32A32_FLOAT:
++      return DXGI_FORMAT_R32G32B32A32_FLOAT;
++   case PIPE_FORMAT_R32G32B32A32_UINT:
++      return DXGI_FORMAT_R32G32B32A32_UINT;
++   case PIPE_FORMAT_R32G32B32A32_SINT:
++      return DXGI_FORMAT_R32G32B32A32_SINT;
++   case PIPE_FORMAT_R32G32B32_FLOAT:
++      return DXGI_FORMAT_R32G32B32_FLOAT;
++   case PIPE_FORMAT_R32G32B32_UINT:
++      return DXGI_FORMAT_R32G32B32_UINT;
++   case PIPE_FORMAT_R32G32B32_SINT:
++      return DXGI_FORMAT_R32G32B32_SINT;
++   case PIPE_FORMAT_R16G16B16A16_UNORM:
++      return DXGI_FORMAT_R16G16B16A16_UNORM;
++   case PIPE_FORMAT_R16G16B16A16_UINT:
++      return DXGI_FORMAT_R16G16B16A16_UINT;
++   case PIPE_FORMAT_R16G16B16A16_SNORM:
++      return DXGI_FORMAT_R16G16B16A16_SNORM;
++   case PIPE_FORMAT_R16G16B16A16_SINT:
++      return DXGI_FORMAT_R16G16B16A16_SINT;
++   case PIPE_FORMAT_R32G32_FLOAT:
++      return DXGI_FORMAT_R32G32_FLOAT;
++   case PIPE_FORMAT_R32G32_UINT:
++      return DXGI_FORMAT_R32G32_UINT;
++   case PIPE_FORMAT_R32G32_SINT:
++      return DXGI_FORMAT_R32G32_SINT;
++   case PIPE_FORMAT_R8G8B8A8_UNORM:
++      return DXGI_FORMAT_R8G8B8A8_UNORM;
++   case PIPE_FORMAT_R8G8B8A8_UINT:
++      return DXGI_FORMAT_R8G8B8A8_UINT;
++   case PIPE_FORMAT_R8G8B8A8_SNORM:
++      return DXGI_FORMAT_R8G8B8A8_SNORM;
++   case PIPE_FORMAT_R8G8B8A8_SINT:
++      return DXGI_FORMAT_R8G8B8A8_SINT;
++   case PIPE_FORMAT_R16G16_UNORM:
++      return DXGI_FORMAT_R16G16_UNORM;
++   case PIPE_FORMAT_R16G16_UINT:
++      return DXGI_FORMAT_R16G16_UINT;
++   case PIPE_FORMAT_R16G16_SNORM:
++      return DXGI_FORMAT_R16G16_SNORM;
++   case PIPE_FORMAT_R16G16_SINT:
++      return DXGI_FORMAT_R16G16_SINT;
++   case PIPE_FORMAT_Z32_FLOAT:
++      return DXGI_FORMAT_D32_FLOAT;
++   case PIPE_FORMAT_R32_FLOAT:
++      return DXGI_FORMAT_R32_FLOAT;
++   case PIPE_FORMAT_R32_UINT:
++      return DXGI_FORMAT_R32_UINT;
++   case PIPE_FORMAT_R32_SINT:
++      return DXGI_FORMAT_R32_SINT;
++   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
++      return DXGI_FORMAT_D24_UNORM_S8_UINT;
++   case PIPE_FORMAT_R8G8_UNORM:
++      return DXGI_FORMAT_R8G8_UNORM;
++   case PIPE_FORMAT_R8G8_UINT:
++      return DXGI_FORMAT_R8G8_UINT;
++   case PIPE_FORMAT_R8G8_SNORM:
++      return DXGI_FORMAT_R8G8_SNORM;
++   case PIPE_FORMAT_R8G8_SINT:
++      return DXGI_FORMAT_R8G8_SINT;
++   case PIPE_FORMAT_Z16_UNORM:
++      return DXGI_FORMAT_D16_UNORM;
++   case PIPE_FORMAT_R16_UNORM:
++      return DXGI_FORMAT_R16_UNORM;
++   case PIPE_FORMAT_R16_UINT:
++      return DXGI_FORMAT_R16_UINT;
++   case PIPE_FORMAT_R16_SNORM:
++      return DXGI_FORMAT_R16_SNORM;
++   case PIPE_FORMAT_R16_SINT:
++      return DXGI_FORMAT_R16_SINT;
++   case PIPE_FORMAT_R8_UNORM:
++      return DXGI_FORMAT_R8_UNORM;
++   case PIPE_FORMAT_R8_UINT:
++      return DXGI_FORMAT_R8_UINT;
++   case PIPE_FORMAT_R8_SNORM:
++      return DXGI_FORMAT_R8_SNORM;
++   case PIPE_FORMAT_R8_SINT:
++      return DXGI_FORMAT_R8_SINT;
++   case PIPE_FORMAT_A8_UNORM:
++      return DXGI_FORMAT_A8_UNORM;
++   case PIPE_FORMAT_DXT1_RGBA:
++      return DXGI_FORMAT_BC1_UNORM;
++   case PIPE_FORMAT_DXT1_SRGBA:
++      return DXGI_FORMAT_BC1_UNORM_SRGB;
++   case PIPE_FORMAT_DXT3_RGBA:
++      return DXGI_FORMAT_BC2_UNORM;
++   case PIPE_FORMAT_DXT3_SRGBA:
++      return DXGI_FORMAT_BC2_UNORM_SRGB;
++   case PIPE_FORMAT_DXT5_RGBA:
++      return DXGI_FORMAT_BC3_UNORM;
++   case PIPE_FORMAT_DXT5_SRGBA:
++      return DXGI_FORMAT_BC3_UNORM_SRGB;
++   case PIPE_FORMAT_R8G8B8A8_SRGB:
++      return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
++
++   case PIPE_FORMAT_R8G8_B8G8_UNORM:
++      return DXGI_FORMAT_R8G8_B8G8_UNORM;
++   case PIPE_FORMAT_G8R8_G8B8_UNORM:
++      return DXGI_FORMAT_G8R8_G8B8_UNORM;
++
++   case PIPE_FORMAT_R16G16B16A16_FLOAT:
++      return DXGI_FORMAT_R16G16B16A16_FLOAT;
++   case PIPE_FORMAT_R16G16_FLOAT:
++      return DXGI_FORMAT_R16G16_FLOAT;
++   case PIPE_FORMAT_R16_FLOAT:
++      return DXGI_FORMAT_R16_FLOAT;
++   case PIPE_FORMAT_R9G9B9E5_FLOAT:
++      return DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
++   case PIPE_FORMAT_R1_UNORM:
++      return DXGI_FORMAT_R1_UNORM;
++
++   case PIPE_FORMAT_Z32_FLOAT_S8X24_UINT:
++      return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
++
++   case PIPE_FORMAT_R10G10B10A2_UNORM:
++       return DXGI_FORMAT_R10G10B10A2_UNORM;
++   case PIPE_FORMAT_R10G10B10A2_UINT:
++      return DXGI_FORMAT_R10G10B10A2_UINT;
++   case PIPE_FORMAT_R11G11B10_FLOAT:
++      return DXGI_FORMAT_R11G11B10_FLOAT;
++
++   case PIPE_FORMAT_RGTC1_UNORM:
++      return DXGI_FORMAT_BC4_UNORM;
++   case PIPE_FORMAT_RGTC1_SNORM:
++      return DXGI_FORMAT_BC4_SNORM;
++
++   case PIPE_FORMAT_RGTC2_UNORM:
++      return DXGI_FORMAT_BC5_UNORM;
++   case PIPE_FORMAT_RGTC2_SNORM:
++      return DXGI_FORMAT_BC5_SNORM;
++
++   case PIPE_FORMAT_B5G6R5_UNORM:
++      return DXGI_FORMAT_B5G6R5_UNORM;
++   case PIPE_FORMAT_B5G5R5A1_UNORM:
++      return DXGI_FORMAT_B5G5R5A1_UNORM;
++   case PIPE_FORMAT_B8G8R8A8_UNORM:
++      return DXGI_FORMAT_B8G8R8A8_UNORM;
++   case PIPE_FORMAT_B8G8R8X8_UNORM:
++      return DXGI_FORMAT_B8G8R8X8_UNORM;
++   case PIPE_FORMAT_B8G8R8A8_SRGB:
++      return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
++
++   case PIPE_FORMAT_B8G8R8X8_SRGB:
++      return DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
++
++   default:
++      return DXGI_FORMAT_UNKNOWN;
++   }
++}
++
++
++
+ 
+ #define CASE(fmt) case fmt: return #fmt
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Format.h b/src/gallium/frontends/d3d10umd/Format.h
+index 2ee4371..875336a 100644
+--- a/src/gallium/frontends/d3d10umd/Format.h
++++ b/src/gallium/frontends/d3d10umd/Format.h
+@@ -38,6 +38,8 @@
+ enum pipe_format
+ FormatTranslate(DXGI_FORMAT Format, BOOL depth);
+ 
++DXGI_FORMAT FormatDeTranslate(enum pipe_format Format);
++
+ const char *
+ FormatToName(DXGI_FORMAT Format);
+ 
+diff --git a/src/gallium/frontends/d3d10umd/InputAssembly.cpp b/src/gallium/frontends/d3d10umd/InputAssembly.cpp
+index d36a070..ca071b6 100644
+--- a/src/gallium/frontends/d3d10umd/InputAssembly.cpp
++++ b/src/gallium/frontends/d3d10umd/InputAssembly.cpp
+@@ -159,7 +159,7 @@ IaSetVertexBuffers(D3D10DDI_HDEVICE hDevice,
+             pipe_resource_reference(&vb->buffer.resource, NULL);
+             vb->is_user_buffer = true;
+          }
+-         vb->buffer.user = dummy;
++         vb->buffer.user = NULL;
+       }
+    }
+ 
+@@ -171,7 +171,7 @@ IaSetVertexBuffers(D3D10DDI_HDEVICE hDevice,
+          pDevice->vertex_strides[i] = 0;
+          vb->buffer_offset = 0;
+          vb->is_user_buffer = true;
+-         vb->buffer.user = dummy;
++         vb->buffer.user = NULL;
+       }
+    }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/OutputMerger.cpp b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+index 2a38864..3fd31c5 100644
+--- a/src/gallium/frontends/d3d10umd/OutputMerger.cpp
++++ b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
+@@ -41,6 +41,22 @@
+ #include "util/format/u_format.h"
+ 
+ 
++static inline struct pipe_surface *
++GetPipeRenderTargetView(D3D10DDI_HRENDERTARGETVIEW hRenderTargetView)
++{
++   RenderTargetView *pRenderTargetView = CastRenderTargetView(hRenderTargetView);
++   if (!pRenderTargetView) return NULL;
++
++   // The view follows its resource: after a rotation (a DXGI present that
++   // swaps the buffers behind the resources) the texture is another one.
++   Resource *res = pRenderTargetView->resource;
++   if (res && pRenderTargetView->surface.texture != res->resource) {
++      pipe_resource_reference(&pRenderTargetView->surface.texture, res->resource);
++   }
++
++   return &pRenderTargetView->surface;
++}
++
+ /*
+  * ----------------------------------------------------------------------
+  *
+@@ -85,9 +101,9 @@ CreateRenderTargetView(
+ 
+    struct pipe_resource *resource = CastPipeResource(pCreateRenderTargetView->hDrvResource);
+    RenderTargetView *pRTView = CastRenderTargetView(hRenderTargetView);
++   pRTView->resource = CastResource(pCreateRenderTargetView->hDrvResource);
+ 
+    struct pipe_surface desc;
+-
+    memset(&desc, 0, sizeof desc);
+    pipe_resource_reference(&desc.texture, resource);
+    desc.format = FormatTranslate(pCreateRenderTargetView->Format, false);
+@@ -176,7 +192,7 @@ ClearRenderTargetView(D3D10DDI_HDEVICE hDevice,                      // IN
+    LOG_ENTRYPOINT();
+ 
+    struct pipe_context *pipe = CastPipeContext(hDevice);
+-   struct pipe_surface *surface = CastPipeRenderTargetView(hRenderTargetView);
++   struct pipe_surface *surface = GetPipeRenderTargetView(hRenderTargetView);
+    union pipe_color_union clear_color;
+ 
+    /*
+@@ -750,7 +766,7 @@ SetRenderTargets(D3D10DDI_HDEVICE hDevice,                              // IN
+ 
+    pDevice->fb.nr_cbufs = 0;
+    for (unsigned i = 0; i < RTargets; ++i) {
+-      struct pipe_surface *psurf = CastPipeRenderTargetView(phRenderTargetView[i]);
++      struct pipe_surface *psurf = GetPipeRenderTargetView(phRenderTargetView[i]);
+       pipe_resource_reference(&pDevice->fb.cbufs[i].texture,
+                               psurf && psurf->texture ? psurf->texture : NULL);
+       if (psurf && psurf->texture) {
+diff --git a/src/gallium/frontends/d3d10umd/Query.cpp b/src/gallium/frontends/d3d10umd/Query.cpp
+index 8e76023..e7c2a1c 100644
+--- a/src/gallium/frontends/d3d10umd/Query.cpp
++++ b/src/gallium/frontends/d3d10umd/Query.cpp
+@@ -167,11 +167,10 @@ QueryBegin(D3D10DDI_HDEVICE hDevice,   // IN
+    Device *pDevice = CastDevice(hDevice);
+    struct pipe_context *pipe = pDevice->pipe;
+ 
+-   Query *pQuery = CastQuery(hQuery);
+    struct pipe_query *state = CastPipeQuery(hQuery);
+ 
+    if (state) {
+-      assert(pQuery->pipe_type < PIPE_QUERY_TYPES);
++      assert(CastQuery(hQuery)->pipe_type < PIPE_QUERY_TYPES);
+       pipe->begin_query(pipe, state);
+    }
+ }
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+index 65729f1..8785392 100644
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -38,6 +38,7 @@
+ 
+ #include "Debug.h"
+ 
++#include "pipe/p_defines.h"
+ #include "util/u_math.h"
+ #include "util/u_rect.h"
+ #include "util/u_surface.h"
+@@ -246,9 +247,15 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+ 
+    }
+ 
++   Device *device = CastDevice(hDevice);
+    struct pipe_context *pipe = CastPipeContext(hDevice);
+    struct pipe_screen *screen = pipe->screen;
+ 
++   mtx_lock(&device->CreateResourceMtx);
++   device->device.allocationVidPn = 0;
++   device->device.isPrimary = pCreateResource->pPrimaryDesc != NULL;
++   device->device.hRTResource = hRTResource.handle;
++
+    Resource *pResource = CastResource(hResource);
+ 
+    memset(pResource, 0, sizeof *pResource);
+@@ -293,6 +300,18 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+    templat.bind       = translate_resource_flags(pCreateResource->BindFlags);
+    templat.usage      = translate_resource_usage(pCreateResource->Usage);
+ 
++   if (templat.bind == 0) {
++      templat.bind = PIPE_BIND_SAMPLER_VIEW;
++   }
++   if ((pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED)) {
++      templat.bind |= PIPE_BIND_SHARED;
++   }
++   /* Entangled: a primary - what a screen itself shows, not a window's
++    * buffer - says so, for a winsys that presents primaries its own way. */
++   if (pCreateResource->pPrimaryDesc) {
++      templat.bind |= PIPE_BIND_SCANOUT;
++   }
++
+    if (templat.target != PIPE_BUFFER) {
+       if (!screen->is_format_supported(screen,
+                                        templat.format,
+@@ -303,7 +322,7 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+          debug_printf("%s: unsupported format %s\n",
+                      __func__, util_format_name(templat.format));
+          SetError(hDevice, E_OUTOFMEMORY);
+-         return;
++         goto unlock;
+       }
+    }
+ 
+@@ -311,7 +330,7 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+    if (!pResource) {
+       DebugPrintf("%s: failed to create resource\n", __func__);
+       SetError(hDevice, E_OUTOFMEMORY);
+-      return;
++      goto unlock;
+    }
+ 
+    pResource->NumSubResources = pCreateResource->MipLevels * pCreateResource->ArraySize;
+@@ -378,6 +397,12 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
+          }
+       }
+    }
++
++   device->device.allocationVidPn = 0;
++   device->device.isPrimary = false;
++   device->device.hRTResource = NULL;
++unlock:
++   mtx_unlock(&device->CreateResourceMtx);
+ }
+ 
+ 
+@@ -418,8 +443,44 @@ OpenResource(D3D10DDI_HDEVICE hDevice,                            // IN
+              D3D10DDI_HRESOURCE hResource,                        // IN
+              D3D10DDI_HRTRESOURCE hRTResource)                    // IN
+ {
+-   LOG_UNSUPPORTED_ENTRYPOINT();
+-   SetError(hDevice, E_OUTOFMEMORY);
++   LOG_ENTRYPOINT();
++   
++   Device *pDevice = CastDevice(hDevice);
++   if (!pDevice->screen->resource_from_handle) {
++      SetError(hDevice, E_OUTOFMEMORY);
++      return;
++   }
++   
++   mtx_lock(&pDevice->CreateResourceMtx);
++   pDevice->device.pOpenResource = pOpenResource;
++   
++   Resource *pResource = CastResource(hResource);
++   memset(pResource, 0, sizeof *pResource);
++   
++   struct winsys_handle whandle;
++   memset(&whandle, 0, sizeof(whandle));
++   whandle.type = WINSYS_HANDLE_TYPE_WIN32_HANDLE;
++   whandle.handle = (HANDLE)pOpenResource->hKMResource.handle;
++   
++   pResource->resource =
++      pDevice->screen->resource_from_handle(pDevice->screen, NULL, &whandle, 0);
++   
++   if (!pResource->resource) {
++      SetError(hDevice, E_OUTOFMEMORY);
++      goto unlock;
++   }
++   
++   pResource->buffer = false;
++   pResource->Format = FormatDeTranslate(pResource->resource->format);
++   pResource->MipLevels = pResource->resource->last_level + 1;
++   pResource->NumSubResources =
++      pResource->MipLevels * pResource->resource->array_size;
++   pResource->transfers = (struct pipe_transfer **)calloc(
++      pResource->NumSubResources, sizeof *pResource->transfers);
++
++unlock:
++   pDevice->device.pOpenResource = NULL;
++   mtx_unlock(&pDevice->CreateResourceMtx);
+ }
+ 
+ 
+diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
+index df6ffa1..984a1cd 100644
+--- a/src/gallium/frontends/d3d10umd/Shader.cpp
++++ b/src/gallium/frontends/d3d10umd/Shader.cpp
+@@ -45,6 +45,26 @@
+ #include "util/format/u_format.h"
+ 
+ 
++static inline struct pipe_sampler_view *
++GetPipeShaderResourceView(D3D10DDI_HSHADERRESOURCEVIEW hRenderTargetView)
++{
++   ShaderResourceView *pShaderResourceView = CastShaderResourceView(hRenderTargetView);
++   if (!pShaderResourceView) return NULL;
++
++   // Validate that view texture matches resource 
++   // If it is not (resource rotated) then recreate view
++   struct pipe_sampler_view *currentSurface = pShaderResourceView->handle;
++   Resource *res = pShaderResourceView->resource;
++   if (currentSurface->texture != res->resource) {
++      struct pipe_context *pipe = currentSurface->context;
++      struct pipe_sampler_view *newView = pipe->create_sampler_view(pipe, res->resource, currentSurface);
++      pipe_sampler_view_reference(&pShaderResourceView->handle, newView);
++      pipe_sampler_view_reference(&newView, NULL);
++   }
++
++   return pShaderResourceView->handle;
++}
++
+ /*
+  * ----------------------------------------------------------------------
+  *
+@@ -173,7 +193,7 @@ SetConstantBuffers(mesa_shader_stage shader_type,    // IN
+       cb.buffer_size = cb.buffer ? cb.buffer->width0 : 0;
+       pipe->set_constant_buffer(pipe,
+                                 shader_type,
+-                                StartBuffer + i,
++                                StartBuffer + i + 1,
+                                 &cb);
+    }
+ }
+@@ -234,7 +254,7 @@ SetShaderResources(mesa_shader_stage shader_type,                  // IN
+    struct pipe_sampler_view **sampler_views = pDevice->sampler_views[shader_type];
+    for (UINT i = 0; i < NumViews; i++) {
+       struct pipe_sampler_view *sampler_view =
+-            CastPipeShaderResourceView(phShaderResourceViews[i]);
++            GetPipeShaderResourceView(phShaderResourceViews[i]);
+       if (Offset + i < PIPE_MAX_SHADER_SAMPLER_VIEWS) {
+          sampler_views[Offset + i] = sampler_view;
+       } else {
+@@ -1198,6 +1218,8 @@ CreateShaderResourceView(
+    ShaderResourceView *pSRView = CastShaderResourceView(hShaderResourceView);
+    struct pipe_resource *resource;
+    enum pipe_format format;
++   
++   pSRView->resource = CastResource(pCreateSRView->hDrvResource);
+ 
+    struct pipe_sampler_view desc;
+    memset(&desc, 0, sizeof desc);
+@@ -1279,6 +1301,8 @@ CreateShaderResourceView1(
+    struct pipe_resource *resource;
+    enum pipe_format format;
+ 
++   pSRView->resource = CastResource(pCreateSRView->hDrvResource);
++
+    struct pipe_sampler_view desc;
+    memset(&desc, 0, sizeof desc);
+    resource = CastPipeResource(pCreateSRView->hDrvResource);
+@@ -1388,7 +1412,7 @@ GenMips(D3D10DDI_HDEVICE hDevice,                           // IN
+    }
+ 
+    struct pipe_context *pipe = pDevice->pipe;
+-   struct pipe_sampler_view *sampler_view = CastPipeShaderResourceView(hShaderResourceView);
++   struct pipe_sampler_view *sampler_view = GetPipeShaderResourceView(hShaderResourceView);
+ 
+    util_gen_mipmap(pipe,
+                    sampler_view->texture,
+diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+index 653cb96..5422b36 100644
+--- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
++++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
+@@ -33,6 +33,7 @@
+ #include "Debug.h"
+ #include "ShaderParse.h"
+ 
++#include "pipe/p_shader_tokens.h"
+ #include "pipe/p_state.h"
+ #include "tgsi/tgsi_ureg.h"
+ #include "tgsi/tgsi_dump.h"
+@@ -41,6 +42,7 @@
+ 
+ #include "ShaderDump.h"
+ 
++extern bool use_old_tex_ops;
+ 
+ enum dx10_opcode_format {
+    OF_FLOAT,
+@@ -179,6 +181,7 @@ static struct dx10_opcode_xlate opcode_xlate[D3D10_SB_NUM_OPCODES] = {
+ };
+ 
+ #define SHADER_MAX_TEMPS 4096
++#define SHADER_MAX_ADDRS 3
+ #define SHADER_MAX_INPUTS 32
+ #define SHADER_MAX_OUTPUTS 32
+ #define SHADER_MAX_CONSTS 4096
+@@ -208,12 +211,14 @@ struct Shader_xlate {
+ 
+    struct ureg_dst temps[SHADER_MAX_TEMPS];
+    struct ureg_dst output_depth;
++   struct ureg_dst addrs[SHADER_MAX_ADDRS];
+    struct Shader_resource resources[SHADER_MAX_RESOURCES];
+    struct ureg_src sv[SHADER_MAX_RESOURCES];
+    struct ureg_src samplers[SHADER_MAX_SAMPLERS];
+    struct ureg_src imms;
+    struct ureg_src prim_id;
+ 
++   uint addr_cur;
+    uint temp_offset;
+    uint indexable_temp_offsets[SHADER_MAX_INDEXABLE_TEMPS];
+ 
+@@ -702,7 +707,14 @@ translate_relative_operand(struct Shader_xlate *sx,
+    }
+ 
+    reg = ureg_scalar(reg, operand->comp);
+-   return reg;
++   
++   struct ureg_dst addr_reg = sx->addrs[sx->addr_cur];
++   ureg_UARL(sx->ureg, addr_reg, reg);
++      
++   sx->addr_cur++;
++   if(sx->addr_cur >= SHADER_MAX_ADDRS) sx->addr_cur = 0;
++
++   return ureg_src(addr_reg);
+ }
+ 
+ static struct ureg_dst
+@@ -995,14 +1007,14 @@ translate_src_operand(struct Shader_xlate *sx,
+       assert(operand->base.index_dim == 2);
+ 
+       assert(operand->base.index[0].index_rep == D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+-      assert(operand->base.index[0].imm < PIPE_MAX_CONSTANT_BUFFERS);
++      assert(operand->base.index[0].imm + 1 < PIPE_MAX_CONSTANT_BUFFERS);
+ 
+       switch (operand->base.index[1].index_rep) {
+       case D3D10_SB_OPERAND_INDEX_IMMEDIATE32:
+          assert(operand->base.index[1].imm < SHADER_MAX_CONSTS);
+ 
+          reg = ureg_src_register(TGSI_FILE_CONSTANT, operand->base.index[1].imm);
+-         reg = ureg_src_dimension(reg, operand->base.index[0].imm);
++         reg = ureg_src_dimension(reg, operand->base.index[0].imm + 1);
+          break;
+       case D3D10_SB_OPERAND_INDEX_RELATIVE:
+       case D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE:
+@@ -1010,7 +1022,7 @@ translate_src_operand(struct Shader_xlate *sx,
+          reg = ureg_src_indirect(
+             reg,
+             translate_relative_operand(sx, &operand->base.index[1].rel));
+-         reg = ureg_src_dimension(reg, operand->base.index[0].imm);
++         reg = ureg_src_dimension(reg, operand->base.index[0].imm + 1);
+          break;
+       default:
+          /* XXX: Other index representations.
+@@ -1292,6 +1304,11 @@ Shader_tgsi_translate(const unsigned *code,
+    assert(ureg);
+    sx.ureg = ureg;
+ 
++   for(uint i = 0; i < SHADER_MAX_ADDRS; i++) {
++      sx.addrs[i] = ureg_DECL_address(sx.ureg);
++   }
++   sx.addr_cur = 0;
++
+    while (Shader_parse_opcode(&parser, &opcode)) {
+       const struct dx10_opcode_xlate *ox;
+ 
+@@ -1395,7 +1412,7 @@ Shader_tgsi_translate(const unsigned *code,
+           * this opcode regardless, so we just ignore sample index operand
+           * for now */
+       case D3D10_SB_OPCODE_LD:
+-         if (st_debug & ST_DEBUG_OLD_TEX_OPS) {
++         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+             unsigned resource = opcode.src[1].base.index[0].imm;
+             assert(opcode.src[1].base.index_dim == 1);
+             assert(opcode.src[1].base.index[0].imm < SHADER_MAX_RESOURCES);
+@@ -1436,7 +1453,7 @@ Shader_tgsi_translate(const unsigned *code,
+          break;
+ 
+       case D3D10_SB_OPCODE_RESINFO:
+-         if (st_debug & ST_DEBUG_OLD_TEX_OPS) {
++         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+             unsigned resource = opcode.src[1].base.index[0].imm;
+             assert(opcode.src[1].base.index_dim == 1);
+             assert(opcode.src[1].base.index[0].imm < SHADER_MAX_RESOURCES);
+@@ -1517,7 +1534,7 @@ Shader_tgsi_translate(const unsigned *code,
+          break;
+ 
+       case D3D10_SB_OPCODE_SAMPLE:
+-         if (st_debug & ST_DEBUG_OLD_TEX_OPS) {
++         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+             assert(opcode.src[1].base.index_dim == 1);
+             assert(opcode.src[1].base.index[0].imm < SHADER_MAX_RESOURCES);
+ 
+@@ -1544,7 +1561,7 @@ Shader_tgsi_translate(const unsigned *code,
+          break;
+ 
+       case D3D10_SB_OPCODE_SAMPLE_C:
+-         if (st_debug & ST_DEBUG_OLD_TEX_OPS) {
++         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+             struct ureg_dst r0 = ureg_DECL_temporary(ureg);
+ 
+             /* XXX: Support only 2D texture targets for now.
+@@ -1594,7 +1611,7 @@ Shader_tgsi_translate(const unsigned *code,
+          break;
+ 
+       case D3D10_SB_OPCODE_SAMPLE_C_LZ:
+-         if (st_debug & ST_DEBUG_OLD_TEX_OPS) {
++         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+             struct ureg_dst r0 = ureg_DECL_temporary(ureg);
+ 
+             assert(opcode.src[1].base.index_dim == 1);
+@@ -1645,7 +1662,7 @@ Shader_tgsi_translate(const unsigned *code,
+          break;
+ 
+       case D3D10_SB_OPCODE_SAMPLE_L:
+-         if (st_debug & ST_DEBUG_OLD_TEX_OPS) {
++         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+             struct ureg_dst r0 = ureg_DECL_temporary(ureg);
+ 
+             assert(opcode.src[1].base.index_dim == 1);
+@@ -1684,7 +1701,7 @@ Shader_tgsi_translate(const unsigned *code,
+          break;
+ 
+       case D3D10_SB_OPCODE_SAMPLE_D:
+-         if (st_debug & ST_DEBUG_OLD_TEX_OPS) {
++         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+             assert(opcode.src[1].base.index_dim == 1);
+             assert(opcode.src[1].base.index[0].imm < SHADER_MAX_RESOURCES);
+ 
+@@ -1713,7 +1730,7 @@ Shader_tgsi_translate(const unsigned *code,
+          break;
+ 
+       case D3D10_SB_OPCODE_SAMPLE_B:
+-         if (st_debug & ST_DEBUG_OLD_TEX_OPS) {
++         if (use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS)) {
+             struct ureg_dst r0 = ureg_DECL_temporary(ureg);
+ 
+             assert(opcode.src[1].base.index_dim == 1);
+@@ -1832,7 +1849,7 @@ Shader_tgsi_translate(const unsigned *code,
+ 
+          target = translate_resource_dimension(opcode.specific.dcl_resource_dimension);
+          sx.resources[res_index].target = target;
+-         if (!(st_debug & ST_DEBUG_OLD_TEX_OPS)) {
++         if (!(use_old_tex_ops || (st_debug & ST_DEBUG_OLD_TEX_OPS))) {
+             sx.sv[res_index] =
+                ureg_DECL_sampler_view(ureg, res_index, target,
+                                       trans_dcl_ret_type(opcode.dcl_resource_ret_type[0]),
+@@ -1846,7 +1863,7 @@ Shader_tgsi_translate(const unsigned *code,
+       case D3D10_SB_OPCODE_DCL_CONSTANT_BUFFER: {
+          unsigned num_constants = opcode.src[0].base.index[1].imm;
+ 
+-         assert(opcode.src[0].base.index[0].imm < PIPE_MAX_CONSTANT_BUFFERS);
++         assert(opcode.src[0].base.index[0].imm + 1 < PIPE_MAX_CONSTANT_BUFFERS);
+ 
+          if (num_constants == 0) {
+             num_constants = SHADER_MAX_CONSTS;
+@@ -1857,7 +1874,7 @@ Shader_tgsi_translate(const unsigned *code,
+          ureg_DECL_constant2D(ureg,
+                               0,
+                               num_constants - 1,
+-                              opcode.src[0].base.index[0].imm);
++                              opcode.src[0].base.index[0].imm + 1);
+          break;
+       }
+ 
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+index 7c7f2c2..fb8ba96 100644
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -32,8 +32,13 @@
+ 
+ 
+ #include "DriverIncludes.h"
++#include "pipe/p_screen.h"
+ #include "util/u_hash_table.h"
+ #include "cso_cache/cso_context.h"
++#include "util/u_thread.h"
++
++#include <d3dukmdt.h>
++#include "gdikmt_d3dddi.h"
+ 
+ #define SUPPORT_MSAA 0
+ #define SUPPORT_D3D10_1 0
+@@ -43,6 +48,8 @@
+ struct Adapter
+ {
+    struct pipe_screen *screen;
++   HANDLE hRTAdapter;
++   D3DDDI_ADAPTERCALLBACKS AdapterCallbacks;
+ };
+ 
+ 
+@@ -66,9 +73,13 @@ struct ElementLayout;
+ 
+ struct Device
+ {
++   struct pipe_screen *screen;
+    struct pipe_context *pipe;
+ 
++   struct gdikmt_device_d3dddi device;
++
+    struct cso_context *cso;
++
+    struct pipe_framebuffer_state fb;
+    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
+    unsigned vertex_strides[PIPE_MAX_ATTRIBS];
+@@ -90,15 +101,9 @@ struct Device
+    Shader *bound_vs;
+ 
+    unsigned max_dual_source_render_targets;
+-
++   
+    D3D10DDI_HRTCORELAYER  hRTCoreLayer;
+-
+-   HANDLE hDevice;
+-   HANDLE hContext;
+-
+-   D3DDDI_DEVICECALLBACKS KTCallbacks;
+    D3D10DDI_CORELAYER_DEVICECALLBACKS UMCallbacks;
+-   DXGI_DDI_BASE_CALLBACKS *pDXGIBaseCallbacks;
+ 
+    INT LastEmittedQuerySeqNo;
+    INT LastFinishedQuerySeqNo;
+@@ -109,6 +114,8 @@ struct Device
+    ElementLayout *element_layout;
+    BOOL velems_changed;
+    BOOL vbuffers_changed;
++   
++   mtx_t CreateResourceMtx;
+ };
+ 
+ 
+@@ -208,6 +215,7 @@ CastPipeBuffer(D3D10DDI_HRESOURCE hResource)
+ struct RenderTargetView
+ {
+    struct pipe_surface surface;
++   Resource *resource;
+    D3D10DDI_HRTRENDERTARGETVIEW hRTRenderTargetView;
+ };
+ 
+@@ -363,6 +371,7 @@ CastPipeSamplerState(D3D10DDI_HSAMPLER hSampler)
+ struct ShaderResourceView
+ {
+    struct pipe_sampler_view *handle;
++   Resource *resource;
+ };
+ 
+ 
+diff --git a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
+new file mode 100644
+index 0000000..843fdc2
+--- /dev/null
++++ b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
+@@ -0,0 +1,324 @@
++#include "gdikmt_d3dddi.h"
++#include <string.h>
++#include "gdikmt/gdikmt.h"
++#include "pipe/p_state.h"
++#include "util/u_debug.h"
++#include "util/u_memory.h"
++
++#include <d3dukmdt.h>
++#include "winddk_compat.h"
++
++static inline struct gdikmt_context_d3dddi *
++gdikmt_context_d3dddi(struct gdikmt_context *iws)
++{
++   return (struct gdikmt_context_d3dddi *)iws;
++};
++
++static inline struct gdikmt_device_d3dddi *
++gdikmt_device_d3dddi(struct gdikmt_device *iws)
++{
++   return (struct gdikmt_device_d3dddi *)iws;
++}
++
++NTSTATUS
++gdikmt_d3dddi_queryadapterinfo(struct gdikmt_device *_device,
++                               KMTQUERYADAPTERINFOTYPE Type,
++                               VOID *pPrivateDriverData,
++                               UINT PrivateDriverDataSize)
++{
++   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
++
++   D3DDDICB_QUERYADAPTERINFO queryAdapterInfo;
++   memset(&queryAdapterInfo, 0, sizeof(queryAdapterInfo));
++   queryAdapterInfo.pPrivateDriverData = pPrivateDriverData;
++   queryAdapterInfo.PrivateDriverDataSize = PrivateDriverDataSize;
++
++   return device->pAdapterCallbacks->pfnQueryAdapterInfoCb(device->hRTAdapter,
++                                                           &queryAdapterInfo);
++}
++
++NTSTATUS
++gdikmt_d3dddi_escape(struct gdikmt_device *_device, VOID *pPrivateDriverData,
++                     UINT PrivateDriverDataSize)
++{
++   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
++
++   D3DDDICB_ESCAPE escape;
++   memset(&escape, 0, sizeof(escape));
++   escape.hDevice = device->hRTDevice;
++   escape.pPrivateDriverData = pPrivateDriverData;
++   escape.PrivateDriverDataSize = PrivateDriverDataSize;
++
++   return device->KTCallbacks.pfnEscapeCb(device->hRTAdapter, &escape);
++}
++
++NTSTATUS
++gdikmt_d3dddi_render(struct gdikmt_context *_ctx, struct gdikmt_render *options)
++{
++   struct gdikmt_context_d3dddi *ctx = gdikmt_context_d3dddi(_ctx);
++   struct gdikmt_device_d3dddi *dev = gdikmt_device_d3dddi(ctx->base.device);
++
++   D3DDDICB_RENDER render;
++   memset(&render, 0, sizeof(render));
++   render.hContext = ctx->hContext;
++
++   render.CommandOffset = options->CommandOffset;
++   render.CommandLength = options->CommandLength;
++   render.NumAllocations = options->AllocationCount;
++   render.NumPatchLocations = options->PatchLocationCount;
++
++   render.NewCommandBufferSize = options->NewCommandBufferSize;
++   render.NewAllocationListSize = options->NewAllocationListSize;
++   render.NewPatchLocationListSize = options->NewPatchLocationListSize;
++
++   render.Flags.ResizeCommandBuffer = options->ResizeCommandBuffer;
++   render.Flags.ResizeAllocationList = options->ResizeAllocationList;
++   render.Flags.ResizePatchLocationList = options->ResizePatchLocationList;
++
++   NTSTATUS Status = dev->KTCallbacks.pfnRenderCb(dev->hRTDevice, &render);
++
++   if(options->CompletionEvent) {
++      D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 signalEvent;
++      memset(&signalEvent, 0, sizeof(signalEvent));
++      signalEvent.hContext = ctx->hContext;
++      signalEvent.ObjectCount = 0;
++      signalEvent.BroadcastContextCount = 0;
++      signalEvent.Flags.EnqueueCpuEvent = TRUE;
++      signalEvent.CpuEventHandle = options->CompletionEvent;
++      dev->KTCallbacks.pfnSignalSynchronizationObject2Cb(dev->hRTDevice, &signalEvent);
++   }
++
++   ctx->base.pCommandBuffer = render.pNewCommandBuffer;
++   ctx->base.pAllocationList = render.pNewAllocationList;
++   ctx->base.pPatchLocationList = render.pNewPatchLocationList;
++
++   ctx->base.CommandBufferSize = render.NewCommandBufferSize;
++   ctx->base.AllocationListSize = render.NewAllocationListSize;
++   ctx->base.PatchLocationListSize = render.NewPatchLocationListSize;
++
++   return Status;
++}
++
++void
++gdikmt_d3dddi_destroycontext(struct gdikmt_context *_ctx)
++{
++   struct gdikmt_context_d3dddi *ctx = gdikmt_context_d3dddi(_ctx);
++   struct gdikmt_device_d3dddi *dev = gdikmt_device_d3dddi(ctx->base.device);
++
++   D3DDDICB_DESTROYCONTEXT destroyContext;
++   memset(&destroyContext, 0, sizeof(destroyContext));
++   destroyContext.hContext = ctx->hContext;
++   dev->KTCallbacks.pfnDestroyContextCb(dev->hRTDevice, &destroyContext);
++
++   FREE(ctx);
++
++   return;
++}
++
++NTSTATUS
++gdikmt_d3dddi_createcontext(struct gdikmt_device *_device,
++                            struct gdikmt_context **out_ctx)
++{
++   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
++
++   struct gdikmt_context_d3dddi *ctx = CALLOC_STRUCT(gdikmt_context_d3dddi);
++   if (!ctx) {
++      return STATUS_NO_MEMORY;
++   }
++   ctx->base.device = _device;
++
++   D3DDDICB_CREATECONTEXT createContext;
++   memset(&createContext, 0, sizeof(createContext));
++   NTSTATUS Status =
++      device->KTCallbacks.pfnCreateContextCb(device->hRTDevice, &createContext);
++
++   if (NT_SUCCESS(Status)) {
++      ctx->hContext = createContext.hContext;
++
++      ctx->base.pCommandBuffer = createContext.pCommandBuffer;
++      ctx->base.pAllocationList = createContext.pAllocationList;
++      ctx->base.pPatchLocationList = createContext.pPatchLocationList;
++
++      ctx->base.CommandBufferSize = createContext.CommandBufferSize;
++      ctx->base.AllocationListSize = createContext.AllocationListSize;
++      ctx->base.PatchLocationListSize = createContext.PatchLocationListSize;
++
++      ctx->base.destroy = gdikmt_d3dddi_destroycontext;
++      ctx->base.render = gdikmt_d3dddi_render;
++
++      *out_ctx = &ctx->base;
++   }
++
++   return Status;
++}
++
++NTSTATUS
++gdikmt_d3dddi_createallocation(struct gdikmt_device *_device,
++                               struct gdikmt_createallocation *options)
++{
++   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
++
++   D3DDDICB_ALLOCATE createAllocation;
++   memset(&createAllocation, 0, sizeof(createAllocation));
++   createAllocation.NumAllocations = options->NumAllocations;
++   createAllocation.pAllocationInfo = options->pAllocationInfo;
++
++   createAllocation.pPrivateDriverData = options->pPrivateDriverData;
++   createAllocation.PrivateDriverDataSize = options->PrivateDriverDataSize;
++
++   createAllocation.hResource = device->hRTResource;
++
++   if (device->isPrimary) {
++      options->pAllocationInfo->VidPnSourceId = device->allocationVidPn;
++      options->pAllocationInfo->Flags.Primary = 1;
++   }
++
++   NTSTATUS Status =
++      device->KTCallbacks.pfnAllocateCb(device->hRTDevice, &createAllocation);
++
++   options->hResource = (HANDLE)createAllocation.hKMResource;
++
++   return Status;
++}
++
++NTSTATUS
++gdikmt_d3dddi_destroyallocation(struct gdikmt_device *_device, HANDLE hResource,
++                                D3DKMT_HANDLE hAllocation)
++{
++   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
++
++   D3DDDICB_DEALLOCATE destroyAllocation;
++   memset(&destroyAllocation, 0, sizeof(destroyAllocation));
++
++   D3DKMT_HANDLE allocations[1];
++   allocations[0] = hAllocation;
++   destroyAllocation.NumAllocations = 1;
++   destroyAllocation.HandleList = allocations;
++
++   return device->KTCallbacks.pfnDeallocateCb(device->hRTDevice,
++                                              &destroyAllocation);
++}
++
++NTSTATUS
++gdikmt_d3dddi_lockallocation(struct gdikmt_device *_device,
++                             D3DKMT_HANDLE hAllocation,
++                             D3DDDICB_LOCKFLAGS flags, void **out_ptr)
++{
++   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
++
++   D3DDDICB_LOCK lock;
++   memset(&lock, 0, sizeof(lock));
++   lock.Flags = flags;
++   lock.Flags.LockEntire = TRUE;
++   lock.hAllocation = hAllocation;
++   NTSTATUS Status = device->KTCallbacks.pfnLockCb(device->hRTDevice, &lock);
++
++   *out_ptr = lock.pData;
++
++   return Status;
++}
++
++NTSTATUS
++gdikmt_d3dddi_unlockallocation(struct gdikmt_device *_device,
++                               D3DKMT_HANDLE hAllocation)
++{
++   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
++
++   D3DDDICB_UNLOCK unlock;
++   memset(&unlock, 0, sizeof(unlock));
++   unlock.NumAllocations = 1;
++   unlock.phAllocations = &hAllocation;
++   return device->KTCallbacks.pfnUnlockCb(device->hRTDevice, &unlock);
++}
++
++NTSTATUS
++gdikmt_d3dddi_queryallocation(struct gdikmt_device *_device,
++                              struct gdikmt_openallocation *options)
++{
++   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
++
++   options->NumAllocations = device->pOpenResource->NumAllocations;
++   options->PrivateDriverDataSize =
++      device->pOpenResource->PrivateDriverDataSize;
++   options->TotalBufferSize = 1;
++
++   return STATUS_SUCCESS;
++}
++
++NTSTATUS
++gdikmt_d3dddi_openallocation(struct gdikmt_device *_device,
++                             struct gdikmt_openallocation *options)
++{
++   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
++
++   for (UINT i = 0; i < options->NumAllocations; i++) {
++      options->pOpenAllocation[i] =
++         device->pOpenResource->pOpenAllocationInfo[i];
++   }
++
++   memcpy(options->pPrivateDriverData,
++          device->pOpenResource->pPrivateDriverData,
++          device->pOpenResource->PrivateDriverDataSize);
++
++   options->PrivateDriverDataSize =
++      device->pOpenResource->PrivateDriverDataSize;
++
++   return STATUS_SUCCESS;
++}
++
++NTSTATUS
++gdikmt_d3dddi_present(struct gdikmt_context *_ctx, D3DKMT_HANDLE hSrcAllocation,
++                      void *winsys_drawable_handle, struct pipe_box *sub_box)
++{
++   struct gdikmt_context_d3dddi *ctx = gdikmt_context_d3dddi(_ctx);
++   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_ctx->device);
++
++   DXGIDDICB_PRESENT kmPresent;
++   memset(&kmPresent, 0, sizeof(kmPresent));
++   kmPresent.hSrcAllocation = hSrcAllocation;
++   kmPresent.hDstAllocation = NULL;
++   kmPresent.pDXGIContext = winsys_drawable_handle;
++   kmPresent.hContext = ctx->hContext;
++   kmPresent.BroadcastContextCount = 0;
++
++   HRESULT res =
++      device->pDXGIBaseCallbacks->pfnPresentCb(device->hRTDevice, &kmPresent);
++   return res;
++};
++
++NTSTATUS
++gdikmt_d3dddi_setdisplaymode(struct gdikmt_device *_device,
++                             D3DKMT_HANDLE hSrcAllocation)
++{
++   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
++
++   D3DDDICB_SETDISPLAYMODE setMode;
++   setMode.hPrimaryAllocation = hSrcAllocation;
++   setMode.PrivateDriverFormatAttribute = 0;
++
++   HRESULT res =
++      device->KTCallbacks.pfnSetDisplayModeCb(device->hRTDevice, &setMode);
++   return res;
++};
++
++void gdikmt_d3dddi_destroy(struct gdikmt_device *_device){};
++
++void
++gdikmt_d3dddi_fill_basefuncs(struct gdikmt_device_d3dddi *device)
++{
++   device->base.destroy = gdikmt_d3dddi_destroy;
++   device->base.queryAdapterInfo = gdikmt_d3dddi_queryadapterinfo;
++   device->base.escape = gdikmt_d3dddi_escape;
++
++   device->base.createContext = gdikmt_d3dddi_createcontext;
++
++   device->base.createAllocation = gdikmt_d3dddi_createallocation;
++   device->base.destroyAllocation = gdikmt_d3dddi_destroyallocation;
++   device->base.lockAllocation = gdikmt_d3dddi_lockallocation;
++   device->base.unlockAllocation = gdikmt_d3dddi_unlockallocation;
++   device->base.queryAllocation = gdikmt_d3dddi_queryallocation;
++   device->base.openAllocation = gdikmt_d3dddi_openallocation;
++
++   device->base.present = gdikmt_d3dddi_present;
++   device->base.setDisplayMode = gdikmt_d3dddi_setdisplaymode;
++};
+\ No newline at end of file
+diff --git a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.h b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.h
+new file mode 100644
+index 0000000..a3e62d2
+--- /dev/null
++++ b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.h
+@@ -0,0 +1,28 @@
++#include "gdikmt/gdikmt.h"
++#include <d3d10umddi.h>
++
++struct gdikmt_device_d3dddi {  
++   gdikmt_device base;
++
++   HANDLE hRTAdapter;
++   HANDLE hRTDevice;
++   
++   D3DDDI_DEVICECALLBACKS KTCallbacks;
++   D3DDDI_ADAPTERCALLBACKS *pAdapterCallbacks;
++   DXGI_DDI_BASE_CALLBACKS *pDXGIBaseCallbacks;
++
++   UINT allocationVidPn;
++   boolean isPrimary;
++   HANDLE hRTResource;
++
++   const D3D10DDIARG_OPENRESOURCE *pOpenResource;
++};
++
++
++struct gdikmt_context_d3dddi {
++    struct gdikmt_context base;
++
++    HANDLE hContext;
++};
++
++void gdikmt_d3dddi_fill_basefuncs(struct gdikmt_device_d3dddi *device);
+\ No newline at end of file
+diff --git a/src/gallium/frontends/d3d10umd/meson.build b/src/gallium/frontends/d3d10umd/meson.build
+index 614db91..4b971dc 100644
+--- a/src/gallium/frontends/d3d10umd/meson.build
++++ b/src/gallium/frontends/d3d10umd/meson.build
+@@ -24,6 +24,7 @@ libd3d10umd = static_library(
+     'ShaderParse.c',
+     'ShaderTGSI.c',
+     'D3DKMT.cpp',
++    'gdikmt_d3dddi.cpp'
+   ),
+   c_args : _c_args_d3d10umd,
+   cpp_args : _c_args_d3d10umd,
+diff --git a/src/gallium/include/frontend/winsys_handle.h b/src/gallium/include/frontend/winsys_handle.h
+index 289cb9d..22c3068 100644
+--- a/src/gallium/include/frontend/winsys_handle.h
++++ b/src/gallium/include/frontend/winsys_handle.h
+@@ -19,6 +19,8 @@ extern "C" {
+ #define WINSYS_HANDLE_TYPE_D3D12_RES 4
+ #define WINSYS_HANDLE_TYPE_WIN32_NAME 5
+ #define WINSYS_HANDLE_TYPE_UNBACKED 5
++/* Used in DXGI functions to resolve to d3dkmt allocation handle from resource */
++#define WINSYS_HANDLE_TYPE_D3DKMT_ALLOC 6
+ 
+ /**
+  * For use with pipe_screen::{resource_from_handle|resource_get_handle}.
+diff --git a/src/gallium/meson.build b/src/gallium/meson.build
+index 67011f5..980c297 100644
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -44,6 +44,9 @@ if with_platform_windows
+ else
+   libwsgdi = null_dep
+ endif
++if with_gallium_st_d3d10umd
++  subdir('winsys/sw/wddm')
++endif
+ subdir('winsys/sw/wrapper')
+ if with_platform_haiku
+   subdir('winsys/sw/hgl')
+diff --git a/src/gallium/targets/d3d10umd/meson.build b/src/gallium/targets/d3d10umd/meson.build
+index ab1cf05..db52ded 100644
+--- a/src/gallium/targets/d3d10umd/meson.build
++++ b/src/gallium/targets/d3d10umd/meson.build
+@@ -12,17 +12,17 @@ libgallium_d3d10_def = custom_target(
+ gallium_d3d10_name = get_option('gallium-d3d10-dll-name')
+ libgallium_d3d10 = shared_library(
+   gallium_d3d10_name,
+-  ['d3d10_gdi.c'],
++  ['d3d10_wddm.c'],
+   vs_module_defs : libgallium_d3d10_def,
+   include_directories : [
+     inc_include, inc_src, inc_gallium, inc_gallium_aux, inc_d3d10umd, inc_gallium_winsys, inc_gallium_winsys_sw, inc_gallium_drivers, inc_winddk
+   ],
+   link_whole : [libd3d10umd],
+   link_with : [
+-    libgallium, libwsgdi
++    libgallium, libwswddm
+   ],
+   dependencies : [
+-    dep_ws2_32, idep_nir, driver_swrast, idep_mesautil
++    dep_ws2_32, idep_nir, driver_swrast, driver_zink, idep_xmlconfig, idep_mesautil
+   ],
+   name_prefix: '',
+   install : true,
+diff --git a/src/gallium/winsys/sw/wddm/meson.build b/src/gallium/winsys/sw/wddm/meson.build
+new file mode 100644
+index 0000000..aff6736
+--- /dev/null
++++ b/src/gallium/winsys/sw/wddm/meson.build
+@@ -0,0 +1,11 @@
++# Copyright 2026 Entangled Desktop contributors
++# SPDX-License-Identifier: MIT
++
++libwswddm = static_library(
++  'wswddm',
++  'wddm_sw_winsys.c',
++  include_directories : [
++    inc_src, inc_include, inc_gallium, inc_gallium_aux, inc_gallium_drivers, inc_frontends, inc_virtio
++  ],
++  dependencies: idep_mesautil,
++)
+diff --git a/src/virtio/wddm/viogpu_wddm_driver.h b/src/virtio/wddm/viogpu_wddm_driver.h
+new file mode 100644
+index 0000000..457e87c
+--- /dev/null
++++ b/src/virtio/wddm/viogpu_wddm_driver.h
+@@ -0,0 +1,198 @@
++/*
++ * Copyright (C) 2019-2020 Red Hat, Inc.
++ *
++ * Written By: Vadim Rozenfeld <vrozenfe@redhat.com>
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met :
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and / or other materials provided with the distribution.
++ * 3. Neither the names of the copyright holders nor the names of their contributors
++ *    may be used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#pragma once
++
++#include <d3dkmthk.h>
++
++
++#pragma pack(1)
++typedef struct _VIOGPU_BOX {
++    ULONG x;
++    ULONG y;
++    ULONG z;
++    ULONG width;
++    ULONG height;
++    ULONG depth;
++} VIOGPU_BOX;
++#pragma pack()
++
++// ================= QueryAdapterInfo UMDRIVERPRIVATE
++#define VIOGPU_IAM 0x56696f475055 // Identified for queryadapterinfo (VioGPU as hex)
++
++typedef struct _VIOGPU_ADAPTERINFO {
++    ULONGLONG IamVioGPU; // Should be set by driver to VIOGPU_IAM
++    struct {
++        UINT Supports3d : 1;
++        UINT Reserved : 31;
++    } Flags;
++    ULONGLONG SupportedCapsetIDs;
++} VIOGPU_ADAPTERINFO;
++
++// ================= ESCAPES
++#define VIOGPU_GET_DEVICE_ID                              0x000
++#define VIOGPU_GET_CUSTOM_RESOLUTION                      0x001
++#define VIOGPU_GET_CAPS                                   0x002
++
++#define VIOGPU_RES_INFO                                   0x100
++#define VIOGPU_RES_BUSY                                   0x101
++
++#define VIOGPU_CTX_INIT                                   0x200
++
++
++#pragma pack(1)
++typedef struct _VIOGPU_DISP_MODE {
++    USHORT XResolution;
++    USHORT YResolution;
++}VIOGPU_DISP_MODE, *PVIOGPU_DISP_MODE;
++#pragma pack()
++
++
++#pragma pack(1)
++typedef struct _VIOGPU_PARAM_REQ {
++    ULONG ParamId;
++    UINT64 Value;
++}VIOGPU_PARAM_REQ;
++#pragma pack()
++
++
++#pragma pack(1)
++typedef struct _VIOGPU_CAPSET_REQ {
++    ULONG CapsetId;
++    ULONG Version;
++    ULONG Size;
++    UCHAR *Capset;
++}VIOGPU_CAPSET_REQ;
++#pragma pack()
++
++
++#pragma pack(1)
++typedef struct _VIOGPU_RES_INFO_REQ {
++    D3DKMT_HANDLE ResHandle;
++    ULONG Id;
++}VIOGPU_RES_INFO_REQ;
++#pragma pack()
++
++
++#pragma pack(1)
++typedef struct _VIOGPU_RES_BUSY_REQ {
++    D3DKMT_HANDLE ResHandle;
++    BOOL Wait;
++    BOOL IsBusy;
++}VIOGPU_RES_BUSY_REQ;
++#pragma pack()
++
++
++#pragma pack(1)
++typedef struct _VIOGPU_CTX_INIT_REQ {   
++    UINT CapsetID;
++}VIOGPU_CTX_INIT_REQ;
++#pragma pack()
++
++
++#pragma pack(1)
++typedef struct  _VIOGPU_ESCAPE{
++    USHORT      Type;
++    USHORT      DataLength;
++    union {
++        ULONG Id;
++        VIOGPU_DISP_MODE Resolution;
++        VIOGPU_PARAM_REQ Parameter;
++        VIOGPU_CAPSET_REQ Capset;
++
++        VIOGPU_RES_INFO_REQ ResourceInfo;
++        VIOGPU_RES_BUSY_REQ ResourceBusy;
++        
++        VIOGPU_CTX_INIT_REQ CtxInit;
++    } DUMMYUNIONNAME;
++} VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
++#pragma pack()
++
++// ================= CreateResource
++#pragma pack(1)
++typedef struct _VIOGPU_RESOURCE_OPTIONS {
++    ULONG target;
++    ULONG format;
++    ULONG bind;
++    ULONG width;
++    ULONG height;
++    ULONG depth;
++    ULONG array_size;
++    ULONG last_level;
++    ULONG nr_samples;
++    ULONG flags;
++} VIOGPU_RESOURCE_OPTIONS;
++
++
++#pragma pack(1)
++typedef struct _VIOGPU_CREATE_RESOURCE_EXCHANGE {
++    ULONG magic;
++} VIOGPU_CREATE_RESOURCE_EXCHANGE;
++#pragma pack()
++
++#pragma pack(1)
++typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE {
++    VIOGPU_RESOURCE_OPTIONS ResourceOptions;
++    ULONGLONG Size;
++} VIOGPU_CREATE_ALLOCATION_EXCHANGE;
++#pragma pack()
++
++
++// ================= COMMAND BUFFER
++#define VIOGPU_CMD_NOP                          0x0
++#define VIOGPU_CMD_SUBMIT                       0x1 // Submit Command to virgl
++#define VIOGPU_CMD_TRANSFER_TO_HOST             0x2 // Transfer resource to host
++#define VIOGPU_CMD_TRANSFER_FROM_HOST           0x3 // Transfer resource to host
++
++#pragma pack(1)
++typedef struct _VIOGPU_COMMAND_HDR {
++    UINT type;
++    UINT size;
++} VIOGPU_COMMAND_HDR;
++#pragma pack()
++
++
++#pragma pack(1)
++typedef struct _VIOGPU_TRANSFER_CMD {
++    ULONG res_id;
++
++    VIOGPU_BOX box;
++    
++    ULONGLONG offset;
++    ULONG level;
++    ULONG stride;
++    ULONG layer_stride;
++} VIOGPU_TRANSFER_CMD;
++#pragma pack()
++
++
++
++#define BASE_NAMED_OBJECTS    L"\\BaseNamedObjects\\"
++#define GLOBAL_OBJECTS    L"Global\\"
++#define RESOLUTION_EVENT_NAME L"VioGpuResolutionEvent"

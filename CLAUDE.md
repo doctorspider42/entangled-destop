@@ -32,6 +32,14 @@ read before adding a guest-family switch or a legacy platform device).
 [docs/adr/0009-own-windows-gpu-driver.md](docs/adr/0009-own-windows-gpu-driver.md)
 (proposed: replacing the third-party viogpu3d with our own KMDF driver, a Mesa
 Venus winsys for Windows, and DXVK/Zink on top).
+[docs/adr/0010-wddm-desktop-on-the-gpu.md](docs/adr/0010-wddm-desktop-on-the-gpu.md)
+(proposed: a WDDM driver for the display function after all, so DWM composes
+on the GPU — `viogpu3d` carrying Venus, `d3d10umd` on Zink; phases W0–W5).
+[docs/adr/0011-direct3d-9-driver.md](docs/adr/0011-direct3d-9-driver.md)
+(proposed: a real Direct3D 9 user-mode driver, x64 and x86, from Gallium
+Nine's state machine behind the WDDM DDI — so a game needs no switch; phases
+N0–N4, all done: Portal 2 plays a level full screen with no switch, on the
+host's plane; WPF programs draw).
 
 ## Build and test
 

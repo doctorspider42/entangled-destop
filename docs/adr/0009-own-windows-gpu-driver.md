@@ -378,3 +378,42 @@ build A; E is performance; F is distribution.
 - virglrenderer MR !1185, its host side: https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1185
 - Mesa drops `d3d10umd` (Mesa 26.3): https://www.phoronix.com/news/Mesa-Drops-Direct3D-10-UMD
 - Venus in Mesa: https://docs.mesa3d.org/drivers/venus
+
+## Amendment (2026-11-11): the Venus backend never released a buffer object
+
+Found while putting DWM on this stack (ADR-0010). `vn_renderer_bo_unref`
+drops the last reference and only then calls the backend's `destroy`;
+`entangled_bo_destroy` dropped it a second time, saw a count that was not
+one, and returned without releasing. So no mapped `VkDeviceMemory` of any
+Vulkan program in a Windows guest gave its host pages back before the process
+ended: the host log shows `vkFreeMemory` arriving in step with the
+allocations and the blobs unmapped only at teardown. A program that allocates
+its memory once and keeps it (DXVK does, mostly) never reached the context's
+host-visible budget; one that frees a frame-sized staging buffer per frame
+reaches it in seconds. Fixed in `guest/windows-gpu/mesa/vn_renderer_entangled.c`
+(the destroy releases unconditionally). Packages up to `gpu3d-5` have the
+bug; the next build of the 3D package carries the fix.
+
+The same work added an export to `vulkan_virtio.dll`,
+`entangled_present_overlay` (the phase E overlay hook by name, for a
+compositor with no window to present to), and a rule for the one plane: a
+window's swapchain leaves it alone while the desktop is shown on it
+(ADR-0010).
+
+### Amendment: 32-bit programs (2026-11-11)
+
+Everything above was 64-bit, and a 32-bit program had no graphics driver in
+the guest at all: Portal 2 (32-bit, Direct3D 9) left at start without a word,
+on the display-only driver and on the WDDM one alike. The Venus ICD now also
+builds for x86 (`guest/windows-gpu/mesa/build-x86.cmd`, the same tree and
+patches; the render node's IOCTLs were already fixed-width). The package
+carries it as `vulkan_virtio_x86.dll` and DXVK's `x32` DLLs as `*_x86.dll` (a
+release is a flat list of files); the installer puts them in `x86\` and
+`dxvk\x86\` and registers the ICD under `WOW6432Node`. With it, Portal 2's
+own `-vulkan` (its bundled DXVK) reaches the menu at 105-110 frames a second
+in a 1280x720 window, under the WDDM desktop.
+
+Verified by hand in the test guest only: the workflow step and the
+installer's copy have not run. And it is still a switch per game: Windows'
+own `d3d9.dll` finds no Direct3D 9 driver here, so a game that is not told
+to use Vulkan, and has no DXVK beside its `.exe`, still does not start.

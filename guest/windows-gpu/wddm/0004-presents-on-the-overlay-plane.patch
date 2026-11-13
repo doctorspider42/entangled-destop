@@ -1,0 +1,60 @@
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 78aa512..eab0044 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -631,6 +631,13 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+     }
+ #endif
+ 
++    if (pVioGpuEscape->Type == 0x901)
++    {
++        // The presents are on the overlay plane for the next two seconds.
++        InterlockedExchange64(&m_overlayUntil, (LONGLONG)KeQueryInterruptTime() + 2 * 10000000LL);
++        return STATUS_SUCCESS;
++    }
++
+     switch (pVioGpuEscape->Type)
+     {
+         case VIOGPU_GET_DEVICE_ID:
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index f35309a..eaded38 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -68,6 +68,15 @@ class VioGpuAdapter : IVioGpuPCI
+     VioGpuIdr ctxIdr;
+     CtrlQueue ctrlQueue;
+ 
++    // Entangled (ADR-0010 phase W2): while the user-mode driver has the host
++    // show its presents on the overlay plane, the primary under the plane is
++    // not what anyone sees. The driver says so through an escape, as a lease
++    // it renews; until it runs out a flip brings the primary up to date once
++    // a second (for whatever reads the primary: a screenshot, the moment the
++    // plane goes away) instead of on every frame. Interrupt time, 100 ns.
++    volatile LONGLONG m_overlayUntil = 0;
++    volatile LONGLONG m_overlayShownAt = 0;
++
+     // Entangled: a host whose renderer serves no virgl capset (ours on Windows
+     // serves Venus only) has no virgl contexts and no 3D resources. The driver
+     // then keeps every allocation as a 2D resource over the guest's own pages
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index 7b55eee..0f88680 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -185,6 +185,17 @@ void VioGpuAllocation::FlushToScreen(UINT scan_id)
+     box.height = m_options.height;
+     box.depth = 1;
+ 
++    if (!m_adapter->IsVirglHost())
++    {
++        // Under the overlay plane: once a second is enough (see the adapter).
++        LONGLONG now = (LONGLONG)KeQueryInterruptTime();
++        if (now < m_adapter->m_overlayUntil && now - m_adapter->m_overlayShownAt < 10000000LL)
++        {
++            return;
++        }
++        m_adapter->m_overlayShownAt = now;
++    }
++
+     m_adapter->ctrlQueue.SetScanout(scan_id, m_Id, m_options.width, m_options.height, 0, 0);
+     if (!m_adapter->IsVirglHost())
+     {

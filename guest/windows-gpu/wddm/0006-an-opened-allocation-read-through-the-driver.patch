@@ -1,0 +1,192 @@
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index eab0044..0b6f90f 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -631,6 +631,46 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+     }
+ #endif
+ 
++    if ((pVioGpuEscape->Type == 0x902 || pVioGpuEscape->Type == 0x903) && size >= 24)
++    {
++        // Type and DataLength (two bytes each), the allocation's handle, a
++        // buffer of the caller's and its size, at offsets 4, 8 and 16; and
++        // for a read the write count last seen, at 24, answered in place.
++        ULONG handle;
++        ULONGLONG buffer;
++        ULONGLONG bytes;
++        RtlCopyMemory(&handle, (PUCHAR)pVioGpuEscape + 4, sizeof(handle));
++        RtlCopyMemory(&buffer, (PUCHAR)pVioGpuEscape + 8, sizeof(buffer));
++        RtlCopyMemory(&bytes, (PUCHAR)pVioGpuEscape + 16, sizeof(bytes));
++        VioGpuAllocation *allocation = AllocationFromHandle(handle);
++        if (allocation == NULL)
++        {
++            DbgPrint(TRACE_LEVEL_ERROR, ("%s read: handle 0x%x is no allocation\n", __FUNCTION__, handle));
++            return STATUS_INVALID_HANDLE;
++        }
++        if (pVioGpuEscape->Type == 0x903)
++        {
++            status = allocation->CopyIn((PVOID)(ULONG_PTR)buffer, (SIZE_T)bytes);
++        }
++        else if (size < 32)
++        {
++            status = STATUS_INVALID_BUFFER_SIZE;
++        }
++        else
++        {
++            ULONGLONG seen;
++            RtlCopyMemory(&seen, (PUCHAR)pVioGpuEscape + 24, sizeof(seen));
++            status = allocation->CopyOut((PVOID)(ULONG_PTR)buffer, (SIZE_T)bytes, &seen);
++            RtlCopyMemory((PUCHAR)pVioGpuEscape + 24, &seen, sizeof(seen));
++        }
++        if (!NT_SUCCESS(status))
++        {
++            DbgPrint(TRACE_LEVEL_ERROR,
++                     ("%s read: allocation %u, %I64u bytes: 0x%x\n", __FUNCTION__, allocation->GetId(), bytes, status));
++        }
++        return status;
++    }
++
+     if (pVioGpuEscape->Type == 0x901)
+     {
+         // The presents are on the overlay plane for the next two seconds.
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index 0f88680..a5e8018 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -50,6 +50,10 @@ VioGpuAllocation::~VioGpuAllocation(void)
+     {
+         IoFreeMdl(m_pMapMdl);
+     }
++    if (m_pShared != NULL)
++    {
++        delete[] reinterpret_cast<BYTE *>(m_pShared);
++    }
+     m_adapter->ctrlQueue.DestroyResource(m_Id);
+     m_adapter->resourceIdr.PutId(m_Id);
+ 
+@@ -229,6 +233,95 @@ void VioGpuAllocation::FlushToScreen(UINT scan_id)
+ // surfaces are four bytes a pixel with no padding between rows. The rectangle
+ // is clipped to both; a surface that is not mapped (not in the aperture) is
+ // left alone - the next present repaints it.
++// Entangled (no virgl): a surface one process draws and another shows - a
++// window's frame on its way to DWM. Windows refuses a lock of an allocation
++// the caller only opened (STATUS_INVALID_PARAMETER, whatever the flags), and
++// an allocation nothing renders with never enters the aperture, so the pages
++// are not mapped here either. The driver therefore keeps the pixels itself:
++// the producer writes them in (escape 0x903), whoever opened the allocation
++// reads them out (0x902). Both run in the caller's context, as an escape does.
++NTSTATUS VioGpuAllocation::CopyIn(PVOID user, SIZE_T size)
++{
++    PAGED_CODE();
++
++    NTSTATUS status = STATUS_SUCCESS;
++    if (size == 0 || size > (SIZE_T)m_options.width * m_options.height * 4)
++    {
++        return STATUS_BUFFER_OVERFLOW;
++    }
++    ExAcquireFastMutex(&m_mapLock);
++    if (m_pShared == NULL)
++    {
++        m_sharedSize = (SIZE_T)m_options.width * m_options.height * 4;
++        m_pShared = new (PagedPool) BYTE[m_sharedSize];
++    }
++    if (m_pShared == NULL)
++    {
++        status = STATUS_INSUFFICIENT_RESOURCES;
++    }
++    else
++    {
++        __try
++        {
++            ProbeForRead(user, size, 1);
++            RtlCopyMemory(m_pShared, user, size);
++            m_sharedWrites++;
++        }
++        __except (EXCEPTION_EXECUTE_HANDLER)
++        {
++            status = STATUS_ACCESS_VIOLATION;
++        }
++    }
++    ExReleaseFastMutex(&m_mapLock);
++    return status;
++}
++
++NTSTATUS VioGpuAllocation::CopyOut(PVOID user, SIZE_T size, ULONGLONG *seen)
++{
++    PAGED_CODE();
++
++    NTSTATUS status = STATUS_SUCCESS;
++    ExAcquireFastMutex(&m_mapLock);
++    // What a producer wrote, or else the pages themselves when they are
++    // mapped (a primary).
++    PVOID pixels = NULL;
++    if (m_pShared != NULL && size <= m_sharedSize)
++    {
++        // The same frame the caller already has: a compositor asks every
++        // time it draws the window.
++        if (*seen == m_sharedWrites)
++        {
++            ExReleaseFastMutex(&m_mapLock);
++            return STATUS_SUCCESS;
++        }
++        *seen = m_sharedWrites;
++        pixels = m_pShared;
++    }
++    else if (m_pMapVa != NULL && size <= m_pageCount * PAGE_SIZE)
++    {
++        pixels = m_pMapVa;
++    }
++    if (pixels == NULL || size == 0)
++    {
++        // Nothing drawn into it yet.
++        status = STATUS_DEVICE_NOT_READY;
++    }
++    else
++    {
++        __try
++        {
++            ProbeForWrite(user, size, 1);
++            RtlCopyMemory(user, pixels, size);
++        }
++        __except (EXCEPTION_EXECUTE_HANDLER)
++        {
++            status = STATUS_ACCESS_VIOLATION;
++        }
++    }
++    ExReleaseFastMutex(&m_mapLock);
++    return status;
++}
++
+ void VioGpuAllocation::CopyFrom(VioGpuAllocation *src, LONG dstX, LONG dstY, LONG srcX, LONG srcY, LONG width, LONG height)
+ {
+     PAGED_CODE();
+diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
+index dbad614..908d373 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.h
++++ b/viogpu/viogpu3d/viogpu_allocation.h
+@@ -47,6 +47,12 @@ class VioGpuAllocation
+     // Entangled (no virgl): copies a rectangle of another allocation's pixels
+     // into this one in guest memory and sends it to the host.
+     void CopyFrom(VioGpuAllocation *src, LONG dstX, LONG dstY, LONG srcX, LONG srcY, LONG width, LONG height);
++    // Entangled: the allocation's pixels out of, and into, a buffer of the
++    // calling process (see CopyOut in the .cpp).
++    // `seen` is the write count the caller last read at, and comes back as
++    // the count now: equal, and nothing was copied.
++    NTSTATUS CopyOut(PVOID user, SIZE_T size, ULONGLONG *seen);
++    NTSTATUS CopyIn(PVOID user, SIZE_T size);
+     static NTSTATUS GetStandardAllocationDriverData(DXGKARG_GETSTANDARDALLOCATIONDRIVERDATA *pStandardAllocation);
+     static NTSTATUS DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_CREATEALLOCATION *pCreateAllocation);
+ 
+@@ -73,6 +79,12 @@ class VioGpuAllocation
+     // present can be copied by the driver; guarded by m_mapLock.
+     MDL *m_pMapMdl;
+     PVOID m_pMapVa;
++    // A shared surface's pixels, kept for whoever opened it (CopyIn/CopyOut);
++    // paged pool, guarded by m_mapLock too.
++    PVOID m_pShared = NULL;
++    SIZE_T m_sharedSize = 0;
++    // How many times it was written: never 0 once there is a frame.
++    ULONGLONG m_sharedWrites = 0;
+     FAST_MUTEX m_mapLock;
+     KEVENT m_busyNotification;
+     volatile LONG m_busy;

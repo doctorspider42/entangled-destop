@@ -1835,20 +1835,35 @@ impl<H: HostVulkan> VulkanContext<H> {
         let Some(info) = &args.p_create_info else {
             return Err(invalid(NAME, "pCreateInfo is null"));
         };
-        // Its one link (`VkBufferUsageFlags2CreateInfo`) is 1.4's, refused
-        // by the chain policy before a command is dispatched; kept here so
-        // no path hands it to the driver.
-        if let Some(link) = info.p_next.first() {
-            return Err(unimplemented_link(
-                NAME,
-                "VkBufferViewCreateInfo",
-                ChainLink::structure_type(link),
-            ));
-        }
         let buffer = self
             .objects
             .buffer(device_id, info.buffer.0)
             .map_err(id_error(NAME))?;
+        // Its one link, `VkBufferUsageFlags2CreateInfo` (`VK_KHR_maintenance5`):
+        // the view's own usage, which may only narrow the buffer's texel
+        // usages. Zink chains it on every view it makes (Mesa 26.2).
+        for link in &info.p_next {
+            let crate::venus::protocol::VkBufferViewCreateInfoNext::VkBufferUsageFlags2CreateInfo(
+                usage,
+            ) = link;
+            if !device.enabled(policy::MAINTENANCE_5) {
+                return Err(unimplemented_link(
+                    NAME,
+                    "VkBufferViewCreateInfo",
+                    ChainLink::structure_type(link),
+                ));
+            }
+            let texel = u64::from(policy::BUFFER_USAGE_TEXEL);
+            if usage.usage == 0
+                || usage.usage & !texel != 0
+                || usage.usage & !u64::from(buffer.usage) != 0
+            {
+                return Err(invalid(
+                    NAME,
+                    "a view usage that is empty, not a texel usage, or not one of its buffer's",
+                ));
+            }
+        }
         let limit = guest
             .properties
             .properties

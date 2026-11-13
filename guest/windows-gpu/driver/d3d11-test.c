@@ -45,17 +45,31 @@ int main(void)
     ID3D11DeviceContext *ctx = NULL;
     IDXGISwapChain *swap = NULL;
     D3D_FEATURE_LEVEL level = 0;
-    CHECK("D3D11CreateDeviceAndSwapChain",
-          D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
-                                        D3D11_SDK_VERSION, &sd, &swap, &dev, &level, &ctx));
+    /* The device and the swap chain apart, so that a refusal names its step. */
+    CHECK("D3D11CreateDevice",
+          D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION,
+                            &dev, &level, &ctx));
 
     IDXGIDevice *dxgi = NULL;
     IDXGIAdapter *adapter = NULL;
+    IDXGIFactory *factory = NULL;
     DXGI_ADAPTER_DESC ad = {0};
-    if (SUCCEEDED(ID3D11Device_QueryInterface(dev, &IID_IDXGIDevice, (void **)&dxgi)) &&
-        SUCCEEDED(IDXGIDevice_GetAdapter(dxgi, &adapter)) &&
-        SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad))) {
+    CHECK("IDXGIDevice", ID3D11Device_QueryInterface(dev, &IID_IDXGIDevice, (void **)&dxgi));
+    CHECK("GetAdapter", IDXGIDevice_GetAdapter(dxgi, &adapter));
+    if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad)))
         printf("adapter  %ls\nfeature level 0x%x\n", ad.Description, level);
+    CHECK("GetParent", IDXGIAdapter_GetParent(adapter, &IID_IDXGIFactory, (void **)&factory));
+    {
+        HRESULT hr = IDXGIFactory_CreateSwapChain(factory, (IUnknown *)dev, &sd, &swap);
+
+        if (FAILED(hr)) {
+            /* A driver without the flip model: the copying swap chain. */
+            printf("flip-model swap chain: 0x%08lx; the copying one\n", (unsigned long)hr);
+            sd.BufferCount = 1;
+            sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+            hr = IDXGIFactory_CreateSwapChain(factory, (IUnknown *)dev, &sd, &swap);
+        }
+        CHECK("CreateSwapChain", hr);
     }
 
     ID3D11Texture2D *back = NULL;

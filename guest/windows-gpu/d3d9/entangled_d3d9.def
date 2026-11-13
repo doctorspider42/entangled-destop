@@ -1,0 +1,3 @@
+LIBRARY entangled_d3d9
+EXPORTS
+    OpenAdapter

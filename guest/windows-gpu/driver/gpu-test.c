@@ -4,7 +4,9 @@
  *
  * `gpu-test install <inf>` puts the driver on the render-only function first:
  * a Microsoft-signed driver (viogpudo) outranks a test-signed one there, so
- * pnputil alone leaves the function where it was. */
+ * pnputil alone leaves the function where it was. `gpu-test install <inf>
+ * <hardware id>` does the same for another function: the display one, for
+ * entangled-display (guest/windows-gpu/display). */
 #include <windows.h>
 #include <newdev.h>
 #include <stdio.h>
@@ -12,7 +14,7 @@
 
 #pragma comment(lib, "newdev.lib")
 
-static int install(const wchar_t *inf)
+static int install(const wchar_t *inf, const wchar_t *hardware_id)
 {
     BOOL reboot = FALSE;
     wchar_t full[MAX_PATH];
@@ -20,8 +22,7 @@ static int install(const wchar_t *inf)
         printf("GPU-TEST FAIL path: error %lu\n", GetLastError());
         return 1;
     }
-    if (!UpdateDriverForPlugAndPlayDevicesW(NULL, L"PCI\\VEN_1AF4&DEV_1050&SUBSYS_00401AF4&REV_01",
-                                            full, INSTALLFLAG_FORCE, &reboot)) {
+    if (!UpdateDriverForPlugAndPlayDevicesW(NULL, hardware_id, full, INSTALLFLAG_FORCE, &reboot)) {
         printf("GPU-TEST FAIL install: error %lu\n", GetLastError());
         return 1;
     }
@@ -178,8 +179,9 @@ int wmain(int argc, wchar_t **argv)
     ENTANGLED_GPU_INFO info;
     DWORD got = 0, i;
     int venus = 0;
-    if (argc == 3 && lstrcmpiW(argv[1], L"install") == 0) {
-        return install(argv[2]);
+    if ((argc == 3 || argc == 4) && lstrcmpiW(argv[1], L"install") == 0) {
+        return install(argv[2],
+                       argc == 4 ? argv[3] : L"PCI\\VEN_1AF4&DEV_1050&SUBSYS_00401AF4&REV_01");
     }
     dev = CreateFileW(ENTANGLED_GPU_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE, 0, NULL,
                       OPEN_EXISTING, 0, NULL);

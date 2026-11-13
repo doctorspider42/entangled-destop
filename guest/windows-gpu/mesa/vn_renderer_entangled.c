@@ -307,8 +307,9 @@ entangled_bo_create_from_dma_buf(struct vn_renderer *renderer,
 static bool
 entangled_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *bo)
 {
-   if (!vn_refcount_dec(&bo->refcount))
-      return false;
+   /* The last reference is already gone: vn_renderer_bo_unref drops it and
+    * calls this only then. Dropping it again here kept every bo, and the
+    * host pages behind it, until the process ended. */
    entangled_release((struct entangled *)renderer, bo->res_id);
    free(bo);
    return true;

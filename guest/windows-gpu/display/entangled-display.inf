@@ -1,0 +1,76 @@
+; entangled-display: the display function's driver for Windows guests, our
+; build of virtio-win's display-only driver viogpudo (BSD-3-Clause) with a
+; refresh rate and a vsync (ADR-0008, the vsync amendment). It binds the
+; virtio-vga function only; the render-only one is entangled-gpu's.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %Entangled%
+CatalogFile = entangled-display.cat
+DriverVer   = 11/10/2026,0.1.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%Entangled% = Entangled, NTamd64.10.0...16299
+
+; The same hardware id viogpudo names first. A Microsoft-signed viogpudo still
+; outranks a test-signed package, so the installer forces this one
+; (display-bind.ps1).
+[Entangled.NTamd64.10.0...16299]
+%DeviceDesc% = EntangledDisplay, PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+entangled-display.sys = 1
+
+[EntangledDisplay.NT]
+Include      = msdv.inf
+FeatureScore = F9
+CopyFiles    = EntangledDisplay.CopyFiles
+AddReg       = EntangledDisplay.Settings
+
+[EntangledDisplay.CopyFiles]
+entangled-display.sys
+
+; viogpudo's own settings, at its defaults. UsePresentProgress stays off: the
+; vsync is this driver's only DxgkCbNotifyInterrupt.
+[EntangledDisplay.Settings]
+HKR,, HWCursor,           0x00010001, 0
+HKR,, FlexResolution,     0x00010001, 1
+HKR,, UsePhysicalMemory,  0x00010001, 0
+HKR,, UsePresentProgress, 0x00010001, 0
+
+[EntangledDisplay.NT.HW]
+AddReg = EntangledDisplay.MsiReg
+
+[EntangledDisplay.MsiReg]
+HKR, "Interrupt Management",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 1
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, 0x00010001, 4
+HKR, "Interrupt Management\Affinity Policy",, 0x00000010
+HKR, "Interrupt Management\Affinity Policy", DevicePolicy, 0x00010001, 5
+HKR, "Interrupt Management\Affinity Policy", DevicePriority, 0x00010001, 3
+
+[EntangledDisplay.NT.Services]
+AddService = EntangledDisplay, 0x00000002, EntangledDisplay.Service
+
+[EntangledDisplay.Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 0
+ServiceBinary = %13%\entangled-display.sys
+
+[Strings]
+Entangled   = "Entangled Desktop"
+DeviceDesc  = "Entangled display (virtio-gpu, with vsync)"
+ServiceDesc = "Entangled display"
+DiskName    = "Entangled display driver"
