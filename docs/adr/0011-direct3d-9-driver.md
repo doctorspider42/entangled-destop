@@ -487,3 +487,15 @@ by hand; user clip planes ride on Nine's emulation, unverified. And outside
 this ADR: the Direct3D 10 driver stops at feature level 10_0 and refuses a
 flip-model swap chain (`E_INVALIDARG`; programs fall back to the copying
 one), so a Direct3D 11 game that needs 11_0 still wants DXVK (ADR-0009).
+
+**From a published package, on a fresh install (2026-11-13).** `gpu3d-7` is
+the first release with these drivers, and `guest/windows/pinned.toml` pins
+it. `entangled install windows --gpu3d auto` from Microsoft's Windows 10 ISO
+onto an empty disk, then `wddm-on.cmd` in the guest: the adapter is
+"Entangled GPU (virtio-gpu, WDDM)", `d3d9-test` passes in 64 and 32 bits on
+`entangled_d3d9.dll` and `entangled_d3d9_x86.dll`, `d3d11-test` in both at
+feature level 10_0, and the desktop comes back after a restart. The first
+such install failed at `wddm-on.cmd` ("error 2"): the first-logon script
+copied `entangled_d3d10.dll` by name and left its 32-bit twin on the disc,
+and the INF names it. It copies by pattern now, and a test holds every WDDM
+file to a pattern. Not done on the fresh guest: a game (no Steam there).

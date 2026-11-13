@@ -1489,6 +1489,29 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Every file the WDDM driver's INF names reaches the guest's driver
+    /// folder: the first-logon script copies by pattern, and a file no
+    /// pattern covers makes `wddm-on.cmd` fail with "file not found" (the
+    /// 32-bit Direct3D 10 driver did, in the first install from gpu3d-7).
+    #[test]
+    fn the_first_logon_script_copies_every_wddm_file() {
+        let patterns = [
+            "entangled-wddm.*",
+            "entangled_d3d10*.dll",
+            "entangled_d3d9*.dll",
+        ];
+        for pattern in patterns {
+            assert!(FIRST_LOGON.contains(&format!("\\{pattern}\"")), "{pattern}");
+        }
+        for name in WDDM_DRIVER_FILES.iter().chain(WDDM_D3D9_FILES) {
+            let covered = patterns.iter().any(|pattern| {
+                let (head, tail) = pattern.split_once('*').unwrap();
+                name.starts_with(head) && name.ends_with(tail.trim_start_matches('.'))
+            });
+            assert!(covered, "{name} is copied by no pattern");
+        }
+    }
+
     /// An answer disc built from two synthetic ISOs: the edition is read out
     /// of the WIM header, the drivers of the right version are copied.
     #[test]
