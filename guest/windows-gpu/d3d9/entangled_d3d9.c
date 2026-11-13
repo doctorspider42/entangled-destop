@@ -3079,6 +3079,54 @@ d3d9_now(void)
    return now.QuadPart * 1000000 / frequency.QuadPart;
 }
 
+/* The claim on the host's plane, which the desktop's driver inside DWM reads
+ * (d3d10_wddm_plane_claimed): a tick count and this process, in a section
+ * both map. Renewed at every present that goes to the plane. */
+static void
+d3d9_claim_plane(void)
+{
+   static volatile LONG *claim;
+   static BOOL looked;
+
+   if (!looked) {
+      SECURITY_DESCRIPTOR descriptor;
+      SECURITY_ATTRIBUTES attributes = {sizeof attributes, &descriptor, FALSE};
+      HANDLE section;
+
+      InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION);
+      SetSecurityDescriptorDacl(&descriptor, TRUE, NULL, FALSE);
+      section = CreateFileMappingA(INVALID_HANDLE_VALUE, &attributes, PAGE_READWRITE, 0, 16,
+                                   "Local\\EntangledPlaneClaim");
+      if (section)
+         claim = MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 16);
+      looked = TRUE;
+   }
+   if (claim) {
+      claim[1] = (LONG)GetCurrentProcessId();
+      claim[0] = (LONG)GetTickCount();
+   }
+}
+
+/* Whether a window of this process is in front and covers the whole screen
+ * with a client area of the given size: a game "full screen in a window",
+ * whose frames can go to the plane as an exclusive one's do. */
+static BOOL
+d3d9_covers_screen(UINT width, UINT height)
+{
+   HWND window = GetForegroundWindow();
+   POINT origin = {0, 0};
+   DWORD process = 0;
+   RECT client;
+
+   if (!window || !GetWindowThreadProcessId(window, &process) ||
+       process != GetCurrentProcessId() || !GetClientRect(window, &client) ||
+       !ClientToScreen(window, &origin))
+      return FALSE;
+   return origin.x == 0 && origin.y == 0 && (UINT)client.right == width &&
+          (UINT)client.bottom == height && (UINT)GetSystemMetrics(SM_CXSCREEN) == width &&
+          (UINT)GetSystemMetrics(SM_CYSCREEN) == height;
+}
+
 /* Where the frames' time went, since it was last said. */
 static struct {
    LONGLONG last, read, escape, present, frames;
@@ -3108,8 +3156,10 @@ d3d9_present1(HANDLE handle, const D3DDDIARG_PRESENT1 *arg)
       return S_OK;
    resource = arg->phSrcResources[0].hResource;
    d3d9_realize(device, resource);
-   if (resource && resource->chain && resource->nine) {
-      /* The whole screen: the frame onto the host's plane, copied on the GPU.
+   if (resource && resource->nine &&
+       (resource->chain || d3d9_covers_screen(resource->width, resource->height))) {
+      /* The whole screen, exclusively or as a window in front that covers it:
+       * the frame onto the host's plane, copied on the GPU.
        * The kernel driver is told (a lease of two seconds, renewed here) so
        * that it leaves the primary under the plane alone. Nothing is flipped:
        * what the screen shows is the plane. */
@@ -3119,6 +3169,7 @@ d3d9_present1(HANDLE handle, const D3DDDIARG_PRESENT1 *arg)
                               resource->height)) {
          DWORD now = GetTickCount();
 
+         d3d9_claim_plane();
          device->on_plane = TRUE;
          if (now - device->leased >= 500) {
             struct {
@@ -3157,6 +3208,11 @@ d3d9_present1(HANDLE handle, const D3DDDIARG_PRESENT1 *arg)
       }
       if (InterlockedIncrement(&said) <= 4)
          d3d9_log("present: the plane is not to be had; through the CPU");
+   } else if (device->on_plane && device->nine) {
+      /* No longer in front, or no longer the size of the screen: the plane
+       * back to the desktop, and this frame to DWM. */
+      entangled_nine_show(device->nine, NULL, 0, 0);
+      device->on_plane = FALSE;
    }
    if (!resource || !resource->nine || !resource->allocation || !resource->pixels) {
       if (InterlockedIncrement(&said) <= 4)
