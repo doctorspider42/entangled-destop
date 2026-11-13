@@ -531,3 +531,55 @@ destroys a shader that is still bound when it tears a device down, d3d10umd
 deleted it, and Zink reads the shader it is replacing at the next bind.
 llvmpipe, which d3d10umd was written for, does not. The front now remembers
 what the context has bound and unbinds a shader before deleting it (0002).
+
+### Where it stands, and what is left (2026-11-13)
+
+Work stopped here. The pin is `gpu3d-9`, on `main` and in release v0.2.152.
+
+**Checked on a fresh Windows 10 install from the published `gpu3d-9`.**
+`entangled install windows --gpu3d auto`, then `wddm-on.cmd`: the desktop is
+on the WDDM adapter, `d3d11-test` passes in 64 and 32 bits (feature level
+10_0, the copying swap chain), and `d3d9-test pure` passes its state blocks.
+
+**Broken: the Direct3D 9 driver dies when a device is destroyed.** Found on
+that install: `d3d9-test 30` draws its frames and then takes an access
+violation (0xc0000005 in `RtlWaitOnAddress`, access to 0x24) in 4 of 5
+64-bit runs and 1 of 5 32-bit ones; `d3d9-test pure` never. The thread is
+one of Mesa's queue workers, not the caller's: with a local build and its
+map the stack reads `util_queue_thread_func` -> `util_queue_finish_execute`
+-> `util_barrier_wait`/`util_barrier_destroy` -> `mtx_lock`, with
+`gfx_shader_init_job` (Zink's shader compile job) beside it. So a
+`util_queue_finish` at teardown: a worker is still inside the barrier, or
+takes its mutex, after it is gone. The mutex-and-condvar barrier (Windows
+has no pthread one) already waits for `inside` to reach zero before it is
+destroyed, and that is not enough. Not seen on the long-lived test guest,
+whose shader cache is warm; a fresh guest's is empty, so compile jobs are
+still in flight when the device goes - a guess that fits, not a finding.
+Next: read `util_queue_finish` against the barrier (who destroys it - the
+serial waiter, while the caller's stack frame that holds it may already be
+gone), fix it in the Mesa patch, and loop `loop9.cmd`-style on a fresh
+guest until 50 runs pass in both sizes.
+
+**Not done.**
+
+- Direct3D 10/11: the driver stops at feature level 10_0 and has no
+  flip-model swap chain. A Direct3D 11 game that needs 11_0 runs on DXVK.
+- A present to a window smaller than the screen waits for DWM (~27 ms a
+  frame); only the whole screen goes to the host's plane.
+- The WDDM desktop is opt-in in the guest (`wddm-on.cmd`), not what an
+  install ends with.
+- Direct3D 9 placeholders: patches, video, overlay and content protection,
+  a stretched copy with system memory, `UpdateWInfo`.
+
+**Not verified.**
+
+- No game on a fresh guest, and Portal 2 not at all on `gpu3d-9`'s binaries
+  (it needs Steam and its owner's login in the guest).
+- Sleep and resume with the WDDM driver loaded.
+- A soak on a quiet host: the half hour of Portal 2 fell from 43 to 30
+  frames a second, put down to the host's GPU load and not proven to be
+  that rather than a leak.
+- The UAC prompt's crash: three elevated starts without it after the fix;
+  it was intermittent before.
+- A state block that rebinds a stream the front draws from the program's
+  memory.
