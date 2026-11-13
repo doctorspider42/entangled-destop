@@ -101,9 +101,9 @@ impl Planes {
             // Read mode 1: a bit is set where every plane that matters has
             // the compare colour's bit.
             let mut same = 0xffu8;
-            for plane in 0..4 {
+            for (plane, latch) in self.latch.iter().enumerate() {
                 if controls.colour_dont_care >> plane & 1 != 0 {
-                    same &= !(self.latch[plane] ^ spread(controls.colour_compare, plane));
+                    same &= !(latch ^ spread(controls.colour_compare, plane));
                 }
             }
             return same;
