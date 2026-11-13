@@ -1397,6 +1397,12 @@ struct d3d9_adapter {
 
 struct d3d9_resource;
 
+/* A state block of a pure device: Nine's, behind a handle that exists from
+ * BEGIN on, before Nine has the block. */
+struct d3d9_state_set {
+   void *block;
+};
+
 struct d3d9_device {
    HANDLE runtime;
    struct d3d9_adapter *adapter;
@@ -1406,6 +1412,8 @@ struct d3d9_device {
    /* Nine on a Gallium screen (d3d9_nine.c), or NULL where there is none:
     * the device then only answers, as in phase N0. */
    struct entangled_nine *nine;
+   /* The state block being recorded (StateSet's BEGIN to its END). */
+   struct d3d9_state_set *recording;
 
    /* Stream 0 and the indices, when the runtime hands them over as memory of
     * the program's (SetStreamSourceUm, SetIndicesUm) and not as buffers. */
@@ -3046,6 +3054,155 @@ d3d9_draw_indexed_primitive2(HANDLE handle, const D3DDDIARG_DRAWINDEXEDPRIMITIVE
 
 /* -------------------------------------------------------------- queries */
 
+/* ----------------------------------------------- answers, and state blocks */
+
+/* The fixed-function stages Nine is given are the ones it draws: one pass. */
+static HRESULT APIENTRY
+d3d9_validate_device(HANDLE handle, D3DDDIARG_VALIDATETEXTURESTAGESTATE *arg)
+{
+   D3D9_HERE();
+   (void)handle;
+   arg->NumPasses = 1;
+   return S_OK;
+}
+
+/* A pure device's state blocks (the runtime keeps an ordinary device's state
+ * itself and never calls this). The operations are d3dhal.h's
+ * D3DHAL_STATESET*: 0 begin, 1 end, 2 delete, 3 execute, 4 capture, 5 create. */
+static HRESULT APIENTRY
+d3d9_state_set(HANDLE handle, D3DDDIARG_STATESET *arg)
+{
+   D3D9_HERE();
+   struct d3d9_device *device = handle;
+   struct d3d9_state_set *set = arg->hStateSet;
+   long result = S_OK;
+
+   if (!device->nine)
+      return S_OK;
+   switch (arg->Operation) {
+   case 0:
+   case 5:
+      arg->hStateSet = NULL;
+      set = calloc(1, sizeof *set);
+      if (!set)
+         return E_OUTOFMEMORY;
+      if (arg->Operation == 5)
+         set->block = entangled_nine_state_block_create(device->nine,
+                                                        (unsigned)arg->StateBlockType, &result);
+      else
+         result = entangled_nine_state_block_begin(device->nine);
+      if (FAILED(result)) {
+         free(set);
+         break;
+      }
+      if (arg->Operation == 0)
+         device->recording = set;
+      arg->hStateSet = set;
+      break;
+   case 1:
+      set = device->recording;
+      device->recording = NULL;
+      if (!set)
+         return E_INVALIDARG;
+      set->block = entangled_nine_state_block_end(device->nine, &result);
+      break;
+   case 2:
+      if (!set)
+         break;
+      if (set == device->recording) {
+         /* Deleted while recording: the recording ends with it. */
+         device->recording = NULL;
+         set->block = entangled_nine_state_block_end(device->nine, &result);
+         result = S_OK;
+      }
+      if (set->block)
+         entangled_nine_release(set->block);
+      free(set);
+      break;
+   case 3:
+      if (set && set->block)
+         result = entangled_nine_state_block_apply(set->block);
+      break;
+   case 4:
+      if (set && set->block)
+         result = entangled_nine_state_block_capture(set->block);
+      break;
+   default:
+      return E_INVALIDARG;
+   }
+   D3D9_FRAME("state set: operation %u, type %u, %p", arg->Operation,
+              (unsigned)arg->StateBlockType, (void *)set);
+   D3D9_CHECK("state set", result);
+}
+
+/* Nothing is ever given up, so nothing was discarded. */
+static HRESULT APIENTRY
+d3d9_reclaim_resources(HANDLE handle, const D3DDDIARG_RECLAIMRESOURCES *arg)
+{
+   D3D9_HERE();
+   UINT i;
+
+   (void)handle;
+   if (arg->pDiscarded)
+      for (i = 0; i < arg->Resources; i++)
+         arg->pDiscarded[i] = FALSE;
+   return S_OK;
+}
+
+/* Presents go the driver's own ways (ADR-0011): no direct flip, no planes of
+ * the runtime's. */
+static HRESULT APIENTRY
+d3d9_check_direct_flip(HANDLE handle, D3DDDIARG_CHECKDIRECTFLIPSUPPORT *arg)
+{
+   D3D9_HERE();
+   (void)handle;
+   arg->Supported = FALSE;
+   return S_OK;
+}
+
+static HRESULT APIENTRY
+d3d9_check_multiplane_overlay(HANDLE handle, D3DDDIARG_CHECKMULTIPLANEOVERLAYSUPPORT *arg)
+{
+   D3D9_HERE();
+   (void)handle;
+   arg->Supported = FALSE;
+   return S_OK;
+}
+
+/* No counters of the driver's own. */
+static VOID APIENTRY
+d3d9_check_counter_info(HANDLE handle, D3DDDIARG_COUNTER_INFO *info)
+{
+   (void)handle;
+   memset(info, 0, sizeof *info);
+}
+
+/* Statistics the driver does not keep: zeros, not what was in the buffer. */
+static HRESULT APIENTRY
+d3d9_get_info(HANDLE handle, UINT id, VOID *data, UINT size)
+{
+   D3D9_HERE();
+   (void)handle;
+   (void)id;
+   if (data && size)
+      memset(data, 0, size);
+   return S_OK;
+}
+
+/* Another device's work on a shared resource is seen once this one's is
+ * with the host. */
+static HRESULT APIENTRY
+d3d9_resolve_shared_resource(HANDLE handle, const D3DDDIARG_RESOLVESHAREDRESOURCE *arg)
+{
+   D3D9_HERE();
+   struct d3d9_device *device = handle;
+
+   (void)arg;
+   if (device->nine)
+      entangled_nine_flush(device->nine);
+   return S_OK;
+}
+
 static HRESULT APIENTRY
 d3d9_create_query(HANDLE handle, D3DDDIARG_CREATEQUERY *arg)
 {
@@ -3410,6 +3567,14 @@ d3d9_create_device(HANDLE adapter, D3DDDIARG_CREATEDEVICE *arg)
    funcs->pfnDestroyQuery = d3d9_delete_object;
    funcs->pfnIssueQuery = d3d9_issue_query;
    funcs->pfnGetQueryData = d3d9_get_query_data;
+   funcs->pfnValidateDevice = d3d9_validate_device;
+   funcs->pfnStateSet = d3d9_state_set;
+   funcs->pfnReclaimResources = d3d9_reclaim_resources;
+   funcs->pfnCheckDirectFlipSupport = d3d9_check_direct_flip;
+   funcs->pfnCheckMultiPlaneOverlaySupport = d3d9_check_multiplane_overlay;
+   funcs->pfnCheckCounterInfo = d3d9_check_counter_info;
+   funcs->pfnGetInfo = d3d9_get_info;
+   funcs->pfnResolveSharedResource = d3d9_resolve_shared_resource;
    funcs->pfnFlush1 = d3d9_flush1;
    funcs->pfnPresent1 = d3d9_present1;
    /* A driver of this interface version has the newer form of six functions

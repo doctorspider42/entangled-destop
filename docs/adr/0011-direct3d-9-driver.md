@@ -510,3 +510,24 @@ repeating on a quiet host. Seen once in that session and not again:
 `consent.exe` (the UAC prompt) took an access violation inside
 `entangled_d3d10.dll` (+0xe6b44, under `d3d11.dll`); the prompt still came
 up and elevated.
+
+**Placeholders that had an answer to give (2026-11-13).** A pure device's
+state blocks are Nine's own (`pfnStateSet`: created, recorded, applied,
+captured, deleted; `d3d9-test pure` checks them by what a clear reaches
+under a scissor test the blocks turn on and off, and passes in 64 and 32
+bits). `ValidateDevice` says one pass, `ReclaimResources` that nothing was
+discarded, `CheckDirectFlipSupport` and `CheckMultiPlaneOverlaySupport` no,
+`CheckCounterInfo` and `GetInfo` zeros and not what was in the caller's
+buffer, `ResolveSharedResource` flushes. Still placeholders: `DepthFill`
+(DirectDraw's; no Direct3D 9 call reaches it), patches, the video, overlay
+and content-protection entries the caps do not offer, and a stretched copy
+with system memory. A state block applied by Nine does not tell the front
+what it bound: a stream the front draws from the program's memory and a
+block that rebinds it have not been tried together.
+
+**The UAC prompt's crash was the Direct3D 10 driver's.** The frames were
+`DestroyDevice` -> `zink_bind_fs_state` -> `bind_gfx_stage`: the runtime
+destroys a shader that is still bound when it tears a device down, d3d10umd
+deleted it, and Zink reads the shader it is replacing at the next bind.
+llvmpipe, which d3d10umd was written for, does not. The front now remembers
+what the context has bound and unbinds a shader before deleting it (0002).

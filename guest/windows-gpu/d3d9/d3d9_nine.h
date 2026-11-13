@@ -285,4 +285,25 @@ entangled_nine_query_data(void *query, void *data, unsigned size, int flush);
 unsigned
 entangled_nine_query_size(void *query);
 
+/* ---- state blocks ------------------------------------------------------- */
+
+/* The runtime keeps the state of an ordinary device itself and plays a state
+ * block back as so many Set calls. Of a pure device it keeps none, and the
+ * blocks are the driver's: Nine's own. `type` is a D3DSTATEBLOCKTYPE. */
+void *
+entangled_nine_state_block_create(struct entangled_nine *nine, unsigned type, long *result);
+
+/* Between the two, Set calls are recorded and not applied. */
+long
+entangled_nine_state_block_begin(struct entangled_nine *nine);
+
+void *
+entangled_nine_state_block_end(struct entangled_nine *nine, long *result);
+
+long
+entangled_nine_state_block_capture(void *block);
+
+long
+entangled_nine_state_block_apply(void *block);
+
 #endif

@@ -688,7 +688,7 @@ index 63104c0..3847cb3 100644
  
     --numAdapters;
 diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
-index 80e8a4e..dfb2243 100644
+index 80e8a4eb..89c4f7e9 100644
 --- a/src/gallium/frontends/d3d10umd/Device.cpp
 +++ b/src/gallium/frontends/d3d10umd/Device.cpp
 @@ -47,7 +47,10 @@
@@ -735,7 +735,14 @@ index 80e8a4e..dfb2243 100644
     pDevice->pipe = pipe;
     pDevice->cso = cso_create_context(pipe, CSO_NO_VBUF);
  
-@@ -144,12 +163,6 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+@@ -140,16 +159,13 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+ 
+    pipe->bind_vs_state(pipe, pDevice->empty_vs);
+    pipe->bind_fs_state(pipe, pDevice->empty_fs);
++   pDevice->bound_vs_state = pDevice->empty_vs;
++   pDevice->bound_fs_state = pDevice->empty_fs;
++   pDevice->bound_gs_state = NULL;
+ 
     pDevice->max_dual_source_render_targets =
           screen->caps.max_dual_source_render_targets;
  
@@ -748,7 +755,7 @@ index 80e8a4e..dfb2243 100644
     pDevice->draw_so_target = NULL;
  
     if (0) {
-@@ -157,6 +170,13 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+@@ -157,6 +173,13 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
     }
  
     st_debug_parse();
@@ -762,7 +769,7 @@ index 80e8a4e..dfb2243 100644
  
     /*
      * Fill in the D3D10 DDI functions
-@@ -294,14 +314,7 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
+@@ -294,14 +317,7 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
     pCreateData->DXGIBaseDDI.pDXGIDDIBaseFunctions->pfnBlt =
        _Blt;
  
@@ -778,7 +785,7 @@ index 80e8a4e..dfb2243 100644
  }
  
  
-@@ -362,9 +375,10 @@ DestroyDevice(D3D10DDI_HDEVICE hDevice)   // IN
+@@ -362,9 +378,10 @@ DestroyDevice(D3D10DDI_HDEVICE hDevice)   // IN
                             PIPE_MAX_SHADER_SAMPLER_VIEWS, 0, sampler_views);
  
     pipe->destroy(pipe);
@@ -791,6 +798,28 @@ index 80e8a4e..dfb2243 100644
  /*
   * ----------------------------------------------------------------------
   *
+diff --git a/src/gallium/frontends/d3d10umd/Draw.cpp b/src/gallium/frontends/d3d10umd/Draw.cpp
+index 3bf231ea..671b8154 100644
+--- a/src/gallium/frontends/d3d10umd/Draw.cpp
++++ b/src/gallium/frontends/d3d10umd/Draw.cpp
+@@ -95,12 +95,17 @@ ResolveState(Device *pDevice)
+             }
+          }
+          if (remapped) {
++            if (pDevice->bound_gs_state == gs->handle) {
++               pipe->bind_gs_state(pipe, NULL);
++               pDevice->bound_gs_state = NULL;
++            }
+             pipe->delete_gs_state(pipe, gs->handle);
+             gs->handle = pipe->create_gs_state(pipe, &gs->state);
+          }
+          gs->output_resolved = true;
+       }
+       pipe->bind_gs_state(pipe, gs->handle);
++      pDevice->bound_gs_state = gs->handle;
+    }
+    update_velems(pDevice);
+ 
 diff --git a/src/gallium/frontends/d3d10umd/DxgiFns.cpp b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
 index ea61523..5720c88 100644
 --- a/src/gallium/frontends/d3d10umd/DxgiFns.cpp
@@ -1340,7 +1369,7 @@ index 65729f1..8785392 100644
  
  
 diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
-index df6ffa1..984a1cd 100644
+index df6ffa19..2f3ece84 100644
 --- a/src/gallium/frontends/d3d10umd/Shader.cpp
 +++ b/src/gallium/frontends/d3d10umd/Shader.cpp
 @@ -45,6 +45,26 @@
@@ -1388,7 +1417,70 @@ index df6ffa1..984a1cd 100644
        if (Offset + i < PIPE_MAX_SHADER_SAMPLER_VIEWS) {
           sampler_views[Offset + i] = sampler_view;
        } else {
-@@ -1198,6 +1218,8 @@ CreateShaderResourceView(
+@@ -295,17 +315,38 @@ DestroyShader(D3D10DDI_HDEVICE hDevice,   // IN
+    LOG_ENTRYPOINT();
+ 
+    struct pipe_context *pipe = CastPipeContext(hDevice);
++   Device *pDevice = CastDevice(hDevice);
+    Shader *pShader = CastShader(hShader);
+ 
++   /* The runtime destroys a shader that is still bound. */
++   if (pDevice->bound_vs == pShader) {
++      pDevice->bound_vs = NULL;
++   }
++   if (pDevice->bound_empty_gs == pShader) {
++      pDevice->bound_empty_gs = NULL;
++   }
++
+    if (pShader->handle) {
+       switch (pShader->type) {
+       case MESA_SHADER_FRAGMENT:
++         if (pDevice->bound_fs_state == pShader->handle) {
++            pipe->bind_fs_state(pipe, pDevice->empty_fs);
++            pDevice->bound_fs_state = pDevice->empty_fs;
++         }
+          pipe->delete_fs_state(pipe, pShader->handle);
+          break;
+       case MESA_SHADER_VERTEX:
++         if (pDevice->bound_vs_state == pShader->handle) {
++            pipe->bind_vs_state(pipe, pDevice->empty_vs);
++            pDevice->bound_vs_state = pDevice->empty_vs;
++         }
+          pipe->delete_vs_state(pipe, pShader->handle);
+          break;
+       case MESA_SHADER_GEOMETRY:
++         if (pDevice->bound_gs_state == pShader->handle) {
++            pipe->bind_gs_state(pipe, NULL);
++            pDevice->bound_gs_state = NULL;
++         }
+          pipe->delete_gs_state(pipe, pShader->handle);
+          break;
+       default:
+@@ -582,6 +623,7 @@ VsSetShader(D3D10DDI_HDEVICE hDevice,  // IN
+    }
+ 
+    pipe->bind_vs_state(pipe, state);
++   pDevice->bound_vs_state = state;
+ }
+ 
+ 
+@@ -718,6 +760,7 @@ GsSetShader(D3D10DDI_HDEVICE hDevice,  // IN
+    } else {
+       pDevice->bound_empty_gs = NULL;
+       pipe->bind_gs_state(pipe, state);
++      pDevice->bound_gs_state = state;
+    }
+ }
+ 
+@@ -1033,6 +1076,7 @@ PsSetShader(D3D10DDI_HDEVICE hDevice,  // IN
+    }
+ 
+    pipe->bind_fs_state(pipe, state);
++   pDevice->bound_fs_state = state;
+ }
+ 
+ 
+@@ -1198,6 +1242,8 @@ CreateShaderResourceView(
     ShaderResourceView *pSRView = CastShaderResourceView(hShaderResourceView);
     struct pipe_resource *resource;
     enum pipe_format format;
@@ -1397,7 +1489,7 @@ index df6ffa1..984a1cd 100644
  
     struct pipe_sampler_view desc;
     memset(&desc, 0, sizeof desc);
-@@ -1279,6 +1301,8 @@ CreateShaderResourceView1(
+@@ -1279,6 +1325,8 @@ CreateShaderResourceView1(
     struct pipe_resource *resource;
     enum pipe_format format;
  
@@ -1406,7 +1498,7 @@ index df6ffa1..984a1cd 100644
     struct pipe_sampler_view desc;
     memset(&desc, 0, sizeof desc);
     resource = CastPipeResource(pCreateSRView->hDrvResource);
-@@ -1388,7 +1412,7 @@ GenMips(D3D10DDI_HDEVICE hDevice,                           // IN
+@@ -1388,7 +1436,7 @@ GenMips(D3D10DDI_HDEVICE hDevice,                           // IN
     }
  
     struct pipe_context *pipe = pDevice->pipe;
@@ -1612,7 +1704,7 @@ index 653cb96..5422b36 100644
        }
  
 diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
-index 7c7f2c2..fb8ba96 100644
+index 7c7f2c29..e040ac23 100644
 --- a/src/gallium/frontends/d3d10umd/State.h
 +++ b/src/gallium/frontends/d3d10umd/State.h
 @@ -32,8 +32,13 @@
@@ -1652,8 +1744,16 @@ index 7c7f2c2..fb8ba96 100644
     struct pipe_framebuffer_state fb;
     struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
     unsigned vertex_strides[PIPE_MAX_ATTRIBS];
-@@ -90,15 +101,9 @@ struct Device
+@@ -88,17 +99,17 @@ struct Device
+    struct pipe_stream_output_target *draw_so_target;
+    Shader *bound_empty_gs;
     Shader *bound_vs;
++   /* What the context has bound, so that a shader destroyed while bound
++    * (the runtime does that when it tears a device down) is unbound first:
++    * Zink reads the shader it is replacing at the next bind. */
++   void *bound_vs_state;
++   void *bound_gs_state;
++   void *bound_fs_state;
  
     unsigned max_dual_source_render_targets;
 -
@@ -1669,7 +1769,7 @@ index 7c7f2c2..fb8ba96 100644
  
     INT LastEmittedQuerySeqNo;
     INT LastFinishedQuerySeqNo;
-@@ -109,6 +114,8 @@ struct Device
+@@ -109,6 +120,8 @@ struct Device
     ElementLayout *element_layout;
     BOOL velems_changed;
     BOOL vbuffers_changed;
@@ -1678,7 +1778,7 @@ index 7c7f2c2..fb8ba96 100644
  };
  
  
-@@ -208,6 +215,7 @@ CastPipeBuffer(D3D10DDI_HRESOURCE hResource)
+@@ -208,6 +221,7 @@ CastPipeBuffer(D3D10DDI_HRESOURCE hResource)
  struct RenderTargetView
  {
     struct pipe_surface surface;
@@ -1686,7 +1786,7 @@ index 7c7f2c2..fb8ba96 100644
     D3D10DDI_HRTRENDERTARGETVIEW hRTRenderTargetView;
  };
  
-@@ -363,6 +371,7 @@ CastPipeSamplerState(D3D10DDI_HSAMPLER hSampler)
+@@ -363,6 +377,7 @@ CastPipeSamplerState(D3D10DDI_HSAMPLER hSampler)
  struct ShaderResourceView
  {
     struct pipe_sampler_view *handle;
