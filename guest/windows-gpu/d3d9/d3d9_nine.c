@@ -45,6 +45,11 @@ struct entangled_nine {
    struct NineDevice9 *device;
    /* The viewport, which the DDI sets in two halves. */
    D3DVIEWPORT9 viewport;
+   /* A full-screen frame on its way to the host's plane: a buffer whose
+    * memory the host can see, and the Vulkan device it is of. */
+   struct pipe_resource *frame;
+   unsigned frame_size;
+   void *overlay_device;
 };
 
 /* Nine calls this last, when its adapter goes: the screen is the context's. */
@@ -225,6 +230,91 @@ entangled_nine_read_surface(struct entangled_nine *nine, void *surface, void *pi
              (char *)locked.pBits + (size_t)y * locked.Pitch, (size_t)width * 4);
    NineSurface9_UnlockRect(nine_surface);
    return S_OK;
+}
+
+typedef bool (*entangled_overlay_entry)(void *device, uint64_t memory, uint32_t width,
+                                       uint32_t height, uint32_t stride, int32_t x, int32_t y);
+
+/* The Venus driver's entry for the plane: the driver Zink loaded, 64-bit or
+ * 32-bit, is the one in this process. */
+static entangled_overlay_entry
+entangled_nine_overlay_entry(void)
+{
+   static entangled_overlay_entry entry;
+   static bool looked;
+
+   if (!looked) {
+      HMODULE icd = GetModuleHandleA("vulkan_virtio.dll");
+
+      if (icd)
+         entry = (entangled_overlay_entry)(void *)GetProcAddress(icd, "entangled_present_overlay");
+      looked = true;
+   }
+   return entry;
+}
+
+int
+entangled_nine_show(struct entangled_nine *nine, void *surface, unsigned width, unsigned height)
+{
+   entangled_overlay_entry entry = entangled_nine_overlay_entry();
+   struct pipe_context *pipe;
+   struct pipe_screen *screen;
+   struct pipe_fence_handle *fence = NULL;
+   struct pipe_resource *texture;
+   void *device = NULL;
+   uint64_t memory = 0;
+
+   if (!entry || !nine->device)
+      return 0;
+   if (!surface) {
+      /* The plane back to whoever had it. */
+      if (nine->overlay_device)
+         entry(nine->overlay_device, 0, 0, 0, 0, 0, 0);
+      nine->overlay_device = NULL;
+      return 1;
+   }
+   pipe = NineDevice9_GetPipe(nine->device);
+   screen = pipe->screen;
+   texture = NineSurface9(surface)->base.resource;
+   if (!texture || texture->nr_samples > 1 || texture->width0 != width ||
+       texture->height0 != height)
+      return 0;
+   if (!nine->frame || nine->frame_size != width * height * 4) {
+      struct pipe_resource templat;
+      struct pipe_transfer *transfer = NULL;
+      struct pipe_box box;
+
+      pipe_resource_reference(&nine->frame, NULL);
+      memset(&templat, 0, sizeof templat);
+      templat.target = PIPE_BUFFER;
+      templat.format = PIPE_FORMAT_R8_UNORM;
+      templat.width0 = width * height * 4;
+      templat.height0 = 1;
+      templat.depth0 = 1;
+      templat.array_size = 1;
+      templat.usage = PIPE_USAGE_STAGING;
+      nine->frame = screen->resource_create(screen, &templat);
+      nine->frame_size = nine->frame ? templat.width0 : 0;
+      if (!nine->frame)
+         return 0;
+      /* Mapped once: that is when the Venus driver makes the memory a
+       * resource the host can be pointed at. */
+      u_box_1d(0, templat.width0, &box);
+      if (pipe->buffer_map(pipe, nine->frame, 0, PIPE_MAP_READ, &box, &transfer))
+         pipe->buffer_unmap(pipe, transfer);
+   }
+   if (!zink_entangled_frame(pipe, nine->frame, texture, &device, &memory))
+      return 0;
+   /* The host reads the buffer when it is told to: the copy must have run. */
+   pipe->flush(pipe, &fence, 0);
+   if (fence) {
+      screen->fence_finish(screen, NULL, fence, OS_TIMEOUT_INFINITE);
+      screen->fence_reference(screen, &fence, NULL);
+   }
+   if (!entry(device, memory, width, height, width * 4, 0, 0))
+      return 0;
+   nine->overlay_device = device;
+   return 1;
 }
 
 void

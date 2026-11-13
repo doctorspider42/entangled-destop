@@ -74,6 +74,14 @@ entangled_nine_read_surface(struct entangled_nine *nine, void *surface, void *pi
 void
 entangled_nine_flush(struct entangled_nine *nine);
 
+/* Shows a render target on the host's overlay plane, at the screen's origin:
+ * the frame is copied on the GPU into memory the host can see, and the Venus
+ * driver has the host show that memory over the whole screen (ADR-0010's
+ * plane, which DWM's driver uses for the desktop). Nothing goes through this
+ * CPU. `surface` NULL takes the plane away again. 1 if the host shows it. */
+int entangled_nine_show(struct entangled_nine *nine, void *surface, unsigned width,
+                        unsigned height);
+
 /* ---- resources ---------------------------------------------------------
  *
  * A resource of the DDI's is one of these; the front keeps the kind beside

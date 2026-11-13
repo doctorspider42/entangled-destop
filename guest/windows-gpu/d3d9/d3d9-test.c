@@ -306,6 +306,75 @@ scene_draw(IDirect3DDevice9 *device, struct scene *scene, int frame, int say)
    return hr;
 }
 
+/* "d3d9-test modes": the display modes the kernel gives the runtime for the
+ * screen, as the runtime sees them (D3DKMTGetDisplayModeList). A full-screen
+ * device needs one that matches its back buffer exactly, or the runtime gives
+ * up on a front buffer and dies at its first present. */
+struct kmt_open_from_hdc {
+   HDC dc;
+   UINT adapter;
+   LUID luid;
+   UINT source;
+};
+struct kmt_mode {
+   UINT width, height, format, integer_refresh, refresh_numerator, refresh_denominator;
+   UINT scanline, orientation, fixed_output, flags;
+   UINT pad;
+};
+struct kmt_mode_list {
+   UINT adapter;
+   UINT source;
+   struct kmt_mode *modes;
+   UINT count;
+};
+__declspec(dllimport) LONG APIENTRY D3DKMTOpenAdapterFromHdc(struct kmt_open_from_hdc *);
+__declspec(dllimport) LONG APIENTRY D3DKMTGetDisplayModeList(struct kmt_mode_list *);
+
+static void
+print_modes(void)
+{
+   struct kmt_open_from_hdc open;
+   struct kmt_mode_list list;
+   LONG status;
+
+   {
+      /* What GDI says the screen is in now: the runtime takes the scan line
+       * ordering and the rotation of a full-screen device from here. */
+      DEVMODEA mode;
+
+      memset(&mode, 0, sizeof mode);
+      mode.dmSize = sizeof mode;
+      if (EnumDisplaySettingsExA(NULL, ENUM_CURRENT_SETTINGS, &mode, 0))
+         printf("gdi: %lux%lu, %lu bits, %lu Hz, fields 0x%lx, display flags 0x%lx, orientation %lu\n",
+                mode.dmPelsWidth, mode.dmPelsHeight, mode.dmBitsPerPel, mode.dmDisplayFrequency,
+                mode.dmFields, mode.dmDisplayFlags, mode.dmDisplayOrientation);
+   }
+   memset(&open, 0, sizeof open);
+   open.dc = GetDC(NULL);
+   status = D3DKMTOpenAdapterFromHdc(&open);
+   printf("adapter: 0x%08lx, source %u\n", (unsigned long)status, open.source);
+   memset(&list, 0, sizeof list);
+   list.adapter = open.adapter;
+   list.source = open.source;
+   status = D3DKMTGetDisplayModeList(&list);
+   printf("mode count: 0x%08lx, %u (an entry is %u bytes here)\n", (unsigned long)status,
+          list.count, (unsigned)sizeof(struct kmt_mode));
+   if (!list.count)
+      return;
+   list.modes = calloc(list.count, sizeof *list.modes);
+   status = D3DKMTGetDisplayModeList(&list);
+   printf("modes: 0x%08lx\n", (unsigned long)status);
+   for (UINT i = 0; i < list.count; i++) {
+      const struct kmt_mode *m = &list.modes[i];
+
+      if (m->width != 1920 && i > 6)
+         continue;
+      printf("  %ux%u format %u, %u Hz (%u/%u), scanline %u, orientation %u, fixed %u, flags 0x%x\n",
+             m->width, m->height, m->format, m->integer_refresh, m->refresh_numerator,
+             m->refresh_denominator, m->scanline, m->orientation, m->fixed_output, m->flags);
+   }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -320,6 +389,10 @@ main(int argc, char **argv)
    HWND window;
 
    printf("d3d9-test, %u-bit\n", (unsigned)(8 * sizeof(void *)));
+   if (argc > 1 && strcmp(argv[1], "modes") == 0) {
+      print_modes();
+      return 0;
+   }
    d3d = Direct3DCreate9(D3D_SDK_VERSION);
    if (!d3d) {
       printf("Direct3DCreate9: nothing\n");
@@ -393,6 +466,12 @@ main(int argc, char **argv)
       IDirect3D9_Release(d3d);
       return 1;
    }
+   /* Whether the runtime thinks it has the screen: a full-screen device that
+    * is "lost" from the start was never given its front buffer. */
+   printf("cooperative level: 0x%08lx, foreground %p, window %p\n",
+          (unsigned long)IDirect3DDevice9_TestCooperativeLevel(device),
+          (void *)GetForegroundWindow(), (void *)window);
+   fflush(stdout);
    memset(&scene, 0, sizeof scene);
    scene.made = scene_make(device, &scene);
    for (int frame = 0; frame < frames; frame++) {

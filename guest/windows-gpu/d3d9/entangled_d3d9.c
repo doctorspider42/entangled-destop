@@ -182,6 +182,166 @@ d3d9_print_rings(void)
    }
 }
 
+/* -------------------------------------------------- the runtime's errors */
+
+#if !defined(_WIN64)
+/* What d3d9.dll last said to itself. Its retail build keeps the sentences its
+ * debug build would print in a table of its own, newest first; where the
+ * table is, is known for the builds this was read from, and anything that
+ * does not look like the table is left alone. */
+static void
+d3d9_print_runtime_errors(void)
+{
+   const BYTE *base = (const BYTE *)GetModuleHandleA("d3d9.dll");
+   BYTE table[8 * 0x80];
+   SIZE_T got = 0;
+
+   if (!base ||
+       !ReadProcessMemory(GetCurrentProcess(), base + 0x177360, table, sizeof table, &got) ||
+       got != sizeof table)
+      return;
+   for (unsigned i = 0; i < 8; i++) {
+      const BYTE *entry = table + i * 0x80;
+      UINT code, line;
+      char text[0x59], file[0x1d];
+      BOOL plain = TRUE;
+
+      memcpy(&code, entry, 4);
+      memcpy(&line, entry + 0x60, 4);
+      memcpy(text, entry + 4, 0x58);
+      text[0x58] = 0;
+      memcpy(file, entry + 0x64, 0x1c);
+      file[0x1c] = 0;
+      if (!text[0])
+         break;
+      for (const char *c = text; *c; c++) {
+         if ((unsigned char)*c < 0x20 || (unsigned char)*c > 0x7e)
+            plain = FALSE;
+      }
+      if (!plain)
+         break;
+      d3d9_log("  runtime: 0x%08x \"%s\" (%s:%u)", code, text, file, line);
+   }
+}
+#endif
+
+/* ---------------------------------------------------------------- traps */
+
+#if !defined(_WIN64)
+struct d3d9_trap {
+   const char *name;
+   UINT rva;           /* where the build this was read from has it */
+   UINT length;
+   BYTE bytes[12];
+   BYTE *at;           /* where this process has it, once armed */
+   BYTE saved;
+};
+
+static struct d3d9_trap d3d9_traps[] = {
+   {"swap chain: dummy or driver primary?", 0xd19e0, 8, {0x39, 0xbb, 0x48, 0x01, 0x00, 0x00, 0x0f, 0x84}},
+   {"swap chain: dummy primary", 0xd1a15, 12, {0x8d, 0x85, 0x88, 0xfa, 0xff, 0xff, 0xc7, 0x85, 0x90, 0xfa, 0xff, 0xff}},
+   {"swap chain: driver primary", 0xd1beb, 7, {0x8b, 0x8d, 0xfc, 0xfa, 0xff, 0xff, 0xe8}},
+   {"swap chain: fallback to one surface", 0xd1e82, 12, {0x89, 0x8d, 0x90, 0xfa, 0xff, 0xff, 0x8d, 0x8d, 0x88, 0xfa, 0xff, 0xff}},
+   {"swap chain: after the fallback (eax)", 0xd1ea5, 12, {0x8b, 0xf0, 0x89, 0xb5, 0x04, 0xfb, 0xff, 0xff, 0x89, 0xb5, 0x00, 0xfb}},
+   {"swap chain: creates the chain", 0xd1d64, 12, {0x57, 0xff, 0xb5, 0xfc, 0xfa, 0xff, 0xff, 0x8d, 0x85, 0xac, 0xfa, 0xff}},
+   {"swap chain: back buffers", 0xd2298, 8, {0x39, 0xbb, 0x40, 0x03, 0x00, 0x00, 0x0f, 0x84}},
+   {"CreateSurfaceLH: before the driver", 0x5d298, 12, {0xf6, 0x87, 0x84, 0x00, 0x00, 0x00, 0x02, 0x8b, 0x8d, 0x84, 0xfb, 0xff}},
+   {"CreateSurfaceLH: calls the driver", 0x5d2f1, 12, {0xff, 0xd6, 0x8b, 0xf0, 0x89, 0x85, 0x8c, 0xfb, 0xff, 0xff, 0x85, 0xf6}},
+   {"CreateSurfaceLH: a primary, matching a mode", 0x5d632, 10, {0xc7, 0x85, 0x24, 0xfb, 0xff, 0xff, 0x03, 0x00, 0x00, 0x00}},
+   {"CreateSurfaceLH: no mode matches", 0x9d0db, 10, {0x81, 0xa5, 0x60, 0xfb, 0xff, 0xff, 0xff, 0x7f, 0xff, 0xf7}},
+};
+
+static UINT
+d3d9_peek(ULONG_PTR address)
+{
+   UINT value = 0xdeadc0de;
+   SIZE_T got = 0;
+
+   if (address < 0x10000 ||
+       !ReadProcessMemory(GetCurrentProcess(), (const void *)address, &value, sizeof value, &got))
+      return 0xdeadc0de;
+   return value;
+}
+
+static void
+d3d9_arm_traps(void)
+{
+   static volatile LONG armed;
+   char want[4] = "";
+   BYTE *base = (BYTE *)GetModuleHandleA("d3d9.dll");
+   const IMAGE_NT_HEADERS *nt;
+   BYTE *text, *end;
+
+   GetEnvironmentVariableA("ENTANGLED_D3D9_BREAK", want, sizeof want);
+   if (want[0] != '1' || !base || InterlockedExchange(&armed, 1))
+      return;
+   nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+   text = base + nt->OptionalHeader.BaseOfCode;
+   end = text + nt->OptionalHeader.SizeOfCode - 16;
+   for (unsigned i = 0; i < ARRAYSIZE(d3d9_traps); i++) {
+      struct d3d9_trap *trap = &d3d9_traps[i];
+      BYTE *found = NULL;
+      unsigned matches = 0;
+      DWORD old;
+
+      /* The other build has it a few hundred bytes lower at most. */
+      for (BYTE *at = base + trap->rva - 0x500; at <= base + trap->rva + 0x40; at++) {
+         if (at < text || at >= end || memcmp(at, trap->bytes, trap->length) != 0)
+            continue;
+         found = at;
+         matches++;
+      }
+      if (matches != 1) {
+         d3d9_log("trap \"%s\": %u places, not armed", trap->name, matches);
+         continue;
+      }
+      if (!VirtualProtect(found, 1, PAGE_EXECUTE_READWRITE, &old))
+         continue;
+      trap->saved = *found;
+      trap->at = found;
+      *found = 0xcc;
+      VirtualProtect(found, 1, old, &old);
+      FlushInstructionCache(GetCurrentProcess(), found, 1);
+      d3d9_log("trap \"%s\" at d3d9+0x%Ix", trap->name, (size_t)(found - base));
+   }
+}
+
+/* A breakpoint of ours: say what is there, put the byte back, go on. */
+static BOOL
+d3d9_trap_hit(EXCEPTION_POINTERS *info)
+{
+   BYTE *where = info->ExceptionRecord->ExceptionAddress;
+
+   for (unsigned i = 0; i < ARRAYSIZE(d3d9_traps); i++) {
+      struct d3d9_trap *trap = &d3d9_traps[i];
+      CONTEXT *c = info->ContextRecord;
+      DWORD old;
+
+      if (trap->at != where)
+         continue;
+      if (VirtualProtect(where, 1, PAGE_EXECUTE_READWRITE, &old)) {
+         *where = trap->saved;
+         VirtualProtect(where, 1, old, &old);
+         FlushInstructionCache(GetCurrentProcess(), where, 1);
+      }
+      trap->at = NULL;
+      c->Eip = (DWORD)(ULONG_PTR)where;
+      d3d9_log("trap \"%s\": eax %lx ebx %lx ecx %lx edx %lx esi %lx edi %lx", trap->name,
+               c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi);
+      d3d9_log("  [ebx+8] %x [ebx+0x14] %x [ebx+0x10c] %x [ebx+0x114] %x [ebx+0x148] %x "
+               "[ebx+0x340] %x [edi+0x84] %x [ebp-0x4a0] %x",
+               d3d9_peek(c->Ebx + 8), d3d9_peek(c->Ebx + 0x14), d3d9_peek(c->Ebx + 0x10c),
+               d3d9_peek(c->Ebx + 0x114), d3d9_peek(c->Ebx + 0x148), d3d9_peek(c->Ebx + 0x340),
+               d3d9_peek(c->Edi + 0x84), d3d9_peek(c->Ebp - 0x4a0));
+      d3d9_log("  [ebp-0x514] %x [ebp-0x508] %x [ebp-0x510] %x [ebp-0x504] %x [ebp-0x570] %x",
+               d3d9_peek(c->Ebp - 0x514), d3d9_peek(c->Ebp - 0x508), d3d9_peek(c->Ebp - 0x510),
+               d3d9_peek(c->Ebp - 0x504), d3d9_peek(c->Ebp - 0x570));
+      return TRUE;
+   }
+   return FALSE;
+}
+#endif
+
 /* ---------------------------------------------------------------- crash */
 
 /* A fault in the process this DLL is loaded into: say where, once, and let
@@ -269,6 +429,10 @@ d3d9_crash(EXCEPTION_POINTERS *info)
          d3d9_log("%.200s", (const char *)info->ExceptionRecord->ExceptionInformation[1]);
       return EXCEPTION_CONTINUE_SEARCH;
    }
+#if !defined(_WIN64)
+   if (code == 0x80000003u && d3d9_trap_hit(info))
+      return EXCEPTION_CONTINUE_EXECUTION;
+#endif
    /* Errors only (not C++ throws or breakpoints). */
    if (code < 0xC0000000u || code == 0xE06D7363u)
       return EXCEPTION_CONTINUE_SEARCH;
@@ -309,8 +473,46 @@ d3d9_crash(EXCEPTION_POINTERS *info)
                (size_t)info->ContextRecord->Ebp, (size_t)info->ContextRecord->Esp);
 #endif
    }
+#if !defined(_WIN64)
+   {
+      /* What the registers that hold pointers point at, two levels deep: a
+       * fault inside the runtime is about one of its own structures. */
+      const struct {
+         const char *name;
+         ULONG_PTR value;
+      } regs[] = {{"edi", info->ContextRecord->Edi},
+                  {"esi", info->ContextRecord->Esi},
+                  {"ebx", info->ContextRecord->Ebx},
+                  {"ecx", info->ContextRecord->Ecx}};
+
+      for (unsigned r = 0; r < 4; r++) {
+         ULONG_PTR words[10], inner[8];
+         SIZE_T got = 0;
+
+         if (regs[r].value < 0x10000 ||
+             !ReadProcessMemory(GetCurrentProcess(), (const void *)regs[r].value, words,
+                                sizeof words, &got) ||
+             got != sizeof words)
+            continue;
+         d3d9_log("  [%s]: %Ix %Ix %Ix %Ix %Ix %Ix %Ix %Ix %Ix %Ix", regs[r].name, words[0],
+                  words[1], words[2], words[3], words[4], words[5], words[6], words[7],
+                  words[8], words[9]);
+         for (unsigned w = 0; w < 6 && r == 0; w++) {
+            if (words[w] < 0x10000 ||
+                !ReadProcessMemory(GetCurrentProcess(), (const void *)words[w], inner,
+                                   sizeof inner, &got) ||
+                got != sizeof inner)
+               continue;
+            d3d9_log("    [%s+%u]: %Ix %Ix %Ix %Ix %Ix %Ix %Ix %Ix", regs[r].name, w * 4,
+                     inner[0], inner[1], inner[2], inner[3], inner[4], inner[5], inner[6],
+                     inner[7]);
+         }
+      }
+   }
+#endif
    d3d9_print_rings();
 #if !defined(_WIN64)
+   d3d9_print_runtime_errors();
    {
       /* The stack's words by module: return addresses mostly, some stale. */
       ULONG_PTR *w = (ULONG_PTR *)info->ContextRecord->Esp;
@@ -695,7 +897,12 @@ static const FORMATOP d3d9_formats[] = {
    /* Never a display mode: d3d9.dll disables a driver that reports "an alpha
     * format with D3DFORMAT_OP_3DACCELERATION" (its words). */
    {D3DDDIFMT_A8R8G8B8, OPS_COLOR | FORMATOP_SAME_FORMAT_UP_TO_ALPHA_RENDERTARGET, 0, 0, 0},
-   {D3DDDIFMT_R5G6B5, OPS_COLOR & ~FORMATOP_VOLUMETEXTURE, 0, 0, 0},
+   /* A display mode too, though the kernel driver has none of 16 bits: the
+    * runtime looks through this list for a 16-bit display format (this one or
+    * X1R5G5B5), and a driver with none is taken for one that cannot make the
+    * front buffer of a full-screen device - which the runtime then goes
+    * without, and dies of at the first present. */
+   {D3DDDIFMT_R5G6B5, OPS_DISPLAY & ~FORMATOP_VOLUMETEXTURE, 0, 0, 0},
    {D3DDDIFMT_A2B10G10R10, OPS_TARGET, 0, 0, 0},
    {D3DDDIFMT_A2R10G10B10, OPS_TARGET, 0, 0, 0},
    {D3DDDIFMT_A16B16G16R16, OPS_TARGET, 0, 0, 0},
@@ -1033,6 +1240,14 @@ struct d3d9_device {
     * vertex buffer: indices in memory, vertices not). */
    void *scratch_indices;
    UINT scratch_size;
+   /* Exclusive full screen: the size and format of the flip chain (what the
+    * back buffer the runtime creates as a primary says; the front buffer it
+    * opens says nothing), and when the kernel driver was last told that the
+    * presents are on the host's plane. */
+   UINT chain_width, chain_height;
+   D3DDDIFORMAT chain_format;
+   DWORD leased;
+   BOOL on_plane;
 };
 
 /* One surface of a resource the runtime keeps in system memory: the driver
@@ -1065,6 +1280,10 @@ struct d3d9_resource {
    D3DKMT_HANDLE allocation;
    /* The frame on its way from the GPU to that allocation. */
    void *pixels;
+   /* One of a full-screen device's flip chain: the back buffer the runtime
+    * creates with the Primary flag, or the screen's shared primary, which it
+    * opens (and which has nothing of Nine's until it is first drawn to). */
+   BOOL chain, opened;
 };
 
 /* The kernel driver's escape that takes a frame for a present to copy on
@@ -1196,8 +1415,14 @@ d3d9_allocate(struct d3d9_device *device, HANDLE runtime_resource, UINT width, U
 static void
 d3d9_resource_free(struct d3d9_device *device, struct d3d9_resource *resource)
 {
+   if (resource->chain && device->on_plane && device->nine) {
+      /* The chain goes (the device leaves the whole screen, or ends): the
+       * plane back to the desktop. */
+      entangled_nine_show(device->nine, NULL, 0, 0);
+      device->on_plane = FALSE;
+   }
    entangled_nine_release(resource->nine);
-   if (resource->allocation) {
+   if (resource->allocation && !resource->opened) {
       D3DDDICB_DEALLOCATE deallocate;
 
       memset(&deallocate, 0, sizeof deallocate);
@@ -1208,6 +1433,95 @@ d3d9_resource_free(struct d3d9_device *device, struct d3d9_resource *resource)
    free(resource->pixels);
    free(resource);
 }
+
+#if !defined(_WIN64)
+static void
+d3d9_dump_runtime_modes(void)
+{
+   static volatile LONG done;
+   char want[4] = "";
+   const BYTE *base = (const BYTE *)GetModuleHandleA("d3d9.dll");
+   const IMAGE_NT_HEADERS *nt;
+   const BYTE *text, *end;
+
+   GetEnvironmentVariableA("ENTANGLED_D3D9_MODES", want, sizeof want);
+   if (want[0] != '1' || !base || InterlockedExchange(&done, 1))
+      return;
+   nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+   text = base + nt->OptionalHeader.BaseOfCode;
+   end = text + nt->OptionalHeader.SizeOfCode - 16;
+   for (const BYTE *at = text; at < end; at++) {
+      const UINT *table;
+      UINT first, second;
+
+      /* 8b 0c c5 <table>  8b 04 c5 <table + 4> */
+      if (at[0] != 0x8b || at[1] != 0x0c || at[2] != 0xc5 || at[7] != 0x8b || at[8] != 0x04 ||
+          at[9] != 0xc5)
+         continue;
+      memcpy(&first, at + 3, 4);
+      memcpy(&second, at + 10, 4);
+      if (second != first + 4)
+         continue;
+      table = (const UINT *)(ULONG_PTR)first;
+      d3d9_log("runtime mode table at d3d9+0x%Ix (read at +0x%Ix)",
+               (size_t)((ULONG_PTR)table - (ULONG_PTR)base), (size_t)(at - base));
+      for (unsigned source = 0; source < 3; source++) {
+         UINT count = table[source * 2];
+         const UINT *modes = (const UINT *)(ULONG_PTR)table[source * 2 + 1];
+
+         d3d9_log("  source %u: %u modes at %p", source, count, (const void *)modes);
+         if (!modes || count > 400)
+            continue;
+         for (UINT i = 0; i < count; i++) {
+            const UINT *m = modes + i * 11;
+
+            if (m[0] != 1920 && i > 3)
+               continue;
+            d3d9_log("    %ux%u format %u, %u Hz (%u/%u), scanline %u, orientation %u, fixed %u, "
+                     "flags 0x%x, +0x28 0x%x",
+                     m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10]);
+         }
+      }
+      return;
+   }
+   d3d9_log("runtime mode table: not found");
+}
+
+static void
+d3d9_dump_runtime_frames(const char *what)
+{
+   static volatile LONG left = 3;
+   char want[4] = "";
+   const BYTE *base = (const BYTE *)GetModuleHandleA("d3d9.dll");
+   const IMAGE_NT_HEADERS *nt;
+   ULONG_PTR low, high, here = 0, *word, *limit;
+   unsigned found = 0;
+
+   GetEnvironmentVariableA("ENTANGLED_D3D9_MODES", want, sizeof want);
+   if (want[0] != '1' || !base || InterlockedDecrement(&left) < 0)
+      return;
+   nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+   low = (ULONG_PTR)base + nt->OptionalHeader.BaseOfCode;
+   high = low + nt->OptionalHeader.SizeOfCode;
+   limit = (ULONG_PTR *)((NT_TIB *)NtCurrentTeb())->StackBase;
+   d3d9_print_runtime_errors();
+   d3d9_log("runtime frames above %s:", what);
+   for (word = &here; word < limit && found < 14; word++) {
+      const BYTE *code;
+      char hex[80];
+      int h = 0;
+
+      if (*word < low + 16 || *word >= high)
+         continue;
+      code = (const BYTE *)*word - 14;
+      for (int b = 0; b < 22; b++)
+         h += _snprintf(hex + h, sizeof hex - 1 - h, "%02x", code[b]);
+      hex[h] = 0;
+      d3d9_log("  d3d9+0x%Ix: %s", (size_t)(*word - (ULONG_PTR)base), hex);
+      found++;
+   }
+}
+#endif
 
 static HRESULT APIENTRY
 d3d9_create_resource2(HANDLE handle, D3DDDIARG_CREATERESOURCE2 *arg)
@@ -1224,6 +1538,12 @@ d3d9_create_resource2(HANDLE handle, D3DDDIARG_CREATERESOURCE2 *arg)
 
    if (!resource)
       return E_OUTOFMEMORY;
+#if !defined(_WIN64)
+   if (arg->Flags.RenderTarget) {
+      d3d9_dump_runtime_modes();
+      d3d9_dump_runtime_frames("a render target's creation");
+   }
+#endif
    resource->runtime = arg->hResource;
    resource->format = arg->Format;
    resource->flags = arg->Flags;
@@ -1286,6 +1606,12 @@ d3d9_create_resource2(HANDLE handle, D3DDDIARG_CREATERESOURCE2 *arg)
    }
    resource->kind = desc.kind;
    resource->levels = desc.levels;
+   if (arg->Flags.Primary) {
+      resource->chain = TRUE;
+      device->chain_width = resource->width;
+      device->chain_height = resource->height;
+      device->chain_format = arg->Format;
+   }
 
    /* In video memory, or a buffer wherever it is (a draw needs one of
     * Nine's): an object of Nine's. System-memory textures and surfaces stay
@@ -1326,6 +1652,10 @@ d3d9_create_resource2(HANDLE handle, D3DDDIARG_CREATERESOURCE2 *arg)
    return S_OK;
 }
 
+/* The runtime opens the screen's shared primary when a device takes the whole
+ * screen: the front buffer of its flip chain, which it then draws to and
+ * presents in turn with the back buffer. Its size is the chain's, which the
+ * back buffer says when it is created - after this. */
 static HRESULT APIENTRY
 d3d9_open_resource(HANDLE device, D3DDDIARG_OPENRESOURCE *arg)
 {
@@ -1336,9 +1666,45 @@ d3d9_open_resource(HANDLE device, D3DDDIARG_OPENRESOURCE *arg)
    if (!resource)
       return E_OUTOFMEMORY;
    resource->runtime = arg->hResource;
+   resource->opened = TRUE;
+   resource->chain = TRUE;
+   if (arg->NumAllocations && arg->pOpenAllocationInfo)
+      resource->allocation = arg->pOpenAllocationInfo[0].hAllocation;
    arg->hResource = resource;
-   d3d9_log("resource %p: opened, %u allocations", (void *)resource, arg->NumAllocations);
+   d3d9_log("resource %p: opened, %u allocations (the first 0x%x), flags 0x%x", (void *)resource,
+            arg->NumAllocations, resource->allocation, arg->Flags.Value);
    return S_OK;
+}
+
+/* An opened front buffer gets its render target the first time it is used. */
+static void
+d3d9_realize(struct d3d9_device *device, struct d3d9_resource *resource)
+{
+   struct entangled_nine_resource desc;
+   long result = S_OK;
+
+   if (!resource || !resource->opened || resource->nine || !device->nine ||
+       !device->chain_width)
+      return;
+   memset(&desc, 0, sizeof desc);
+   desc.kind = ENTANGLED_NINE_SURFACE;
+   desc.width = device->chain_width;
+   desc.height = device->chain_height;
+   desc.format = (unsigned)device->chain_format;
+   desc.levels = 1;
+   desc.usage = 0x1; /* D3DUSAGE_RENDERTARGET */
+   desc.render_target = 1;
+   resource->nine = entangled_nine_resource_create(device->nine, &desc, &result);
+   resource->kind = ENTANGLED_NINE_SURFACE;
+   resource->levels = 1;
+   resource->surfaces = 1;
+   resource->format = device->chain_format;
+   resource->width = device->chain_width;
+   resource->height = device->chain_height;
+   if (resource->nine && !resource->pixels)
+      resource->pixels = malloc((size_t)resource->width * 4 * resource->height);
+   d3d9_log("front buffer %p: %ux%u, 0x%08lx", (void *)resource, resource->width,
+            resource->height, (unsigned long)result);
 }
 
 static HRESULT APIENTRY
@@ -1369,6 +1735,7 @@ d3d9_lock(HANDLE handle, D3DDDIARG_LOCK *arg)
 
    if (!resource)
       return E_INVALIDARG;
+   d3d9_realize(device, resource);
    D3D9_TRACE("lock %p%s sub %u flags 0x%x range %u+%u given %p", (void *)resource,
               resource->sysmem ? " (sysmem)" : "", arg->SubResourceIndex, arg->Flags.Value,
               arg->Range.Offset, arg->Range.Size, arg->pSurfData);
@@ -1643,6 +2010,8 @@ d3d9_blt(HANDLE handle, const D3DDDIARG_BLT *arg)
    struct d3d9_device *device = handle;
    struct d3d9_resource *dst = arg->hDstResource, *src = arg->hSrcResource;
 
+   d3d9_realize(device, dst);
+   d3d9_realize(device, src);
    D3D9_FRAME("blt %p.%u (%ld,%ld-%ld,%ld) to %p.%u (%ld,%ld-%ld,%ld) flags 0x%x", (void *)src,
               arg->SrcSubResourceIndex, arg->SrcRect.left, arg->SrcRect.top, arg->SrcRect.right,
               arg->SrcRect.bottom, (void *)dst, arg->DstSubResourceIndex, arg->DstRect.left,
@@ -1668,6 +2037,7 @@ d3d9_color_fill(HANDLE handle, const D3DDDIARG_COLORFILL *arg)
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = arg->hResource;
 
+   d3d9_realize(device, resource);
    D3D9_FRAME("fill %p.%u (%ld,%ld-%ld,%ld) 0x%08x", (void *)resource, arg->SubResourceIndex,
               arg->DstRect.left, arg->DstRect.top, arg->DstRect.right, arg->DstRect.bottom,
               (unsigned)arg->Color);
@@ -1700,6 +2070,7 @@ d3d9_set_render_target(HANDLE handle, const D3DDDIARG_SETRENDERTARGET *arg)
    struct d3d9_device *device = handle;
    struct d3d9_resource *resource = arg->hRenderTarget;
 
+   d3d9_realize(device, resource);
    D3D9_FRAME("target %u: %p.%u%s", arg->RenderTargetIndex, (void *)resource,
               arg->SubResourceIndex, resource && !resource->nine ? " (not Nine's)" : "");
    if (!device->nine)
@@ -2527,6 +2898,57 @@ d3d9_present1(HANDLE handle, const D3DDDIARG_PRESENT1 *arg)
    if (!device->nine || !arg->SrcResources || !arg->phSrcResources)
       return S_OK;
    resource = arg->phSrcResources[0].hResource;
+   d3d9_realize(device, resource);
+   if (resource && resource->chain && resource->nine) {
+      /* The whole screen: the frame onto the host's plane, copied on the GPU.
+       * The kernel driver is told (a lease of two seconds, renewed here) so
+       * that it leaves the primary under the plane alone. Nothing is flipped:
+       * what the screen shows is the plane. */
+      LONGLONG t0 = d3d9_now(), t1;
+
+      if (entangled_nine_show(device->nine, resource->nine, resource->width,
+                              resource->height)) {
+         DWORD now = GetTickCount();
+
+         device->on_plane = TRUE;
+         if (now - device->leased >= 500) {
+            struct {
+               unsigned short type;
+               unsigned short length;
+               char text[236];
+            } lease;
+
+            device->leased = now;
+            memset(&lease, 0, sizeof lease);
+            lease.type = 0x901;
+            d3d9_escape(device, &lease, sizeof lease);
+         }
+         t1 = d3d9_now();
+         pace.read += t1 - t0;
+         if (pace.last)
+            pace.frames += t1 - pace.last;
+         pace.last = t1;
+         if (++pace.count == 120) {
+            LONG draws = count_draws;
+
+            d3d9_log("pace: %u.%u ms a frame (%u.%u fps) on the plane, of which showing it "
+                     "%u.%u; %ld draws a frame",
+                     (unsigned)(pace.frames / 120000), (unsigned)(pace.frames / 12000 % 10),
+                     pace.frames ? (unsigned)(120000000 / pace.frames) : 0,
+                     pace.frames ? (unsigned)(1200000000 / pace.frames % 10) : 0,
+                     (unsigned)(pace.read / 120000), (unsigned)(pace.read / 12000 % 10),
+                     (long)((draws - pace.draws) / 120));
+            pace.draws = draws;
+            pace.read = pace.escape = pace.present = pace.frames = 0;
+            pace.count = 0;
+         }
+         if (InterlockedIncrement(&said) <= 2)
+            d3d9_log("present %ux%u on the plane", resource->width, resource->height);
+         return S_OK;
+      }
+      if (InterlockedIncrement(&said) <= 4)
+         d3d9_log("present: the plane is not to be had; through the CPU");
+   }
    if (!resource || !resource->nine || !resource->allocation || !resource->pixels) {
       if (InterlockedIncrement(&said) <= 4)
          d3d9_log("present of %p: nothing to present from", (void *)resource);
@@ -2598,6 +3020,8 @@ d3d9_destroy_device(HANDLE handle)
    D3D9_HERE();
    struct d3d9_device *device = handle;
 
+   if (device->on_plane && device->nine)
+      entangled_nine_show(device->nine, NULL, 0, 0);
    entangled_nine_release(device->scratch_indices);
    entangled_nine_close(device->nine);
    if (device->context) {
@@ -2616,6 +3040,10 @@ d3d9_create_device(HANDLE adapter, D3DDDIARG_CREATEDEVICE *arg)
 {
    struct d3d9_device *device = calloc(1, sizeof *device);
    D3DDDI_DEVICEFUNCS *funcs = arg->pDeviceFuncs;
+
+#if !defined(_WIN64)
+   d3d9_arm_traps();
+#endif
 
    if (!device)
       return E_OUTOFMEMORY;

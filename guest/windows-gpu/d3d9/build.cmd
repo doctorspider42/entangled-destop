@@ -27,7 +27,7 @@ exit /b 0
 setlocal
 call "%VCVARS%" %1 >nul
 clang-cl %~3 /nologo /W3 /O2 /MT "%HERE%d3d9-test.c" /Fo"%~2\d3d9-test.obj" /Fe"%~2\d3d9-test.exe" ^
-  /link d3d9.lib user32.lib
+  /link d3d9.lib user32.lib gdi32.lib
 if errorlevel 1 exit /b 1
 endlocal
 exit /b 0
