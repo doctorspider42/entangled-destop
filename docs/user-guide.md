@@ -1345,12 +1345,16 @@ earlier one has an older agent, which ignores the request (the answer is
 quarantined a development build of the agent that knows `exec` as
 `Trojan:Win32/Wacatac.H!ml` — a machine-learning verdict, given minutes after
 the program had run fine, to a program that takes commands over a port and
-starts processes with their output captured. Nothing about it is malicious,
-but the guest's Defender decides: if `exec` (and the shared clipboard, which is
-the same program) stops answering, look in *Windows Security → Protection
-history*, restore the file and allow it. Whether the release build is flagged
-the same way, and what to do about it (a signed agent, an exclusion the
-installer sets, or `exec` in a program of its own), is still open.
+starts processes with their output captured. So `install windows` excludes
+the agent's own file, `C:\Program Files\Entangled\entangled-agent.exe`, from
+Defender's scanning — that file only; what it starts is scanned as usual. A
+guest installed before that has no exclusion: if `exec` and the shared
+clipboard stop answering, look in *Windows Security → Protection history*,
+restore the file, and add the same exclusion from an elevated PowerShell:
+
+```powershell
+Add-MpPreference -ExclusionPath 'C:\Program Files\Entangled\entangled-agent.exe'
+```
 
 ## Machines on disk
 

@@ -1490,6 +1490,22 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Defender's exclusion is the agent's file alone (not the folder, whose
+    /// other programs stay scanned), and it is in place before the file is
+    /// copied, or the scan on write could quarantine it first.
+    #[test]
+    fn the_agent_is_excluded_from_defender_before_it_is_copied() {
+        let exclusion = FIRST_LOGON
+            .find("Add-MpPreference -ExclusionPath '%dir%\\entangled-agent.exe'")
+            .expect("the agent's exclusion");
+        let copy = FIRST_LOGON
+            .find("copy /y \"%disc%\\entangled\\entangled-agent.exe\"")
+            .expect("the agent's copy");
+        assert!(exclusion < copy);
+        assert!(!FIRST_LOGON.contains("-ExclusionPath '%dir%'"));
+        assert!(!FIRST_LOGON.contains("ExclusionProcess"));
+    }
+
     /// Every file the WDDM driver's INF names reaches the guest's driver
     /// folder: the first-logon script copies by pattern, and a file no
     /// pattern covers makes `wddm-on.cmd` fail with "file not found" (the

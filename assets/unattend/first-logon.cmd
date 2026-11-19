@@ -22,7 +22,13 @@ rem The guest agent (the shared clipboard), when the installer had one to
 rem put on this disc. It has no window and reconnects by itself. vioserial's
 rem ports admit administrators only, so it starts at this user's logon with
 rem the full token (a scheduled task, run level highest), not from Run.
+rem Microsoft Defender's machine-learning verdict took an agent that runs
+rem commands for `exec` for a trojan (Trojan:Win32/Wacatac.H!ml, 2026-11-19),
+rem so the agent's own file - that file only, before it is copied - is
+rem excluded from scanning. What it starts is scanned as usual. A guest
+rem without Defender skips this quietly.
 if exist "%disc%\entangled\entangled-agent.exe" (
+  powershell -NoProfile -Command "Add-MpPreference -ExclusionPath '%dir%\entangled-agent.exe' -ErrorAction SilentlyContinue" >nul 2>&1
   copy /y "%disc%\entangled\entangled-agent.exe" "%dir%\" >nul
   powershell -NoProfile -Command "$a = New-ScheduledTaskAction -Execute '%dir%\entangled-agent.exe'; $t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest; $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName 'Entangled agent' -Action $a -Trigger $t -Principal $p -Settings $s -Force" >nul
 )
