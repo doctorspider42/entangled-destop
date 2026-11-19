@@ -465,6 +465,73 @@ of an id it never made, once), and not in the last runs. Not understood.
 8. the workflow and `install windows` with the new package, neither of which
    has run.
 
+### Amendment, 2026-11-19: DWM's 3D composition corrupts — narrowed, not fixed
+
+A user prototype ("wintanyl") asks DWM for live window thumbnails as
+composition visuals (`dwmapi!#147`) and moves them in 3D: perspective
+transforms, the interop compositor, `CompositionVisualSurface` on sprites.
+Everything is drawn by `dwm.exe` on this driver stack; the same executable is
+clean on a host with a vendor driver. In the guest it is not. What a day of
+reproducing it established:
+
+**How it was looked at.** A sparse copy of the Windows 10 test disk, the
+engine headless with `--control-stdin`, the program started with the control
+channel's `exec`, and bursts of `screenshot` (full-size, a second apart). A
+headless run has no window, so the overlay plane declines every present
+(`0 overlaid` in the driver's statistics) and DWM's frames go the CPU way:
+read back into the primary's allocation at each present, then a **flip**.
+The kernel driver's serial log shows three primaries in turn (allocations 1,
+2 and 7), and each flip transfers the whole allocation to the host
+(`FlushToScreen`), so a screenshot is exactly the back buffer DWM rendered.
+The corruption is in that buffer — DWM's drawing through `d3d10umd` on Zink
+on Venus — not in the transport behind it.
+
+**What it looks like** (the same in all four of the program's modes,
+including the plain DirectComposition one the report called clean — it has no
+dimmed backdrop, so stale content is harder to see there):
+
+- axis-aligned rectangles of *old* content — the desktop as it was before
+  the program started, un-dimmed, with a window at its own place — inside the
+  region that animates, changing from frame to frame (three states, one per
+  buffer, is the pattern);
+- the program's full-screen backdrop drawn only inside a sub-rectangle
+  (different from boot to boot), and the thumbnails outside it missing;
+- thin vertical and horizontal lines at the edges of those rectangles, a grey
+  polygon now and then, and in the DirectComposition mode a black triangle in
+  the lower-left corner that stays.
+
+**Ruled out.** No Venus `FATAL` and no command the host refused in any run;
+the only Mesa complaint is the known `restart_index … TRIANGLE_LIST` line. The
+DXGI `Blt` entry point, which the frontend leaves unimplemented, is never
+called (it would log `_Blt XXX`). The transport, as above.
+
+**Tried and measured as no help.** The frontend's
+`_RotateResourceIdentities` (DXGI's flip) swaps the `pipe_resource` pointers
+behind the swap chain's resources, and a view refreshes when it is next
+bound — but what is *bound* at that moment keeps the old texture, and Direct3D
+state survives a present. That is a real gap: after a rotation, a back buffer
+left bound is drawn into while another one is shown. A build that re-points
+the bound render targets and shader resources at each rotation was installed
+in the test guest and compared with the shipped one on fresh boots, same
+procedure: no visible difference. It is not in the patch set; the diff is
+kept with the session notes, worth carrying once the real cause is found.
+
+**What the fix needs, in order.**
+
+1. The same procedure with a window, so the overlay plane takes DWM's frames
+   from the GPU: if the artifacts go, the readback path is implicated after
+   all; if they stay, it is DWM's rendering on this stack. (The report's
+   pictures and this repro were both headless.)
+2. A trace of the DDI calls of one corrupted DWM frame — scissor rectangles,
+   viewports, `ResourceCopyRegion` boxes, clears, render-target binds per
+   draw — against the region that comes out stale. The shape of the damage
+   (rectangles of old content where DWM updates part of a buffer) points at
+   partial updates: a scissor or viewport that is not what DWM set, a copy
+   region with a box, or a render target that is not the one bound.
+3. Zink's handling of DWM's intermediate render targets (`SetRenderTargets`
+   onto offscreen textures, then sampling them): the clipped backdrop is what
+   a stale scissor would draw.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

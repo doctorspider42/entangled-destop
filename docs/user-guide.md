@@ -1197,6 +1197,13 @@ a change on the host is seen at the next open, within a second. Measured
 2026-11-19: `hostname.exe` copied over a running `ping.exe` on the share
 still ran as `ping`; the same start after `ping` ended ran `hostname`.
 
+**Copying a large file off the share can fail now and then** with "Error
+performing inpage operation" — measured 2026-11-19: 6 to 18 of 50 copies of a
+12 MiB file from `Z:` failed, each retry then succeeded, with no error on the
+host's side. Not yet understood (a write-only handle that Windows reads
+through is one cause, and is fixed; it is not the only one). Copy again, or
+check big copies (`fc /b`).
+
 ### Without a window
 
 ```bash
@@ -1333,6 +1340,17 @@ earlier one has an older agent, which ignores the request (the answer is
 `error no answer from the guest agent` after the timeout). Copy the new
 `entangled-agent.exe` from the installation directory over
 `C:\Program Files\Entangled\entangled-agent.exe` in the guest and log on again.
+
+**Microsoft Defender may take the agent for malware.** On 2026-11-19 it
+quarantined a development build of the agent that knows `exec` as
+`Trojan:Win32/Wacatac.H!ml` — a machine-learning verdict, given minutes after
+the program had run fine, to a program that takes commands over a port and
+starts processes with their output captured. Nothing about it is malicious,
+but the guest's Defender decides: if `exec` (and the shared clipboard, which is
+the same program) stops answering, look in *Windows Security → Protection
+history*, restore the file and allow it. Whether the release build is flagged
+the same way, and what to do about it (a signed agent, an exclusion the
+installer sets, or `exec` in a program of its own), is still open.
 
 ## Machines on disk
 
