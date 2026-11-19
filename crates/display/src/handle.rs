@@ -407,6 +407,27 @@ impl DisplayHandle {
         crate::thumbnail::write_png_atomically(path.as_ref(), w, h, &rgba)
     }
 
+    /// Writes a full-size PNG of the current scanout (cursor included) to
+    /// `path` through a temporary file renamed into place, so a reader that
+    /// sees the file sees all of it; answers its size. The control channel's
+    /// `screenshot`.
+    pub fn write_screenshot(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(u32, u32), DisplayError> {
+        let path = path.as_ref();
+        let snapshot = self.snapshot()?;
+        let png = snapshot.to_png()?;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        std::fs::write(&tmp, &png)?;
+        std::fs::rename(&tmp, path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+        Ok(snapshot.size())
+    }
+
     /// Writes a PNG screenshot of the current scanout to `path`.
     pub fn screenshot(&self, path: impl AsRef<std::path::Path>) -> Result<(), DisplayError> {
         let path = path.as_ref();

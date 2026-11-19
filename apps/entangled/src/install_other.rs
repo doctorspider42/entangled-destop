@@ -99,6 +99,7 @@ fn prepare(args: &InstallArgs) -> Result<(VmConfig, std::path::PathBuf), String>
         ignore_msrs: false,
         hyperv_enlightenments: false,
         guest_agent: false,
+        guest_exec: false,
     };
     let text = toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
     let cfg = VmConfig::from_toml(&text).map_err(|e| e.to_string())?;

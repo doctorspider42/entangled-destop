@@ -351,6 +351,7 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
         hyperv_enlightenments: true,
         // The clipboard, through entangled-agent (first-logon.cmd).
         guest_agent: true,
+        guest_exec: false,
     };
     let mut install = installed.clone();
     // Offline: Setup needs nothing from the network, and with it OOBE

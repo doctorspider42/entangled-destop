@@ -25,8 +25,13 @@ const POLL: Duration = Duration::from_millis(300);
 /// How long to wait before opening the port again.
 const RETRY: Duration = Duration::from_secs(5);
 
-/// The port's handle, shared by the reader thread and the writer.
-struct Port(HANDLE);
+/// The port's handle, shared by the reader thread and the writers (the
+/// clipboard watcher and every running command). Writes take `write`, so two
+/// messages never interleave on the wire.
+struct Port {
+    handle: HANDLE,
+    write: Mutex<()>,
+}
 
 // SAFETY: a file handle is a kernel object reference; overlapped I/O on it
 // from two threads, each with its own OVERLAPPED and event, is what Windows
@@ -38,7 +43,7 @@ unsafe impl Sync for Port {}
 impl Drop for Port {
     fn drop(&mut self) {
         // SAFETY: the handle came from CreateFileW and is closed once, here.
-        let _ = unsafe { CloseHandle(self.0) };
+        let _ = unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -77,7 +82,10 @@ fn open_port() -> Option<Port> {
         )
     }
     .ok()?;
-    Some(Port(handle))
+    Some(Port {
+        handle,
+        write: Mutex::new(()),
+    })
 }
 
 /// Runs one connection until the port fails.
@@ -124,7 +132,7 @@ fn serve(port: Arc<Port>) {
     let _ = reader.join();
 }
 
-fn read_loop(port: &Port, seen: &Mutex<Seen>) {
+fn read_loop(port: &Arc<Port>, seen: &Mutex<Seen>) {
     let mut decoder = Decoder::default();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
@@ -136,6 +144,19 @@ fn read_loop(port: &Port, seen: &Mutex<Seen>) {
             return;
         };
         for (kind, payload) in decoder.push(&buffer[..n]) {
+            if kind == protocol::KIND_EXEC {
+                // A request that does not parse has no id to answer.
+                if let Some(request) = protocol::ExecRequest::decode(&payload) {
+                    let port = Arc::clone(port);
+                    crate::exec::spawn(request, move |result| {
+                        let _ = write_all(
+                            &port,
+                            &protocol::encode(protocol::KIND_EXEC_RESULT, &result.encode()),
+                        );
+                    });
+                }
+                continue;
+            }
             if kind != KIND_CLIPBOARD_TEXT {
                 continue;
             }
@@ -149,6 +170,7 @@ fn read_loop(port: &Port, seen: &Mutex<Seen>) {
 }
 
 fn write_all(port: &Port, mut bytes: &[u8]) -> bool {
+    let _one_message_at_a_time = port.write.lock().unwrap_or_else(PoisonError::into_inner);
     while !bytes.is_empty() {
         let chunk = bytes;
         let Some(n) = overlapped(port, |handle, overlapped| {
@@ -178,7 +200,7 @@ fn overlapped(
         hEvent: event,
         ..Default::default()
     };
-    let started = start(port.0, &mut ov);
+    let started = start(port.handle, &mut ov);
     let pending = match &started {
         Ok(()) => true,
         // ERROR_IO_PENDING: started, finishing later.
@@ -188,7 +210,7 @@ fn overlapped(
     // SAFETY: `ov` is the structure the operation was started with and lives
     // until this returns; waiting is what makes reusing it safe.
     let done =
-        pending && unsafe { GetOverlappedResult(port.0, &ov, &mut transferred, true) }.is_ok();
+        pending && unsafe { GetOverlappedResult(port.handle, &ov, &mut transferred, true) }.is_ok();
     // SAFETY: the event was created above and is closed once.
     let _ = unsafe { CloseHandle(event) };
     done.then_some(transferred as usize)

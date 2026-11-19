@@ -74,6 +74,59 @@ pub const CMD_PASTE: &str = "paste";
 /// and named keys by name, other keys as one character
 /// (`virtio_input::typing::parse_chord`).
 pub const CMD_CHORD: &str = "chord";
+/// Write one full-resolution PNG of the guest's screen, `screenshot <path>`
+/// (cursor included), atomically: answered `screenshot <path> <W>x<H>` once
+/// the file is complete, or `error screenshot <detail>`.
+pub const CMD_SCREENSHOT: &str = "screenshot";
+/// Run a command line in a Windows guest through its agent,
+/// `exec [--timeout SECS] <command line>` (`cmd.exe /d /s /c`, no window).
+/// Off unless the profile says `guest_exec = true`. Answered at once with
+/// `exec <id> sent`, then — whenever the guest answers — zero or more
+/// `exec <id> stdout <line>` / `exec <id> stderr <line>` lines followed by
+/// exactly one of `exec <id> exit <code> [stdout-truncated]
+/// [stderr-truncated]`, `exec <id> timeout`, `exec <id> error <detail>`.
+pub const CMD_EXEC: &str = "exec";
+/// How long an `exec` may run when the line does not say.
+pub const EXEC_DEFAULT_TIMEOUT_SECS: u32 = 60;
+/// The longest `--timeout` an `exec` accepts.
+pub const EXEC_MAX_TIMEOUT_SECS: u32 = 600;
+
+/// Splits one control line into its command word and the rest, after
+/// trimming — and after dropping a leading UTF-8 byte-order mark, which
+/// .NET's `Process.StandardInput` writes before the first line and which
+/// would otherwise turn that line's command into `"\u{feff}chord"`.
+pub fn split_command(line: &str) -> (&str, &str) {
+    let line = line.trim_start_matches('\u{feff}').trim();
+    match line.split_once(char::is_whitespace) {
+        Some((command, rest)) => (command, rest),
+        None => (line, ""),
+    }
+}
+
+/// The argument of `exec`: an optional `--timeout SECS`, then the command
+/// line. `Err` carries what to tell the caller.
+pub fn parse_exec(argument: &str) -> Result<(u32, &str), String> {
+    let argument = argument.trim();
+    let (timeout, command) = match argument.strip_prefix("--timeout") {
+        Some(rest) if rest.starts_with(char::is_whitespace) => {
+            let rest = rest.trim_start();
+            let (secs, command) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            let secs = secs
+                .parse::<u32>()
+                .ok()
+                .filter(|s| (1..=EXEC_MAX_TIMEOUT_SECS).contains(s))
+                .ok_or_else(|| {
+                    format!("--timeout takes 1..={EXEC_MAX_TIMEOUT_SECS} seconds, not {secs:?}")
+                })?;
+            (secs, command.trim())
+        }
+        _ => (EXEC_DEFAULT_TIMEOUT_SECS, argument),
+    };
+    if command.is_empty() {
+        return Err("needs a command line".into());
+    }
+    Ok((timeout, command))
+}
 
 /// Where a machine's card picture lives: `.thumbnails/<name>.png` beside its
 /// profile. The engine derives it from the default snapshot path (which sits
@@ -161,6 +214,32 @@ mod tests {
         assert_eq!(serial_key_bytes("enter"), Some(&b"\r"[..]));
         assert_eq!(serial_key_bytes("up\nreset"), None);
         assert_eq!(serial_key_bytes("unknown"), None);
+    }
+
+    /// .NET's `Process.StandardInput` starts the stream with a BOM.
+    #[test]
+    fn a_leading_byte_order_mark_is_not_part_of_the_command() {
+        assert_eq!(split_command("\u{feff}chord alt f4"), ("chord", "alt f4"));
+        assert_eq!(split_command("  status \r"), ("status", ""));
+        assert_eq!(split_command("\u{feff}"), ("", ""));
+        assert_eq!(split_command("paste a b"), ("paste", "a b"));
+    }
+
+    #[test]
+    fn exec_takes_an_optional_timeout_and_a_command_line() {
+        assert_eq!(parse_exec("dir Z:\\"), Ok((60, "dir Z:\\")));
+        assert_eq!(parse_exec("--timeout 5 ver"), Ok((5, "ver")));
+        assert_eq!(
+            parse_exec("--timeout 5 echo a --timeout b"),
+            Ok((5, "echo a --timeout b"))
+        );
+        assert!(parse_exec("").is_err());
+        assert!(parse_exec("--timeout 5").is_err());
+        assert!(parse_exec("--timeout 0 ver").is_err());
+        assert!(parse_exec("--timeout 601 ver").is_err());
+        assert!(parse_exec("--timeout x ver").is_err());
+        // Not the flag: a command that happens to start with the word.
+        assert_eq!(parse_exec("--timeoutx"), Ok((60, "--timeoutx")));
     }
 
     #[test]

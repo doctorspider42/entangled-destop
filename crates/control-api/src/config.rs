@@ -152,6 +152,15 @@ pub struct VmConfig {
     /// it takes a device slot.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guest_agent: bool,
+    /// Let the host run command lines in the guest through its agent (the
+    /// control channel's `exec`). Off by default, and only meaningful with
+    /// [`Self::guest_agent`]: it is code execution in the guest on the host's
+    /// say-so, so a profile asks for it in writing. Nothing new is reachable
+    /// from outside — the only writer is whoever owns the VM's control pipe,
+    /// who can already type on the guest's keyboard — but a typed command is
+    /// blind, and this one answers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guest_exec: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1206,6 +1215,20 @@ impl VmConfig {
         out
     }
 
+    /// A Windows guest: the Hyper-V enlightenments are what `install windows`
+    /// turns on and no Linux profile has (the manager's test too).
+    pub fn windows_guest(&self) -> bool {
+        self.hyperv_enlightenments
+    }
+
+    /// Whether `share` is served as virtio-fs: when it says so, and always on
+    /// a Windows guest — Windows has no 9P client, so a `[[share]]` written by
+    /// hand without `virtiofs = true` would otherwise be a drive that never
+    /// appears.
+    pub fn share_uses_virtiofs(&self, share: &ShareSection) -> bool {
+        share.virtiofs || self.windows_guest()
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let err = |m: String| Err(ConfigError::Invalid(m));
         if self.name.is_empty() {
@@ -1252,6 +1275,13 @@ impl VmConfig {
             if self.shares[..i].iter().any(|s| s.tag == share.tag) {
                 return err(format!("two shares are tagged {:?}", share.tag));
             }
+        }
+        if self.guest_exec && !self.guest_agent {
+            return err(
+                "guest_exec needs guest_agent = true: commands travel over the \
+                 agent's port"
+                    .into(),
+            );
         }
         if !(1..=MAX_GAMEPAD_PLAYERS).contains(&self.gamepad.players) {
             return err(format!(
@@ -2501,6 +2531,45 @@ path = "/home/you/.cache/entangled/ubuntu/26.04/ubuntu-26.04-desktop-amd64.iso"
             .map(|i| new_machine_mac(&format!("vm{i}"), &disk("vms", &format!("vm{i}.raw"))))
             .collect();
         assert_eq!(many.len(), 1000);
+    }
+
+    /// `exec` is opt-in, and rides the agent's port: asking for it without the
+    /// agent is a mistake caught at load, not a command that silently never
+    /// answers.
+    #[test]
+    fn guest_exec_is_off_by_default_and_needs_the_agent() {
+        let with =
+            |keys: &str| BACKLOG_EXAMPLE.replace("vcpus = 2\n", &format!("vcpus = 2\n{keys}\n"));
+        let cfg = VmConfig::from_toml(BACKLOG_EXAMPLE).unwrap();
+        assert!(!cfg.guest_exec);
+        assert!(!toml::to_string(&cfg).unwrap().contains("guest_exec"));
+        let error = VmConfig::from_toml(&with("guest_exec = true")).expect_err("no agent");
+        assert!(error.to_string().contains("guest_agent"), "{error}");
+        let cfg = VmConfig::from_toml(&with("guest_agent = true\nguest_exec = true")).unwrap();
+        assert!(cfg.guest_exec);
+        let again = VmConfig::from_toml(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert!(again.guest_exec);
+    }
+
+    /// A share written by hand into a Windows profile without
+    /// `virtiofs = true` is still served the way Windows can mount it; a
+    /// Linux guest keeps 9P unless the share asks.
+    #[test]
+    fn a_windows_guests_shares_are_virtiofs_whatever_the_flag_says() {
+        let share = "\n[[share]]\npath = \"/srv/share\"\ntag = \"host\"\n";
+        let linux = VmConfig::from_toml(&format!("{BACKLOG_EXAMPLE}{share}")).unwrap();
+        assert!(!linux.share_uses_virtiofs(&linux.shares[0]));
+        let mut asked = linux.clone();
+        asked.shares[0].virtiofs = true;
+        assert!(asked.share_uses_virtiofs(&asked.shares[0]));
+        let windows = VmConfig::from_toml(&format!(
+            "{}{share}",
+            BACKLOG_EXAMPLE.replace("vcpus = 2\n", "vcpus = 2\nhyperv_enlightenments = true\n")
+        ))
+        .unwrap();
+        assert!(windows.windows_guest());
+        assert!(!windows.shares[0].virtiofs, "the profile is not rewritten");
+        assert!(windows.share_uses_virtiofs(&windows.shares[0]));
     }
 
     /// A profile's MAC is checked at load: six hex octets, unicast, not zero.

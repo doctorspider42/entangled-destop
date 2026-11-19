@@ -728,8 +728,11 @@ The installed machine uses virtio-pci, UEFI with persistent NVRAM, the
 virtio-vga display, an Intel HD Audio sound card (Windows' in-box driver),
 user-mode networking, the Hyper-V reference clock and the agent's console.
 
-**Shared folders.** Add one under *Configure → Storage → Shared folders*. For
-a Windows machine it is served as virtio-fs and the first one appears as
+**Shared folders.** Add one under *Configure → Storage → Shared folders*, or
+write a `[[share]]` into the profile by hand. For a Windows machine (one with
+`hyperv_enlightenments = true`, which is how a profile says Windows) it is
+always served as virtio-fs, whether or not the section says
+`virtiofs = true` — Windows has no 9P client — and the first one appears as
 **`Z:`** at the next start. Only the first share mounts by itself.
 
 **Gamepads do not reach Windows yet.** With `[gamepad] enabled = true` the
@@ -1175,6 +1178,25 @@ and nothing has to be installed in the guest. What to expect:
 - **A mounted share cannot be suspended.** Its open files live on the host and
   cannot go into a snapshot, so *Suspend* is refused until you `umount` it.
 
+**Windows guests** mount shares as virtio-fs (through virtio-win's `viofs`
+and WinFsp, which the installer sets up), never 9P. A Windows machine's
+shares are therefore always served as virtio-fs, and `virtiofs = true` in the
+`[[share]]` section is only needed to ask for virtio-fs on a Linux guest
+(`mount -t virtiofs <tag> <dir>`).
+
+**A program replaced on the host while it still runs in the guest stays the
+old program** — for every new start too, until the last copy of it in the
+guest has exited. Windows keeps a running executable's image in memory and
+starts new copies from it, and nothing in virtio-fs can tell the guest that
+the file changed underneath (on a local disk Windows would simply refuse the
+overwrite). A process that looks gone may not be: a failed start that shows
+an error dialog ("VCRUNTIME140.dll was not found") stays alive until the
+dialog is closed. So close the old program (and any such dialog) before
+running the new build, or copy it under a new name. Ordinary files are re-read:
+a change on the host is seen at the next open, within a second. Measured
+2026-11-19: `hostname.exe` copied over a running `ping.exe` on the share
+still ran as `ping`; the same start after `ping` ended ran `hostname`.
+
 ### Without a window
 
 ```bash
@@ -1206,18 +1228,42 @@ the guest is told (`refresh_us` in the file), not the host monitor's.
 entangled run --headless --control-stdin ~/entangled-vms/ubuntu.toml
 ```
 
-reads one lifecycle command per line on stdin: `pause`, `resume`, `reset`,
-`save [path]`, `type <text>` (types on the guest's serial console), `status`,
-`shutdown` (presses the ACPI power button), `display WIDTHxHEIGHT` (asks the
-guest for another desktop size), `paste <text>` (types the text on the
-guest's keyboard; `
-` is Enter) and `thumbnail [path]`. The last one writes a
-picture of the screen, at most 480 pixels wide, to the path, or by default to
-`.thumbnails/<name>.png` beside the profile. It is the only command that
-answers nothing when it succeeds, because the manager sends it every three
-seconds.
+reads one command per line on stdin:
+
+| Command | What it does |
+|---|---|
+| `pause`, `resume`, `reset` | freeze, unfreeze, reboot in place |
+| `save [path]` | suspend to a file and exit |
+| `status` | print the run state |
+| `shutdown` | press the ACPI power button |
+| `display WIDTHxHEIGHT` | ask the guest for another desktop size |
+| `type <text>` | type on the guest's **serial console**, then Enter |
+| `paste <text>` | type on the guest's **keyboard** (US layout; `\n` is Enter) |
+| `chord <keys>` | press keys together: `chord alt f4`, `chord ctrl shift esc`, `chord super r` |
+| `thumbnail [path]` | a small picture (at most 480 px wide); silent when it works |
+| `screenshot <path>` | a full-size PNG of the screen, answered when the file is complete |
+| `exec [--timeout S] <command line>` | run a command in a **Windows** guest and get its output (see below) |
+
+`chord` knows the modifiers (`ctrl`, `alt`, `shift`, `super`/`win`,
+`rightctrl`, `rightalt`/`altgr`, `rightshift`), `f1`–`f12`, `enter`,
+`escape`/`esc`, `tab`, `space`, `backspace`, `delete`/`del`,
+`insert`/`ins`, the arrows, `home`, `end`, `pageup`/`pgup`,
+`pagedown`/`pgdn`, `printscreen`/`prtsc`, `menu`/`apps`, `capslock`,
+`numlock`, `scrolllock`, and any single character; up to eight keys.
+
+`thumbnail` writes to the path, or by default to `.thumbnails/<name>.png`
+beside the profile, and is the only command that answers nothing when it
+succeeds, because the manager sends it every three seconds. `screenshot`
+writes through a temporary file renamed into place, so once its answer
+arrives the file is whole:
+
+```text
+entangled-control: screenshot C:\shots\now.png 1920x1080
+```
+
 This is how the GUI manager's buttons work, and how the end-to-end tests log
-into a guest.
+into a guest. A line may start with a UTF-8 byte-order mark (.NET's
+`Process.StandardInput` writes one); it is ignored.
 
 Each one is answered on stdout, interleaved with the guest's own console output
 and prefixed so a reader can pick it out of the noise:
@@ -1233,6 +1279,60 @@ entangled-control: error save <why it could not be written>
 two ways a suspend ends, and they are the last thing that VM says — it exits
 either way. The vocabulary is a wire format between two programs, so it lives in
 one place (`control_api::control`) rather than being spelled out twice.
+
+#### Running commands in a Windows guest
+
+`exec` hands a command line to the guest agent, which runs it with
+`cmd.exe /d /s /c` — no window, stdin empty — and sends back the exit code and
+what it printed. It is **off unless the profile asks for it**, because it is
+code execution in the guest on the host's say-so:
+
+```toml
+guest_agent = true      # the installer sets this for Windows guests
+guest_exec = true       # let `exec` run commands through the agent
+```
+
+Who can use it is whoever owns the VM's control pipe — the program that
+started `entangled run --control-stdin`, who could already type on the
+guest's keyboard. The command runs as the logged-on user, with the agent's
+rights: the installer starts the agent at logon with the highest privileges
+that user has (elevated, for the installer's `entangled` account), because
+`vioserial` lets only administrators open the agent's port. Nothing
+runs before someone has logged on.
+
+```text
+exec ver
+entangled-control: exec 1 sent
+entangled-control: exec 1 stdout
+entangled-control: exec 1 stdout Microsoft Windows [Version 10.0.19045.6466]
+entangled-control: exec 1 exit 0
+```
+
+Every `exec` is answered at once with `exec <id> sent` (or `error exec …`),
+and later — the VM keeps taking other commands meanwhile — by its output, one
+`exec <id> stdout <line>` / `exec <id> stderr <line>` per line, then exactly
+one final line:
+
+| Final line | Meaning |
+|---|---|
+| `exec <id> exit <code>` | it ran; `stdout-truncated` / `stderr-truncated` follow when a stream passed 64 KiB |
+| `exec <id> timeout` | it ran past `--timeout` (default 60 s, at most 600) and its `cmd.exe` was killed |
+| `exec <id> error <why>` | it did not run: no agent connected, the agent is busy (four at once), an agent older than `exec`, … |
+
+The limits: a command line of at most 8 KiB, 64 KiB of each stream, four
+commands running at once in the guest. A program that `start` launches keeps
+running after the command answers — `exec start "" Z:\tool.exe` opens a GUI
+program and returns straight away. Output in the console code page is turned
+into UTF-8 (so a character the console code page cannot hold arrives as its
+nearest stand-in: `echo zażółć` comes back `zazólc`; put `chcp 65001 >nul &`
+in front for UTF-8 output), and control characters in it are replaced, so a
+guest cannot print a line that looks like a reply of its own.
+
+The agent that knows `exec` ships with this release: a guest installed by an
+earlier one has an older agent, which ignores the request (the answer is
+`error no answer from the guest agent` after the timeout). Copy the new
+`entangled-agent.exe` from the installation directory over
+`C:\Program Files\Entangled\entangled-agent.exe` in the guest and log on again.
 
 ## Machines on disk
 
