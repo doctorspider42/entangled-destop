@@ -479,6 +479,16 @@ static volatile LONG64 d3d10_wddm_copied;
 /* Microseconds a present spent waiting for the GPU's copy of the frame, and
  * in the host showing it. */
 static volatile LONG64 d3d10_wddm_wait_us, d3d10_wddm_show_us;
+/* Where a present of the screen's frame spends its time, in microseconds:
+ * reading it back (the map, which waits for the GPU's copy to memory, and
+ * the copy out of it on this CPU), the kernel driver's flip, and the whole
+ * present; and how many presents of the screen's frame there were. */
+static volatile LONG64 d3d10_wddm_map_us, d3d10_wddm_memcpy_us,
+   d3d10_wddm_display_us, d3d10_wddm_present_us;
+/* And in the context's own flushes: Zink's submits to the GPU, which wait
+ * for it when they carry a fence. */
+static volatile LONG64 d3d10_wddm_flush_us;
+static volatile LONG d3d10_wddm_screen_presents;
 
 static LONG64
 d3d10_wddm_now_us(void)
@@ -505,6 +515,15 @@ d3d10_wddm_stats(void)
    d3d10_wddm_log("overlay: %lld ms waiting for the copy, %lld ms shown by the host",
                   (long long)(InterlockedExchange64(&d3d10_wddm_wait_us, 0) / 1000),
                   (long long)(InterlockedExchange64(&d3d10_wddm_show_us, 0) / 1000));
+   d3d10_wddm_log("presents: %ld of the screen in %ld ms: %lld ms whole, %lld ms readback map, %lld ms readback memcpy, %lld ms flip",
+                  InterlockedExchange(&d3d10_wddm_screen_presents, 0),
+                  (long)(now - before),
+                  (long long)(InterlockedExchange64(&d3d10_wddm_present_us, 0) / 1000),
+                  (long long)(InterlockedExchange64(&d3d10_wddm_map_us, 0) / 1000),
+                  (long long)(InterlockedExchange64(&d3d10_wddm_memcpy_us, 0) / 1000),
+                  (long long)(InterlockedExchange64(&d3d10_wddm_display_us, 0) / 1000));
+   d3d10_wddm_log("flushes: %lld ms in the driver's flush",
+                  (long long)(InterlockedExchange64(&d3d10_wddm_flush_us, 0) / 1000));
    d3d10_wddm_log("copies in %lu ms: %ld overlaid, %ld flushes, %ld readbacks, %ld uploads, %lld MiB",
                   (unsigned long)(now - before),
                   InterlockedExchange(&d3d10_wddm_overlays, 0),
@@ -559,17 +578,24 @@ d3d10_wddm_readback(struct d3d10_wddm_screen *ws, struct pipe_context *pipe,
    dst = ws->winsys->displaytarget_map(ws->winsys, shared->dt, PIPE_MAP_WRITE);
    if (!dst)
       return;
-   src = pipe->texture_map(pipe, res, 0, PIPE_MAP_READ, &box, &transfer);
-   if (!src) {
+   {
+      LONG64 start = d3d10_wddm_now_us(), mapped;
+
+      src = pipe->texture_map(pipe, res, 0, PIPE_MAP_READ, &box, &transfer);
+      mapped = d3d10_wddm_now_us();
+      InterlockedAdd64(&d3d10_wddm_map_us, mapped - start);
+      if (!src) {
+         ws->winsys->displaytarget_unmap(ws->winsys, shared->dt);
+         return;
+      }
+      for (unsigned y = 0; y < shared->height; y++) {
+         memcpy(dst + (size_t)y * shared->stride,
+                src + (size_t)y * transfer->stride, (size_t)shared->width * 4);
+      }
+      pipe->texture_unmap(pipe, transfer);
       ws->winsys->displaytarget_unmap(ws->winsys, shared->dt);
-      return;
+      InterlockedAdd64(&d3d10_wddm_memcpy_us, d3d10_wddm_now_us() - mapped);
    }
-   for (unsigned y = 0; y < shared->height; y++) {
-      memcpy(dst + (size_t)y * shared->stride,
-             src + (size_t)y * transfer->stride, (size_t)shared->width * 4);
-   }
-   pipe->texture_unmap(pipe, transfer);
-   ws->winsys->displaytarget_unmap(ws->winsys, shared->dt);
    InterlockedIncrement(&d3d10_wddm_readbacks);
    InterlockedAdd64(&d3d10_wddm_copied, (LONG64)shared->width * shared->height * 4);
 }
@@ -908,6 +934,7 @@ d3d10_wddm_flush_frontbuffer_inner(struct pipe_screen *screen,
    struct d3d10_wddm_screen *ws = d3d10_wddm_screen(screen);
    struct d3d10_wddm_shared *shared = d3d10_wddm_lookup(ws, res);
    LONG present = InterlockedIncrement(&d3d10_wddm_presents);
+   LONG64 started = d3d10_wddm_now_us();
 
    if (d3d10_wddm_tracing) {
       char r[40];
@@ -970,8 +997,19 @@ d3d10_wddm_flush_frontbuffer_inner(struct pipe_screen *screen,
       ws->overlaid = false;
       d3d10_wddm_readback(ws, pipe, res, shared);
    }
-   ws->winsys->displaytarget_display(ws->winsys, shared->dt,
-                                     winsys_drawable_handle, nboxes, sub_box);
+   {
+      LONG64 flip = d3d10_wddm_now_us();
+
+      ws->winsys->displaytarget_display(ws->winsys, shared->dt,
+                                        winsys_drawable_handle, nboxes, sub_box);
+      if (shared->presentable) {
+         LONG64 end = d3d10_wddm_now_us();
+
+         InterlockedAdd64(&d3d10_wddm_display_us, end - flip);
+         InterlockedAdd64(&d3d10_wddm_present_us, end - started);
+         InterlockedIncrement(&d3d10_wddm_screen_presents);
+      }
+   }
 }
 
 /* The frame a traced present showed, as DWM drew it: the allocation, which
@@ -1154,8 +1192,10 @@ d3d10_wddm_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
    struct pipe_resource *dirty[16];
    struct d3d10_wddm_shared *shared[16];
    unsigned count = 0;
+   LONG64 start = d3d10_wddm_now_us();
 
    wc->flush(pipe, fence, flags);
+   InterlockedAdd64(&d3d10_wddm_flush_us, d3d10_wddm_now_us() - start);
    if (d3d10_wddm_tracing)
       d3d10_wddm_trace("%p flush 0x%x", (void *)pipe, flags);
    /* A screen on its way out flushes the contexts it keeps for itself, after

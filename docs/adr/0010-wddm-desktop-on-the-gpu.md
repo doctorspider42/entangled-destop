@@ -610,7 +610,8 @@ quotes. What DWM itself put on the screen in those runs, from the host's
 frame-pacing log, was **12–21 frames a second**: a headless run declines the
 overlay plane, so each present reads the 1920×1080 frame back through the CPU
 (the W2 path), and that, not the GPU, is the ceiling. A run with a window
-(the overlay plane) is the measurement still owed.
+(the overlay plane) is the measurement still owed. *(Both measured, and the
+headless readback removed, in the amendment that follows.)*
 
 **The trace, for next time.** In `dwm.exe` only, every present looks at
 `C:\Users\Public\dwmtrace.txt`; writing a number into it (e.g. `cmd /c echo 3
@@ -632,6 +633,129 @@ the DWM process does not count. Draws are traced at the DDI (Zink swaps its
 - The dev agent was quarantined again by Defender in the guest mid-session
   (`Wacatac.H!ml`, deleted from the virtio-fs share it was started from);
   driving fell back to the Run box.
+
+### Amendment, 2026-11-20 (later): DWM's frames stay on the GPU with no window
+
+The owner's rule for this path is that a frame does not go through a CPU, with
+a window or without. Headless, it did: every present of DWM's desktop was read
+back into the primary's allocation and flipped. That is the path every
+wintanyl battery runs on.
+
+**Measured first.** The user-mode driver's statistics gained a breakdown,
+printed every two seconds from each process:
+
+- `presents: N of the screen in T ms: … whole, … readback map, … readback memcpy, … flip`
+- `flushes: … ms in the driver's flush`
+
+The readback is split into the map (Zink's copy to memory, waited for) and
+the copy out of it on the guest's CPU; the flush is Zink's submit, which waits
+for the host when the batch carries a fence.
+
+On machine `b`, headless with the engine as it was, wintanyl's PoC on the 3D
+adapter gave these numbers. Each window is about 26 s and includes the
+program's start-up:
+
+| | `show` | `hybrid` | `surface` | effects (`fx jelly`, `fx lamp`) |
+|---|---|---|---|---|
+| DWM presents a second | 8.8 | 15.3 | 1.3 | 5.1 |
+| readbacks (8 MiB each) | 1 618 | 1 117 | 1 318 | 2 892 (in 129 s) |
+| bytes copied by the guest's CPU | 492 MiB/s | 338 MiB/s | 415 MiB/s | 177 MiB/s |
+| present time in a failed overlay call | 3.1 s | 6.1 s | 0.4 s | 7.4 s |
+| the program's own tick/s | 62.0 | 62.0 | 62.0 | — |
+
+There were about seven readbacks per present. Every flush with a dirty
+primary reads it back too, which `d3d10_wddm_flush` skips only while
+`ws->overlaid` holds. In `surface` the screen hardly changed between
+screenshots a second apart.
+
+**Why the plane declined.** A window installs two presenters on its GPU: one
+for the desktop and one for the overlay plane (`renderer.rs`). A headless
+display got only the first (`attach_offscreen_gpu`). The render node's
+`OverlaySink` therefore never accepted host pages. The device's copy path read
+the frame on the host's CPU instead, and the guest saw
+`entangled_present_overlay` fail and fell back to the readback.
+
+**The fix** (`display`): `attach_offscreen_gpu` gives the overlay plane its
+presenter on the same off-screen device (`GpuScanout::open_offscreen_pair`),
+as a window does. The host then logs *"presents a renderer blob's host pages
+through the display's GPU: no readback, no CPU copy"*. The guest presents
+every frame on the plane (`N overlaid` = presents), and the readback runs only
+under W2's lease: once per 0.9 s, about 8 MiB/s. A screenshot from the control
+line reads the plane's texture back from the GPU (`gpu_overlay`) when it is
+asked, never before. Screenshots in the guest (`BitBlt` of the screen, which
+wintanyl's effect tests take) still show the current frame: the lamp's
+mid-animation shot catches the trapezoid. The framebuffer profile has no
+Venus, so it never calls this; its screenshots are as clean as
+`evidence/warp-*.png`, at 54.4 / 51.9 / 5.9 tick/s.
+
+After the fix, same machine, same program:
+
+| | `show` | `hybrid` | `surface` | effects |
+|---|---|---|---|---|
+| DWM presents a second | 22.9–27.6 (one run 7.0) | 19.6–39.8 | 1.4–2.6 | 10.8 |
+| readbacks | 28 | 26–28 | 12–15 | 78 (in 81 s) |
+| bytes copied by the guest's CPU | 8 MiB/s | 7–8 MiB/s | 3–4 MiB/s | 7 MiB/s |
+| the program's own tick/s | 61.3–61.6 | 61.6 (one run 41.5) | 61.3–61.6 | — |
+
+Two other agents' VMs shared this host's GPU and CPU during these runs. That
+explains the spread in frames a second between runs. The readback counts do
+not depend on it.
+
+**With a window.** The code path has no CPU copy:
+
+1. The window's overlay presenter imports the blob's host pages.
+2. It copies them into its texture on the GPU.
+3. The renderer samples that texture over the desktop.
+
+Measured with the engine's window on a separate Windows desktop (zitter's
+`windows_test_desktop.py`, so off the owner's desktop and never visible): DWM
+made 13.0 / 28.9 / 2.0 presents a second (`show` / `hybrid` / `surface`).
+Readbacks were the same lease-paced 8 MiB/s, the program ran 60–62 tick/s,
+and the screenshots were clean. A window on an invisible desktop may well be
+paced differently from one on screen, so these are not on-screen numbers.
+
+**The next ceiling is the flush, not a copy.** After the fix, DWM spent this
+share of its wall time inside `pipe->flush`:
+
+| | flush time | of wall time |
+|---|---|---|
+| `show` headless | 13.6 s | 26 s |
+| `surface` headless | 8.6 s | 26 s |
+| `show` windowed | 8.4 s | 26 s |
+| `hybrid` windowed | 13.2 s | 26 s |
+
+DWM flushes about 200–800 times a second. `vn_renderer_entangled`'s submit is
+an `IOCTL` that returns once the host has retired the batch's fence, so a
+flush that carries one waits a host round trip. In `surface` that leaves DWM
+at about 2 presents a second while the program commits 62 times. This is not
+fixed here; it is the next thing to measure.
+
+**What still goes through a CPU, and why it stays for now:**
+
+- **The primary under the plane**, once per 0.9 s, about 8 MiB/s. It is for
+  what reads the primary in the guest, and for the moment the plane goes away.
+- **A texture shared between processes.** A program rendering through this
+  driver reads its window's surface back at each flush for DWM to upload. In
+  these runs that was about 20 readbacks per program run. A Venus blob both
+  processes import is the fix, as before.
+
+**Not measured.** wintanyl's full grids (jelly 16×10, lamp 48 strips) never
+ran. Its demo opens Direct3D 12 only (`wt-scene/src/gpu.rs`). This driver has
+no D3D12, so the demo gets WARP12, which reports a CPU device. The demo then
+caps itself at `soft_max_tiles` = 40, which gives jelly 8×5 and lamp 20
+strips. The effect numbers above are for those grids. wintanyl's own pass/fail
+lines were the same before and after, apart from one lamp check. That check
+now counts Paint's colour swatches, because a different window happened to be
+behind it in this run.
+
+**Defender, again.** On 2026-11-20 at 16:31 the guest's Defender quarantined
+the driver itself (`Trojan:Win32/Bearfoos.B!ml`, a machine-learning verdict)
+from the driver store, when a newly started process loaded it. Processes that
+already had it mapped kept running, so the previous amendment's evidence
+stands. The next boot had no `entangled_d3d10.dll`: Windows stopped the WDDM
+device (code 43) and DWM composed on the basic display. Machine `b` was
+repaired by reinstalling the driver; no exclusion was added. Expect it again
+whenever a build is new to Defender's cloud model.
 
 ## Risks, in the order they are likely to bite
 

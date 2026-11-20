@@ -17,7 +17,8 @@
 //! callback) because the guest compositor releases every scanout buffer to
 //! `VK_QUEUE_FAMILY_FOREIGN_EXT`, and acquiring from that family needs it.
 //! The window uses the same device for its surface; a headless VM gets one of
-//! its own ([`GpuScanout::open_offscreen`]).
+//! its own, with the overlay plane's presenter beside the desktop's
+//! ([`GpuScanout::open_offscreen_pair`]).
 //!
 //! # One present
 //!
@@ -551,13 +552,24 @@ impl GpuScanout {
         })
     }
 
-    /// A presenter on a device of its own, for a display with no window
-    /// (`--headless`): the frames are still presented — copied on the GPU,
-    /// where screenshots read them — exactly as the window's are.
+    /// Presenters on a device of their own, for a display with no window
+    /// (`--headless`): the desktop's and the overlay plane's (ADR-0009 phase
+    /// E), as a window has on its GPU. The frames are still presented —
+    /// copied on the GPU, where screenshots read them — exactly as the
+    /// window's are; a render node's frames on the plane (DWM's whole desktop
+    /// under ADR-0010) stay on the GPU, and only a screenshot reads them back.
     ///
     /// # Errors
     /// No Vulkan adapter, or none that can share.
-    pub fn open_offscreen() -> Result<Self, String> {
+    pub fn open_offscreen_pair() -> Result<(Self, Self), String> {
+        let (device, queue) = Self::offscreen_device()?;
+        Ok((
+            Self::new(device.clone(), queue.clone())?,
+            Self::new(device, queue)?,
+        ))
+    }
+
+    fn offscreen_device() -> Result<(wgpu::Device, wgpu::Queue), String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::from_env_or_default()
@@ -572,7 +584,7 @@ impl GpuScanout {
         device.on_uncaptured_error(Box::new(|err| {
             tracing::error!(%err, "wgpu reported an uncaptured error (off-screen presenter)");
         }));
-        Self::new(device, queue)
+        Ok((device, queue))
     }
 
     /// Nothing of ours on the GPU, however long that takes — before
