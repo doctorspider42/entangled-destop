@@ -68,6 +68,49 @@ trace_on(void)
    return on;
 }
 
+/* Where this process's renderer spends its time, for the Direct3D driver's
+ * statistics (entangled_renderer_stats, read and reset by name): fenced and
+ * plain submits (count, microseconds, the longest), fenced submits over 2 ms,
+ * and waits that did not return at once. */
+enum {
+   STAT_FENCED, STAT_FENCED_US, STAT_FENCED_MAX_US, STAT_FENCED_SLOW,
+   STAT_PLAIN, STAT_PLAIN_US, STAT_WAITS, STAT_WAIT_US,
+   /* Venus's own polling waits (vn_relax), per reason: waits, microseconds,
+    * and the waits that got past busy-waiting into sleeps. */
+   STAT_RELAX, STAT_COUNT = STAT_RELAX + 5 * 3
+};
+static volatile LONG64 entangled_stats[STAT_COUNT];
+
+static int64_t
+entangled_now_us(void)
+{
+   static LARGE_INTEGER frequency;
+   LARGE_INTEGER now;
+   if (!frequency.QuadPart)
+      QueryPerformanceFrequency(&frequency);
+   QueryPerformanceCounter(&now);
+   return now.QuadPart * 1000000 / frequency.QuadPart;
+}
+
+void
+entangled_note_relax(unsigned reason, int64_t ns, uint32_t iters, bool slept)
+{
+   (void)iters;
+   if (reason >= 5)
+      return;
+   InterlockedIncrement64(&entangled_stats[STAT_RELAX + reason * 3]);
+   InterlockedAdd64(&entangled_stats[STAT_RELAX + reason * 3 + 1], ns / 1000);
+   if (slept)
+      InterlockedIncrement64(&entangled_stats[STAT_RELAX + reason * 3 + 2]);
+}
+
+__declspec(dllexport) void
+entangled_renderer_stats(uint64_t *out, uint32_t count)
+{
+   for (uint32_t i = 0; i < count && i < STAT_COUNT; i++)
+      out[i] = (uint64_t)InterlockedExchange64(&entangled_stats[i], 0);
+}
+
 static bool
 ioctl(struct entangled *gpu, DWORD code, void *in, DWORD in_size, void *out,
       DWORD out_size)
@@ -111,11 +154,30 @@ entangled_submit(struct vn_renderer *renderer,
       memcpy(req + 1, batch->cs_data, batch->cs_size);
 
    ENTANGLED_GPU_RESPONSE resp = {0};
+   const int64_t start = entangled_now_us();
    AcquireSRWLockExclusive(&gpu->lock);
    const bool ok = ioctl(gpu, IOCTL_ENTANGLED_GPU_SUBMIT_3D, req, (DWORD)size,
                          &resp, sizeof(resp));
    ReleaseSRWLockExclusive(&gpu->lock);
    free(req);
+   {
+      const LONG64 took = entangled_now_us() - start;
+      if (batch->sync_count) {
+         InterlockedIncrement64(&entangled_stats[STAT_FENCED]);
+         InterlockedAdd64(&entangled_stats[STAT_FENCED_US], took);
+         if (took > 2000)
+            InterlockedIncrement64(&entangled_stats[STAT_FENCED_SLOW]);
+         for (LONG64 max = entangled_stats[STAT_FENCED_MAX_US]; took > max;
+              max = entangled_stats[STAT_FENCED_MAX_US]) {
+            if (InterlockedCompareExchange64(&entangled_stats[STAT_FENCED_MAX_US],
+                                             took, max) == max)
+               break;
+         }
+      } else {
+         InterlockedIncrement64(&entangled_stats[STAT_PLAIN]);
+         InterlockedAdd64(&entangled_stats[STAT_PLAIN_US], took);
+      }
+   }
    if (trace_on()) {
       fprintf(stderr, "entangled: submit tid %lu ring %u size %zu syncs %u ->%s 0x%x\n",
               GetCurrentThreadId(), batch->ring_idx, batch->cs_size,
@@ -165,7 +227,8 @@ entangled_wait(struct vn_renderer *renderer,
 {
    (void)renderer;
    const int64_t deadline = os_time_get_absolute_timeout(wait->timeout);
-   bool traced = false;
+   const int64_t start = entangled_now_us();
+   bool traced = false, slept = false;
    for (;;) {
       uint32_t reached = 0;
       for (uint32_t i = 0; i < wait->sync_count; i++) {
@@ -174,8 +237,13 @@ entangled_wait(struct vn_renderer *renderer,
          if (sync->value >= wait->sync_values[i])
             reached++;
       }
-      if (wait->wait_any ? reached > 0 : reached == wait->sync_count)
+      if (wait->wait_any ? reached > 0 : reached == wait->sync_count) {
+         if (slept) {
+            InterlockedIncrement64(&entangled_stats[STAT_WAITS]);
+            InterlockedAdd64(&entangled_stats[STAT_WAIT_US], entangled_now_us() - start);
+         }
          return VK_SUCCESS;
+      }
       if (os_time_timeout(0, deadline, os_time_get_nano()))
          return VK_TIMEOUT;
       if (trace_on() && !traced) {
@@ -190,7 +258,9 @@ entangled_wait(struct vn_renderer *renderer,
                                             wait->syncs[i])->value,
                     (unsigned long long)wait->sync_values[i]);
       }
-      Sleep(1);
+      slept = true;
+      /* Not Sleep(1): that is a whole timer tick (15.6 ms) on Windows. */
+      vn_sleep_us(200);
    }
 }
 

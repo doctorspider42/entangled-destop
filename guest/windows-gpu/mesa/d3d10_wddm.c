@@ -524,6 +524,36 @@ d3d10_wddm_stats(void)
                   (long long)(InterlockedExchange64(&d3d10_wddm_display_us, 0) / 1000));
    d3d10_wddm_log("flushes: %lld ms in the driver's flush",
                   (long long)(InterlockedExchange64(&d3d10_wddm_flush_us, 0) / 1000));
+   {
+      /* The Venus driver's side of it: its submits and waits (exported by
+       * name from vulkan_virtio.dll, like the overlay). */
+      typedef void (*stats_fn)(uint64_t *, uint32_t);
+      static stats_fn renderer_stats;
+      static bool looked;
+      uint64_t v[23] = {0};
+
+      if (!looked) {
+         HMODULE icd = GetModuleHandleA("vulkan_virtio.dll");
+
+         if (icd)
+            renderer_stats = (stats_fn)(void *)GetProcAddress(icd, "entangled_renderer_stats");
+         looked = icd != NULL;
+      }
+      if (renderer_stats) {
+         renderer_stats(v, 23);
+         d3d10_wddm_log("venus: %llu fenced submits %llu ms (max %llu us, %llu over 2 ms), %llu plain submits %llu ms, %llu waits %llu ms",
+                        (unsigned long long)v[0], (unsigned long long)(v[1] / 1000),
+                        (unsigned long long)v[2], (unsigned long long)v[3],
+                        (unsigned long long)v[4], (unsigned long long)(v[5] / 1000),
+                        (unsigned long long)v[6], (unsigned long long)(v[7] / 1000));
+         d3d10_wddm_log("venus waits: ring seqno %llu %llu ms (%llu slept), tls ring %llu %llu ms (%llu), ring space %llu %llu ms (%llu), semaphore %llu %llu ms (%llu), query %llu %llu ms (%llu)",
+                        (unsigned long long)v[8], (unsigned long long)(v[9] / 1000), (unsigned long long)v[10],
+                        (unsigned long long)v[11], (unsigned long long)(v[12] / 1000), (unsigned long long)v[13],
+                        (unsigned long long)v[14], (unsigned long long)(v[15] / 1000), (unsigned long long)v[16],
+                        (unsigned long long)v[17], (unsigned long long)(v[18] / 1000), (unsigned long long)v[19],
+                        (unsigned long long)v[20], (unsigned long long)(v[21] / 1000), (unsigned long long)v[22]);
+      }
+   }
    d3d10_wddm_log("copies in %lu ms: %ld overlaid, %ld flushes, %ld readbacks, %ld uploads, %lld MiB",
                   (unsigned long)(now - before),
                   InterlockedExchange(&d3d10_wddm_overlays, 0),

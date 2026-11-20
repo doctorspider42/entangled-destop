@@ -38,8 +38,114 @@ index fda382d..0d48e6d 100644
    include_directories : vn_incs,
    link_with : vn_libs,
    dependencies : vn_deps,
+diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
+index fe9c375..b7cdfbc 100644
+--- a/src/virtio/vulkan/vn_common.c
++++ b/src/virtio/vulkan/vn_common.c
+@@ -153,9 +153,81 @@ vn_watchdog_acquire(struct vn_watchdog *watchdog, bool alive)
+    return true;
+ }
+ 
++#ifdef _WIN32
++void entangled_note_relax(unsigned reason, int64_t ns, uint32_t iters, bool slept);
++
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++
++/* A thread's high-resolution timer, in a fiber-local slot whose callback
++ * closes it when the thread ends. NO_TIMER marks a thread the system gave
++ * none (before Windows 10 1803): it sleeps the old way. */
++#define VN_NO_TIMER ((HANDLE)(intptr_t)-2)
++static INIT_ONCE vn_timer_once = INIT_ONCE_STATIC_INIT;
++static DWORD vn_timer_slot = FLS_OUT_OF_INDEXES;
++
++static void WINAPI
++vn_timer_release(void *data)
++{
++   if (data && data != VN_NO_TIMER)
++      CloseHandle(data);
++}
++
++static BOOL CALLBACK
++vn_timer_slot_init(PINIT_ONCE once, void *param, void **context)
++{
++   (void)once;
++   (void)param;
++   (void)context;
++   vn_timer_slot = FlsAlloc(vn_timer_release);
++   return TRUE;
++}
++
++static HANDLE
++vn_thread_timer(void)
++{
++   InitOnceExecuteOnce(&vn_timer_once, vn_timer_slot_init, NULL, NULL);
++   if (vn_timer_slot == FLS_OUT_OF_INDEXES)
++      return VN_NO_TIMER;
++   HANDLE timer = FlsGetValue(vn_timer_slot);
++   if (!timer) {
++      timer = CreateWaitableTimerExW(NULL, NULL,
++                                     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                     TIMER_ALL_ACCESS);
++      if (!timer)
++         timer = VN_NO_TIMER;
++      FlsSetValue(vn_timer_slot, timer);
++   }
++   return timer;
++}
++#endif
++
++void
++vn_sleep_us(uint32_t usecs)
++{
++#ifdef _WIN32
++   HANDLE timer = vn_thread_timer();
++   if (timer != VN_NO_TIMER) {
++      LARGE_INTEGER due;
++      due.QuadPart = -(LONGLONG)usecs * 10; /* relative, 100 ns units */
++      if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE) &&
++          WaitForSingleObject(timer, INFINITE) == WAIT_OBJECT_0)
++         return;
++   }
++#endif
++   os_time_sleep(usecs);
++}
++
+ void
+ vn_relax_fini(struct vn_relax_state *state)
+ {
++#ifdef _WIN32
++   if (state->iter)
++      entangled_note_relax(state->reason, os_time_get_nano() - state->start_ns,
++                           state->iter,
++                           state->iter >= (1u << state->profile.busy_wait_order));
++#endif
+    vn_watchdog_release(&state->instance->ring.watchdog);
+ }
+ 
+@@ -239,6 +311,10 @@ vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason)
+       .iter = 0,
+       .profile = vn_relax_get_profile(reason),
+       .reason_str = vn_relax_reason_string(reason),
++#ifdef _WIN32
++      .start_ns = os_time_get_nano(),
++      .reason = reason,
++#endif
+    };
+ }
+ 
+@@ -289,7 +365,7 @@ vn_relax(struct vn_relax_state *state)
+    }
+ 
+    const uint32_t shift = util_last_bit(*iter) - busy_wait_order - 1;
+-   os_time_sleep(base_sleep_us << shift);
++   vn_sleep_us(base_sleep_us << shift);
+ }
+ 
+ struct vn_ring *
 diff --git a/src/virtio/vulkan/vn_common.h b/src/virtio/vulkan/vn_common.h
-index 86235f6..cb97805 100644
+index 86235f6..3bea6d1 100644
 --- a/src/virtio/vulkan/vn_common.h
 +++ b/src/virtio/vulkan/vn_common.h
 @@ -32,6 +32,23 @@
@@ -66,6 +172,32 @@ index 86235f6..cb97805 100644
  #include "util/u_math.h"
  #include "util/u_memset.h"
  #include "util/u_thread.h"
+@@ -275,6 +292,11 @@ struct vn_relax_state {
+    const struct vn_relax_profile profile;
+    const char *reason_str;
+    bool warn;
++#ifdef _WIN32
++   /* Entangled: when the wait began and why, for the renderer's stats. */
++   int64_t start_ns;
++   enum vn_relax_reason reason;
++#endif
+ };
+ 
+ /* TLS ring
+@@ -442,6 +464,13 @@ vn_relax(struct vn_relax_state *state);
+ void
+ vn_relax_fini(struct vn_relax_state *state);
+ 
++/* Sleeps about `usecs`. On Windows a plain Sleep() rounds anything below a
++ * millisecond up to the timer tick (15.6 ms by default), which turned every
++ * Venus polling wait into a tick; this uses a high-resolution waitable timer
++ * instead, one per thread, and Sleep() only where the system has none. */
++void
++vn_sleep_us(uint32_t usecs);
++
+ static inline bool
+ vn_relax_warn(struct vn_relax_state *state)
+ {
 diff --git a/src/virtio/vulkan/vn_instance.c b/src/virtio/vulkan/vn_instance.c
 index 948c59b..088739c 100644
 --- a/src/virtio/vulkan/vn_instance.c

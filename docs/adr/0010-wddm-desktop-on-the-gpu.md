@@ -757,6 +757,123 @@ device (code 43) and DWM composed on the basic display. Machine `b` was
 repaired by reinstalling the driver; no exclusion was added. Expect it again
 whenever a build is new to Defender's cloud model.
 
+### Amendment, 2026-11-20 (evening): what DWM waits for in its flushes
+
+Once the per-frame readback was gone, `surface` still showed only about 2 DWM
+presents a second, with DWM spending 30–52% of its time in `pipe->flush`. The
+owner asked for that wait to be removed. This section records:
+
+- what the wait turned out to be;
+- the half of it that was fixed;
+- the half that is out of reach without the kernel driver.
+
+**Measured first.** Two sets of counters were added.
+
+- In the Venus driver (`vn_renderer_entangled.c`): fenced and plain submits
+  (count, time, the longest, how many took over 2 ms) and its own waits. Read
+  by name through `entangled_renderer_stats`.
+- In Venus's polling loop (`vn_relax`, `0001`): time per reason.
+
+The Direct3D driver prints both every two seconds as `venus:` and
+`venus waits:` lines. Machine `b`, headless, wintanyl's PoC, 26–27 s windows.
+Another agent's VM shared the host throughout.
+
+| | `show` | `hybrid` | `surface` |
+|---|---|---|---|
+| d3d10 flushes per DWM present | 38–42 | 30 | 90–154 |
+| fenced Venus submits per flush | 1 | 1 | 1 |
+| DWM time in fenced submits | 8.6 s | 12.6 s | 6.3 s |
+| … of which took over 2 ms | 301 | 314 | 226 |
+| DWM time waiting on Venus's ring (`ring seqno`) | 7.5 s | not measured | **13.3 s** |
+| … waits that reached a sleep | 511 | — | 827 |
+| DWM presents a second | 9.6 | 23.8 | 1.9 |
+
+So the wait had two halves, and in `surface` the larger one was not the fence.
+
+**Half 1: Venus's polling sleep.** Venus waits for the host to reach a ring
+sequence number by polling. After a short busy wait it sleeps
+`base_sleep_us` (160 µs) and doubles from there, through `os_time_sleep()`.
+On Windows that is `Sleep(1)`, and a `Sleep(1)` lasts a whole timer tick,
+15.6 ms by default. Every synchronous call DWM's Zink makes through the ring
+therefore cost a tick or more. `entangled_wait` had the same `Sleep(1)`.
+
+**The fix** (`0001`: `vn_common.c`; `vn_renderer_entangled.c`): `vn_sleep_us`
+sleeps on a high-resolution waitable timer instead
+(`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10 1803 and later). The timer
+is created once per thread and kept in a fiber-local slot, whose callback
+closes it when the thread ends. A system that refuses the flag gets the old
+`Sleep`. The global timer resolution is not touched (no `timeBeginPeriod`).
+
+| | `show` | `hybrid` | `surface` | effects (jelly + lamp, 86 s) |
+|---|---|---|---|---|
+| ring waits, before → after | 7.5 s → 0.66 s | not measured → under 0.2 s | 13.3 s → **2.0 s** | not measured → 0.85 s |
+| DWM presents/s, before → after | 9.6 → 12.0 | 23.8 → 20.7 | 1.9 → **3.5** | 10.8 → 10.5 |
+| program tick/s after | 60.5 | 61.5 | 61.1 | — |
+| CPU readbacks after (8 MiB each) | 28 | 28 | 21 | 82 |
+
+Screenshots of all three modes are clean. The framebuffer profile does not
+load this driver; its screenshots are clean at 51.3 / 53.9 / 5.3 tick/s.
+
+**Half 2: the fenced submit, now the whole of what is left.** After the fix,
+DWM's fenced submits took this much of its wall time:
+
+| | fenced submits | over 2 ms | time | of wall time |
+|---|---|---|---|---|
+| `surface` | 11 389 | 659 | 13.8 s | 51% |
+| `show` | 11 187 | 587 | 13.5 s | 52% |
+| `hybrid` | 16 128 | 332 | 11.8 s | 45% |
+
+Each flush of the d3d10 frontend is a Zink batch. Zink submits each batch
+with a `VkFence`. Venus backs fences with renderer syncs, so the batch ends in
+a renderer submit that signals one. This backend makes that submit
+synchronous: `entangled-gpu.sys` answers the IOCTL only once the host has
+retired the fence.
+
+The host retires fences quickly: 0.46–0.65 ms on average, at most one
+outstanding. The guest pays more, because of how the kernel driver waits:
+
+1. It has a single sequential IOCTL queue shared by every process.
+2. It polls the used ring for about 2 ms.
+3. It then waits in `KeDelayExecutionThread(1 ms)`, which, like `Sleep(1)`,
+   lasts a timer tick.
+
+So every fenced submit that takes over 2 ms costs at least 15.6 ms. In
+`surface` that was 659 of 11 389 submits, about 7 of its 13.8 s. Every other
+process's IOCTLs queue behind that wait.
+
+**Why it is not fixed here.** The useful fix is in the kernel driver, which
+cannot be rebuilt here because it would have to be signed:
+
+- **A fenced submit that returns at once.** Several commands in flight, and
+  the driver records retired fence ids from the used ring.
+- **A way to read those ids** (an IOCTL, or a shared page).
+- **A wait that blocks on an event**, instead of polling at the tick.
+
+Any one of these removes the 15.6 ms tail. The first and second together
+remove the synchronous wait as well.
+
+A user-mode worker thread that issues the fenced IOCTL on the caller's behalf
+was considered and not built. Each fenced submit is paired with a plain one
+(12 555 plain to 11 389 fenced in `surface`), so DWM's next IOCTL would queue
+behind the worker's in the same sequential queue. The gain would be small, and
+the risk to ordering, error reporting and teardown is not.
+
+**An observation, not acted on.** The fence per flush comes from Zink: every
+batch is submitted with a `VkFence` that Zink reads later, if at all, to
+recycle the batch. Making the renderer sync cheaper for a fence nobody waits
+on, or having Zink fence only when it must, would take the wait out of most
+flushes. Both are changes to Zink or Venus semantics, and this round did not
+make them.
+
+**Counters, for next time.** Every two seconds, each process that has the
+Direct3D driver loaded prints:
+
+- `venus: N fenced submits T ms (max …, K over 2 ms), … plain submits …, … waits …`
+- `venus waits: ring seqno … (… slept), … semaphore …, query …`
+
+Evidence: `F:\entangled-targets\dwm3d\evidence-flush\` (`summary.txt`, logs,
+grids).
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
