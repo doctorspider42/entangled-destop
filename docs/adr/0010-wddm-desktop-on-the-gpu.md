@@ -467,6 +467,8 @@ of an id it never made, once), and not in the last runs. Not understood.
 
 ### Amendment, 2026-11-19: DWM's 3D composition corrupts — narrowed, not fixed
 
+*Found and fixed the next day: see the amendment of 2026-11-20 below.*
+
 A user prototype ("wintanyl") asks DWM for live window thumbnails as
 composition visuals (`dwmapi!#147`) and moves them in 3D: perspective
 transforms, the interop compositor, `CompositionVisualSurface` on sprites.
@@ -531,6 +533,105 @@ kept with the session notes, worth carrying once the real cause is found.
 3. Zink's handling of DWM's intermediate render targets (`SetRenderTargets`
    onto offscreen textures, then sampling them): the clipped backdrop is what
    a stale scissor would draw.
+
+### Amendment, 2026-11-20: DWM's 3D composition corruption — found and fixed
+
+None of the three leads above was it. The scissors, viewports and copy boxes
+DWM sends are what reach Zink, and its intermediate render targets work. The
+geometry was wrong: **DWM's vertices were overwritten on the GPU after DWM
+wrote them.** A one-line change in the user-mode driver fixes it, and the
+three modes of the wintanyl prototype (`show`, `hybrid`, `surface`) are clean
+on the 3D stack.
+
+**How it was found.** The Windows 10 test machine `b` of wintanyl, headless,
+with the program driven through the control channel and full-size
+`screenshot` bursts as before. `d3d10_wddm.c` gained a trace of DWM's frames
+(below; it stays in the driver, dormant): every Gallium call that reaches
+Zink for a few presents, plus each presented frame written to a file in the
+guest. The first trace showed the damage inside the presented buffers and
+the partial-update pattern of DWM (per-frame dirty scissors, back-buffer
+tiles copied into a 256×256 scratch texture and drawn back for the backdrop
+effects), all consistent — so the state was right and the draws' inputs
+were not.
+
+Tried on the way and measured as no help: `ZINK_DEBUG=noreorder` in DWM (the
+copies into the scratch texture are not reordered past its draws); DWM on
+`ENTANGLED_D3D10_DRIVER=softpipe`, which presents black — that path does not
+work for DWM at all, so it cannot be an A/B arm.
+
+**The A/B that settled it.** A switch in `ResourceMap`, read from the
+environment of DWM, bit 1 dropping `PIPE_MAP_UNSYNCHRONIZED` and bit 2 the
+discard flags. Same DLL, same boot procedure, `show` mode, six shots each:
+`0` corrupt, both bits clean, **bit 1 alone clean** — so it is the
+unsynchronized write of Direct3D's `MAP_WRITE_NOOVERWRITE`.
+
+**The mechanism, from the trace with Zink's side of each map added.** DWM
+streams vertices into dynamic buffers of 16 000, 160 000 and 240 012 bytes:
+`WRITE_DISCARD` when it wraps, then a series of `WRITE_NOOVERWRITE` appends.
+A Direct3D 10 map has no range, so every map is of the whole buffer. Zink
+answers the discard with `invalidate_buffer`, which refuses when it thinks
+the buffer idle (`!zink_resource_has_usage`); the map then falls back to a
+**temporary buffer whose copy into the real one — all 160 000 bytes — is
+recorded in the batch** and runs later on the GPU. The appends that follow
+are unsynchronized maps of host-visible coherent memory (`hv 1 coherent 1
+staging 0`): DWM writes the next vertices straight into the buffer, the
+pending copy lands on top of them when the batch executes, and the draws
+read whatever the temporary buffer held there. Stale geometry, sprites at
+old places, degenerate quads (the thin lines), missing thumbnails, and
+regions of a buffer DWM believes it redrew left as they were — every symptom
+of the 2026-11-19 amendment. The trace (one frame):
+
+```
+DDI Map 30480 buffer 160000x1 sub 0 map 4 (DISCARD)        usage 0x82
+zink map 30480 [0+160000] hv 1 coherent 1 staging 1 ... usage 0x2a
+DDI Map 30480 buffer 160000x1 sub 0 map 5 (NOOVERWRITE)    usage 0x22
+zink map 30480 [0+160000] hv 1 coherent 1 staging 0 ... usage 0x22
+... five more direct appends before the batch is flushed
+```
+
+Gallium allows an unsynchronized write only where the caller knows nothing
+pending touches the range; the frontend cannot know about a copy the driver
+made up itself, and Zink does not check its own pending copies for an
+explicit `UNSYNCHRONIZED` map (it does when it infers one).
+
+**The fix** (`0002`, `Resource.cpp`): `MAP_WRITE_NOOVERWRITE` maps as a plain
+`PIPE_MAP_WRITE`. Zink then sends a write to a buffer the batch still uses
+through its own staging copy, in order and without waiting, so the measured
+cost is nil. The same driver build, installed in `b`, from fresh boots:
+
+| Mode | before (3D) | after (3D) | WARP (`adapter = "framebuffer"`) |
+|---|---|---|---|
+| `show` | corrupt, ~58–60 tick/s | clean, 61.9 tick/s | clean, ~52 tick/s |
+| `hybrid` | corrupt | clean, 60.9 tick/s | clean, ~47 tick/s |
+| `surface` | corrupt | clean, 62.1 tick/s | clean |
+
+Tick/s is the program's own loop (its `Commit` rate), the number wintanyl
+quotes. What DWM itself put on the screen in those runs, from the host's
+frame-pacing log, was **12–21 frames a second**: a headless run declines the
+overlay plane, so each present reads the 1920×1080 frame back through the CPU
+(the W2 path), and that, not the GPU, is the ceiling. A run with a window
+(the overlay plane) is the measurement still owed.
+
+**The trace, for next time.** In `dwm.exe` only, every present looks at
+`C:\Users\Public\dwmtrace.txt`; writing a number into it (e.g. `cmd /c echo 3
+> C:\Users\Public\dwmtrace.txt`) traces that many presents through the
+diagnostic kernel driver's COM1 lines (`T …`) and writes each presented frame
+to `C:\Users\Public\dwmframe-<n>.raw` (BGRA, screen size). A file older than
+the DWM process does not count. Draws are traced at the DDI (Zink swaps its
+`draw_vbo` on every state change, so a Gallium hook misses them).
+
+**Left over.**
+
+- The Direct3D 9 driver (Nine) has its own buffer uploads and was not looked
+  at; a game streaming vertices with `D3DLOCK_NOOVERWRITE` on Zink deserves
+  the same check.
+- Zink's fallback itself (a full-buffer temporary copy after a refused
+  invalidate, under later explicit unsynchronized maps) is an upstream bug
+  worth reporting with this trace; the frontend change does not depend on it
+  being fixed.
+- The dev agent was quarantined again by Defender in the guest mid-session
+  (`Wacatac.H!ml`, deleted from the virtio-fs share it was started from);
+  driving fell back to the Run box.
 
 ## Risks, in the order they are likely to bite
 

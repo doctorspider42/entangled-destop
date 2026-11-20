@@ -95,6 +95,95 @@ d3d10_wddm_log(const char *format, ...)
    device->escape(device, &escape, sizeof escape);
 }
 
+/* ---------------------------------------------------------------------- */
+/* A trace of DWM's frames                                                 */
+/* ---------------------------------------------------------------------- */
+
+/* What DWM asks of the GPU, call by call, for a few frames - what reaches
+ * the rasteriser, with the frames themselves written beside it. Armed in
+ * dwm.exe only; started by writing C:\Users\Public\dwmtrace.txt (its first
+ * number is how many presents to trace), which every present looks at. The
+ * frames land in C:\Users\Public\dwmframe-<n>.raw (BGRA, the screen's size)
+ * when DWM may write there. A diagnostic kernel driver carries the lines. */
+volatile LONG d3d10_wddm_tracing;
+static int d3d10_wddm_trace_armed = -1;
+static LONG d3d10_wddm_presents;
+
+void
+d3d10_wddm_trace(const char *format, ...)
+{
+   char line[220];
+   va_list args;
+
+   if (!d3d10_wddm_tracing)
+      return;
+   va_start(args, format);
+   vsnprintf(line, sizeof line, format, args);
+   va_end(args);
+   d3d10_wddm_log("T %s", line);
+}
+
+/* A short name for a resource in the trace: its address and its size. */
+static const char *
+d3d10_wddm_rid(char buf[40], const struct pipe_resource *res)
+{
+   if (!res)
+      snprintf(buf, 40, "-");
+   else
+      snprintf(buf, 40, "%05llx:%ux%u", (unsigned long long)(uintptr_t)res & 0xfffff,
+               res->width0, res->height0);
+   return buf;
+}
+
+static void
+d3d10_wddm_trace_check(void)
+{
+   static FILETIME seen;
+   WIN32_FILE_ATTRIBUTE_DATA data;
+
+   if (d3d10_wddm_trace_armed < 0) {
+      char exe[MAX_PATH] = "";
+      const char *base = exe;
+
+      GetModuleFileNameA(NULL, exe, sizeof exe);
+      for (const char *p = exe; *p; p++) {
+         if (*p == '\\' || *p == '/')
+            base = p + 1;
+      }
+      d3d10_wddm_trace_armed = _stricmp(base, "dwm.exe") == 0;
+   }
+   if (!d3d10_wddm_trace_armed)
+      return;
+   if (!GetFileAttributesExA("C:\\Users\\Public\\dwmtrace.txt", GetFileExInfoStandard,
+                             &data))
+      memset(&data, 0, sizeof data);
+   /* A file left from before this process started does not count. */
+   if (d3d10_wddm_trace_armed == 1) {
+      seen = data.ftLastWriteTime;
+      d3d10_wddm_trace_armed = 2;
+      return;
+   }
+   if (CompareFileTime(&data.ftLastWriteTime, &seen) == 0)
+      return;
+   seen = data.ftLastWriteTime;
+   if (!data.ftLastWriteTime.dwLowDateTime && !data.ftLastWriteTime.dwHighDateTime)
+      return;
+   {
+      FILE *f = fopen("C:\\Users\\Public\\dwmtrace.txt", "r");
+      int frames = 3;
+
+      if (f) {
+         if (fscanf(f, "%d", &frames) != 1)
+            frames = 3;
+         fclose(f);
+      }
+      if (frames < 1 || frames > 30)
+         frames = 3;
+      InterlockedExchange(&d3d10_wddm_tracing, frames + 1);
+      d3d10_wddm_log("T begin: %d presents", frames);
+   }
+}
+
 /* An access violation or the like in this process: say where, as module and
  * offset for every frame, then let it take its course. The frames are what
  * the linker map of this DLL (build-d3d10.cmd keeps one) turns into names. */
@@ -810,7 +899,7 @@ d3d10_wddm_plane_claimed(void)
 }
 
 static void
-d3d10_wddm_flush_frontbuffer(struct pipe_screen *screen,
+d3d10_wddm_flush_frontbuffer_inner(struct pipe_screen *screen,
                              struct pipe_context *pipe,
                              struct pipe_resource *res, unsigned level,
                              unsigned layer, void *winsys_drawable_handle,
@@ -818,6 +907,15 @@ d3d10_wddm_flush_frontbuffer(struct pipe_screen *screen,
 {
    struct d3d10_wddm_screen *ws = d3d10_wddm_screen(screen);
    struct d3d10_wddm_shared *shared = d3d10_wddm_lookup(ws, res);
+   LONG present = InterlockedIncrement(&d3d10_wddm_presents);
+
+   if (d3d10_wddm_tracing) {
+      char r[40];
+
+      d3d10_wddm_trace("present %ld ctx %p res %s alloc %p presentable %d", present,
+                       (void *)pipe, d3d10_wddm_rid(r, res),
+                       shared ? (void *)shared->dt : NULL, shared ? shared->presentable : -1);
+   }
 
    if (!shared) {
       ws->flush_frontbuffer(screen, pipe, res, level, layer,
@@ -876,6 +974,54 @@ d3d10_wddm_flush_frontbuffer(struct pipe_screen *screen,
                                      winsys_drawable_handle, nboxes, sub_box);
 }
 
+/* The frame a traced present showed, as DWM drew it: the allocation, which
+ * the present has just filled. */
+static void
+d3d10_wddm_trace_frame(struct d3d10_wddm_screen *ws, struct pipe_resource *res)
+{
+   struct d3d10_wddm_shared *shared = d3d10_wddm_lookup(ws, res);
+   const uint8_t *src;
+   char path[64];
+   FILE *f;
+
+   if (!shared)
+      return;
+   snprintf(path, sizeof path, "C:\\Users\\Public\\dwmframe-%ld.raw",
+            (long)d3d10_wddm_presents);
+   src = ws->winsys->displaytarget_map(ws->winsys, shared->dt, PIPE_MAP_READ);
+   if (!src)
+      return;
+   f = fopen(path, "wb");
+   if (f) {
+      for (unsigned y = 0; y < shared->height; y++)
+         fwrite(src + (size_t)y * shared->stride, 4, shared->width, f);
+      fclose(f);
+   }
+   ws->winsys->displaytarget_unmap(ws->winsys, shared->dt);
+   d3d10_wddm_trace("frame %s %s", path, f ? "written" : "NOT written");
+}
+
+static void
+d3d10_wddm_flush_frontbuffer(struct pipe_screen *screen,
+                             struct pipe_context *pipe,
+                             struct pipe_resource *res, unsigned level,
+                             unsigned layer, void *winsys_drawable_handle,
+                             unsigned nboxes, struct pipe_box *sub_box)
+{
+   struct d3d10_wddm_screen *ws = d3d10_wddm_screen(screen);
+
+   d3d10_wddm_flush_frontbuffer_inner(screen, pipe, res, level, layer,
+                                      winsys_drawable_handle, nboxes, sub_box);
+   if (d3d10_wddm_tracing) {
+      d3d10_wddm_trace_frame(ws, res);
+      if (InterlockedDecrement(&d3d10_wddm_tracing) == 1) {
+         d3d10_wddm_trace("end");
+         InterlockedExchange(&d3d10_wddm_tracing, 0);
+      }
+   }
+   d3d10_wddm_trace_check();
+}
+
 /* ---------------------------------------------------------------------- */
 /* Context: noticing draws into, and reads from, a shared texture          */
 /* ---------------------------------------------------------------------- */
@@ -912,6 +1058,15 @@ d3d10_wddm_set_framebuffer_state(struct pipe_context *pipe,
       for (unsigned i = 0; i < state->nr_cbufs; i++)
          d3d10_wddm_mark(wc->ws, state->cbufs[i].texture);
    }
+   if (d3d10_wddm_tracing && state) {
+      char r0[40], r1[40], z[40];
+
+      d3d10_wddm_trace("%p framebuffer %ux%u cbufs %u [%s %s] zs %s", (void *)pipe,
+                       state->width, state->height, state->nr_cbufs,
+                       d3d10_wddm_rid(r0, state->nr_cbufs > 0 ? state->cbufs[0].texture : NULL),
+                       d3d10_wddm_rid(r1, state->nr_cbufs > 1 ? state->cbufs[1].texture : NULL),
+                       d3d10_wddm_rid(z, state->zsbuf.texture));
+   }
    wc->set_framebuffer_state(pipe, state);
 }
 
@@ -919,6 +1074,17 @@ static void
 d3d10_wddm_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 {
    struct d3d10_wddm_context *wc = d3d10_wddm_context(pipe);
+
+   if (d3d10_wddm_tracing) {
+      char s[40], d[40];
+
+      d3d10_wddm_trace("%p blit %s [%d,%d %dx%d] -> %s [%d,%d %dx%d] scissor %d",
+                       (void *)pipe, d3d10_wddm_rid(s, info->src.resource),
+                       info->src.box.x, info->src.box.y, info->src.box.width,
+                       info->src.box.height, d3d10_wddm_rid(d, info->dst.resource),
+                       info->dst.box.x, info->dst.box.y, info->dst.box.width,
+                       info->dst.box.height, info->scissor_enable);
+   }
 
    d3d10_wddm_fetch(wc, pipe, info->src.resource);
    d3d10_wddm_mark(wc->ws, info->dst.resource);
@@ -933,6 +1099,14 @@ d3d10_wddm_resource_copy_region(struct pipe_context *pipe,
                                 const struct pipe_box *src_box)
 {
    struct d3d10_wddm_context *wc = d3d10_wddm_context(pipe);
+
+   if (d3d10_wddm_tracing) {
+      char s[40], d[40];
+
+      d3d10_wddm_trace("%p copy %s [%d,%d %dx%d] -> %s at %u,%u", (void *)pipe,
+                       d3d10_wddm_rid(s, src), src_box->x, src_box->y, src_box->width,
+                       src_box->height, d3d10_wddm_rid(d, dst), dstx, dsty);
+   }
 
    d3d10_wddm_fetch(wc, pipe, src);
    d3d10_wddm_mark(wc->ws, dst);
@@ -958,6 +1132,13 @@ d3d10_wddm_set_sampler_views(struct pipe_context *pipe,
          d3d10_wddm_fetch(wc, pipe, views[i]->texture);
       }
    }
+   if (d3d10_wddm_tracing && shader == MESA_SHADER_FRAGMENT) {
+      char r0[40], r1[40];
+
+      d3d10_wddm_trace("%p views fs %u+%u [%s %s]", (void *)pipe, start_slot, num_views,
+                       d3d10_wddm_rid(r0, views && num_views > 0 && views[0] ? views[0]->texture : NULL),
+                       d3d10_wddm_rid(r1, views && num_views > 1 && views[1] ? views[1]->texture : NULL));
+   }
    wc->set_sampler_views(pipe, shader, start_slot, num_views,
                          unbind_num_trailing_slots, views);
 }
@@ -975,6 +1156,8 @@ d3d10_wddm_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
    unsigned count = 0;
 
    wc->flush(pipe, fence, flags);
+   if (d3d10_wddm_tracing)
+      d3d10_wddm_trace("%p flush 0x%x", (void *)pipe, flags);
    /* A screen on its way out flushes the contexts it keeps for itself, after
     * the table of shared textures has gone. */
    if (wc->flushing || !ws->shared)
