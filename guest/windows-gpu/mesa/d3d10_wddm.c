@@ -530,7 +530,7 @@ d3d10_wddm_stats(void)
       typedef void (*stats_fn)(uint64_t *, uint32_t);
       static stats_fn renderer_stats;
       static bool looked;
-      uint64_t v[23] = {0};
+      uint64_t v[25] = {0};
 
       if (!looked) {
          HMODULE icd = GetModuleHandleA("vulkan_virtio.dll");
@@ -540,7 +540,7 @@ d3d10_wddm_stats(void)
          looked = icd != NULL;
       }
       if (renderer_stats) {
-         renderer_stats(v, 23);
+         renderer_stats(v, 25);
          d3d10_wddm_log("venus: %llu fenced submits %llu ms (max %llu us, %llu over 2 ms), %llu plain submits %llu ms, %llu waits %llu ms",
                         (unsigned long long)v[0], (unsigned long long)(v[1] / 1000),
                         (unsigned long long)v[2], (unsigned long long)v[3],
@@ -552,6 +552,32 @@ d3d10_wddm_stats(void)
                         (unsigned long long)v[14], (unsigned long long)(v[15] / 1000), (unsigned long long)v[16],
                         (unsigned long long)v[17], (unsigned long long)(v[18] / 1000), (unsigned long long)v[19],
                         (unsigned long long)v[20], (unsigned long long)(v[21] / 1000), (unsigned long long)v[22]);
+         d3d10_wddm_log("venus reads: %llu waits with a timeout, %llu polls",
+                        (unsigned long long)v[23], (unsigned long long)v[24]);
+         {
+            /* ENTANGLED_WAIT_CALLERS=1 in the Venus driver: who waited. */
+            typedef size_t (*callers_fn)(char *, size_t);
+            static callers_fn renderer_callers;
+            static bool looked_callers;
+            static char chains[4096];
+
+            if (!looked_callers) {
+               HMODULE icd = GetModuleHandleA("vulkan_virtio.dll");
+
+               if (icd)
+                  renderer_callers = (callers_fn)(void *)GetProcAddress(icd, "entangled_renderer_callers");
+               looked_callers = icd != NULL;
+            }
+            if (renderer_callers && renderer_callers(chains, sizeof chains)) {
+               char *line = chains, *end;
+
+               while (*line && (end = strchr(line, '\n'))) {
+                  *end = 0;
+                  d3d10_wddm_log("waited by %.220s", line);
+                  line = end + 1;
+               }
+            }
+         }
       }
    }
    d3d10_wddm_log("copies in %lu ms: %ld overlaid, %ld flushes, %ld readbacks, %ld uploads, %lld MiB",

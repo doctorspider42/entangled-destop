@@ -77,7 +77,10 @@ enum {
    STAT_PLAIN, STAT_PLAIN_US, STAT_WAITS, STAT_WAIT_US,
    /* Venus's own polling waits (vn_relax), per reason: waits, microseconds,
     * and the waits that got past busy-waiting into sleeps. */
-   STAT_RELAX, STAT_COUNT = STAT_RELAX + 5 * 3
+   STAT_RELAX,
+   /* Every wait with a timeout, and every poll (a zero timeout, or a read
+    * of a sync): who reads what the fenced submits signal. */
+   STAT_BLOCKING_WAITS = STAT_RELAX + 5 * 3, STAT_POLLS, STAT_COUNT
 };
 static volatile LONG64 entangled_stats[STAT_COUNT];
 
@@ -109,6 +112,101 @@ entangled_renderer_stats(uint64_t *out, uint32_t count)
 {
    for (uint32_t i = 0; i < count && i < STAT_COUNT; i++)
       out[i] = (uint64_t)InterlockedExchange64(&entangled_stats[i], 0);
+}
+
+/* ENTANGLED_WAIT_CALLERS=1: who waits with a timeout, by call chain, for
+ * entangled_renderer_callers (the Direct3D driver logs it with its
+ * statistics). A measuring instrument; off unless asked for. */
+#define CALLER_SLOTS 24
+#define CALLER_FRAMES 10
+static struct {
+   uint32_t hash;
+   uint32_t frames;
+   LONG64 count;
+   void *frame[CALLER_FRAMES];
+} entangled_callers[CALLER_SLOTS];
+static SRWLOCK entangled_callers_lock = SRWLOCK_INIT;
+
+static bool
+callers_on(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("ENTANGLED_WAIT_CALLERS") != NULL;
+   return on;
+}
+
+static void
+entangled_note_caller(void)
+{
+   void *frame[CALLER_FRAMES];
+   const USHORT frames = RtlCaptureStackBackTrace(1, CALLER_FRAMES, frame, NULL);
+   uint32_t hash = 2166136261u;
+   for (USHORT i = 0; i < frames; i++)
+      hash = (hash ^ (uint32_t)(uintptr_t)frame[i]) * 16777619u;
+   AcquireSRWLockExclusive(&entangled_callers_lock);
+   for (uint32_t i = 0; i < CALLER_SLOTS; i++) {
+      if (entangled_callers[i].count && entangled_callers[i].hash != hash)
+         continue;
+      if (!entangled_callers[i].count) {
+         entangled_callers[i].hash = hash;
+         entangled_callers[i].frames = frames;
+         memcpy(entangled_callers[i].frame, frame, frames * sizeof(void *));
+      }
+      entangled_callers[i].count++;
+      break;
+   }
+   ReleaseSRWLockExclusive(&entangled_callers_lock);
+}
+
+/* One line per call chain seen since the last call: the count, then each
+ * frame as module+offset. Returns the lines' total length. */
+__declspec(dllexport) size_t
+entangled_renderer_callers(char *out, size_t size)
+{
+   size_t used = 0;
+   if (!size)
+      return 0;
+   out[0] = 0;
+   AcquireSRWLockExclusive(&entangled_callers_lock);
+   for (uint32_t i = 0; i < CALLER_SLOTS && used + 1 < size; i++) {
+      if (!entangled_callers[i].count)
+         continue;
+      int n = snprintf(out + used, size - used, "%lld:",
+                       (long long)entangled_callers[i].count);
+      used += n > 0 ? (size_t)n : 0;
+      for (uint32_t f = 0; f < entangled_callers[i].frames && used + 1 < size; f++) {
+         HMODULE module = NULL;
+         char name[MAX_PATH] = "?";
+         if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                (LPCSTR)entangled_callers[i].frame[f], &module) &&
+             module) {
+            GetModuleFileNameA(module, name, sizeof(name));
+         }
+         const char *base = strrchr(name, '\\');
+         base = base ? base + 1 : name;
+         /* Short, so a chain fits a log line: D the Direct3D driver (Zink
+          * inside), V this one, else the module's first letters. */
+         if (_strnicmp(base, "entangled_d3d10", 15) == 0)
+            base = "D";
+         else if (_strnicmp(base, "vulkan_virtio", 13) == 0)
+            base = "V";
+         n = snprintf(out + used, size - used, " %.6s+%llx", base,
+                      (unsigned long long)((uintptr_t)entangled_callers[i].frame[f] -
+                                           (uintptr_t)module));
+         used += n > 0 ? (size_t)n : 0;
+      }
+      if (used + 1 < size)
+         out[used++] = '\n';
+      out[used] = 0;
+      entangled_callers[i].count = 0;
+   }
+   ReleaseSRWLockExclusive(&entangled_callers_lock);
+   if (used >= size)
+      used = size - 1;
+   out[used] = 0;
+   return used;
 }
 
 static bool
@@ -228,6 +326,10 @@ entangled_wait(struct vn_renderer *renderer,
    (void)renderer;
    const int64_t deadline = os_time_get_absolute_timeout(wait->timeout);
    const int64_t start = entangled_now_us();
+   const bool blocking = wait->timeout != 0;
+   InterlockedIncrement64(&entangled_stats[blocking ? STAT_BLOCKING_WAITS : STAT_POLLS]);
+   if (blocking && callers_on())
+      entangled_note_caller();
    bool traced = false, slept = false;
    for (;;) {
       uint32_t reached = 0;
@@ -476,6 +578,8 @@ entangled_sync_read(struct vn_renderer *renderer,
                     uint64_t *val)
 {
    (void)renderer;
+   /* A read is a poll (vkGetFenceStatus, vkGetSemaphoreCounterValue). */
+   InterlockedIncrement64(&entangled_stats[STAT_POLLS]);
    *val = ((struct entangled_sync *)sync)->value;
    return VK_SUCCESS;
 }

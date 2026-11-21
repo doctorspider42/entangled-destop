@@ -918,6 +918,118 @@ logged in the same session, all at the same offset.
 Evidence: `F:\entangled-targets\dwm3d\evidence-lazy\` (`consent-crash-events.txt`,
 `uac-after-fix.txt`).
 
+### Amendment, 2026-11-21: who reads DWM's fences — two ideas measured and rejected
+
+The previous amendment ended on an observation: Zink fences every batch, and
+almost nobody reads those fences. This amendment measures that claim. It is
+wrong, and both changes built on it were rejected.
+
+**Correction.** Zink does not submit with a `VkFence`. It signals its
+timeline semaphore (`screen->sem`) with each batch's id. Venus backs that
+semaphore with renderer syncs, and that is what turns every batch into a
+fenced submit.
+
+**Who waits.** Two new counters in the Venus driver count every wait with a
+timeout and every poll. They are printed as `venus reads:`. A third instrument
+records who waits, as call chains: set `ENTANGLED_WAIT_CALLERS=1` and the
+Direct3D driver prints `waited by` lines. Resolve those against
+`entangled_d3d10.map`.
+
+In `show` (machine `b`, headless), 30 seconds saw 19 674 fenced submits,
+18 389 waits with a timeout and no polls. In a 20-second `show` run with the
+call-chain recorder on, 15 241 of about 15 900 waits had one call chain:
+
+```
+ResourceMap → zink_buffer_map → zink_batch_usage_try_wait → zink_wait_on_batch → zink_screen_timeline_wait
+```
+
+So the fence of almost every batch is read, by a mapping that waits for it.
+The cause is the corruption fix of 2026-11-20: `MAP_WRITE_NOOVERWRITE` maps as
+a plain `PIPE_MAP_WRITE`. For a buffer the current batch still uses, Zink then
+flushes the batch and waits for the GPU (`try_wait`), on every append. That is
+roughly fifteen round trips to the GPU per DWM frame. The comment there, which
+says this costs no waiting, is wrong about the cost but right about
+correctness.
+
+**Rejected: signalling lazily.** A renderer could hold a batch's signal back
+until someone waits for it, sending held-back signals at a limit of batches,
+or when a poll finds them idle. This was built (`ENTANGLED_VENUS_FENCE`) and
+measured A/B with the same build:
+
+| | signals held back | sent because someone waited | DWM presents/s, `every` → lazy |
+|---|---|---|---|
+| `show` | 25 827 | 25 129 | 42.8 → 21.5 |
+| `hybrid` | 28 776 | 27 819 | 45.1 → 30.2 |
+| `surface` | 11 559 | 11 515 | 2.4 → 1.5 |
+
+97–99% of the signals were waited for. Holding them back only moves the wait
+from the submit to the waiter, and costs a fenced submit more on top. The
+mechanism is not kept in the driver. Its source and the `vn_queue.c` hook are
+in the evidence directory.
+
+**Rejected for now: unsynchronized appends (P1).** The plan had two parts:
+
+1. Map `MAP_WRITE_NOOVERWRITE` as `PIPE_MAP_UNSYNCHRONIZED` again.
+2. Remove the hazard of 2026-11-20 at its source.
+
+The source was found. Venus reports no resizable BAR, so Zink marks every
+buffer of 8 196 bytes or more `PIPE_RESOURCE_FLAG_DONT_MAP_DIRECTLY`, and
+answers a discard of one through a temporary buffer whose copy runs later.
+
+The change built for it (`ENTANGLED_D3D10_NOOVERWRITE=unsync`) had two parts:
+
+- Direct3D dynamic buffers no longer get that flag. A discard of one is then
+  either a renamed buffer or a direct map of an idle one.
+- As a safety net, each buffer object records the batch of the last
+  temporary-buffer copy into it. An explicit unsynchronized write that could
+  still meet such a copy, flushed or not, is made synchronous.
+
+Writing through a temporary buffer was not an option: a Direct3D map covers
+the whole buffer, so copying the temporary buffer back would overwrite the
+appends already in place.
+
+It removes the waits:
+
+| | fenced submits per DWM present, sync → unsync | waits with a timeout in 30 s |
+|---|---|---|
+| `show` | 15.3 → 2.0 | 18 389 → 1 172 |
+| `hybrid` | 10.0 → 2.0 | 12 158 → 1 226 |
+| `surface` | 91.6 → 7.4 | 6 980 → 126 |
+
+**It also corrupts DWM's frames.** In wintanyl's effects, the "scene equals
+desktop" checks differed by 98.4%, 34.7% and 48.2% of pixels; synchronous maps
+give about 0.6%, as in every earlier round. A `show` shot had garbage in its
+top-left corner and a stray dark triangle, and `hybrid` drew a dark rectangle
+over a background window. All of it came with 0–2 temporary-buffer copies and
+0 writes made synchronous by the safety net. So the copy found on 2026-11-20
+is not the only thing that makes these writes unsafe here. What else is, is not
+known yet.
+
+The rule was that a single trace of corruption sends the default back to
+synchronous maps, so synchronous maps stay, and the change is not in `0002`.
+The patch, the trace shots and the effect results are in the evidence
+directory. The next step for anyone who takes it up is to run the frame trace
+of 2026-11-20 (`dwmtrace.txt`) with the patch applied.
+
+**What is left of the wait.** With synchronous maps, each frame still pays
+for every append with a flush and a GPU round trip. That GPU round trip is
+where the kernel driver's 15.6 ms tail comes in. With unsynchronized maps the
+batches grow, and half of the remaining fenced submits take over 2 ms
+(1 190 of 2 298 in `show`): the same tail, met by fewer and larger submits.
+Removing the tail stays a kernel-driver change, as recorded above.
+
+**Measurement caveat.** Across boots, the host's load changed. Another agent's
+VM ran during the first arms, and OBS and NVIDIA Broadcast ran during the
+last. DWM's present rate moved with it: the final build, identical in its path
+to the first arm, presented 18.5 times a second in `show` against 42.8, while
+flushing at the same rate (685 against 670 a second). Per-present and
+per-second counts of flushes, fenced submits and waits compare across boots;
+presents a second only within one boot.
+
+Evidence: `F:\entangled-targets\dwm3d\evidence-lazy\` (shots `A6-*`, `L8-*`,
+`C8-*`, `P9-*`, `F10-*` with their logs, `p1-noover-unsync.patch`,
+`lazy-fence-vn_queue.patch`, the effects results `fx-*`).
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
