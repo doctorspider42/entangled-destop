@@ -39,10 +39,10 @@ index fda382d..0d48e6d 100644
    link_with : vn_libs,
    dependencies : vn_deps,
 diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
-index fe9c375..b7cdfbc 100644
+index fe9c375..ac8a275 100644
 --- a/src/virtio/vulkan/vn_common.c
 +++ b/src/virtio/vulkan/vn_common.c
-@@ -153,9 +153,81 @@ vn_watchdog_acquire(struct vn_watchdog *watchdog, bool alive)
+@@ -153,9 +153,98 @@ vn_watchdog_acquire(struct vn_watchdog *watchdog, bool alive)
     return true;
  }
  
@@ -67,6 +67,18 @@ index fe9c375..b7cdfbc 100644
 +      CloseHandle(data);
 +}
 +
++/* The slot's callback is this DLL's code: a thread that outlives the DLL
++ * (it is unloaded, say by consent.exe after its UI drew through Direct3D)
++ * would end in an unloaded module. atexit in a DLL runs when it unloads;
++ * FlsFree runs the callback for every thread still holding a timer. */
++static void
++vn_timer_slot_free(void)
++{
++   if (vn_timer_slot != FLS_OUT_OF_INDEXES)
++      FlsFree(vn_timer_slot);
++   vn_timer_slot = FLS_OUT_OF_INDEXES;
++}
++
 +static BOOL CALLBACK
 +vn_timer_slot_init(PINIT_ONCE once, void *param, void **context)
 +{
@@ -74,6 +86,11 @@ index fe9c375..b7cdfbc 100644
 +   (void)param;
 +   (void)context;
 +   vn_timer_slot = FlsAlloc(vn_timer_release);
++   if (vn_timer_slot != FLS_OUT_OF_INDEXES && atexit(vn_timer_slot_free) != 0) {
++      /* No way to take the callback back at unload: go without timers. */
++      FlsFree(vn_timer_slot);
++      vn_timer_slot = FLS_OUT_OF_INDEXES;
++   }
 +   return TRUE;
 +}
 +
@@ -124,7 +141,7 @@ index fe9c375..b7cdfbc 100644
     vn_watchdog_release(&state->instance->ring.watchdog);
  }
  
-@@ -239,6 +311,10 @@ vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason)
+@@ -239,6 +328,10 @@ vn_relax_init(struct vn_instance *instance, enum vn_relax_reason reason)
        .iter = 0,
        .profile = vn_relax_get_profile(reason),
        .reason_str = vn_relax_reason_string(reason),
@@ -135,7 +152,7 @@ index fe9c375..b7cdfbc 100644
     };
  }
  
-@@ -289,7 +365,7 @@ vn_relax(struct vn_relax_state *state)
+@@ -289,7 +382,7 @@ vn_relax(struct vn_relax_state *state)
     }
  
     const uint32_t shift = util_last_bit(*iter) - busy_wait_order - 1;

@@ -874,6 +874,50 @@ Direct3D driver loaded prints:
 Evidence: `F:\entangled-targets\dwm3d\evidence-flush\` (`summary.txt`, logs,
 grids).
 
+### Amendment, 2026-11-21: the timer fix above broke UAC until it was fixed again
+
+**Never take the commit of the timer fix (`ecf335c`, "Venus's polling waits
+sleep what they ask for") without the one after it.** On its own it makes
+every elevation in the guest fail.
+
+What happens:
+
+1. The fiber-local slot that holds each thread's timer has a callback in
+   `vulkan_virtio.dll`, which closes the timer when a thread ends.
+2. A process that draws through Direct3D and then unloads the Vulkan driver
+   (`FreeLibrary`, with the process still running) leaves that callback
+   registered, pointing into an unloaded module.
+3. When one of its threads that slept on a timer ends, Windows calls the
+   callback and the process dies with an access violation.
+
+`consent.exe` (the UAC prompt) does exactly this. It draws its dialog through
+Direct3D, unloads the driver, and dies at `vulkan_virtio.dll_unloaded+0x1d790`
+with `0xc0000005`. Disassembly confirms that offset is the slot's callback
+(`cmp rcx, -2`, the no-timer marker). Every "Yes" in a UAC prompt then shows
+"File system error (-1073741819)", and nothing can be elevated. Machine `b`
+was recovered by a boot on the framebuffer profile, where the driver is not
+loaded.
+
+**The fix** (`0001`, `vn_common.c`):
+
+- When the slot is allocated, it registers an `atexit` handler that calls
+  `FlsFree`.
+- The driver links the CRT statically (`b_vscrt=mt`). In such a DLL, `atexit`
+  runs at `DLL_PROCESS_DETACH`, which covers both `FreeLibrary` and process
+  exit.
+- `FlsFree` runs the callback for the threads that still hold a timer and
+  removes the slot. After that, no thread's exit can reach the module.
+- If `atexit` refuses the handler, the slot is freed at once, and every
+  thread sleeps the old way.
+
+Checked on machine `b` with the fixed driver: `whoami /groups` from an
+elevated prompt reports the High mandatory level, and no `consent.exe`
+failure is logged after the install. Before the fix, three failures were
+logged in the same session, all at the same offset.
+
+Evidence: `F:\entangled-targets\dwm3d\evidence-lazy\` (`consent-crash-events.txt`,
+`uac-after-fix.txt`).
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
