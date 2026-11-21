@@ -3272,6 +3272,10 @@ fn a_handle_blob_flip_is_presented_by_the_displays_own_gpu_exactly() {
         return;
     }
     assert!(display.accepts_shared_scanout());
+    // The overlay plane has its presenter on the same off-screen GPU, as a
+    // window's does (ADR-0010): a render node's frames — DWM's desktop — are
+    // taken from their host pages there, not read back by the guest.
+    assert!(display.overlay_sink().accepts_host_pages());
     zink_device(&mut h, S1);
 
     let pitch = scanout_export(

@@ -465,6 +465,697 @@ of an id it never made, once), and not in the last runs. Not understood.
 8. the workflow and `install windows` with the new package, neither of which
    has run.
 
+### Amendment, 2026-11-19: DWM's 3D composition corrupts — narrowed, not fixed
+
+*Found and fixed the next day: see the amendment of 2026-11-20 below.*
+
+A user prototype ("wintanyl") asks DWM for live window thumbnails as
+composition visuals (`dwmapi!#147`) and moves them in 3D: perspective
+transforms, the interop compositor, `CompositionVisualSurface` on sprites.
+Everything is drawn by `dwm.exe` on this driver stack; the same executable is
+clean on a host with a vendor driver. In the guest it is not. What a day of
+reproducing it established:
+
+**How it was looked at.** A sparse copy of the Windows 10 test disk, the
+engine headless with `--control-stdin`, the program started with the control
+channel's `exec`, and bursts of `screenshot` (full-size, a second apart). A
+headless run has no window, so the overlay plane declines every present
+(`0 overlaid` in the driver's statistics) and DWM's frames go the CPU way:
+read back into the primary's allocation at each present, then a **flip**.
+The kernel driver's serial log shows three primaries in turn (allocations 1,
+2 and 7), and each flip transfers the whole allocation to the host
+(`FlushToScreen`), so a screenshot is exactly the back buffer DWM rendered.
+The corruption is in that buffer — DWM's drawing through `d3d10umd` on Zink
+on Venus — not in the transport behind it.
+
+**What it looks like** (the same in all four of the program's modes,
+including the plain DirectComposition one the report called clean — it has no
+dimmed backdrop, so stale content is harder to see there):
+
+- axis-aligned rectangles of *old* content — the desktop as it was before
+  the program started, un-dimmed, with a window at its own place — inside the
+  region that animates, changing from frame to frame (three states, one per
+  buffer, is the pattern);
+- the program's full-screen backdrop drawn only inside a sub-rectangle
+  (different from boot to boot), and the thumbnails outside it missing;
+- thin vertical and horizontal lines at the edges of those rectangles, a grey
+  polygon now and then, and in the DirectComposition mode a black triangle in
+  the lower-left corner that stays.
+
+**Ruled out.** No Venus `FATAL` and no command the host refused in any run;
+the only Mesa complaint is the known `restart_index … TRIANGLE_LIST` line. The
+DXGI `Blt` entry point, which the frontend leaves unimplemented, is never
+called (it would log `_Blt XXX`). The transport, as above.
+
+**Tried and measured as no help.** The frontend's
+`_RotateResourceIdentities` (DXGI's flip) swaps the `pipe_resource` pointers
+behind the swap chain's resources, and a view refreshes when it is next
+bound — but what is *bound* at that moment keeps the old texture, and Direct3D
+state survives a present. That is a real gap: after a rotation, a back buffer
+left bound is drawn into while another one is shown. A build that re-points
+the bound render targets and shader resources at each rotation was installed
+in the test guest and compared with the shipped one on fresh boots, same
+procedure: no visible difference. It is not in the patch set; the diff is
+kept with the session notes, worth carrying once the real cause is found.
+
+**What the fix needs, in order.**
+
+1. The same procedure with a window, so the overlay plane takes DWM's frames
+   from the GPU: if the artifacts go, the readback path is implicated after
+   all; if they stay, it is DWM's rendering on this stack. (The report's
+   pictures and this repro were both headless.)
+2. A trace of the DDI calls of one corrupted DWM frame — scissor rectangles,
+   viewports, `ResourceCopyRegion` boxes, clears, render-target binds per
+   draw — against the region that comes out stale. The shape of the damage
+   (rectangles of old content where DWM updates part of a buffer) points at
+   partial updates: a scissor or viewport that is not what DWM set, a copy
+   region with a box, or a render target that is not the one bound.
+3. Zink's handling of DWM's intermediate render targets (`SetRenderTargets`
+   onto offscreen textures, then sampling them): the clipped backdrop is what
+   a stale scissor would draw.
+
+### Amendment, 2026-11-20: DWM's 3D composition corruption — found and fixed
+
+None of the three leads above was it. The scissors, viewports and copy boxes
+DWM sends are what reach Zink, and its intermediate render targets work. The
+geometry was wrong: **DWM's vertices were overwritten on the GPU after DWM
+wrote them.** A one-line change in the user-mode driver fixes it, and the
+three modes of the wintanyl prototype (`show`, `hybrid`, `surface`) are clean
+on the 3D stack.
+
+**How it was found.** The Windows 10 test machine `b` of wintanyl, headless,
+with the program driven through the control channel and full-size
+`screenshot` bursts as before. `d3d10_wddm.c` gained a trace of DWM's frames
+(below; it stays in the driver, dormant): every Gallium call that reaches
+Zink for a few presents, plus each presented frame written to a file in the
+guest. The first trace showed the damage inside the presented buffers and
+the partial-update pattern of DWM (per-frame dirty scissors, back-buffer
+tiles copied into a 256×256 scratch texture and drawn back for the backdrop
+effects), all consistent — so the state was right and the draws' inputs
+were not.
+
+Tried on the way and measured as no help: `ZINK_DEBUG=noreorder` in DWM (the
+copies into the scratch texture are not reordered past its draws); DWM on
+`ENTANGLED_D3D10_DRIVER=softpipe`, which presents black — that path does not
+work for DWM at all, so it cannot be an A/B arm.
+
+**The A/B that settled it.** A switch in `ResourceMap`, read from the
+environment of DWM, bit 1 dropping `PIPE_MAP_UNSYNCHRONIZED` and bit 2 the
+discard flags. Same DLL, same boot procedure, `show` mode, six shots each:
+`0` corrupt, both bits clean, **bit 1 alone clean** — so it is the
+unsynchronized write of Direct3D's `MAP_WRITE_NOOVERWRITE`.
+
+**The mechanism, from the trace with Zink's side of each map added.** DWM
+streams vertices into dynamic buffers of 16 000, 160 000 and 240 012 bytes:
+`WRITE_DISCARD` when it wraps, then a series of `WRITE_NOOVERWRITE` appends.
+A Direct3D 10 map has no range, so every map is of the whole buffer. Zink
+answers the discard with `invalidate_buffer`, which refuses when it thinks
+the buffer idle (`!zink_resource_has_usage`); the map then falls back to a
+**temporary buffer whose copy into the real one — all 160 000 bytes — is
+recorded in the batch** and runs later on the GPU. The appends that follow
+are unsynchronized maps of host-visible coherent memory (`hv 1 coherent 1
+staging 0`): DWM writes the next vertices straight into the buffer, the
+pending copy lands on top of them when the batch executes, and the draws
+read whatever the temporary buffer held there. Stale geometry, sprites at
+old places, degenerate quads (the thin lines), missing thumbnails, and
+regions of a buffer DWM believes it redrew left as they were — every symptom
+of the 2026-11-19 amendment. The trace (one frame):
+
+```
+DDI Map 30480 buffer 160000x1 sub 0 map 4 (DISCARD)        usage 0x82
+zink map 30480 [0+160000] hv 1 coherent 1 staging 1 ... usage 0x2a
+DDI Map 30480 buffer 160000x1 sub 0 map 5 (NOOVERWRITE)    usage 0x22
+zink map 30480 [0+160000] hv 1 coherent 1 staging 0 ... usage 0x22
+... five more direct appends before the batch is flushed
+```
+
+Gallium allows an unsynchronized write only where the caller knows nothing
+pending touches the range; the frontend cannot know about a copy the driver
+made up itself, and Zink does not check its own pending copies for an
+explicit `UNSYNCHRONIZED` map (it does when it infers one).
+
+**The fix** (`0002`, `Resource.cpp`): `MAP_WRITE_NOOVERWRITE` maps as a plain
+`PIPE_MAP_WRITE`. Zink then sends a write to a buffer the batch still uses
+through its own staging copy, in order and without waiting, so the measured
+cost is nil. The same driver build, installed in `b`, from fresh boots:
+
+| Mode | before (3D) | after (3D) | WARP (`adapter = "framebuffer"`) |
+|---|---|---|---|
+| `show` | corrupt, ~58–60 tick/s | clean, 61.9 tick/s | clean, ~52 tick/s |
+| `hybrid` | corrupt | clean, 60.9 tick/s | clean, ~47 tick/s |
+| `surface` | corrupt | clean, 62.1 tick/s | clean |
+
+Tick/s is the program's own loop (its `Commit` rate), the number wintanyl
+quotes. What DWM itself put on the screen in those runs, from the host's
+frame-pacing log, was **12–21 frames a second**: a headless run declines the
+overlay plane, so each present reads the 1920×1080 frame back through the CPU
+(the W2 path), and that, not the GPU, is the ceiling. A run with a window
+(the overlay plane) is the measurement still owed. *(Both measured, and the
+headless readback removed, in the amendment that follows.)*
+
+**The trace, for next time.** In `dwm.exe` only, every present looks at
+`C:\Users\Public\dwmtrace.txt`; writing a number into it (e.g. `cmd /c echo 3
+> C:\Users\Public\dwmtrace.txt`) traces that many presents through the
+diagnostic kernel driver's COM1 lines (`T …`) and writes each presented frame
+to `C:\Users\Public\dwmframe-<n>.raw` (BGRA, screen size). A file older than
+the DWM process does not count. Draws are traced at the DDI (Zink swaps its
+`draw_vbo` on every state change, so a Gallium hook misses them).
+
+**Left over.**
+
+- The Direct3D 9 driver (Nine) has its own buffer uploads and was not looked
+  at; a game streaming vertices with `D3DLOCK_NOOVERWRITE` on Zink deserves
+  the same check.
+- Zink's fallback itself (a full-buffer temporary copy after a refused
+  invalidate, under later explicit unsynchronized maps) is an upstream bug
+  worth reporting with this trace; the frontend change does not depend on it
+  being fixed.
+- The dev agent was quarantined again by Defender in the guest mid-session
+  (`Wacatac.H!ml`, deleted from the virtio-fs share it was started from);
+  driving fell back to the Run box.
+
+### Amendment, 2026-11-20 (later): DWM's frames stay on the GPU with no window
+
+The owner's rule for this path is that a frame does not go through a CPU, with
+a window or without. Headless, it did: every present of DWM's desktop was read
+back into the primary's allocation and flipped. That is the path every
+wintanyl battery runs on.
+
+**Measured first.** The user-mode driver's statistics gained a breakdown,
+printed every two seconds from each process:
+
+- `presents: N of the screen in T ms: … whole, … readback map, … readback memcpy, … flip`
+- `flushes: … ms in the driver's flush`
+
+The readback is split into the map (Zink's copy to memory, waited for) and
+the copy out of it on the guest's CPU; the flush is Zink's submit, which waits
+for the host when the batch carries a fence.
+
+On machine `b`, headless with the engine as it was, wintanyl's PoC on the 3D
+adapter gave these numbers. Each window is about 26 s and includes the
+program's start-up:
+
+| | `show` | `hybrid` | `surface` | effects (`fx jelly`, `fx lamp`) |
+|---|---|---|---|---|
+| DWM presents a second | 8.8 | 15.3 | 1.3 | 5.1 |
+| readbacks (8 MiB each) | 1 618 | 1 117 | 1 318 | 2 892 (in 129 s) |
+| bytes copied by the guest's CPU | 492 MiB/s | 338 MiB/s | 415 MiB/s | 177 MiB/s |
+| present time in a failed overlay call | 3.1 s | 6.1 s | 0.4 s | 7.4 s |
+| the program's own tick/s | 62.0 | 62.0 | 62.0 | — |
+
+There were about seven readbacks per present. Every flush with a dirty
+primary reads it back too, which `d3d10_wddm_flush` skips only while
+`ws->overlaid` holds. In `surface` the screen hardly changed between
+screenshots a second apart.
+
+**Why the plane declined.** A window installs two presenters on its GPU: one
+for the desktop and one for the overlay plane (`renderer.rs`). A headless
+display got only the first (`attach_offscreen_gpu`). The render node's
+`OverlaySink` therefore never accepted host pages. The device's copy path read
+the frame on the host's CPU instead, and the guest saw
+`entangled_present_overlay` fail and fell back to the readback.
+
+**The fix** (`display`): `attach_offscreen_gpu` gives the overlay plane its
+presenter on the same off-screen device (`GpuScanout::open_offscreen_pair`),
+as a window does. The host then logs *"presents a renderer blob's host pages
+through the display's GPU: no readback, no CPU copy"*. The guest presents
+every frame on the plane (`N overlaid` = presents), and the readback runs only
+under W2's lease: once per 0.9 s, about 8 MiB/s. A screenshot from the control
+line reads the plane's texture back from the GPU (`gpu_overlay`) when it is
+asked, never before. Screenshots in the guest (`BitBlt` of the screen, which
+wintanyl's effect tests take) still show the current frame: the lamp's
+mid-animation shot catches the trapezoid. The framebuffer profile has no
+Venus, so it never calls this; its screenshots are as clean as
+`evidence/warp-*.png`, at 54.4 / 51.9 / 5.9 tick/s.
+
+After the fix, same machine, same program:
+
+| | `show` | `hybrid` | `surface` | effects |
+|---|---|---|---|---|
+| DWM presents a second | 22.9–27.6 (one run 7.0) | 19.6–39.8 | 1.4–2.6 | 10.8 |
+| readbacks | 28 | 26–28 | 12–15 | 78 (in 81 s) |
+| bytes copied by the guest's CPU | 8 MiB/s | 7–8 MiB/s | 3–4 MiB/s | 7 MiB/s |
+| the program's own tick/s | 61.3–61.6 | 61.6 (one run 41.5) | 61.3–61.6 | — |
+
+Two other agents' VMs shared this host's GPU and CPU during these runs. That
+explains the spread in frames a second between runs. The readback counts do
+not depend on it.
+
+**With a window.** The code path has no CPU copy:
+
+1. The window's overlay presenter imports the blob's host pages.
+2. It copies them into its texture on the GPU.
+3. The renderer samples that texture over the desktop.
+
+Measured with the engine's window on a separate Windows desktop (zitter's
+`windows_test_desktop.py`, so off the owner's desktop and never visible): DWM
+made 13.0 / 28.9 / 2.0 presents a second (`show` / `hybrid` / `surface`).
+Readbacks were the same lease-paced 8 MiB/s, the program ran 60–62 tick/s,
+and the screenshots were clean. A window on an invisible desktop may well be
+paced differently from one on screen, so these are not on-screen numbers.
+
+**The next ceiling is the flush, not a copy.** After the fix, DWM spent this
+share of its wall time inside `pipe->flush`:
+
+| | flush time | of wall time |
+|---|---|---|
+| `show` headless | 13.6 s | 26 s |
+| `surface` headless | 8.6 s | 26 s |
+| `show` windowed | 8.4 s | 26 s |
+| `hybrid` windowed | 13.2 s | 26 s |
+
+DWM flushes about 200–800 times a second. `vn_renderer_entangled`'s submit is
+an `IOCTL` that returns once the host has retired the batch's fence, so a
+flush that carries one waits a host round trip. In `surface` that leaves DWM
+at about 2 presents a second while the program commits 62 times. This is not
+fixed here; it is the next thing to measure.
+
+**What still goes through a CPU, and why it stays for now:**
+
+- **The primary under the plane**, once per 0.9 s, about 8 MiB/s. It is for
+  what reads the primary in the guest, and for the moment the plane goes away.
+- **A texture shared between processes.** A program rendering through this
+  driver reads its window's surface back at each flush for DWM to upload. In
+  these runs that was about 20 readbacks per program run. A Venus blob both
+  processes import is the fix, as before.
+
+**Not measured.** wintanyl's full grids (jelly 16×10, lamp 48 strips) never
+ran. Its demo opens Direct3D 12 only (`wt-scene/src/gpu.rs`). This driver has
+no D3D12, so the demo gets WARP12, which reports a CPU device. The demo then
+caps itself at `soft_max_tiles` = 40, which gives jelly 8×5 and lamp 20
+strips. The effect numbers above are for those grids. wintanyl's own pass/fail
+lines were the same before and after, apart from one lamp check. That check
+now counts Paint's colour swatches, because a different window happened to be
+behind it in this run.
+
+**Defender, again.** On 2026-11-20 at 16:31 the guest's Defender quarantined
+the driver itself (`Trojan:Win32/Bearfoos.B!ml`, a machine-learning verdict)
+from the driver store, when a newly started process loaded it. Processes that
+already had it mapped kept running, so the previous amendment's evidence
+stands. The next boot had no `entangled_d3d10.dll`: Windows stopped the WDDM
+device (code 43) and DWM composed on the basic display. Machine `b` was
+repaired by reinstalling the driver; no exclusion was added. Expect it again
+whenever a build is new to Defender's cloud model.
+
+### Amendment, 2026-11-20 (evening): what DWM waits for in its flushes
+
+Once the per-frame readback was gone, `surface` still showed only about 2 DWM
+presents a second, with DWM spending 30–52% of its time in `pipe->flush`. The
+owner asked for that wait to be removed. This section records:
+
+- what the wait turned out to be;
+- the half of it that was fixed;
+- the half that is out of reach without the kernel driver.
+
+**Measured first.** Two sets of counters were added.
+
+- In the Venus driver (`vn_renderer_entangled.c`): fenced and plain submits
+  (count, time, the longest, how many took over 2 ms) and its own waits. Read
+  by name through `entangled_renderer_stats`.
+- In Venus's polling loop (`vn_relax`, `0001`): time per reason.
+
+The Direct3D driver prints both every two seconds as `venus:` and
+`venus waits:` lines. Machine `b`, headless, wintanyl's PoC, 26–27 s windows.
+Another agent's VM shared the host throughout.
+
+| | `show` | `hybrid` | `surface` |
+|---|---|---|---|
+| d3d10 flushes per DWM present | 38–42 | 30 | 90–154 |
+| fenced Venus submits per flush | 1 | 1 | 1 |
+| DWM time in fenced submits | 8.6 s | 12.6 s | 6.3 s |
+| … of which took over 2 ms | 301 | 314 | 226 |
+| DWM time waiting on Venus's ring (`ring seqno`) | 7.5 s | not measured | **13.3 s** |
+| … waits that reached a sleep | 511 | — | 827 |
+| DWM presents a second | 9.6 | 23.8 | 1.9 |
+
+So the wait had two halves, and in `surface` the larger one was not the fence.
+
+**Half 1: Venus's polling sleep.** Venus waits for the host to reach a ring
+sequence number by polling. After a short busy wait it sleeps
+`base_sleep_us` (160 µs) and doubles from there, through `os_time_sleep()`.
+On Windows that is `Sleep(1)`, and a `Sleep(1)` lasts a whole timer tick,
+15.6 ms by default. Every synchronous call DWM's Zink makes through the ring
+therefore cost a tick or more. `entangled_wait` had the same `Sleep(1)`.
+
+**The fix** (`0001`: `vn_common.c`; `vn_renderer_entangled.c`): `vn_sleep_us`
+sleeps on a high-resolution waitable timer instead
+(`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`, Windows 10 1803 and later). The timer
+is created once per thread and kept in a fiber-local slot, whose callback
+closes it when the thread ends. A system that refuses the flag gets the old
+`Sleep`. The global timer resolution is not touched (no `timeBeginPeriod`).
+
+| | `show` | `hybrid` | `surface` | effects (jelly + lamp, 86 s) |
+|---|---|---|---|---|
+| ring waits, before → after | 7.5 s → 0.66 s | not measured → under 0.2 s | 13.3 s → **2.0 s** | not measured → 0.85 s |
+| DWM presents/s, before → after | 9.6 → 12.0 | 23.8 → 20.7 | 1.9 → **3.5** | 10.8 → 10.5 |
+| program tick/s after | 60.5 | 61.5 | 61.1 | — |
+| CPU readbacks after (8 MiB each) | 28 | 28 | 21 | 82 |
+
+Screenshots of all three modes are clean. The framebuffer profile does not
+load this driver; its screenshots are clean at 51.3 / 53.9 / 5.3 tick/s.
+
+**Half 2: the fenced submit, now the whole of what is left.** After the fix,
+DWM's fenced submits took this much of its wall time:
+
+| | fenced submits | over 2 ms | time | of wall time |
+|---|---|---|---|---|
+| `surface` | 11 389 | 659 | 13.8 s | 51% |
+| `show` | 11 187 | 587 | 13.5 s | 52% |
+| `hybrid` | 16 128 | 332 | 11.8 s | 45% |
+
+Each flush of the d3d10 frontend is a Zink batch. Zink submits each batch
+with a `VkFence`. Venus backs fences with renderer syncs, so the batch ends in
+a renderer submit that signals one. This backend makes that submit
+synchronous: `entangled-gpu.sys` answers the IOCTL only once the host has
+retired the fence.
+
+The host retires fences quickly: 0.46–0.65 ms on average, at most one
+outstanding. The guest pays more, because of how the kernel driver waits:
+
+1. It has a single sequential IOCTL queue shared by every process.
+2. It polls the used ring for about 2 ms.
+3. It then waits in `KeDelayExecutionThread(1 ms)`, which, like `Sleep(1)`,
+   lasts a timer tick.
+
+So every fenced submit that takes over 2 ms costs at least 15.6 ms. In
+`surface` that was 659 of 11 389 submits, about 7 of its 13.8 s. Every other
+process's IOCTLs queue behind that wait.
+
+**Why it is not fixed here.** The useful fix is in the kernel driver, which
+cannot be rebuilt here because it would have to be signed:
+
+- **A fenced submit that returns at once.** Several commands in flight, and
+  the driver records retired fence ids from the used ring.
+- **A way to read those ids** (an IOCTL, or a shared page).
+- **A wait that blocks on an event**, instead of polling at the tick.
+
+Any one of these removes the 15.6 ms tail. The first and second together
+remove the synchronous wait as well.
+
+A user-mode worker thread that issues the fenced IOCTL on the caller's behalf
+was considered and not built. Each fenced submit is paired with a plain one
+(12 555 plain to 11 389 fenced in `surface`), so DWM's next IOCTL would queue
+behind the worker's in the same sequential queue. The gain would be small, and
+the risk to ordering, error reporting and teardown is not.
+
+**An observation, not acted on.** The fence per flush comes from Zink: every
+batch is submitted with a `VkFence` that Zink reads later, if at all, to
+recycle the batch. Making the renderer sync cheaper for a fence nobody waits
+on, or having Zink fence only when it must, would take the wait out of most
+flushes. Both are changes to Zink or Venus semantics, and this round did not
+make them.
+
+**Counters, for next time.** Every two seconds, each process that has the
+Direct3D driver loaded prints:
+
+- `venus: N fenced submits T ms (max …, K over 2 ms), … plain submits …, … waits …`
+- `venus waits: ring seqno … (… slept), … semaphore …, query …`
+
+Evidence: `F:\entangled-targets\dwm3d\evidence-flush\` (`summary.txt`, logs,
+grids).
+
+### Amendment, 2026-11-21: the timer fix above broke UAC until it was fixed again
+
+**Never take the commit of the timer fix (`ecf335c`, "Venus's polling waits
+sleep what they ask for") without the one after it.** On its own it makes
+every elevation in the guest fail.
+
+What happens:
+
+1. The fiber-local slot that holds each thread's timer has a callback in
+   `vulkan_virtio.dll`, which closes the timer when a thread ends.
+2. A process that draws through Direct3D and then unloads the Vulkan driver
+   (`FreeLibrary`, with the process still running) leaves that callback
+   registered, pointing into an unloaded module.
+3. When one of its threads that slept on a timer ends, Windows calls the
+   callback and the process dies with an access violation.
+
+`consent.exe` (the UAC prompt) does exactly this. It draws its dialog through
+Direct3D, unloads the driver, and dies at `vulkan_virtio.dll_unloaded+0x1d790`
+with `0xc0000005`. Disassembly confirms that offset is the slot's callback
+(`cmp rcx, -2`, the no-timer marker). Every "Yes" in a UAC prompt then shows
+"File system error (-1073741819)", and nothing can be elevated. Machine `b`
+was recovered by a boot on the framebuffer profile, where the driver is not
+loaded.
+
+**The fix** (`0001`, `vn_common.c`):
+
+- When the slot is allocated, it registers an `atexit` handler that calls
+  `FlsFree`.
+- The driver links the CRT statically (`b_vscrt=mt`). In such a DLL, `atexit`
+  runs at `DLL_PROCESS_DETACH`, which covers both `FreeLibrary` and process
+  exit.
+- `FlsFree` runs the callback for the threads that still hold a timer and
+  removes the slot. After that, no thread's exit can reach the module.
+- If `atexit` refuses the handler, the slot is freed at once, and every
+  thread sleeps the old way.
+
+Checked on machine `b` with the fixed driver: `whoami /groups` from an
+elevated prompt reports the High mandatory level, and no `consent.exe`
+failure is logged after the install. Before the fix, three failures were
+logged in the same session, all at the same offset.
+
+Evidence: `F:\entangled-targets\dwm3d\evidence-lazy\` (`consent-crash-events.txt`,
+`uac-after-fix.txt`).
+
+### Amendment, 2026-11-21: who reads DWM's fences — two ideas measured and rejected
+
+The previous amendment ended on an observation: Zink fences every batch, and
+almost nobody reads those fences. This amendment measures that claim. It is
+wrong, and both changes built on it were rejected.
+
+**Correction.** Zink does not submit with a `VkFence`. It signals its
+timeline semaphore (`screen->sem`) with each batch's id. Venus backs that
+semaphore with renderer syncs, and that is what turns every batch into a
+fenced submit.
+
+**Who waits.** Two new counters in the Venus driver count every wait with a
+timeout and every poll. They are printed as `venus reads:`. A third instrument
+records who waits, as call chains: set `ENTANGLED_WAIT_CALLERS=1` and the
+Direct3D driver prints `waited by` lines. Resolve those against
+`entangled_d3d10.map`.
+
+In `show` (machine `b`, headless), 30 seconds saw 19 674 fenced submits,
+18 389 waits with a timeout and no polls. In a 20-second `show` run with the
+call-chain recorder on, 15 241 of about 15 900 waits had one call chain:
+
+```
+ResourceMap → zink_buffer_map → zink_batch_usage_try_wait → zink_wait_on_batch → zink_screen_timeline_wait
+```
+
+So the fence of almost every batch is read, by a mapping that waits for it.
+The cause is the corruption fix of 2026-11-20: `MAP_WRITE_NOOVERWRITE` maps as
+a plain `PIPE_MAP_WRITE`. For a buffer the current batch still uses, Zink then
+flushes the batch and waits for the GPU (`try_wait`), on every append. That is
+roughly fifteen round trips to the GPU per DWM frame. The comment there, which
+says this costs no waiting, is wrong about the cost but right about
+correctness.
+
+**Rejected: signalling lazily.** A renderer could hold a batch's signal back
+until someone waits for it, sending held-back signals at a limit of batches,
+or when a poll finds them idle. This was built (`ENTANGLED_VENUS_FENCE`) and
+measured A/B with the same build:
+
+| | signals held back | sent because someone waited | DWM presents/s, `every` → lazy |
+|---|---|---|---|
+| `show` | 25 827 | 25 129 | 42.8 → 21.5 |
+| `hybrid` | 28 776 | 27 819 | 45.1 → 30.2 |
+| `surface` | 11 559 | 11 515 | 2.4 → 1.5 |
+
+97–99% of the signals were waited for. Holding them back only moves the wait
+from the submit to the waiter, and costs a fenced submit more on top. The
+mechanism is not kept in the driver. Its source and the `vn_queue.c` hook are
+in the evidence directory.
+
+**Rejected for now: unsynchronized appends (P1).** The plan had two parts:
+
+1. Map `MAP_WRITE_NOOVERWRITE` as `PIPE_MAP_UNSYNCHRONIZED` again.
+2. Remove the hazard of 2026-11-20 at its source.
+
+The source was found. Venus reports no resizable BAR, so Zink marks every
+buffer of 8 196 bytes or more `PIPE_RESOURCE_FLAG_DONT_MAP_DIRECTLY`, and
+answers a discard of one through a temporary buffer whose copy runs later.
+
+The change built for it (`ENTANGLED_D3D10_NOOVERWRITE=unsync`) had two parts:
+
+- Direct3D dynamic buffers no longer get that flag. A discard of one is then
+  either a renamed buffer or a direct map of an idle one.
+- As a safety net, each buffer object records the batch of the last
+  temporary-buffer copy into it. An explicit unsynchronized write that could
+  still meet such a copy, flushed or not, is made synchronous.
+
+Writing through a temporary buffer was not an option: a Direct3D map covers
+the whole buffer, so copying the temporary buffer back would overwrite the
+appends already in place.
+
+It removes the waits:
+
+| | fenced submits per DWM present, sync → unsync | waits with a timeout in 30 s |
+|---|---|---|
+| `show` | 15.3 → 2.0 | 18 389 → 1 172 |
+| `hybrid` | 10.0 → 2.0 | 12 158 → 1 226 |
+| `surface` | 91.6 → 7.4 | 6 980 → 126 |
+
+**It also corrupts DWM's frames.** In wintanyl's effects, the "scene equals
+desktop" checks differed by 98.4%, 34.7% and 48.2% of pixels; synchronous maps
+give about 0.6%, as in every earlier round. A `show` shot had garbage in its
+top-left corner and a stray dark triangle, and `hybrid` drew a dark rectangle
+over a background window. All of it came with 0–2 temporary-buffer copies and
+0 writes made synchronous by the safety net. So the copy found on 2026-11-20
+is not the only thing that makes these writes unsafe here. What else is, is not
+known yet.
+
+The rule was that a single trace of corruption sends the default back to
+synchronous maps, so synchronous maps stay, and the change is not in `0002`.
+The patch, the trace shots and the effect results are in the evidence
+directory. The next step for anyone who takes it up is to run the frame trace
+of 2026-11-20 (`dwmtrace.txt`) with the patch applied.
+
+**What is left of the wait.** With synchronous maps, each frame still pays
+for every append with a flush and a GPU round trip. That GPU round trip is
+where the kernel driver's 15.6 ms tail comes in. With unsynchronized maps the
+batches grow, and half of the remaining fenced submits take over 2 ms
+(1 190 of 2 298 in `show`): the same tail, met by fewer and larger submits.
+Removing the tail stays a kernel-driver change, as recorded above.
+
+**Measurement caveat.** Across boots, the host's load changed. Another agent's
+VM ran during the first arms, and OBS and NVIDIA Broadcast ran during the
+last. DWM's present rate moved with it: the final build, identical in its path
+to the first arm, presented 18.5 times a second in `show` against 42.8, while
+flushing at the same rate (685 against 670 a second). Per-present and
+per-second counts of flushes, fenced submits and waits compare across boots;
+presents a second only within one boot.
+
+Evidence: `F:\entangled-targets\dwm3d\evidence-lazy\` (shots `A6-*`, `L8-*`,
+`C8-*`, `P9-*`, `F10-*` with their logs, `p1-noover-unsync.patch`,
+`lazy-fence-vn_queue.patch`, the effects results `fx-*`).
+
+### Amendment, 2026-11-21 (later): the unknown hazard found — unsynchronized appends are the default
+
+The corruption under P1 came from Zink, not from DWM and not from the host. A
+discard that **renamed** a buffer left the old memory bound as the index
+buffer, and left the new memory unmarked as in use. P1 maps
+`MAP_WRITE_NOOVERWRITE` unsynchronized again, now by default, with that fixed
+(`0002`).
+
+**Ruled out first.**
+
+- *The host's fence.* It retires only when the host `VkFence` behind it
+  signals, that is, after the GPU has finished (`venus/executor/timeline.rs`).
+- *The host's view of the memory.* Host-visible memory is the guest's own
+  pages, imported with `VK_EXT_external_memory_host`
+  (`venus/executor/memory.rs`). The GPU reads exactly what the guest wrote,
+  when it executes, as on real hardware.
+- *Zink missing that a still-bound buffer is used across batches.* On a new
+  batch, `zink_update_descriptor_refs` marks every bound vertex buffer and
+  descriptor as used again.
+
+**The oracle.** A diagnostic build added `ENTANGLED_D3D10_MAPCHECK=1`, which
+kept a shadow copy of every dynamic buffer the frontend maps. It checks two
+things:
+
+- at a no-overwrite map, that the bytes are still what the last unmap left;
+- that a no-overwrite write never touches a range written since the last
+  discard. To find the range a discard wrote, the discard map is pre-filled
+  with `0xcd`.
+
+In one `show` run under P1, with the corruption on screen, it recorded:
+
+- 45 824 no-overwrite maps (23 331 vertex, 22 493 index);
+- 339 discards, none of which handed back the previous address;
+- 0 changes behind the program;
+- 0 overlaps.
+
+So DWM writes correctly, nothing rewrites its data, and every discard renames.
+The GPU was reading the wrong memory.
+
+**The cause.** `invalidate_buffer` gives the resource a new object, then calls
+`zink_resource_rebind`, which marks the vertex buffers dirty. Two things were
+missing:
+
+1. **The index buffer is never bound again.** `zink_draw` binds the index
+   buffer only on a new batch, or when the `pipe_resource` or index size
+   changes. A rename changes neither, so the batch kept drawing with the old
+   object's indices: thin lines, missing parts of windows, stray triangles.
+   The threaded context's `replace_buffer` clears `ctx->index_buffer` itself,
+   which is why GL, always threaded, never shows this. The D3D10 frontend
+   runs Zink unthreaded.
+2. **The new object is not marked as used** by the current batch, for an
+   index buffer or a vertex buffer, until the next batch begins. The next
+   discard of it within the batch therefore found it idle and mapped it
+   directly, writing into memory this batch's draws still read.
+
+In the synchronous build neither could happen. Every discard of a dynamic
+buffer of 8 196 bytes or more went through Zink's temporary-buffer copy into
+the same object, so there was no rename to miss.
+
+**The fix** is in `invalidate_buffer`, unconditional. After the rename it
+clears `ctx->index_buffer` when the resource is the bound index buffer, and
+marks the new object used by the current batch when it is bound as an index
+or vertex buffer.
+
+The rest of P1 as built earlier stays:
+
+- dynamic buffers are mapped directly, not through `DONT_MAP_DIRECTLY`;
+- the safety net, which synchronizes an explicit unsynchronized write that
+  could still meet one of Zink's own copies. In every run since, it fired 0
+  times, with 0–2 such copies.
+
+`ENTANGLED_D3D10_NOOVERWRITE=sync` returns to plain writes. The Direct3D
+driver logs the mode and the two counters as `no-overwrite maps …`.
+
+**Confirmed A/B, same build.** Without the fix, `show`, `hybrid` and the
+effects were corrupt (above). With it, every check passed:
+
+- `show`, `hybrid` and `surface`: all 18 shots clean.
+- wintanyl's effects: the same six FAILs as every synchronous run, at
+  0.57–0.61% of pixels (jelly 0.602/0.571%, lamp 0.587–0.606%), none higher.
+- Long run: `show` for 300 s, then `hybrid` for 240 s, a shot every 30 s, all
+  clean. DWM's private memory went 85 → 89 MiB over the first run and
+  89 → 89 MiB over the second; handles went 1 203 → 1 227 → 1 223. A
+  first-run settle, no growth.
+- UAC elevates.
+- CPU readbacks: 32–35 per 30 s, as before (the lease refresh).
+- WARP is unchanged: the framebuffer profile loads neither driver, and the
+  run on this same host engine gave 52.7 / 54.4 / 7.8 tick/s.
+
+Final build, all switches at their defaults (the effects row comes from the
+earlier synchronous build):
+
+| | sync (`F10`) | unsync + fix (`X12`, `D13`) |
+|---|---|---|
+| fenced Venus submits per DWM present, `show` | 36.3 | 2.0 |
+| … `hybrid` | 29.6 | 2.0 |
+| … `surface` | 131 | 9.1–9.6 |
+| … effects | 24.6 | 2.3 |
+| waits with a timeout per present, `show` / `hybrid` / `surface` | 35 / 27 / 130 | 1.0 / 1.0 / 1.3–1.7 |
+| DWM's time in its flushes, `show` / `hybrid` / `surface` | 55 / 60 / 66% | 31–34 / 33–36 / 42–48% |
+| program tick/s, `show` / `hybrid` / `surface` | 53.8 / 50.6 / 49.7 | 61.9–62.0 / 61.6–61.7 / 59.5–61.1 |
+
+Two caveats on these numbers:
+
+- **Host load.** Presents a second are not compared here. `F10` ran with OBS
+  and NVIDIA Broadcast on the host; `X12` and `D13` also ran with another
+  agent's VM on it.
+- **The remaining fenced submits are larger.** 80–95% of them now take over
+  2 ms. Each DWM frame pays the kernel driver's 15.6 ms tail about once,
+  instead of round-tripping fifteen times. The total time in fenced submits
+  did not fall (`show`: 13.9 s before, 17.3 s after, per ~32 s run). Removing
+  that tail remains the kernel-driver change described above.
+
+**Portal 2 and `copilotapphost.exe`.** Portal 2 had died in `ntdll` once on
+the new Venus driver, after stray keystrokes had started it. A controlled run
+on the same driver started it, showed the menu full screen for 2.5 minutes,
+and quit cleanly, logging no failure. The guest's log shows the same `ntdll`
+failure of `portal2.exe` on 2026-11-13, long before the timer change, so it
+predates this work. `copilotapphost.exe` fails in `ntdll` at most boots since
+2026-11-20 16:06, before the timer driver was installed that evening. Neither
+is attributed to these changes, and neither was looked into further.
+
+Evidence: `F:\entangled-targets\dwm3d\evidence-lazy\` (`p1-fixed-with-mapcheck.patch`,
+the oracle's run `M11-*`, shots `X12-*`, `D13*`, `L12-*-long-*`, effects
+`fx-fix12-*`, `fx-def13-*`).
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

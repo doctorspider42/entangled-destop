@@ -1274,7 +1274,9 @@ fn edit_storage(ui: &mut egui::Ui, form: &mut EditForm, actions: &mut Vec<Action
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.clone());
-                let place = if windows && share.virtiofs {
+                // A Windows guest's shares are virtio-fs whatever the flag
+                // says (`VmConfig::share_uses_virtiofs`).
+                let place = if windows {
                     if index == 0 {
                         "Drive Z: in Windows".to_string()
                     } else {

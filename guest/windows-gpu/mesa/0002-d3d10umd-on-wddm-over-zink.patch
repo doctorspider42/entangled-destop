@@ -1,6 +1,6 @@
 diff --git a/src/gallium/auxiliary/gdikmt/gdikmt.h b/src/gallium/auxiliary/gdikmt/gdikmt.h
 new file mode 100644
-index 0000000..432f34f
+index 00000000..432f34ff
 --- /dev/null
 +++ b/src/gallium/auxiliary/gdikmt/gdikmt.h
 @@ -0,0 +1,103 @@
@@ -110,7 +110,7 @@ index 0000000..432f34f
 \ No newline at end of file
 diff --git a/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c b/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
 new file mode 100644
-index 0000000..4c985a3
+index 00000000..4c985a33
 --- /dev/null
 +++ b/src/gallium/auxiliary/gdikmt/gdikmt_d3dkmt.c
 @@ -0,0 +1,428 @@
@@ -544,7 +544,7 @@ index 0000000..4c985a3
 +};
 \ No newline at end of file
 diff --git a/src/gallium/auxiliary/meson.build b/src/gallium/auxiliary/meson.build
-index e4815f8..63a5842 100644
+index e4815f8a..63a58421 100644
 --- a/src/gallium/auxiliary/meson.build
 +++ b/src/gallium/auxiliary/meson.build
 @@ -272,6 +272,12 @@ if with_gfx_compute
@@ -561,7 +561,7 @@ index e4815f8..63a5842 100644
      'draw_nir_lower_opcodes.c',
      input : 'draw/draw_nir_lower_opcodes.py',
 diff --git a/src/gallium/drivers/zink/zink_bo.c b/src/gallium/drivers/zink/zink_bo.c
-index a2bbc8e..950fe83 100644
+index a2bbc8e2..950fe83f 100644
 --- a/src/gallium/drivers/zink/zink_bo.c
 +++ b/src/gallium/drivers/zink/zink_bo.c
 @@ -1369,7 +1369,12 @@ zink_bo_init(struct zink_screen *screen)
@@ -579,7 +579,7 @@ index a2bbc8e..950fe83 100644
  
     if (!pb_slabs_init(&screen->pb.bo_slabs,
 diff --git a/src/gallium/drivers/zink/zink_public.h b/src/gallium/drivers/zink/zink_public.h
-index c2fe873..3a48a2a 100644
+index c2fe8732..3a48a2a8 100644
 --- a/src/gallium/drivers/zink/zink_public.h
 +++ b/src/gallium/drivers/zink/zink_public.h
 @@ -36,4 +36,16 @@ struct pipe_screen *
@@ -600,10 +600,45 @@ index c2fe873..3a48a2a 100644
 +                     uint64_t *memory);
  #endif
 diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
-index af3035d..be008b8 100644
+index af3035dc..b4e8006c 100644
 --- a/src/gallium/drivers/zink/zink_resource.c
 +++ b/src/gallium/drivers/zink/zink_resource.c
-@@ -2539,6 +2539,36 @@ zink_transfer_copy_bufimage(struct zink_context *ctx,
+@@ -1883,7 +1883,12 @@ resource_create(struct pipe_screen *pscreen,
+    if (templ->target == PIPE_BUFFER) {
+       util_range_init(&res->valid_buffer_range);
+       res->base.b.bind |= PIPE_BIND_SHADER_IMAGE;
+-      if (!screen->resizable_bar && templ->width0 >= 8196) {
++      /* Entangled (ADR-0010): not a Direct3D dynamic buffer, which is
++       * written by the CPU every frame and whose discards would otherwise
++       * go through a temporary buffer copied in later on the GPU - under
++       * the unsynchronized appends that follow them. */
++      if (!screen->resizable_bar && templ->width0 >= 8196 &&
++          !(templ->usage == PIPE_USAGE_DYNAMIC && zink_entangled_unsync_appends())) {
+          /* We don't want to evict buffers from VRAM by mapping them for CPU access,
+           * because they might never be moved back again. If a buffer is large enough,
+           * upload data by copying from a temporary GTT buffer. 8K might not seem much,
+@@ -2496,6 +2501,20 @@ invalidate_buffer(struct zink_context *ctx, struct zink_resource *res)
+       zink_resource_get_address(screen, res);
+    if (!zink_resource_rebind(ctx, res))
+       ctx->buffer_rebind_counter = p_atomic_inc_return(&screen->buffer_rebind_counter);
++   /* Entangled (ADR-0010, 2026-11-21): without a threaded context nothing
++    * else tells the draw that the index buffer it bound is now other memory -
++    * zink_draw binds it again only when the pipe_resource changes - so the
++    * GPU kept reading the old object's indices. And neither the index nor
++    * the vertex buffers' new object was marked used by this batch until the
++    * next batch began, so the next discard thought it idle and wrote straight
++    * into memory this batch still draws from. (The threaded context's
++    * replace_buffer does the first itself.) */
++   if (ctx->index_buffer == &res->base.b) {
++      ctx->index_buffer = NULL;
++      zink_batch_resource_usage_set(ctx->bs, res, false, true);
++   }
++   if (res->vbo_bind_mask)
++      zink_batch_resource_usage_set(ctx->bs, res, false, true);
+    return true;
+ }
+ 
+@@ -2539,6 +2558,36 @@ zink_transfer_copy_bufimage(struct zink_context *ctx,
     zink_copy_image_buffer(ctx, dst, src, x, 0, 0, trans->base.b.level, &trans->base.b.box, trans->base.b.usage);
  }
  
@@ -640,8 +675,98 @@ index af3035d..be008b8 100644
  ALWAYS_INLINE static void
  align_offset_size(const VkDeviceSize alignment, VkDeviceSize *offset, VkDeviceSize *size, VkDeviceSize obj_size)
  {
+@@ -2638,6 +2687,22 @@ zink_buffer_map(struct pipe_context *pctx,
+    if (res->base.is_user_ptr)
+       usage |= PIPE_MAP_PERSISTENT;
+ 
++   /* Entangled (ADR-0010): an unsynchronized write the caller asked for
++    * promises nothing it queued touches the range - but zink may have
++    * queued a copy of its own into it (a discard answered with a
++    * temporary buffer). Until the batch holding that copy is known done,
++    * flushed or not, the write is synchronized instead: written directly,
++    * it would land under the copy. */
++   if (zink_entangled_unsync_appends() &&
++       (usage & (PIPE_MAP_UNSYNCHRONIZED | PIPE_MAP_WRITE)) ==
++          (PIPE_MAP_UNSYNCHRONIZED | PIPE_MAP_WRITE) &&
++       !(usage & TC_TRANSFER_MAP_THREADED_UNSYNC) &&
++       zink_batch_usage_exists(res->obj->staged_write) &&
++       !zink_screen_usage_check_completion_fast(screen, res->obj->staged_write)) {
++      usage &= ~PIPE_MAP_UNSYNCHRONIZED;
++      p_atomic_inc(&zink_entangled_unsync_demoted);
++   }
++
+    /* See if the buffer range being mapped has never been initialized,
+     * in which case it can be mapped unsynchronized. */
+    if (!(usage & (PIPE_MAP_UNSYNCHRONIZED | TC_TRANSFER_MAP_NO_INFER_UNSYNCHRONIZED)) &&
+@@ -3090,14 +3155,34 @@ zink_transfer_flush_region(struct pipe_context *pctx,
+       if (trans->staging_res) {
+          struct zink_resource *staging_res = zink_resource(trans->staging_res);
+ 
+-         if (ptrans->resource->target == PIPE_BUFFER)
++         if (ptrans->resource->target == PIPE_BUFFER) {
+             zink_copy_buffer(ctx, res, staging_res, dst_offset, src_offset, size, trans->unsync_upload);
++            zink_batch_usage_set(&res->obj->staged_write, ctx->bs);
++            p_atomic_inc(&zink_entangled_staged_writes);
++         }
+          else
+             zink_transfer_copy_bufimage(ctx, res, staging_res, trans);
+       }
+    }
+ }
+ 
++int zink_entangled_staged_writes;
++int zink_entangled_unsync_demoted;
++
++/* Entangled (ADR-0010): Direct3D's MAP_WRITE_NOOVERWRITE maps unsynchronized,
++ * which needs the changes above; ENTANGLED_D3D10_NOOVERWRITE=sync maps it as
++ * a plain write again (every append then flushes and waits). */
++bool
++zink_entangled_unsync_appends(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *mode = getenv("ENTANGLED_D3D10_NOOVERWRITE");
++      on = !(mode && strcmp(mode, "sync") == 0);
++   }
++   return on;
++}
++
+ /* used to determine whether to emit a TRANSFER_DST barrier on copies */
+ bool
+ zink_resource_copy_box_intersects(struct zink_resource *res, unsigned level, const struct pipe_box *box)
+diff --git a/src/gallium/drivers/zink/zink_resource.h b/src/gallium/drivers/zink/zink_resource.h
+index 75216754..ba8000d2 100644
+--- a/src/gallium/drivers/zink/zink_resource.h
++++ b/src/gallium/drivers/zink/zink_resource.h
+@@ -103,6 +103,12 @@ zink_resource_copy_box_add(struct zink_context *ctx, struct zink_resource *res,
+ void
+ zink_resource_copies_reset(struct zink_resource *res);
+ 
++/* Entangled (ADR-0010): unless ENTANGLED_D3D10_NOOVERWRITE=sync. */
++bool
++zink_entangled_unsync_appends(void);
++extern int zink_entangled_staged_writes;
++extern int zink_entangled_unsync_demoted;
++
+ #include "zink_batch.h"
+ #include "zink_bo.h"
+ #include "zink_kopper.h"
+diff --git a/src/gallium/drivers/zink/zink_types.h b/src/gallium/drivers/zink/zink_types.h
+index aab4bacb..3828f4da 100644
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -1194,6 +1194,9 @@ struct zink_rt_attrib {
+ /** resource types */
+ struct zink_resource_object {
+    struct pipe_reference reference;
++   /* Entangled (ADR-0010): the batch that last copied a temporary buffer
++    * into this one, for zink_buffer_map's explicit unsynchronized writes. */
++   struct zink_batch_usage *staged_write;
+ 
+    VkPipelineStageFlags access_stage;
+    VkAccessFlags access;
 diff --git a/src/gallium/frontends/d3d10umd/Adapter.cpp b/src/gallium/frontends/d3d10umd/Adapter.cpp
-index 63104c0..3847cb3 100644
+index 63104c05..3847cb33 100644
 --- a/src/gallium/frontends/d3d10umd/Adapter.cpp
 +++ b/src/gallium/frontends/d3d10umd/Adapter.cpp
 @@ -40,10 +40,6 @@
@@ -799,10 +924,20 @@ index 80e8a4eb..89c4f7e9 100644
   * ----------------------------------------------------------------------
   *
 diff --git a/src/gallium/frontends/d3d10umd/Draw.cpp b/src/gallium/frontends/d3d10umd/Draw.cpp
-index 3bf231ea..671b8154 100644
+index 3bf231ea..2d53f0ba 100644
 --- a/src/gallium/frontends/d3d10umd/Draw.cpp
 +++ b/src/gallium/frontends/d3d10umd/Draw.cpp
-@@ -95,12 +95,17 @@ ResolveState(Device *pDevice)
+@@ -40,6 +40,9 @@
+ #include "util/u_draw.h"
+ #include "util/u_memory.h"
+ 
++extern "C" volatile LONG d3d10_wddm_tracing;
++extern "C" void d3d10_wddm_trace(const char *format, ...);
++
+ static unsigned
+ ClampedUAdd(unsigned a,
+             unsigned b)
+@@ -95,12 +98,17 @@ ResolveState(Device *pDevice)
              }
           }
           if (remapped) {
@@ -820,8 +955,27 @@ index 3bf231ea..671b8154 100644
     }
     update_velems(pDevice);
  
+@@ -151,6 +159,8 @@ Draw(D3D10DDI_HDEVICE hDevice,   // IN
+      UINT StartVertexLocation)   // IN
+ {
+    LOG_ENTRYPOINT();
++   if (d3d10_wddm_tracing)
++      d3d10_wddm_trace("DDI Draw %u start %u", VertexCount, StartVertexLocation);
+ 
+    Device *pDevice = CastDevice(hDevice);
+ 
+@@ -181,6 +191,9 @@ DrawIndexed(D3D10DDI_HDEVICE hDevice,  // IN
+             INT BaseVertexLocation)    // IN
+ {
+    LOG_ENTRYPOINT();
++   if (d3d10_wddm_tracing)
++      d3d10_wddm_trace("DDI DrawIndexed %u start %u base %d", IndexCount,
++                       StartIndexLocation, BaseVertexLocation);
+ 
+    Device *pDevice = CastDevice(hDevice);
+    struct pipe_draw_info info;
 diff --git a/src/gallium/frontends/d3d10umd/DxgiFns.cpp b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
-index ea61523..5720c88 100644
+index ea615236..2087c233 100644
 --- a/src/gallium/frontends/d3d10umd/DxgiFns.cpp
 +++ b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
 @@ -30,7 +30,11 @@
@@ -849,15 +1003,27 @@ index ea61523..5720c88 100644
  /*
   * ----------------------------------------------------------------------
   *
-@@ -51,7 +57,6 @@
+@@ -51,6 +57,8 @@
   *
   * ----------------------------------------------------------------------
   */
--
++extern "C" volatile LONG d3d10_wddm_tracing;
++extern "C" void d3d10_wddm_trace(const char *format, ...);
+ 
  HRESULT APIENTRY
  _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
- {
-@@ -114,7 +119,24 @@ _GetGammaCaps( DXGI_DDI_ARG_GET_GAMMA_CONTROL_CAPS *GetCaps )
+@@ -61,6 +69,10 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
+    struct Device *device = CastDevice(pPresentData->hDevice);
+    Resource *pSrcResource = CastResource(pPresentData->hSurfaceToPresent);
+ 
++   if (d3d10_wddm_tracing)
++      d3d10_wddm_trace("DDI Present surface %p pipe %p", (void *)pSrcResource,
++                       (void *)pSrcResource->resource);
++
+    device->pipe->flush(device->pipe, NULL, 0);
+    device->pipe->screen->flush_frontbuffer(device->pipe->screen, device->pipe, 
+       pSrcResource->resource, 0, 0, pPresentData->pDXGIContext, 0, NULL);
+@@ -114,7 +126,24 @@ _GetGammaCaps( DXGI_DDI_ARG_GET_GAMMA_CONTROL_CAPS *GetCaps )
  HRESULT APIENTRY
  _SetDisplayMode( DXGI_DDI_ARG_SETDISPLAYMODE *SetDisplayMode )
  {
@@ -883,7 +1049,7 @@ index ea61523..5720c88 100644
  
     return S_OK;
  }
-@@ -172,71 +194,25 @@ _QueryResourceResidency( DXGI_DDI_ARG_QUERYRESOURCERESIDENCY *QueryResourceResid
+@@ -172,71 +201,32 @@ _QueryResourceResidency( DXGI_DDI_ARG_QUERYRESOURCERESIDENCY *QueryResourceResid
   */
  
  HRESULT APIENTRY
@@ -910,14 +1076,19 @@ index ea61523..5720c88 100644
 -    * XXX: Copying is not very efficient, but it is much simpler than the
 -    * alternative of recreating all views.
 -    */
--
++   struct pipe_resource *firstResource = CastPipeResource(hResources[0]);
+ 
 -   struct pipe_resource *temp_resource;
 -   temp_resource = screen->resource_create(screen, resource0);
 -   assert(temp_resource);
 -   if (!temp_resource) {
 -      return E_OUTOFMEMORY;
--   }
-+   struct pipe_resource *firstResource = CastPipeResource(hResources[0]);
++   if (d3d10_wddm_tracing) {
++      for (UINT i = 0; i < NumResources; ++i)
++         d3d10_wddm_trace("DDI Rotate %u/%u: %p pipe %p", i, NumResources,
++                          (void *)CastResource(hResources[i]),
++                          (void *)CastResource(hResources[i])->resource);
+    }
  
 -   struct pipe_box src_box;
 -   src_box.x = 0;
@@ -965,7 +1136,7 @@ index ea61523..5720c88 100644
     return S_OK;
  }
 diff --git a/src/gallium/frontends/d3d10umd/Format.cpp b/src/gallium/frontends/d3d10umd/Format.cpp
-index 57076f2..5ae78b8 100644
+index 57076f2d..5ae78b8d 100644
 --- a/src/gallium/frontends/d3d10umd/Format.cpp
 +++ b/src/gallium/frontends/d3d10umd/Format.cpp
 @@ -276,6 +276,166 @@ FormatTranslate(DXGI_FORMAT Format, BOOL depth)
@@ -1136,7 +1307,7 @@ index 57076f2..5ae78b8 100644
  #define CASE(fmt) case fmt: return #fmt
  
 diff --git a/src/gallium/frontends/d3d10umd/Format.h b/src/gallium/frontends/d3d10umd/Format.h
-index 2ee4371..875336a 100644
+index 2ee43710..875336a4 100644
 --- a/src/gallium/frontends/d3d10umd/Format.h
 +++ b/src/gallium/frontends/d3d10umd/Format.h
 @@ -38,6 +38,8 @@
@@ -1149,7 +1320,7 @@ index 2ee4371..875336a 100644
  FormatToName(DXGI_FORMAT Format);
  
 diff --git a/src/gallium/frontends/d3d10umd/InputAssembly.cpp b/src/gallium/frontends/d3d10umd/InputAssembly.cpp
-index d36a070..ca071b6 100644
+index d36a070c..ca071b64 100644
 --- a/src/gallium/frontends/d3d10umd/InputAssembly.cpp
 +++ b/src/gallium/frontends/d3d10umd/InputAssembly.cpp
 @@ -159,7 +159,7 @@ IaSetVertexBuffers(D3D10DDI_HDEVICE hDevice,
@@ -1171,7 +1342,7 @@ index d36a070..ca071b6 100644
     }
  
 diff --git a/src/gallium/frontends/d3d10umd/OutputMerger.cpp b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
-index 2a38864..3fd31c5 100644
+index 2a38864f..3fd31c54 100644
 --- a/src/gallium/frontends/d3d10umd/OutputMerger.cpp
 +++ b/src/gallium/frontends/d3d10umd/OutputMerger.cpp
 @@ -41,6 +41,22 @@
@@ -1227,7 +1398,7 @@ index 2a38864..3fd31c5 100644
                                psurf && psurf->texture ? psurf->texture : NULL);
        if (psurf && psurf->texture) {
 diff --git a/src/gallium/frontends/d3d10umd/Query.cpp b/src/gallium/frontends/d3d10umd/Query.cpp
-index 8e76023..e7c2a1c 100644
+index 8e76023c..e7c2a1cf 100644
 --- a/src/gallium/frontends/d3d10umd/Query.cpp
 +++ b/src/gallium/frontends/d3d10umd/Query.cpp
 @@ -167,11 +167,10 @@ QueryBegin(D3D10DDI_HDEVICE hDevice,   // IN
@@ -1244,7 +1415,7 @@ index 8e76023..e7c2a1c 100644
     }
  }
 diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
-index 65729f1..8785392 100644
+index 65729f15..605296e2 100644
 --- a/src/gallium/frontends/d3d10umd/Resource.cpp
 +++ b/src/gallium/frontends/d3d10umd/Resource.cpp
 @@ -38,6 +38,7 @@
@@ -1368,6 +1539,68 @@ index 65729f1..8785392 100644
  }
  
  
+@@ -476,6 +537,22 @@ DestroyResource(D3D10DDI_HDEVICE hDevice,       // IN
+  * ----------------------------------------------------------------------
+  */
+ 
++extern "C" volatile LONG d3d10_wddm_tracing;
++extern "C" void d3d10_wddm_trace(const char *format, ...);
++
++/* Unless ENTANGLED_D3D10_NOOVERWRITE=sync (see ResourceMap); zink reads the
++ * same. */
++static bool
++UnsyncAppends(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *mode = getenv("ENTANGLED_D3D10_NOOVERWRITE");
++      on = !(mode && strcmp(mode, "sync") == 0);
++   }
++   return on != 0;
++}
++
+ void APIENTRY
+ ResourceMap(D3D10DDI_HDEVICE hDevice,                                // IN
+             D3D10DDI_HRESOURCE hResource,                            // IN
+@@ -510,13 +587,37 @@ ResourceMap(D3D10DDI_HDEVICE hDevice,                                // IN
+       }
+       break;
+    case D3D10_DDI_MAP_WRITE_NOOVERWRITE:
+-      usage = PIPE_MAP_WRITE | PIPE_MAP_UNSYNCHRONIZED;
++      /* PIPE_MAP_UNSYNCHRONIZED, as the promise means - which took two
++       * fixes in zink (ADR-0010, amendments of 2026-11-20 and 2026-11-21):
++       *  - it answered the WRITE_DISCARD before with a temporary buffer whose
++       *    copy into this one (the whole buffer: a Direct3D map has no
++       *    range) still had to run on the GPU, and the appends landed under
++       *    it. A dynamic buffer is now mapped directly, and an unsynchronized
++       *    write that could still meet such a copy is synchronized
++       *    (zink_buffer_map).
++       *  - a discard that renamed the buffer left the old memory bound as
++       *    the index buffer, and the new one unmarked as in use, so the next
++       *    discard wrote into memory the GPU was drawing from
++       *    (invalidate_buffer).
++       * ENTANGLED_D3D10_NOOVERWRITE=sync maps it as a plain write instead:
++       * correct as well, but zink then flushes the batch and waits for the
++       * GPU on every append - some fifteen times per DWM frame.
++       */
++      usage = PIPE_MAP_WRITE;
++      if (UnsyncAppends())
++         usage |= PIPE_MAP_UNSYNCHRONIZED;
+       break;
+    default:
+       assert(0);
+       return;
+    }
+ 
++   if (d3d10_wddm_tracing)
++      d3d10_wddm_trace("DDI Map %05llx %s %ux%u sub %u map %u flags 0x%x usage 0x%x",
++                       (unsigned long long)(uintptr_t)resource & 0xfffff,
++                       pResource->buffer ? "buffer" : "texture", resource->width0,
++                       resource->height0, SubResource, (unsigned)DDIMap, Flags, usage);
++
+    assert(SubResource < pResource->NumSubResources);
+ 
+    unsigned level;
 diff --git a/src/gallium/frontends/d3d10umd/Shader.cpp b/src/gallium/frontends/d3d10umd/Shader.cpp
 index df6ffa19..2f3ece84 100644
 --- a/src/gallium/frontends/d3d10umd/Shader.cpp
@@ -1508,7 +1741,7 @@ index df6ffa19..2f3ece84 100644
     util_gen_mipmap(pipe,
                     sampler_view->texture,
 diff --git a/src/gallium/frontends/d3d10umd/ShaderTGSI.c b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
-index 653cb96..5422b36 100644
+index 653cb965..5422b363 100644
 --- a/src/gallium/frontends/d3d10umd/ShaderTGSI.c
 +++ b/src/gallium/frontends/d3d10umd/ShaderTGSI.c
 @@ -33,6 +33,7 @@
@@ -1796,7 +2029,7 @@ index 7c7f2c29..e040ac23 100644
  
 diff --git a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
 new file mode 100644
-index 0000000..843fdc2
+index 00000000..843fdc29
 --- /dev/null
 +++ b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.cpp
 @@ -0,0 +1,324 @@
@@ -2127,7 +2360,7 @@ index 0000000..843fdc2
 \ No newline at end of file
 diff --git a/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.h b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.h
 new file mode 100644
-index 0000000..a3e62d2
+index 00000000..a3e62d24
 --- /dev/null
 +++ b/src/gallium/frontends/d3d10umd/gdikmt_d3dddi.h
 @@ -0,0 +1,28 @@
@@ -2161,7 +2394,7 @@ index 0000000..a3e62d2
 +void gdikmt_d3dddi_fill_basefuncs(struct gdikmt_device_d3dddi *device);
 \ No newline at end of file
 diff --git a/src/gallium/frontends/d3d10umd/meson.build b/src/gallium/frontends/d3d10umd/meson.build
-index 614db91..4b971dc 100644
+index 614db914..4b971dc1 100644
 --- a/src/gallium/frontends/d3d10umd/meson.build
 +++ b/src/gallium/frontends/d3d10umd/meson.build
 @@ -24,6 +24,7 @@ libd3d10umd = static_library(
@@ -2173,7 +2406,7 @@ index 614db91..4b971dc 100644
    c_args : _c_args_d3d10umd,
    cpp_args : _c_args_d3d10umd,
 diff --git a/src/gallium/include/frontend/winsys_handle.h b/src/gallium/include/frontend/winsys_handle.h
-index 289cb9d..22c3068 100644
+index 289cb9d0..22c3068b 100644
 --- a/src/gallium/include/frontend/winsys_handle.h
 +++ b/src/gallium/include/frontend/winsys_handle.h
 @@ -19,6 +19,8 @@ extern "C" {
@@ -2186,7 +2419,7 @@ index 289cb9d..22c3068 100644
  /**
   * For use with pipe_screen::{resource_from_handle|resource_get_handle}.
 diff --git a/src/gallium/meson.build b/src/gallium/meson.build
-index 67011f5..980c297 100644
+index 67011f56..980c297a 100644
 --- a/src/gallium/meson.build
 +++ b/src/gallium/meson.build
 @@ -44,6 +44,9 @@ if with_platform_windows
@@ -2200,7 +2433,7 @@ index 67011f5..980c297 100644
  if with_platform_haiku
    subdir('winsys/sw/hgl')
 diff --git a/src/gallium/targets/d3d10umd/meson.build b/src/gallium/targets/d3d10umd/meson.build
-index ab1cf05..db52ded 100644
+index ab1cf053..db52ded0 100644
 --- a/src/gallium/targets/d3d10umd/meson.build
 +++ b/src/gallium/targets/d3d10umd/meson.build
 @@ -12,17 +12,17 @@ libgallium_d3d10_def = custom_target(
@@ -2226,7 +2459,7 @@ index ab1cf05..db52ded 100644
    install : true,
 diff --git a/src/gallium/winsys/sw/wddm/meson.build b/src/gallium/winsys/sw/wddm/meson.build
 new file mode 100644
-index 0000000..aff6736
+index 00000000..aff67362
 --- /dev/null
 +++ b/src/gallium/winsys/sw/wddm/meson.build
 @@ -0,0 +1,11 @@
@@ -2243,7 +2476,7 @@ index 0000000..aff6736
 +)
 diff --git a/src/virtio/wddm/viogpu_wddm_driver.h b/src/virtio/wddm/viogpu_wddm_driver.h
 new file mode 100644
-index 0000000..457e87c
+index 00000000..457e87c4
 --- /dev/null
 +++ b/src/virtio/wddm/viogpu_wddm_driver.h
 @@ -0,0 +1,198 @@

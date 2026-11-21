@@ -95,6 +95,95 @@ d3d10_wddm_log(const char *format, ...)
    device->escape(device, &escape, sizeof escape);
 }
 
+/* ---------------------------------------------------------------------- */
+/* A trace of DWM's frames                                                 */
+/* ---------------------------------------------------------------------- */
+
+/* What DWM asks of the GPU, call by call, for a few frames - what reaches
+ * the rasteriser, with the frames themselves written beside it. Armed in
+ * dwm.exe only; started by writing C:\Users\Public\dwmtrace.txt (its first
+ * number is how many presents to trace), which every present looks at. The
+ * frames land in C:\Users\Public\dwmframe-<n>.raw (BGRA, the screen's size)
+ * when DWM may write there. A diagnostic kernel driver carries the lines. */
+volatile LONG d3d10_wddm_tracing;
+static int d3d10_wddm_trace_armed = -1;
+static LONG d3d10_wddm_presents;
+
+void
+d3d10_wddm_trace(const char *format, ...)
+{
+   char line[220];
+   va_list args;
+
+   if (!d3d10_wddm_tracing)
+      return;
+   va_start(args, format);
+   vsnprintf(line, sizeof line, format, args);
+   va_end(args);
+   d3d10_wddm_log("T %s", line);
+}
+
+/* A short name for a resource in the trace: its address and its size. */
+static const char *
+d3d10_wddm_rid(char buf[40], const struct pipe_resource *res)
+{
+   if (!res)
+      snprintf(buf, 40, "-");
+   else
+      snprintf(buf, 40, "%05llx:%ux%u", (unsigned long long)(uintptr_t)res & 0xfffff,
+               res->width0, res->height0);
+   return buf;
+}
+
+static void
+d3d10_wddm_trace_check(void)
+{
+   static FILETIME seen;
+   WIN32_FILE_ATTRIBUTE_DATA data;
+
+   if (d3d10_wddm_trace_armed < 0) {
+      char exe[MAX_PATH] = "";
+      const char *base = exe;
+
+      GetModuleFileNameA(NULL, exe, sizeof exe);
+      for (const char *p = exe; *p; p++) {
+         if (*p == '\\' || *p == '/')
+            base = p + 1;
+      }
+      d3d10_wddm_trace_armed = _stricmp(base, "dwm.exe") == 0;
+   }
+   if (!d3d10_wddm_trace_armed)
+      return;
+   if (!GetFileAttributesExA("C:\\Users\\Public\\dwmtrace.txt", GetFileExInfoStandard,
+                             &data))
+      memset(&data, 0, sizeof data);
+   /* A file left from before this process started does not count. */
+   if (d3d10_wddm_trace_armed == 1) {
+      seen = data.ftLastWriteTime;
+      d3d10_wddm_trace_armed = 2;
+      return;
+   }
+   if (CompareFileTime(&data.ftLastWriteTime, &seen) == 0)
+      return;
+   seen = data.ftLastWriteTime;
+   if (!data.ftLastWriteTime.dwLowDateTime && !data.ftLastWriteTime.dwHighDateTime)
+      return;
+   {
+      FILE *f = fopen("C:\\Users\\Public\\dwmtrace.txt", "r");
+      int frames = 3;
+
+      if (f) {
+         if (fscanf(f, "%d", &frames) != 1)
+            frames = 3;
+         fclose(f);
+      }
+      if (frames < 1 || frames > 30)
+         frames = 3;
+      InterlockedExchange(&d3d10_wddm_tracing, frames + 1);
+      d3d10_wddm_log("T begin: %d presents", frames);
+   }
+}
+
 /* An access violation or the like in this process: say where, as module and
  * offset for every frame, then let it take its course. The frames are what
  * the linker map of this DLL (build-d3d10.cmd keeps one) turns into names. */
@@ -390,6 +479,16 @@ static volatile LONG64 d3d10_wddm_copied;
 /* Microseconds a present spent waiting for the GPU's copy of the frame, and
  * in the host showing it. */
 static volatile LONG64 d3d10_wddm_wait_us, d3d10_wddm_show_us;
+/* Where a present of the screen's frame spends its time, in microseconds:
+ * reading it back (the map, which waits for the GPU's copy to memory, and
+ * the copy out of it on this CPU), the kernel driver's flip, and the whole
+ * present; and how many presents of the screen's frame there were. */
+static volatile LONG64 d3d10_wddm_map_us, d3d10_wddm_memcpy_us,
+   d3d10_wddm_display_us, d3d10_wddm_present_us;
+/* And in the context's own flushes: Zink's submits to the GPU, which wait
+ * for it when they carry a fence. */
+static volatile LONG64 d3d10_wddm_flush_us;
+static volatile LONG d3d10_wddm_screen_presents;
 
 static LONG64
 d3d10_wddm_now_us(void)
@@ -416,6 +515,86 @@ d3d10_wddm_stats(void)
    d3d10_wddm_log("overlay: %lld ms waiting for the copy, %lld ms shown by the host",
                   (long long)(InterlockedExchange64(&d3d10_wddm_wait_us, 0) / 1000),
                   (long long)(InterlockedExchange64(&d3d10_wddm_show_us, 0) / 1000));
+   d3d10_wddm_log("presents: %ld of the screen in %ld ms: %lld ms whole, %lld ms readback map, %lld ms readback memcpy, %lld ms flip",
+                  InterlockedExchange(&d3d10_wddm_screen_presents, 0),
+                  (long)(now - before),
+                  (long long)(InterlockedExchange64(&d3d10_wddm_present_us, 0) / 1000),
+                  (long long)(InterlockedExchange64(&d3d10_wddm_map_us, 0) / 1000),
+                  (long long)(InterlockedExchange64(&d3d10_wddm_memcpy_us, 0) / 1000),
+                  (long long)(InterlockedExchange64(&d3d10_wddm_display_us, 0) / 1000));
+   d3d10_wddm_log("flushes: %lld ms in the driver's flush",
+                  (long long)(InterlockedExchange64(&d3d10_wddm_flush_us, 0) / 1000));
+   {
+      /* The Venus driver's side of it: its submits and waits (exported by
+       * name from vulkan_virtio.dll, like the overlay). */
+      typedef void (*stats_fn)(uint64_t *, uint32_t);
+      static stats_fn renderer_stats;
+      static bool looked;
+      uint64_t v[25] = {0};
+
+      if (!looked) {
+         HMODULE icd = GetModuleHandleA("vulkan_virtio.dll");
+
+         if (icd)
+            renderer_stats = (stats_fn)(void *)GetProcAddress(icd, "entangled_renderer_stats");
+         looked = icd != NULL;
+      }
+      if (renderer_stats) {
+         renderer_stats(v, 25);
+         d3d10_wddm_log("venus: %llu fenced submits %llu ms (max %llu us, %llu over 2 ms), %llu plain submits %llu ms, %llu waits %llu ms",
+                        (unsigned long long)v[0], (unsigned long long)(v[1] / 1000),
+                        (unsigned long long)v[2], (unsigned long long)v[3],
+                        (unsigned long long)v[4], (unsigned long long)(v[5] / 1000),
+                        (unsigned long long)v[6], (unsigned long long)(v[7] / 1000));
+         d3d10_wddm_log("venus waits: ring seqno %llu %llu ms (%llu slept), tls ring %llu %llu ms (%llu), ring space %llu %llu ms (%llu), semaphore %llu %llu ms (%llu), query %llu %llu ms (%llu)",
+                        (unsigned long long)v[8], (unsigned long long)(v[9] / 1000), (unsigned long long)v[10],
+                        (unsigned long long)v[11], (unsigned long long)(v[12] / 1000), (unsigned long long)v[13],
+                        (unsigned long long)v[14], (unsigned long long)(v[15] / 1000), (unsigned long long)v[16],
+                        (unsigned long long)v[17], (unsigned long long)(v[18] / 1000), (unsigned long long)v[19],
+                        (unsigned long long)v[20], (unsigned long long)(v[21] / 1000), (unsigned long long)v[22]);
+         d3d10_wddm_log("venus reads: %llu waits with a timeout, %llu polls",
+                        (unsigned long long)v[23], (unsigned long long)v[24]);
+         {
+            /* ENTANGLED_WAIT_CALLERS=1 in the Venus driver: who waited. */
+            typedef size_t (*callers_fn)(char *, size_t);
+            static callers_fn renderer_callers;
+            static bool looked_callers;
+            static char chains[4096];
+
+            if (!looked_callers) {
+               HMODULE icd = GetModuleHandleA("vulkan_virtio.dll");
+
+               if (icd)
+                  renderer_callers = (callers_fn)(void *)GetProcAddress(icd, "entangled_renderer_callers");
+               looked_callers = icd != NULL;
+            }
+            if (renderer_callers && renderer_callers(chains, sizeof chains)) {
+               char *line = chains, *end;
+
+               while (*line && (end = strchr(line, '\n'))) {
+                  *end = 0;
+                  d3d10_wddm_log("waited by %.220s", line);
+                  line = end + 1;
+               }
+            }
+         }
+      }
+   }
+#ifdef GALLIUM_ZINK
+   {
+      /* MAP_WRITE_NOOVERWRITE (ADR-0010, 2026-11-21): temporary buffers zink
+       * copied into buffers, and unsynchronized writes it synchronized
+       * because such a copy could still be pending. */
+      extern int zink_entangled_staged_writes;
+      extern int zink_entangled_unsync_demoted;
+      extern bool zink_entangled_unsync_appends(void);
+
+      d3d10_wddm_log("no-overwrite maps %s: %ld staged copies into buffers, %ld unsynchronized writes synchronized",
+                     zink_entangled_unsync_appends() ? "unsynchronized" : "synchronized",
+                     InterlockedExchange((volatile LONG *)&zink_entangled_staged_writes, 0),
+                     InterlockedExchange((volatile LONG *)&zink_entangled_unsync_demoted, 0));
+   }
+#endif
    d3d10_wddm_log("copies in %lu ms: %ld overlaid, %ld flushes, %ld readbacks, %ld uploads, %lld MiB",
                   (unsigned long)(now - before),
                   InterlockedExchange(&d3d10_wddm_overlays, 0),
@@ -470,17 +649,24 @@ d3d10_wddm_readback(struct d3d10_wddm_screen *ws, struct pipe_context *pipe,
    dst = ws->winsys->displaytarget_map(ws->winsys, shared->dt, PIPE_MAP_WRITE);
    if (!dst)
       return;
-   src = pipe->texture_map(pipe, res, 0, PIPE_MAP_READ, &box, &transfer);
-   if (!src) {
+   {
+      LONG64 start = d3d10_wddm_now_us(), mapped;
+
+      src = pipe->texture_map(pipe, res, 0, PIPE_MAP_READ, &box, &transfer);
+      mapped = d3d10_wddm_now_us();
+      InterlockedAdd64(&d3d10_wddm_map_us, mapped - start);
+      if (!src) {
+         ws->winsys->displaytarget_unmap(ws->winsys, shared->dt);
+         return;
+      }
+      for (unsigned y = 0; y < shared->height; y++) {
+         memcpy(dst + (size_t)y * shared->stride,
+                src + (size_t)y * transfer->stride, (size_t)shared->width * 4);
+      }
+      pipe->texture_unmap(pipe, transfer);
       ws->winsys->displaytarget_unmap(ws->winsys, shared->dt);
-      return;
+      InterlockedAdd64(&d3d10_wddm_memcpy_us, d3d10_wddm_now_us() - mapped);
    }
-   for (unsigned y = 0; y < shared->height; y++) {
-      memcpy(dst + (size_t)y * shared->stride,
-             src + (size_t)y * transfer->stride, (size_t)shared->width * 4);
-   }
-   pipe->texture_unmap(pipe, transfer);
-   ws->winsys->displaytarget_unmap(ws->winsys, shared->dt);
    InterlockedIncrement(&d3d10_wddm_readbacks);
    InterlockedAdd64(&d3d10_wddm_copied, (LONG64)shared->width * shared->height * 4);
 }
@@ -810,7 +996,7 @@ d3d10_wddm_plane_claimed(void)
 }
 
 static void
-d3d10_wddm_flush_frontbuffer(struct pipe_screen *screen,
+d3d10_wddm_flush_frontbuffer_inner(struct pipe_screen *screen,
                              struct pipe_context *pipe,
                              struct pipe_resource *res, unsigned level,
                              unsigned layer, void *winsys_drawable_handle,
@@ -818,6 +1004,16 @@ d3d10_wddm_flush_frontbuffer(struct pipe_screen *screen,
 {
    struct d3d10_wddm_screen *ws = d3d10_wddm_screen(screen);
    struct d3d10_wddm_shared *shared = d3d10_wddm_lookup(ws, res);
+   LONG present = InterlockedIncrement(&d3d10_wddm_presents);
+   LONG64 started = d3d10_wddm_now_us();
+
+   if (d3d10_wddm_tracing) {
+      char r[40];
+
+      d3d10_wddm_trace("present %ld ctx %p res %s alloc %p presentable %d", present,
+                       (void *)pipe, d3d10_wddm_rid(r, res),
+                       shared ? (void *)shared->dt : NULL, shared ? shared->presentable : -1);
+   }
 
    if (!shared) {
       ws->flush_frontbuffer(screen, pipe, res, level, layer,
@@ -872,8 +1068,67 @@ d3d10_wddm_flush_frontbuffer(struct pipe_screen *screen,
       ws->overlaid = false;
       d3d10_wddm_readback(ws, pipe, res, shared);
    }
-   ws->winsys->displaytarget_display(ws->winsys, shared->dt,
-                                     winsys_drawable_handle, nboxes, sub_box);
+   {
+      LONG64 flip = d3d10_wddm_now_us();
+
+      ws->winsys->displaytarget_display(ws->winsys, shared->dt,
+                                        winsys_drawable_handle, nboxes, sub_box);
+      if (shared->presentable) {
+         LONG64 end = d3d10_wddm_now_us();
+
+         InterlockedAdd64(&d3d10_wddm_display_us, end - flip);
+         InterlockedAdd64(&d3d10_wddm_present_us, end - started);
+         InterlockedIncrement(&d3d10_wddm_screen_presents);
+      }
+   }
+}
+
+/* The frame a traced present showed, as DWM drew it: the allocation, which
+ * the present has just filled. */
+static void
+d3d10_wddm_trace_frame(struct d3d10_wddm_screen *ws, struct pipe_resource *res)
+{
+   struct d3d10_wddm_shared *shared = d3d10_wddm_lookup(ws, res);
+   const uint8_t *src;
+   char path[64];
+   FILE *f;
+
+   if (!shared)
+      return;
+   snprintf(path, sizeof path, "C:\\Users\\Public\\dwmframe-%ld.raw",
+            (long)d3d10_wddm_presents);
+   src = ws->winsys->displaytarget_map(ws->winsys, shared->dt, PIPE_MAP_READ);
+   if (!src)
+      return;
+   f = fopen(path, "wb");
+   if (f) {
+      for (unsigned y = 0; y < shared->height; y++)
+         fwrite(src + (size_t)y * shared->stride, 4, shared->width, f);
+      fclose(f);
+   }
+   ws->winsys->displaytarget_unmap(ws->winsys, shared->dt);
+   d3d10_wddm_trace("frame %s %s", path, f ? "written" : "NOT written");
+}
+
+static void
+d3d10_wddm_flush_frontbuffer(struct pipe_screen *screen,
+                             struct pipe_context *pipe,
+                             struct pipe_resource *res, unsigned level,
+                             unsigned layer, void *winsys_drawable_handle,
+                             unsigned nboxes, struct pipe_box *sub_box)
+{
+   struct d3d10_wddm_screen *ws = d3d10_wddm_screen(screen);
+
+   d3d10_wddm_flush_frontbuffer_inner(screen, pipe, res, level, layer,
+                                      winsys_drawable_handle, nboxes, sub_box);
+   if (d3d10_wddm_tracing) {
+      d3d10_wddm_trace_frame(ws, res);
+      if (InterlockedDecrement(&d3d10_wddm_tracing) == 1) {
+         d3d10_wddm_trace("end");
+         InterlockedExchange(&d3d10_wddm_tracing, 0);
+      }
+   }
+   d3d10_wddm_trace_check();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -912,6 +1167,15 @@ d3d10_wddm_set_framebuffer_state(struct pipe_context *pipe,
       for (unsigned i = 0; i < state->nr_cbufs; i++)
          d3d10_wddm_mark(wc->ws, state->cbufs[i].texture);
    }
+   if (d3d10_wddm_tracing && state) {
+      char r0[40], r1[40], z[40];
+
+      d3d10_wddm_trace("%p framebuffer %ux%u cbufs %u [%s %s] zs %s", (void *)pipe,
+                       state->width, state->height, state->nr_cbufs,
+                       d3d10_wddm_rid(r0, state->nr_cbufs > 0 ? state->cbufs[0].texture : NULL),
+                       d3d10_wddm_rid(r1, state->nr_cbufs > 1 ? state->cbufs[1].texture : NULL),
+                       d3d10_wddm_rid(z, state->zsbuf.texture));
+   }
    wc->set_framebuffer_state(pipe, state);
 }
 
@@ -919,6 +1183,17 @@ static void
 d3d10_wddm_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 {
    struct d3d10_wddm_context *wc = d3d10_wddm_context(pipe);
+
+   if (d3d10_wddm_tracing) {
+      char s[40], d[40];
+
+      d3d10_wddm_trace("%p blit %s [%d,%d %dx%d] -> %s [%d,%d %dx%d] scissor %d",
+                       (void *)pipe, d3d10_wddm_rid(s, info->src.resource),
+                       info->src.box.x, info->src.box.y, info->src.box.width,
+                       info->src.box.height, d3d10_wddm_rid(d, info->dst.resource),
+                       info->dst.box.x, info->dst.box.y, info->dst.box.width,
+                       info->dst.box.height, info->scissor_enable);
+   }
 
    d3d10_wddm_fetch(wc, pipe, info->src.resource);
    d3d10_wddm_mark(wc->ws, info->dst.resource);
@@ -933,6 +1208,14 @@ d3d10_wddm_resource_copy_region(struct pipe_context *pipe,
                                 const struct pipe_box *src_box)
 {
    struct d3d10_wddm_context *wc = d3d10_wddm_context(pipe);
+
+   if (d3d10_wddm_tracing) {
+      char s[40], d[40];
+
+      d3d10_wddm_trace("%p copy %s [%d,%d %dx%d] -> %s at %u,%u", (void *)pipe,
+                       d3d10_wddm_rid(s, src), src_box->x, src_box->y, src_box->width,
+                       src_box->height, d3d10_wddm_rid(d, dst), dstx, dsty);
+   }
 
    d3d10_wddm_fetch(wc, pipe, src);
    d3d10_wddm_mark(wc->ws, dst);
@@ -958,6 +1241,13 @@ d3d10_wddm_set_sampler_views(struct pipe_context *pipe,
          d3d10_wddm_fetch(wc, pipe, views[i]->texture);
       }
    }
+   if (d3d10_wddm_tracing && shader == MESA_SHADER_FRAGMENT) {
+      char r0[40], r1[40];
+
+      d3d10_wddm_trace("%p views fs %u+%u [%s %s]", (void *)pipe, start_slot, num_views,
+                       d3d10_wddm_rid(r0, views && num_views > 0 && views[0] ? views[0]->texture : NULL),
+                       d3d10_wddm_rid(r1, views && num_views > 1 && views[1] ? views[1]->texture : NULL));
+   }
    wc->set_sampler_views(pipe, shader, start_slot, num_views,
                          unbind_num_trailing_slots, views);
 }
@@ -973,8 +1263,12 @@ d3d10_wddm_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
    struct pipe_resource *dirty[16];
    struct d3d10_wddm_shared *shared[16];
    unsigned count = 0;
+   LONG64 start = d3d10_wddm_now_us();
 
    wc->flush(pipe, fence, flags);
+   InterlockedAdd64(&d3d10_wddm_flush_us, d3d10_wddm_now_us() - start);
+   if (d3d10_wddm_tracing)
+      d3d10_wddm_trace("%p flush 0x%x", (void *)pipe, flags);
    /* A screen on its way out flushes the contexts it keeps for itself, after
     * the table of shared textures has gone. */
    if (wc->flushing || !ws->shared)

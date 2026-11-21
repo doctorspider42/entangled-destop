@@ -253,6 +253,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         ignore_msrs: false,
         hyperv_enlightenments: false,
         guest_agent: false,
+        guest_exec: false,
         gamepad: GamepadSection::default(),
     };
 
@@ -376,6 +377,7 @@ pub fn run(args: &InstallArgs) -> Result<(), String> {
         ignore_msrs: false,
         hyperv_enlightenments: false,
         guest_agent: false,
+        guest_exec: false,
         gamepad: GamepadSection {
             enabled: true,
             // One pad. A second is a config edit away and costs another virtio

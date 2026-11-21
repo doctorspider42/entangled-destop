@@ -270,14 +270,21 @@ impl DisplayHandle {
     /// be, and screenshots read that copy back. Without it a headless display
     /// takes every frame through the copy path.
     ///
+    /// The overlay plane (ADR-0009 phase E) gets its presenter on the same
+    /// device, as a window's does: a render node's frames — a Vulkan window's,
+    /// or under ADR-0010 DWM's whole desktop — are copied out of their host
+    /// pages on that GPU and stay there. Without one the plane declined every
+    /// frame, and the guest read each back through its CPU instead.
+    ///
     /// Windows only, where renderers share handle blobs; elsewhere, and on a
     /// host whose GPU cannot import them, an error that says why.
     pub fn attach_offscreen_gpu(&self) -> Result<(), DisplayError> {
         #[cfg(windows)]
         {
-            let presenter = crate::gpu_scanout::GpuScanout::open_offscreen()
+            let (presenter, overlay) = crate::gpu_scanout::GpuScanout::open_offscreen_pair()
                 .map_err(DisplayError::SharedDevice)?;
             self.shared.set(Some(Arc::new(presenter)));
+            self.shared.set_overlay(Some(Arc::new(overlay)));
             Ok(())
         }
         #[cfg(not(windows))]
@@ -405,6 +412,27 @@ impl DisplayHandle {
         let (w, h, rgba) = crate::thumbnail::downscale(width, height, snapshot.pixels(), max_width)
             .ok_or(DisplayError::Config("the scanout has no pixels to scale"))?;
         crate::thumbnail::write_png_atomically(path.as_ref(), w, h, &rgba)
+    }
+
+    /// Writes a full-size PNG of the current scanout (cursor included) to
+    /// `path` through a temporary file renamed into place, so a reader that
+    /// sees the file sees all of it; answers its size. The control channel's
+    /// `screenshot`.
+    pub fn write_screenshot(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(u32, u32), DisplayError> {
+        let path = path.as_ref();
+        let snapshot = self.snapshot()?;
+        let png = snapshot.to_png()?;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        std::fs::write(&tmp, &png)?;
+        std::fs::rename(&tmp, path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+        Ok(snapshot.size())
     }
 
     /// Writes a PNG screenshot of the current scanout to `path`.

@@ -313,11 +313,27 @@ impl FuseServer {
         let fid = self.walk(nfid, &[])?;
         // Linux open flags pass through; O_DIRECTORY for a directory.
         let flags = (flags & !0o100) | if dir { 0o200000 } else { 0 };
-        let mut m = self.msg(wire_t::TLOPEN);
-        m.u32(fid).u32(flags);
-        if let Err(e) = self.call(m) {
-            self.clunk(fid);
-            return Err(e);
+        // A file opened write-only is opened for reading too, when the share
+        // allows it: Windows' cache manager pages a file in through whichever
+        // handle set up its caching (WinFsp hands the read to that handle's
+        // context), and a read through a write-only fid fails with EACCES -
+        // seen as `9p request refused kind=116 errno=13` under a Windows
+        // guest. virtiofsd does the same for Linux's writeback cache.
+        const O_ACCMODE: u32 = 0o3;
+        const O_WRONLY: u32 = 0o1;
+        const O_RDWR: u32 = 0o2;
+        let upgraded = !dir && flags & O_ACCMODE == O_WRONLY && {
+            let mut m = self.msg(wire_t::TLOPEN);
+            m.u32(fid).u32((flags & !O_ACCMODE) | O_RDWR);
+            self.call(m).is_ok()
+        };
+        if !upgraded {
+            let mut m = self.msg(wire_t::TLOPEN);
+            m.u32(fid).u32(flags);
+            if let Err(e) = self.call(m) {
+                self.clunk(fid);
+                return Err(e);
+            }
         }
         self.handles.insert(u64::from(fid), fid);
         let mut o = Vec::with_capacity(16);
@@ -733,6 +749,51 @@ mod tests {
             .is_none());
         let unknown = fs.handle(&request(9999, ROOT_NODE, &[])).unwrap();
         assert_eq!(error(&unknown), -(ENOSYS as i32));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Windows reads a file through whichever handle its cache was set up
+    /// with, a write-only one included: a write-only open can be read
+    /// through, unless the share is read-only (where no write-only open
+    /// succeeds at all).
+    #[test]
+    fn a_write_only_open_can_still_be_read() {
+        let dir = std::env::temp_dir().join(format!("entangled-fuse-wo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big.bin"), b"0123456789").unwrap();
+        let mut fs = FuseServer::new(Server::new(&dir, false).unwrap());
+        fs.handle(&request(op::INIT, 0, &[7, 0, 0, 0, 38, 0, 0, 0]))
+            .unwrap();
+        let entry = fs
+            .handle(&request(op::LOOKUP, ROOT_NODE, b"big.bin\0"))
+            .unwrap();
+        let node = le64(&entry, OUT_HEADER);
+        // O_WRONLY.
+        let open = fs
+            .handle(&request(op::OPEN, node, &[1, 0, 0, 0, 0, 0, 0, 0]))
+            .unwrap();
+        assert_eq!(error(&open), 0);
+        let fh = le64(&open, OUT_HEADER);
+        let mut read = Vec::new();
+        put64(&mut read, fh);
+        put64(&mut read, 2);
+        put32(&mut read, 4);
+        read.resize(40, 0);
+        let data = fs.handle(&request(op::READ, node, &read)).unwrap();
+        assert_eq!(error(&data), 0);
+        assert_eq!(&data[OUT_HEADER..], b"2345");
+
+        let mut ro = FuseServer::new(Server::new(&dir, true).unwrap());
+        ro.handle(&request(op::INIT, 0, &[7, 0, 0, 0, 38, 0, 0, 0]))
+            .unwrap();
+        let entry = ro
+            .handle(&request(op::LOOKUP, ROOT_NODE, b"big.bin\0"))
+            .unwrap();
+        let node = le64(&entry, OUT_HEADER);
+        let refused = ro
+            .handle(&request(op::OPEN, node, &[1, 0, 0, 0, 0, 0, 0, 0]))
+            .unwrap();
+        assert_ne!(error(&refused), 0, "a read-only share takes no writer");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

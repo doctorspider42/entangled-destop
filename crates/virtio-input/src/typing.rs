@@ -320,7 +320,9 @@ impl Typist {
 }
 
 /// The key codes of a chord written as words, `ctrl alt t` or `super r`:
-/// modifiers and a few named keys by name, anything else one character
+/// modifiers, `f1`–`f12` and the ordinary named keys (enter, escape/esc,
+/// tab, space, backspace, delete/del, insert, the arrows, home, end,
+/// pageup, pagedown, printscreen, menu, the locks) by name, anything else one character
 /// [`key_for`] knows. `None` for an unknown word, an empty chord or one of
 /// more than eight keys.
 pub fn parse_chord(chord: &str) -> Option<Vec<u16>> {
@@ -344,7 +346,28 @@ pub fn parse_chord(chord: &str) -> Option<Vec<u16>> {
             "right" => Some(106),
             "home" => Some(102),
             "end" => Some(107),
-            "f8" => Some(66),
+            "insert" | "ins" => Some(110),
+            "pageup" | "pgup" => Some(104),
+            "pagedown" | "pgdn" => Some(109),
+            "printscreen" | "prtsc" | "sysrq" => Some(99),
+            "menu" | "apps" => Some(127),
+            "capslock" => Some(58),
+            "numlock" => Some(69),
+            "scrolllock" => Some(70),
+            "rightctrl" => Some(97),
+            "rightalt" | "altgr" => Some(100),
+            "rightshift" => Some(54),
+            "esc" => Some(1),
+            "del" => Some(111),
+            // Linux input codes: F1–F10 are 59–68, F11 and F12 87 and 88.
+            function if function.len() >= 2 && function.starts_with('f') => {
+                match function[1..].parse::<u16>().ok()? {
+                    n @ 1..=10 => Some(58 + n),
+                    11 => Some(87),
+                    12 => Some(88),
+                    _ => None,
+                }
+            }
             letter if letter.chars().count() == 1 => letter
                 .chars()
                 .next()
@@ -366,6 +389,29 @@ mod tests {
         assert_eq!(parse_chord(""), None);
         assert_eq!(parse_chord("hyper r"), None);
         assert_eq!(parse_chord("a b c d e f g h i"), None);
+    }
+
+    /// Every named key the control channel offers, including the ones a
+    /// Windows guest is driven with (`chord alt f4`); each code also has a
+    /// set-1 scancode, so the 8042 fallback types it too.
+    #[test]
+    fn function_and_navigation_keys_parse() {
+        assert_eq!(parse_chord("alt f4"), Some(vec![56, 62]));
+        assert_eq!(parse_chord("f1"), Some(vec![59]));
+        assert_eq!(parse_chord("f8"), Some(vec![66]));
+        assert_eq!(parse_chord("f10"), Some(vec![68]));
+        assert_eq!(parse_chord("f11"), Some(vec![87]));
+        assert_eq!(parse_chord("f12"), Some(vec![88]));
+        assert_eq!(parse_chord("f13"), None);
+        assert_eq!(parse_chord("f0"), None);
+        assert_eq!(parse_chord("f"), Some(vec![33]), "a lone f is the letter");
+        assert_eq!(parse_chord("fx"), None);
+        assert_eq!(
+            parse_chord("insert pageup pagedown printscreen menu"),
+            Some(vec![110, 104, 109, 99, 127])
+        );
+        assert_eq!(parse_chord("ctrl shift esc"), Some(vec![29, 42, 1]));
+        assert_eq!(parse_chord("ctrl alt del"), Some(vec![29, 56, 111]));
     }
 
     use super::*;

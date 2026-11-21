@@ -351,6 +351,7 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
         hyperv_enlightenments: true,
         // The clipboard, through entangled-agent (first-logon.cmd).
         guest_agent: true,
+        guest_exec: false,
     };
     let mut install = installed.clone();
     // Offline: Setup needs nothing from the network, and with it OOBE
@@ -1487,6 +1488,22 @@ mod tests {
             assert!(names.contains(&(*name).to_owned()), "{names:?}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Defender's exclusion is the agent's file alone (not the folder, whose
+    /// other programs stay scanned), and it is in place before the file is
+    /// copied, or the scan on write could quarantine it first.
+    #[test]
+    fn the_agent_is_excluded_from_defender_before_it_is_copied() {
+        let exclusion = FIRST_LOGON
+            .find("Add-MpPreference -ExclusionPath '%dir%\\entangled-agent.exe'")
+            .expect("the agent's exclusion");
+        let copy = FIRST_LOGON
+            .find("copy /y \"%disc%\\entangled\\entangled-agent.exe\"")
+            .expect("the agent's copy");
+        assert!(exclusion < copy);
+        assert!(!FIRST_LOGON.contains("-ExclusionPath '%dir%'"));
+        assert!(!FIRST_LOGON.contains("ExclusionProcess"));
     }
 
     /// Every file the WDDM driver's INF names reaches the guest's driver

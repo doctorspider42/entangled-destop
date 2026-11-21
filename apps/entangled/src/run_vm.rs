@@ -902,14 +902,22 @@ fn build_devices(
                 share.tag
             )
         })?;
+        let virtiofs = cfg.share_uses_virtiofs(share);
         tracing::info!(
             path = %share.path.display(),
             tag = %share.tag,
             read_only = share.read_only,
-            protocol = if share.virtiofs { "virtio-fs" } else { "virtio-9p" },
+            protocol = if virtiofs { "virtio-fs" } else { "virtio-9p" },
             "attaching a shared folder"
         );
-        if share.virtiofs {
+        if virtiofs && !share.virtiofs {
+            tracing::info!(
+                tag = %share.tag,
+                "a Windows guest mounts virtio-fs only (it has no 9P client): this share is \
+                 served as virtio-fs although its [[share]] does not say virtiofs = true"
+            );
+        }
+        if virtiofs {
             devices.push(Box::new(virtio_9p::FsDevice::new(&share.tag, server)?));
         } else {
             devices.push(Box::new(virtio_9p::NinePDevice::new(&share.tag, server)?));
@@ -1076,6 +1084,12 @@ pub const CONTROL_PREFIX: &str = control_api::control::PREFIX;
 /// | `paste <text>` | type `<text>` on the guest's keyboard (`\n` is Enter) |
 /// | `display WxH` | ask the guest for another desktop resolution |
 /// | `shutdown` | press the ACPI power button |
+/// | `chord <keys>` | press keys together (`chord alt f4`) |
+/// | `screenshot <path>` | write a full-size PNG; answered when the file is complete |
+/// | `exec [--timeout S] <line>` | run a command in a Windows guest (`guest_exec = true`) |
+///
+/// A leading UTF-8 byte-order mark on a line is dropped
+/// (`control_api::control::split_command`).
 ///
 /// `type` is the same host-to-guest path the unattended installer uses to drive
 /// GRUB (`MachineBus::push_serial_input`), exposed rather than kept private:
@@ -1152,6 +1166,7 @@ fn spawn_control_channel(
     snapshot: Option<PathBuf>,
     display: display::DisplayHandle,
     typist: virtio_input::Typist,
+    exec: Option<Arc<clipboard_bridge::Exec>>,
 ) {
     let spawned = std::thread::Builder::new()
         .name("control".into())
@@ -1170,11 +1185,7 @@ fn spawn_control_channel(
                     Ok(_) => {}
                 }
                 let line = String::from_utf8_lossy(&raw);
-                let line = line.trim();
-                let (command, argument) = match line.split_once(char::is_whitespace) {
-                    Some((command, rest)) => (command, rest),
-                    None => (line, ""),
-                };
+                let (command, argument) = control_api::control::split_command(&line);
                 // The command words are `control_api::control`'s constants, so
                 // the writer at the other end of the pipe and the reader here
                 // cannot drift apart.
@@ -1242,6 +1253,39 @@ fn spawn_control_channel(
                             println!("{CONTROL_PREFIX} error thumbnail {error}");
                         }
                         // Silent on success, by contract (`CMD_THUMBNAIL`).
+                        continue;
+                    }
+                    control_api::control::CMD_SCREENSHOT => {
+                        let given = argument.trim();
+                        if given.is_empty() {
+                            println!("{CONTROL_PREFIX} error screenshot needs a path");
+                        } else {
+                            let path = PathBuf::from(given);
+                            match display.write_screenshot(&path) {
+                                Ok((w, h)) => println!(
+                                    "{CONTROL_PREFIX} screenshot {} {w}x{h}",
+                                    path.display()
+                                ),
+                                Err(error) => {
+                                    println!("{CONTROL_PREFIX} error screenshot {error}")
+                                }
+                            }
+                        }
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        continue;
+                    }
+                    control_api::control::CMD_EXEC => {
+                        let outcome = match (&exec, control_api::control::parse_exec(argument)) {
+                            (None, _) => Err("is off for this machine: its profile needs \
+                                 guest_agent = true and guest_exec = true"
+                                .to_string()),
+                            (Some(_), Err(error)) => Err(error),
+                            (Some(exec), Ok((timeout, line))) => exec.run(line, timeout),
+                        };
+                        clipboard_bridge::print_lines(&[match outcome {
+                            Ok(id) => format!("exec {id} sent"),
+                            Err(error) => format!("error exec {error}"),
+                        }]);
                         continue;
                     }
                     CMD_SHUTDOWN => {
@@ -1653,9 +1697,14 @@ pub fn run_with(
     }
     let gpu_scanout = built.gpu_scanout.clone();
     // The shared clipboard: stopped on drop, at the end of the run.
+    // `exec` rides the same port, and only for a profile that asked for it.
+    let agent_exec = match (&built.agent_port, cfg.guest_exec) {
+        (Some(port), true) => Some(clipboard_bridge::Exec::new(port.clone())),
+        _ => None,
+    };
     let _clipboard = match built.agent_port.clone() {
         Some(port) => Some(
-            clipboard_bridge::Bridge::start(port)
+            clipboard_bridge::Bridge::start(port, agent_exec.clone())
                 .map_err(|e| format!("cannot start the clipboard bridge: {e}"))?,
         ),
         None => None,
@@ -1788,6 +1837,7 @@ pub fn run_with(
             snapshot.clone(),
             display_handle.clone(),
             typist,
+            agent_exec,
         );
     }
 
