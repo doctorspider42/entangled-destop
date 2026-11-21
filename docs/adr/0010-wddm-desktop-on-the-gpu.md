@@ -1030,6 +1030,132 @@ Evidence: `F:\entangled-targets\dwm3d\evidence-lazy\` (shots `A6-*`, `L8-*`,
 `C8-*`, `P9-*`, `F10-*` with their logs, `p1-noover-unsync.patch`,
 `lazy-fence-vn_queue.patch`, the effects results `fx-*`).
 
+### Amendment, 2026-11-21 (later): the unknown hazard found — unsynchronized appends are the default
+
+The corruption under P1 came from Zink, not from DWM and not from the host. A
+discard that **renamed** a buffer left the old memory bound as the index
+buffer, and left the new memory unmarked as in use. P1 maps
+`MAP_WRITE_NOOVERWRITE` unsynchronized again, now by default, with that fixed
+(`0002`).
+
+**Ruled out first.**
+
+- *The host's fence.* It retires only when the host `VkFence` behind it
+  signals, that is, after the GPU has finished (`venus/executor/timeline.rs`).
+- *The host's view of the memory.* Host-visible memory is the guest's own
+  pages, imported with `VK_EXT_external_memory_host`
+  (`venus/executor/memory.rs`). The GPU reads exactly what the guest wrote,
+  when it executes, as on real hardware.
+- *Zink missing that a still-bound buffer is used across batches.* On a new
+  batch, `zink_update_descriptor_refs` marks every bound vertex buffer and
+  descriptor as used again.
+
+**The oracle.** A diagnostic build added `ENTANGLED_D3D10_MAPCHECK=1`, which
+kept a shadow copy of every dynamic buffer the frontend maps. It checks two
+things:
+
+- at a no-overwrite map, that the bytes are still what the last unmap left;
+- that a no-overwrite write never touches a range written since the last
+  discard. To find the range a discard wrote, the discard map is pre-filled
+  with `0xcd`.
+
+In one `show` run under P1, with the corruption on screen, it recorded:
+
+- 45 824 no-overwrite maps (23 331 vertex, 22 493 index);
+- 339 discards, none of which handed back the previous address;
+- 0 changes behind the program;
+- 0 overlaps.
+
+So DWM writes correctly, nothing rewrites its data, and every discard renames.
+The GPU was reading the wrong memory.
+
+**The cause.** `invalidate_buffer` gives the resource a new object, then calls
+`zink_resource_rebind`, which marks the vertex buffers dirty. Two things were
+missing:
+
+1. **The index buffer is never bound again.** `zink_draw` binds the index
+   buffer only on a new batch, or when the `pipe_resource` or index size
+   changes. A rename changes neither, so the batch kept drawing with the old
+   object's indices: thin lines, missing parts of windows, stray triangles.
+   The threaded context's `replace_buffer` clears `ctx->index_buffer` itself,
+   which is why GL, always threaded, never shows this. The D3D10 frontend
+   runs Zink unthreaded.
+2. **The new object is not marked as used** by the current batch, for an
+   index buffer or a vertex buffer, until the next batch begins. The next
+   discard of it within the batch therefore found it idle and mapped it
+   directly, writing into memory this batch's draws still read.
+
+In the synchronous build neither could happen. Every discard of a dynamic
+buffer of 8 196 bytes or more went through Zink's temporary-buffer copy into
+the same object, so there was no rename to miss.
+
+**The fix** is in `invalidate_buffer`, unconditional. After the rename it
+clears `ctx->index_buffer` when the resource is the bound index buffer, and
+marks the new object used by the current batch when it is bound as an index
+or vertex buffer.
+
+The rest of P1 as built earlier stays:
+
+- dynamic buffers are mapped directly, not through `DONT_MAP_DIRECTLY`;
+- the safety net, which synchronizes an explicit unsynchronized write that
+  could still meet one of Zink's own copies. In every run since, it fired 0
+  times, with 0–2 such copies.
+
+`ENTANGLED_D3D10_NOOVERWRITE=sync` returns to plain writes. The Direct3D
+driver logs the mode and the two counters as `no-overwrite maps …`.
+
+**Confirmed A/B, same build.** Without the fix, `show`, `hybrid` and the
+effects were corrupt (above). With it, every check passed:
+
+- `show`, `hybrid` and `surface`: all 18 shots clean.
+- wintanyl's effects: the same six FAILs as every synchronous run, at
+  0.57–0.61% of pixels (jelly 0.602/0.571%, lamp 0.587–0.606%), none higher.
+- Long run: `show` for 300 s, then `hybrid` for 240 s, a shot every 30 s, all
+  clean. DWM's private memory went 85 → 89 MiB over the first run and
+  89 → 89 MiB over the second; handles went 1 203 → 1 227 → 1 223. A
+  first-run settle, no growth.
+- UAC elevates.
+- CPU readbacks: 32–35 per 30 s, as before (the lease refresh).
+- WARP is unchanged: the framebuffer profile loads neither driver, and the
+  run on this same host engine gave 52.7 / 54.4 / 7.8 tick/s.
+
+Final build, all switches at their defaults (the effects row comes from the
+earlier synchronous build):
+
+| | sync (`F10`) | unsync + fix (`X12`, `D13`) |
+|---|---|---|
+| fenced Venus submits per DWM present, `show` | 36.3 | 2.0 |
+| … `hybrid` | 29.6 | 2.0 |
+| … `surface` | 131 | 9.1–9.6 |
+| … effects | 24.6 | 2.3 |
+| waits with a timeout per present, `show` / `hybrid` / `surface` | 35 / 27 / 130 | 1.0 / 1.0 / 1.3–1.7 |
+| DWM's time in its flushes, `show` / `hybrid` / `surface` | 55 / 60 / 66% | 31–34 / 33–36 / 42–48% |
+| program tick/s, `show` / `hybrid` / `surface` | 53.8 / 50.6 / 49.7 | 61.9–62.0 / 61.6–61.7 / 59.5–61.1 |
+
+Two caveats on these numbers:
+
+- **Host load.** Presents a second are not compared here. `F10` ran with OBS
+  and NVIDIA Broadcast on the host; `X12` and `D13` also ran with another
+  agent's VM on it.
+- **The remaining fenced submits are larger.** 80–95% of them now take over
+  2 ms. Each DWM frame pays the kernel driver's 15.6 ms tail about once,
+  instead of round-tripping fifteen times. The total time in fenced submits
+  did not fall (`show`: 13.9 s before, 17.3 s after, per ~32 s run). Removing
+  that tail remains the kernel-driver change described above.
+
+**Portal 2 and `copilotapphost.exe`.** Portal 2 had died in `ntdll` once on
+the new Venus driver, after stray keystrokes had started it. A controlled run
+on the same driver started it, showed the menu full screen for 2.5 minutes,
+and quit cleanly, logging no failure. The guest's log shows the same `ntdll`
+failure of `portal2.exe` on 2026-11-13, long before the timer change, so it
+predates this work. `copilotapphost.exe` fails in `ntdll` at most boots since
+2026-11-20 16:06, before the timer driver was installed that evening. Neither
+is attributed to these changes, and neither was looked into further.
+
+Evidence: `F:\entangled-targets\dwm3d\evidence-lazy\` (`p1-fixed-with-mapcheck.patch`,
+the oracle's run `M11-*`, shots `X12-*`, `D13*`, `L12-*-long-*`, effects
+`fx-fix12-*`, `fx-def13-*`).
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

@@ -580,6 +580,21 @@ d3d10_wddm_stats(void)
          }
       }
    }
+#ifdef GALLIUM_ZINK
+   {
+      /* MAP_WRITE_NOOVERWRITE (ADR-0010, 2026-11-21): temporary buffers zink
+       * copied into buffers, and unsynchronized writes it synchronized
+       * because such a copy could still be pending. */
+      extern int zink_entangled_staged_writes;
+      extern int zink_entangled_unsync_demoted;
+      extern bool zink_entangled_unsync_appends(void);
+
+      d3d10_wddm_log("no-overwrite maps %s: %ld staged copies into buffers, %ld unsynchronized writes synchronized",
+                     zink_entangled_unsync_appends() ? "unsynchronized" : "synchronized",
+                     InterlockedExchange((volatile LONG *)&zink_entangled_staged_writes, 0),
+                     InterlockedExchange((volatile LONG *)&zink_entangled_unsync_demoted, 0));
+   }
+#endif
    d3d10_wddm_log("copies in %lu ms: %ld overlaid, %ld flushes, %ld readbacks, %ld uploads, %lld MiB",
                   (unsigned long)(now - before),
                   InterlockedExchange(&d3d10_wddm_overlays, 0),
