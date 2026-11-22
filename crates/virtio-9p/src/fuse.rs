@@ -71,11 +71,15 @@ struct Node {
 pub struct FuseServer {
     server: Server,
     nodes: HashMap<u64, Node>,
+    // The backing fids name paths, even on hosts whose inode numbers are
+    // unavailable. Reuse a fid when the guest looks up that path again.
+    nodes_by_path: HashMap<Vec<String>, u64>,
     /// Open files and directories: the handle is the opened fid.
     handles: HashMap<u64, u32>,
     next_node: u64,
     next_fid: u32,
     tag: u16,
+    reported_fid_limit: bool,
 }
 
 impl FuseServer {
@@ -84,10 +88,12 @@ impl FuseServer {
         let mut this = Self {
             server,
             nodes: HashMap::new(),
+            nodes_by_path: HashMap::new(),
             handles: HashMap::new(),
             next_node: ROOT_NODE + 1,
             next_fid: ROOT_FID + 1,
             tag: 0,
+            reported_fid_limit: false,
         };
         this.attach();
         this
@@ -111,11 +117,17 @@ impl FuseServer {
 
     /// Forgets the session — a device reset.
     pub fn reset(&mut self) {
-        self.server.reset();
-        self.nodes.clear();
-        self.handles.clear();
         self.next_node = ROOT_NODE + 1;
         self.next_fid = ROOT_FID + 1;
+        self.reset_session();
+    }
+
+    fn reset_session(&mut self) {
+        self.server.reset();
+        self.nodes.clear();
+        self.nodes_by_path.clear();
+        self.handles.clear();
+        self.reported_fid_limit = false;
         self.attach();
     }
 
@@ -143,8 +155,16 @@ impl FuseServer {
                 }
                 return None;
             }
-            op::INIT => Ok(init_out(body)),
-            op::DESTROY => Ok(Vec::new()),
+            op::INIT => {
+                // A Windows service restart can remount without resetting the
+                // virtio device or finishing the previous FUSE session.
+                self.reset_session();
+                Ok(init_out(body))
+            }
+            op::DESTROY => {
+                self.reset_session();
+                Ok(Vec::new())
+            }
             op::LOOKUP => self.lookup(nodeid, name(body, 0)),
             op::GETATTR => self.node_fid(nodeid).and_then(|fid| self.attr_out(fid)),
             op::SETATTR => self.setattr(nodeid, body),
@@ -179,7 +199,19 @@ impl FuseServer {
     fn call(&mut self, msg: Msg) -> Result<Vec<u8>, u32> {
         let reply = self.server.handle(&msg.finish());
         match reply.get(4) {
-            Some(&t) if t == wire_t::RLERROR => Err(le32(&reply, 7).max(1)),
+            Some(&t) if t == wire_t::RLERROR => {
+                let code = le32(&reply, 7).max(1);
+                if code == errno::ENFILE && !self.reported_fid_limit {
+                    self.reported_fid_limit = true;
+                    tracing::warn!(
+                        fids = self.server.fid_count(),
+                        nodes = self.nodes.len(),
+                        handles = self.handles.len(),
+                        "virtio-fs share reached its fid limit"
+                    );
+                }
+                Err(code)
+            }
             Some(_) => Ok(reply),
             None => Err(errno::EIO),
         }
@@ -235,6 +267,11 @@ impl FuseServer {
         };
         if gone {
             if let Some(node) = self.nodes.remove(&nodeid) {
+                if let Ok(path) = self.server.fid_path(node.fid) {
+                    if self.nodes_by_path.get(path) == Some(&nodeid) {
+                        self.nodes_by_path.remove(path);
+                    }
+                }
                 self.clunk(node.fid);
             }
         }
@@ -287,9 +324,25 @@ impl FuseServer {
                 return Err(e);
             }
         };
-        let nodeid = self.next_node;
-        self.next_node += 1;
-        self.nodes.insert(nodeid, Node { fid, lookups: 1 });
+        let path = self.server.fid_path(fid)?;
+        let nodeid = if path.is_empty() {
+            self.clunk(fid);
+            ROOT_NODE
+        } else if let Some((nodeid, node)) = self
+            .nodes_by_path
+            .get(path)
+            .and_then(|id| self.nodes.get_mut(id).map(|node| (*id, node)))
+        {
+            node.lookups = node.lookups.saturating_add(1);
+            self.clunk(fid);
+            nodeid
+        } else {
+            let nodeid = self.next_node;
+            self.next_node += 1;
+            self.nodes_by_path.insert(path.to_vec(), nodeid);
+            self.nodes.insert(nodeid, Node { fid, lookups: 1 });
+            nodeid
+        };
         let mut o = Vec::with_capacity(128);
         put64(&mut o, nodeid);
         put64(&mut o, 0); // generation
@@ -466,7 +519,13 @@ impl FuseServer {
                 return Err(e);
             }
         };
-        let mut o = self.entry_out(node)?;
+        let mut o = match self.entry_out(node) {
+            Ok(entry) => entry,
+            Err(e) => {
+                self.clunk(open);
+                return Err(e);
+            }
+        };
         self.handles.insert(u64::from(open), open);
         put64(&mut o, u64::from(open));
         put32(&mut o, 0);
@@ -479,7 +538,15 @@ impl FuseServer {
         let pfid = self.node_fid(parent)?;
         let mut m = self.msg(wire_t::TUNLINKAT);
         m.u32(pfid).bytes_str(name).u32(flags);
-        self.call(m).map(|_| Vec::new())
+        self.call(m)?;
+        // Keep outstanding references to the old node, but give a newly
+        // created entry at this path its own node ID.
+        if let Ok(name) = std::str::from_utf8(name) {
+            let mut path = self.server.fid_path(pfid)?.to_vec();
+            path.push(name.to_owned());
+            self.nodes_by_path.remove(&path);
+        }
+        Ok(Vec::new())
     }
 
     fn rename(&mut self, parent: u64, newdir: u64, names: &[u8]) -> Result<Vec<u8>, u32> {
@@ -489,7 +556,26 @@ impl FuseServer {
         let nfid = self.node_fid(newdir)?;
         let mut m = self.msg(wire_t::TRENAMEAT);
         m.u32(ofid).bytes_str(old).u32(nfid).bytes_str(new);
-        self.call(m).map(|_| Vec::new())
+        self.call(m)?;
+        // The 9P server has rebased the source fids and their descendants.
+        // A moved source wins if it replaced an existing destination path.
+        let mut moved = Vec::new();
+        self.nodes_by_path.retain(|old_path, id| {
+            let Some(path) = self
+                .nodes
+                .get(id)
+                .and_then(|node| self.server.fid_path(node.fid).ok())
+            else {
+                return false;
+            };
+            if path == old_path {
+                return true;
+            }
+            moved.push((path.to_vec(), *id));
+            false
+        });
+        self.nodes_by_path.extend(moved);
+        Ok(Vec::new())
     }
 
     fn setattr(&mut self, nodeid: u64, body: &[u8]) -> Result<Vec<u8>, u32> {
@@ -642,6 +728,114 @@ mod tests {
 
     fn error(reply: &[u8]) -> i32 {
         i32::from_le_bytes([reply[4], reply[5], reply[6], reply[7]])
+    }
+
+    #[test]
+    fn repeated_lookup_and_readdirplus_share_a_fid_until_forgotten() {
+        let dir = std::env::temp_dir().join(format!("entangled-fuse-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("entry"), b"data").unwrap();
+        let mut fs = FuseServer::new(Server::new(&dir, false).unwrap());
+        let lookup = request(op::LOOKUP, ROOT_NODE, b"entry\0");
+        let entry = fs.handle(&lookup).unwrap();
+        let node = le64(&entry, OUT_HEADER);
+        assert_ne!(node, ROOT_NODE);
+        let open = fs
+            .handle(&request(op::OPENDIR, ROOT_NODE, &[0; 8]))
+            .unwrap();
+        assert_eq!(error(&open), 0);
+        let fh = le64(&open, OUT_HEADER);
+        let mut list = Vec::new();
+        put64(&mut list, fh);
+        put64(&mut list, 0);
+        put32(&mut list, 4096);
+        list.resize(40, 0);
+        let readdir = request(op::READDIRPLUS, ROOT_NODE, &list);
+        let repeats = crate::server::MAX_FIDS / 2;
+        for _ in 0..repeats {
+            assert_eq!(fs.handle(&lookup).unwrap(), entry);
+            let dirents = fs.handle(&readdir).unwrap();
+            assert_eq!(error(&dirents), 0);
+            assert_eq!(le64(&dirents, OUT_HEADER), node);
+        }
+        assert_eq!(fs.server.fid_count(), 3); // root, entry, directory handle
+        let lookups = (repeats * 2) as u64;
+        assert!(fs
+            .handle(&request(op::FORGET, node, &lookups.to_le_bytes()))
+            .is_none());
+        assert!(fs.nodes.contains_key(&node));
+        assert!(fs
+            .handle(&request(op::FORGET, node, &1u64.to_le_bytes()))
+            .is_none());
+        assert!(!fs.nodes.contains_key(&node));
+        assert_eq!(fs.server.fid_count(), 2);
+        let new_entry = fs.handle(&lookup).unwrap();
+        assert_ne!(le64(&new_entry, OUT_HEADER), node);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remount_clears_previous_nodes_and_open_handles() {
+        let dir =
+            std::env::temp_dir().join(format!("entangled-fuse-remount-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("entry"), b"data").unwrap();
+        let mut fs = FuseServer::new(Server::new(&dir, false).unwrap());
+        let lookup = request(op::LOOKUP, ROOT_NODE, b"entry\0");
+        let entry = fs.handle(&lookup).unwrap();
+        let node = le64(&entry, OUT_HEADER);
+        let open = fs.handle(&request(op::OPEN, node, &[0; 8])).unwrap();
+        assert_eq!(error(&open), 0);
+        let fh = le64(&open, OUT_HEADER);
+        assert!(fs.busy());
+        let init = fs
+            .handle(&request(op::INIT, 0, &[7, 0, 0, 0, 31, 0, 0, 0]))
+            .unwrap();
+        assert_eq!(error(&init), 0);
+        assert!(!fs.busy());
+        assert_eq!(fs.server.fid_count(), 1);
+        assert_eq!(fs.handle_fid(fh), Err(errno::EBADF));
+        let new_entry = fs.handle(&lookup).unwrap();
+        assert_eq!(error(&new_entry), 0);
+        assert_ne!(le64(&new_entry, OUT_HEADER), node);
+        let destroy = fs.handle(&request(op::DESTROY, ROOT_NODE, &[])).unwrap();
+        assert_eq!(error(&destroy), 0);
+        assert!(!fs.busy());
+        assert_eq!(fs.server.fid_count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn guest_rename_moves_the_cached_node_and_unlink_retires_its_path() {
+        let dir =
+            std::env::temp_dir().join(format!("entangled-fuse-rename-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old"), b"data").unwrap();
+        let mut fs = FuseServer::new(Server::new(&dir, false).unwrap());
+        let entry = fs
+            .handle(&request(op::LOOKUP, ROOT_NODE, b"old\0"))
+            .unwrap();
+        let node = le64(&entry, OUT_HEADER);
+        let mut rename = ROOT_NODE.to_le_bytes().to_vec();
+        rename.extend_from_slice(b"old\0new\0");
+        let renamed = fs.handle(&request(op::RENAME, ROOT_NODE, &rename)).unwrap();
+        assert_eq!(error(&renamed), 0);
+        let lookup = request(op::LOOKUP, ROOT_NODE, b"new\0");
+        assert_eq!(le64(&fs.handle(&lookup).unwrap(), OUT_HEADER), node);
+
+        let removed = fs
+            .handle(&request(op::UNLINK, ROOT_NODE, b"new\0"))
+            .unwrap();
+        assert_eq!(error(&removed), 0);
+        std::fs::write(dir.join("new"), b"replacement").unwrap();
+        let replacement = le64(&fs.handle(&lookup).unwrap(), OUT_HEADER);
+        assert_ne!(replacement, node);
+        assert_ne!(replacement, 0);
+        assert!(fs
+            .handle(&request(op::FORGET, node, &2u64.to_le_bytes()))
+            .is_none());
+        assert_eq!(le64(&fs.handle(&lookup).unwrap(), OUT_HEADER), replacement);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
