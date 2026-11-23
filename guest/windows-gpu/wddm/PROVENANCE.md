@@ -87,6 +87,10 @@ checkout that still has it.
   10 build. It also logs device and context creation, root table size requests
   and failed page table updates in serial diagnostic builds.
 
+- `0011-lab-wddm2-node-gpuva.patch` adds a GPUVA node for virtual rendering
+  contexts and keeps paging and GDI on the physical-address node. It reports
+  completion interrupts and fence values for the node that submitted the work.
+
 ## The user-mode driver
 
 `entangled_d3d10.dll` is built from Mesa (MIT), not from virtio-win:

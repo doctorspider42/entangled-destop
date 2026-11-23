@@ -2,9 +2,7 @@
 #include <windows.h>
 #include <d3d12umddi.h>
 #include <dxgi.h>
-
-/* There is no per-adapter state until we bind a Venus physical device. */
-static char adapter_handle;
+#include "venus-adapter.h"
 
 static SIZE_T APIENTRY private_device_size(D3D12DDI_HADAPTER adapter,
                                            const D3D12DDIARG_CALCPRIVATEDEVICESIZE *args)
@@ -25,7 +23,7 @@ static HRESULT APIENTRY get_supported_versions(D3D12DDI_HADAPTER adapter,
                                                 UINT32 *count, UINT64 *versions)
 {
     (void)versions;
-    if (adapter.pDrvPrivate != &adapter_handle || !count)
+    if (!adapter.pDrvPrivate || !count)
         return E_INVALIDARG;
 
     /* A version commits us to its device and command-list tables. */
@@ -36,12 +34,17 @@ static HRESULT APIENTRY get_supported_versions(D3D12DDI_HADAPTER adapter,
 
 static HRESULT APIENTRY close_adapter(D3D12DDI_HADAPTER adapter)
 {
-    return adapter.pDrvPrivate == &adapter_handle ? S_OK : E_INVALIDARG;
+    VenusAdapter *venus = adapter.pDrvPrivate;
+    if (!venus)
+        return E_INVALIDARG;
+    close_venus_adapter(venus);
+    HeapFree(GetProcessHeap(), 0, venus);
+    return S_OK;
 }
 
 static HRESULT APIENTRY get_caps(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_GETCAPS *args)
 {
-    if (adapter.pDrvPrivate != &adapter_handle || !args)
+    if (!adapter.pDrvPrivate || !args)
         return E_INVALIDARG;
 
     return DXGI_ERROR_UNSUPPORTED;
@@ -51,7 +54,7 @@ static HRESULT APIENTRY get_optional_tables(D3D12DDI_HADAPTER adapter,
                                              UINT32 *count, D3D12DDI_TABLE_REQUEST *tables)
 {
     (void)tables;
-    if (adapter.pDrvPrivate != &adapter_handle || !count)
+    if (!adapter.pDrvPrivate || !count)
         return E_INVALIDARG;
     *count = 0;
     return S_OK;
@@ -90,8 +93,20 @@ __declspec(dllexport) HRESULT APIENTRY OpenAdapter12(D3D12DDIARG_OPENADAPTER *ar
     if (!args || !args->pAdapterFuncs || !args->pAdapterCallbacks)
         return E_INVALIDARG;
 
-    args->hAdapter.pDrvPrivate = &adapter_handle;
-    *args->pAdapterFuncs = adapter_functions;
     OutputDebugStringA("Entangled D3D12: OpenAdapter12\n");
+    VenusAdapter *venus = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*venus));
+    if (!venus)
+        return E_OUTOFMEMORY;
+
+    const HRESULT result = open_venus_adapter(venus);
+    if (FAILED(result)) {
+        close_venus_adapter(venus);
+        HeapFree(GetProcessHeap(), 0, venus);
+        OutputDebugStringA("Entangled D3D12: failed to select a Venus graphics device\n");
+        return result;
+    }
+
+    args->hAdapter.pDrvPrivate = venus;
+    *args->pAdapterFuncs = adapter_functions;
     return S_OK;
 }

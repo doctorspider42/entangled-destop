@@ -1,0 +1,271 @@
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index 705b5da..ac1f580 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -392,6 +392,13 @@ VioGpu3DDdiGetNodeMetadata(_In_ CONST HANDLE hAdapter,
+
+     pGetNodeMetadata->EngineType = DXGK_ENGINE_TYPE_3D;
+     pGetNodeMetadata->Flags.Value = 0;
++#ifdef ENTANGLED_WDDM2_LAB
++    // Keep paging and GDI on the physical-address node. D3D12 can select node 1.
++    pGetNodeMetadata->GpuMmuSupported = NodeOrdinal == ENTANGLED_GPU_VIRTUAL_NODE;
++    pGetNodeMetadata->IoMmuSupported = FALSE;
++    DbgPrint(TRACE_LEVEL_ERROR, ("WDDM2 lab GetNodeMetadata node=%u gpummu=%u\n",
++                               NodeOrdinal, pGetNodeMetadata->GpuMmuSupported));
++#endif
+
+     return STATUS_SUCCESS;
+ };
+@@ -711,6 +718,8 @@ static VOID APIENTRY EntangledSetRootPageTable(HANDLE adapter, const DXGKARG_SET
+     UNREFERENCED_PARAMETER(adapter);
+     auto *context = static_cast<VioGpuContext *>(args->hContext);
+     context->SetRootPageTable(args->Address, args->NumEntries);
++    DbgPrint(TRACE_LEVEL_ERROR, ("WDDM2 lab SetRootPageTable node=%u segment=%u entries=%u\n",
++                               context->NodeOrdinal(), args->Address.SegmentId, args->NumEntries));
+ }
+
+ static SIZE_T APIENTRY EntangledGetRootPageTableSize(HANDLE adapter, DXGKARG_GETROOTPAGETABLESIZE *args)
+@@ -730,12 +739,12 @@ static NTSTATUS APIENTRY EntangledSubmitCommandVirtual(HANDLE adapter, const DXG
+     if (!device->IsDriverActive())
+         return STATUS_INVALID_PARAMETER;
+
+-    // An empty scheduler packet has no GPU command bytes. Keep it ordered
+-    // with the physical submissions on the same single execution node.
++    // An empty scheduler packet has no GPU command bytes. Order it with
++    // physical submissions in the shared backend queue.
+     const bool empty = args->DmaBufferSize == 0;
++    const auto *context = static_cast<const VioGpuContext *>(args->hContext);
+     if (!empty)
+     {
+-        const auto *context = static_cast<const VioGpuContext *>(args->hContext);
+         DbgPrint(TRACE_LEVEL_ERROR, ("virtual DMA packet size=%u root=%u\n",
+                                     args->DmaBufferSize, context && context->HasRootPageTable()));
+     }
+@@ -743,6 +752,8 @@ static NTSTATUS APIENTRY EntangledSubmitCommandVirtual(HANDLE adapter, const DXG
+     // a successful execution interrupt. Dxgkrnl owns the device error.
+     DXGKARG_SUBMITCOMMAND marker = {};
+     marker.hContext = args->hContext;
++    marker.NodeOrdinal = context ? context->NodeOrdinal() : args->NodeOrdinal;
++    marker.EngineOrdinal = args->EngineOrdinal;
+     marker.SubmissionFenceId = args->SubmissionFenceId;
+     const NTSTATUS status = device->commander.SubmitCommand(&marker, empty);
+     return empty && NT_SUCCESS(status) ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+@@ -808,9 +819,11 @@ VioGpu3DDdiCreateContext(_In_ CONST HANDLE hDevice, _Inout_ DXGKARG_CREATECONTEX
+ #ifdef ENTANGLED_WDDM2_LAB
+     DbgPrint(TRACE_LEVEL_ERROR, ("WDDM2 lab CreateContext node=%u flags=%x\n",
+                                pCreateContext->NodeOrdinal, pCreateContext->Flags.Value));
++    if (pCreateContext->Flags.GdiContext && pCreateContext->Flags.VirtualAddressing)
++        return STATUS_NOT_SUPPORTED;
+ #endif
+
+-    auto *context = new (NonPagedPoolNx) VioGpuContext(static_cast<VioGpuDevice *>(hDevice));
++    auto *context = new (NonPagedPoolNx) VioGpuContext(static_cast<VioGpuDevice *>(hDevice), pCreateContext->NodeOrdinal);
+     if (!context)
+     {
+         return STATUS_NO_MEMORY;
+@@ -1205,7 +1218,9 @@ APIENTRY
+ VioGpu3DDdiQueryCurrentFence(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_QUERYCURRENTFENCE *pCurrentFence)
+ {
+     auto *adapter = static_cast<VioGpuAdapter *>(hAdapter);
+-    pCurrentFence->CurrentFence = adapter->commander.CompletedFence();
++    if (pCurrentFence->NodeOrdinal >= VIOGPU_SCHEDULER_NODE_COUNT)
++        return STATUS_INVALID_PARAMETER;
++    pCurrentFence->CurrentFence = adapter->commander.CompletedFence(pCurrentFence->NodeOrdinal);
+     return STATUS_SUCCESS;
+ };
+
+diff --git a/viogpu/viogpu3d/entangled_wddm2.cpp b/viogpu/viogpu3d/entangled_wddm2.cpp
+index d6f4a94..be9f01e 100644
+--- a/viogpu/viogpu3d/entangled_wddm2.cpp
++++ b/viogpu/viogpu3d/entangled_wddm2.cpp
+@@ -21,10 +21,12 @@ NTSTATUS EntangledQueryWddm2(const DXGKARG_QUERYADAPTERINFO *query, HANDLE adapt
+         case DXGKQAITYPE_HISTORYBUFFERPRECISION:
+         {
+             const auto *index = QueryInput<DXGK_QUERYHISTORYBUFFERPRECISIONIN>(query);
+-            auto *precision = QueryOutput<DXGKARG_HISTORYBUFFERPRECISION>(query);
+-            if (!index || index->PhysicalAdapterIndex != 0 || !precision)
++            using NodePrecision = DXGKARG_HISTORYBUFFERPRECISION[ENTANGLED_GPU_NODE_COUNT];
++            auto *precisions = QueryOutput<NodePrecision>(query);
++            if (!index || index->PhysicalAdapterIndex != 0 || !precisions)
+                 return STATUS_INVALID_PARAMETER;
+-            precision->PrecisionBits = 0;  // No GPU timestamps in WDDM history buffers.
++            // The query returns one precision per execution node.
++            RtlZeroMemory(precisions, sizeof(*precisions));
+             return STATUS_SUCCESS;
+         }
+         case DXGKQAITYPE_DISPLAY_DRIVERCAPS_EXTENSION:
+@@ -42,7 +44,7 @@ NTSTATUS EntangledQueryWddm2(const DXGKARG_QUERYADAPTERINFO *query, HANDLE adapt
+             if (!index || index->PhysicalAdapterIndex != 0 || !query->pOutputData || query->OutputDataSize < required)
+                 return STATUS_INVALID_PARAMETER;
+             DXGK_PHYSICALADAPTERCAPS caps = {};
+-            caps.NumExecutionNodes = 1;
++            caps.NumExecutionNodes = ENTANGLED_GPU_NODE_COUNT;
+             caps.DxgkPhysicalAdapterHandle = adapter;
+             caps.Flags.GpuMmuSupported = 1;
+             RtlZeroMemory(query->pOutputData, query->OutputDataSize);
+diff --git a/viogpu/viogpu3d/entangled_wddm2.h b/viogpu/viogpu3d/entangled_wddm2.h
+index 057282b..21d11f1 100644
+--- a/viogpu/viogpu3d/entangled_wddm2.h
++++ b/viogpu/viogpu3d/entangled_wddm2.h
+@@ -10,6 +10,8 @@ constexpr UINT ENTANGLED_GPU_PAGE_TABLE_INDEX_BITS = 8;
+ constexpr UINT ENTANGLED_GPU_PAGE_TABLE_ENTRIES = 1u << ENTANGLED_GPU_PAGE_TABLE_INDEX_BITS;
+ constexpr UINT ENTANGLED_GPU_VA_BITS = 12 + ENTANGLED_GPU_PAGE_TABLE_LEVELS * ENTANGLED_GPU_PAGE_TABLE_INDEX_BITS;
+ constexpr SIZE_T ENTANGLED_GPU_APERTURE_SIZE = 1ull << 30;
++constexpr UINT ENTANGLED_GPU_VIRTUAL_NODE = 1;
++constexpr UINT ENTANGLED_GPU_NODE_COUNT = ENTANGLED_GPU_VIRTUAL_NODE + 1;
+ static_assert(sizeof(DXGK_PTE) * ENTANGLED_GPU_PAGE_TABLE_ENTRIES == PAGE_SIZE, "one system page per GPU page table");
+
+ NTSTATUS EntangledQueryWddm2(const DXGKARG_QUERYADAPTERINFO *query, HANDLE adapter);
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 14f05b4..61e2924 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -529,7 +529,11 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
+                 pDriverCaps->SchedulingCaps.MultiEngineAware = 1;
+                 pDriverCaps->SchedulingCaps.PreemptionAware = 1;
+
++#ifdef ENTANGLED_WDDM2_LAB
++                pDriverCaps->GpuEngineTopology.NbAsymetricProcessingNodes = ENTANGLED_GPU_NODE_COUNT;
++#else
+                 pDriverCaps->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
++#endif
+
+                 pDriverCaps->SupportSmoothRotation = FALSE;
+                 pDriverCaps->SupportNonVGA = IsVgaDevice();
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index 61f2650..0a22868 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -39,6 +39,8 @@ void VioGpuCommand::PrepareSubmit(const DXGKARG_SUBMITCOMMAND *pSubmitCommand, b
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s", __FUNCTION__));
+
+     m_FenceId = pSubmitCommand->SubmissionFenceId;
++    m_nodeOrdinal = pSubmitCommand->NodeOrdinal;
++    m_engineOrdinal = pSubmitCommand->EngineOrdinal;
+     m_reportCompletion = reportCompletion;
+     if (m_pDmaBuffer)
+     {
+@@ -178,14 +180,14 @@ void VioGpuCommand::Run()
+         delete m_allocations;
+     }
+
+-    m_pCommander->RecordCompletion(m_FenceId);
++    m_pCommander->RecordCompletion(m_nodeOrdinal, m_FenceId);
+     if (m_reportCompletion)
+     {
+         DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
+         interrupt.InterruptType = DXGK_INTERRUPT_DMA_COMPLETED;
+         interrupt.DmaCompleted.SubmissionFenceId = m_FenceId;
+-        interrupt.DmaCompleted.NodeOrdinal = 0;
+-        interrupt.DmaCompleted.EngineOrdinal = 0;
++        interrupt.DmaCompleted.NodeOrdinal = m_nodeOrdinal;
++        interrupt.DmaCompleted.EngineOrdinal = m_engineOrdinal;
+         m_pAdapter->NotifyInterrupt(&interrupt, true);
+     }
+
+@@ -258,7 +260,8 @@ NTSTATUS VioGpuCommander::Start()
+     PAGED_CODE();
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s", __FUNCTION__));
+
+-    RecordCompletion(0);
++    for (UINT node = 0; node < VIOGPU_SCHEDULER_NODE_COUNT; ++node)
++        RecordCompletion(node, 0);
+     HANDLE threadHandle = 0;
+
+     NTSTATUS status = PsCreateSystemThread(&threadHandle,
+@@ -377,6 +380,8 @@ PAGED_CODE_SEG_END
+ NTSTATUS VioGpuCommander::SubmitCommand(const DXGKARG_SUBMITCOMMAND *pSubmitCommand, bool reportCompletion)
+ {
+     VIOGPU_ASSERT(pSubmitCommand != NULL);
++    if (pSubmitCommand->NodeOrdinal >= VIOGPU_SCHEDULER_NODE_COUNT)
++        return STATUS_INVALID_PARAMETER;
+
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s fence_id=%d\n", __FUNCTION__, pSubmitCommand->SubmissionFenceId));
+
+diff --git a/viogpu/viogpu3d/viogpu_command.h b/viogpu/viogpu3d/viogpu_command.h
+index a2492f9..b7f6fa2 100644
+--- a/viogpu/viogpu3d/viogpu_command.h
++++ b/viogpu/viogpu3d/viogpu_command.h
+@@ -1,8 +1,14 @@
+ #pragma once
+
+ #include "helper.h"
++#include "entangled_wddm2.h"
+
+ #define VIOGPU_MAX_RUNNING 1
++#ifdef ENTANGLED_WDDM2_LAB
++constexpr UINT VIOGPU_SCHEDULER_NODE_COUNT = ENTANGLED_GPU_NODE_COUNT;
++#else
++constexpr UINT VIOGPU_SCHEDULER_NODE_COUNT = 1;
++#endif
+
+ class VioGpuAdapter;
+ class VioGpuAllocation;
+@@ -35,6 +41,8 @@ class VioGpuCommand
+     ULONG m_contextId;
+
+     UINT m_FenceId;
++    UINT m_nodeOrdinal = 0;
++    UINT m_engineOrdinal = 0;
+     bool m_reportCompletion;
+
+     char *m_pDmaBuffer;
+@@ -64,14 +72,14 @@ class VioGpuCommander
+     NTSTATUS Patch(const DXGKARG_PATCH *pPatch);
+     NTSTATUS SubmitCommand(const DXGKARG_SUBMITCOMMAND *pSubmitCommand, bool reportCompletion = true);
+
+-    void RecordCompletion(UINT fence)
++    void RecordCompletion(UINT node, UINT fence)
+     {
+-        InterlockedExchange(&m_completedFence, static_cast<LONG>(fence));
++        InterlockedExchange(&m_completedFence[node], static_cast<LONG>(fence));
+     }
+
+-    UINT CompletedFence()
++    UINT CompletedFence(UINT node)
+     {
+-        return static_cast<UINT>(InterlockedCompareExchange(&m_completedFence, 0, 0));
++        return static_cast<UINT>(InterlockedCompareExchange(&m_completedFence[node], 0, 0));
+     }
+
+     _IRQL_requires_max_(DISPATCH_LEVEL) _IRQL_saves_global_(OldIrql, Irql) _IRQL_raises_(DISPATCH_LEVEL) void LockQueue(
+@@ -100,5 +108,5 @@ class VioGpuCommander
+     KSPIN_LOCK m_Lock;
+
+     UINT m_running;
+-    volatile LONG m_completedFence = 0;
++    volatile LONG m_completedFence[VIOGPU_SCHEDULER_NODE_COUNT] = {};
+ };
+diff --git a/viogpu/viogpu3d/viogpu_device.h b/viogpu/viogpu3d/viogpu_device.h
+index c38b962..0b002ca 100644
+--- a/viogpu/viogpu3d/viogpu_device.h
++++ b/viogpu/viogpu3d/viogpu_device.h
+@@ -36,7 +36,7 @@ class VioGpuDevice
+ class VioGpuContext
+ {
+   public:
+-    explicit VioGpuContext(VioGpuDevice *device) : m_device(device) {}
++    VioGpuContext(VioGpuDevice *device, UINT nodeOrdinal) : m_device(device), m_nodeOrdinal(nodeOrdinal) {}
+
+     VioGpuDevice *GetDevice() const
+     {
+@@ -44,6 +44,11 @@ class VioGpuContext
+     }
+
+ #ifdef ENTANGLED_WDDM2_LAB
++    UINT NodeOrdinal() const
++    {
++        return m_nodeOrdinal;
++    }
++
+     void SetRootPageTable(D3DGPU_PHYSICAL_ADDRESS address, UINT entries)
+     {
+         m_root = address;
+@@ -58,6 +63,7 @@ class VioGpuContext
+
+   private:
+     VioGpuDevice *const m_device;
++    const UINT m_nodeOrdinal;
+ #ifdef ENTANGLED_WDDM2_LAB
+     D3DGPU_PHYSICAL_ADDRESS m_root = {};
+     UINT m_rootEntries = 0;

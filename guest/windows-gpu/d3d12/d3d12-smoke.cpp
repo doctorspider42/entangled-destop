@@ -15,7 +15,7 @@
 
 using Microsoft::WRL::ComPtr;
 
-void verify_wddm_fence(LUID luid);
+void verify_wddm_fence(LUID luid, bool synchronization_only);
 
 static void check(HRESULT result, const char *operation)
 {
@@ -196,20 +196,23 @@ static void copy_and_verify(ID3D12Device *device)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    bool fence_only = false;
+    enum class Probe { Copy, Fence, RenderFence };
+    Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
             hardware_control = true;
-        else if (!fence_only && std::wcscmp(argv[i], L"--fence") == 0)
-            fence_only = true;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence") == 0)
+            probe = Probe::Fence;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence-render-context") == 0)
+            probe = Probe::RenderFence;
         else {
-            std::fputs("usage: d3d12-smoke.exe [--hardware] [--fence]\n", stderr);
+            std::fputs("usage: d3d12-smoke.exe [--hardware] [--fence | --fence-render-context]\n", stderr);
             return 2;
         }
     }
     const auto adapter = select_adapter(hardware_control);
-    if (fence_only)
-        verify_wddm_fence(adapter.luid);
+    if (probe != Probe::Copy)
+        verify_wddm_fence(adapter.luid, probe == Probe::Fence);
     else
         copy_and_verify(create_device(adapter, hardware_control).Get());
     return 0;

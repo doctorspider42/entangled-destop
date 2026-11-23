@@ -1,0 +1,122 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+#include "venus-adapter.h"
+#include <dxgi.h>
+#include <stdio.h>
+
+static HRESULT find_graphics_queue(VkPhysicalDevice device,
+                                   PFN_vkGetPhysicalDeviceQueueFamilyProperties get_queue_families,
+                                   UINT32 *family)
+{
+    UINT32 count = 0;
+    get_queue_families(device, &count, NULL);
+    if (!count)
+        return DXGI_ERROR_UNSUPPORTED;
+
+    VkQueueFamilyProperties *queues = HeapAlloc(GetProcessHeap(), 0, sizeof(*queues) * count);
+    if (!queues)
+        return E_OUTOFMEMORY;
+    get_queue_families(device, &count, queues);
+
+    HRESULT result = DXGI_ERROR_UNSUPPORTED;
+    for (UINT32 i = 0; i < count; ++i) {
+        if (queues[i].queueCount && (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+            *family = i;
+            result = S_OK;
+            break;
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, queues);
+    return result;
+}
+
+static HRESULT select_physical_device(VenusAdapter *adapter)
+{
+    const PFN_vkEnumeratePhysicalDevices enumerate = (PFN_vkEnumeratePhysicalDevices)
+        adapter->instance_proc_addr(adapter->instance, "vkEnumeratePhysicalDevices");
+    const PFN_vkGetPhysicalDeviceProperties2 get_properties = (PFN_vkGetPhysicalDeviceProperties2)
+        adapter->instance_proc_addr(adapter->instance, "vkGetPhysicalDeviceProperties2");
+    const PFN_vkGetPhysicalDeviceQueueFamilyProperties get_queue_families =
+        (PFN_vkGetPhysicalDeviceQueueFamilyProperties)
+        adapter->instance_proc_addr(adapter->instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+    if (!enumerate || !get_properties || !get_queue_families)
+        return DXGI_ERROR_UNSUPPORTED;
+
+    UINT32 count = 0;
+    if (enumerate(adapter->instance, &count, NULL) != VK_SUCCESS || !count)
+        return DXGI_ERROR_UNSUPPORTED;
+    VkPhysicalDevice *devices = HeapAlloc(GetProcessHeap(), 0, sizeof(*devices) * count);
+    if (!devices)
+        return E_OUTOFMEMORY;
+
+    HRESULT result = DXGI_ERROR_UNSUPPORTED;
+    if (enumerate(adapter->instance, &count, devices) == VK_SUCCESS) {
+        for (UINT32 i = 0; i < count; ++i) {
+            VkPhysicalDeviceProperties2 properties = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+            get_properties(devices[i], &properties);
+            if (properties.properties.apiVersion < VK_API_VERSION_1_2 ||
+                properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
+                continue;
+
+            VkPhysicalDeviceDriverProperties driver = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+            properties.pNext = &driver;
+            get_properties(devices[i], &properties);
+            if (driver.driverID != VK_DRIVER_ID_MESA_VENUS)
+                continue;
+
+            result = find_graphics_queue(devices[i], get_queue_families, &adapter->graphics_queue_family);
+            if (result == DXGI_ERROR_UNSUPPORTED)
+                continue;
+            if (SUCCEEDED(result)) {
+                adapter->physical_device = devices[i];
+                char message[384];
+                snprintf(message, sizeof(message), "Entangled D3D12: Venus device %04x:%04x %s, graphics queue %u\n",
+                         properties.properties.vendorID, properties.properties.deviceID,
+                         properties.properties.deviceName, adapter->graphics_queue_family);
+                OutputDebugStringA(message);
+            }
+            break;
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, devices);
+    return result;
+}
+
+HRESULT open_venus_adapter(VenusAdapter *adapter)
+{
+    adapter->loader = LoadLibraryExW(L"vulkan-1.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!adapter->loader)
+        return DXGI_ERROR_UNSUPPORTED;
+
+    adapter->instance_proc_addr = (PFN_vkGetInstanceProcAddr)(void *)
+        GetProcAddress(adapter->loader, "vkGetInstanceProcAddr");
+    adapter->destroy_instance = (PFN_vkDestroyInstance)(void *)
+        GetProcAddress(adapter->loader, "vkDestroyInstance");
+    if (!adapter->instance_proc_addr || !adapter->destroy_instance)
+        return DXGI_ERROR_UNSUPPORTED;
+
+    const PFN_vkCreateInstance create = (PFN_vkCreateInstance)
+        adapter->instance_proc_addr(VK_NULL_HANDLE, "vkCreateInstance");
+    if (!create)
+        return DXGI_ERROR_UNSUPPORTED;
+
+    const VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                                    .pEngineName = "Entangled D3D12", .apiVersion = VK_API_VERSION_1_2 };
+    const VkInstanceCreateInfo info = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
+    VkInstance instance = VK_NULL_HANDLE;
+    const VkResult result = create(&info, NULL, &instance);
+    if (result == VK_ERROR_OUT_OF_HOST_MEMORY)
+        return E_OUTOFMEMORY;
+    if (result != VK_SUCCESS)
+        return DXGI_ERROR_UNSUPPORTED;
+
+    adapter->instance = instance;
+    return select_physical_device(adapter);
+}
+
+void close_venus_adapter(VenusAdapter *adapter)
+{
+    if (adapter->instance)
+        adapter->destroy_instance(adapter->instance, NULL);
+    if (adapter->loader)
+        FreeLibrary(adapter->loader);
+}

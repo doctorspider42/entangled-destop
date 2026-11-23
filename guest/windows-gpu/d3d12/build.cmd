@@ -11,8 +11,9 @@ if errorlevel 1 exit /b 1
 if not exist "%OUT%" mkdir "%OUT%"
 if not exist "%OUT%" exit /b 1
 
-cl /nologo /std:c11 /W4 /WX /O2 /MT /LD "%SRC%entangled_d3d12.c" ^
-    /Fo"%OUT%\entangled_d3d12.obj" /Fe"%OUT%\entangled_d3d12.dll" /link /IMPLIB:"%OUT%\entangled_d3d12.lib"
+cl /nologo /std:c11 /W4 /WX /O2 /MT /LD /I"%SRC%..\..\..\tools\venus-protocol\include" ^
+    "%SRC%entangled_d3d12.c" "%SRC%venus-adapter.c" ^
+    /Fo"%OUT%\\" /Fe"%OUT%\entangled_d3d12.dll" /link /IMPLIB:"%OUT%\entangled_d3d12.lib"
 if errorlevel 1 exit /b 1
 cl /nologo /std:c11 /W4 /WX /O2 /MT "%SRC%ddi-test.c" /Fo"%OUT%\ddi-test.obj" /Fe"%OUT%\ddi-test.exe"
 if errorlevel 1 exit /b 1

@@ -5,12 +5,13 @@
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #define CHECK(expr) do { \
     if (!(expr)) { fprintf(stderr, "D3D12 DDI FAIL: %s\n", #expr); return 1; } \
 } while (0)
 
-static int check_adapter(PFND3D12DDI_OPENADAPTER open_adapter)
+static int check_adapter(PFND3D12DDI_OPENADAPTER open_adapter, BOOL require_venus)
 {
     D3D12DDIARG_OPENADAPTER args = {0};
     D3D12DDI_ADAPTERFUNCS functions = {0};
@@ -22,7 +23,14 @@ static int check_adapter(PFND3D12DDI_OPENADAPTER open_adapter)
     CHECK(args.hAdapter.pDrvPrivate == NULL);
 
     args.pAdapterCallbacks = &callbacks;
-    CHECK(open_adapter(&args) == S_OK);
+    const HRESULT status = open_adapter(&args);
+    if (!require_venus && status == DXGI_ERROR_UNSUPPORTED) {
+        CHECK(args.hAdapter.pDrvPrivate == NULL);
+        CHECK(functions.pfnCloseAdapter == NULL);
+        puts("D3D12 DDI PASS (no Venus device, adapter declined)");
+        return 0;
+    }
+    CHECK(status == S_OK);
     CHECK(args.hAdapter.pDrvPrivate != NULL);
     CHECK(functions.pfnGetSupportedVersions && functions.pfnGetCaps && functions.pfnCloseAdapter);
     CHECK(functions.pfnCalcPrivateDeviceSize && functions.pfnCreateDevice);
@@ -51,20 +59,33 @@ static int check_adapter(PFND3D12DDI_OPENADAPTER open_adapter)
     D3D12DDIARG_GETCAPS caps = {D3D12DDICAPS_TYPE_3DPIPELINESUPPORT, NULL, &depth, sizeof(depth)};
     CHECK(functions.pfnGetCaps(args.hAdapter, &caps) == DXGI_ERROR_UNSUPPORTED);
     CHECK(depth == UINT_MAX);
+
+    D3D12DDIARG_OPENADAPTER second = {0};
+    D3D12DDI_ADAPTERFUNCS second_functions = {0};
+    second.pAdapterCallbacks = &callbacks;
+    second.pAdapterFuncs = &second_functions;
+    CHECK(open_adapter(&second) == S_OK);
+    CHECK(second.hAdapter.pDrvPrivate && second.hAdapter.pDrvPrivate != args.hAdapter.pDrvPrivate);
     CHECK(functions.pfnCloseAdapter(args.hAdapter) == S_OK);
+    CHECK(second_functions.pfnGetSupportedVersions(second.hAdapter, &count, NULL) == S_OK && count == 0);
+    CHECK(second_functions.pfnCloseAdapter(second.hAdapter) == S_OK);
+    puts("D3D12 DDI PASS (independent Venus adapters; zero device DDI versions)");
     return 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    const BOOL require_venus = argc == 2 && strcmp(argv[1], "--venus") == 0;
+    if (argc != 1 && !require_venus) {
+        fputs("usage: ddi-test.exe [--venus]\n", stderr);
+        return 2;
+    }
     const HMODULE module = LoadLibraryExW(L"entangled_d3d12.dll", NULL, LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
     CHECK(module);
     const PFND3D12DDI_OPENADAPTER open_adapter =
         (PFND3D12DDI_OPENADAPTER)(void *)GetProcAddress(module, "OpenAdapter12");
     CHECK(open_adapter);
-    const int result = check_adapter(open_adapter);
+    const int result = check_adapter(open_adapter, require_venus);
     FreeLibrary(module);
-    if (!result)
-        puts("D3D12 DDI PASS (adapter ABI; zero device DDI versions)");
     return result;
 }

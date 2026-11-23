@@ -33,12 +33,13 @@ GPU work the signal must follow actual Venus completion.
 
 ## Adapter ABI and first GPU workload
 
-- `entangled_d3d12.dll` exports `OpenAdapter12` using the WDK structures. That
-  export is present on this host's NVIDIA and Microsoft WARP UMDs. Microsoft's
-  early DDI spec also describes the `OpenAdapter10_2` entry for D3D12. Verify
-  the entry and callback order against the target guest runtime. This probe
-  reports zero supported DDI versions and refuses device creation. It emits
-  `OutputDebugString` messages at adapter open and version enumeration.
+- `entangled_d3d12.dll` exports `OpenAdapter12` using the WDK structures. The
+  Windows 10 system runtime loaded it from the DriverStore and called that
+  entry, then queried `GetSupportedVersions` twice. Each open owns a Vulkan
+  instance. It selects a non-CPU Mesa Venus physical device with a graphics
+  queue through the system Vulkan loader and releases the instance on close.
+  The runtime trace selected the host RTX 2070 through Venus, queue family `0`.
+  The adapter currently reports zero supported DDI versions.
   [Microsoft's DDI overview](https://microsoft.github.io/DirectX-Specs/d3d/CPUEfficiency.html#initialization).
 - The first workload requests feature level 11_0 and uses a DIRECT queue,
   allocator, command list, upload and readback buffers, `CopyBufferRegion`,
@@ -89,9 +90,12 @@ $probeOut = 'F:\entangled-targets\d3d12'
 & "$probeOut\d3d12-smoke.exe" --hardware --fence
 ```
 
-The ABI test loads the built DLL and calls its WDK adapter entry point. The
-hardware control uses `System32` D3D12/DXGI. On 2026-11-23 the MSVC build
-passed with `/W4 /WX`, the DLL exported `OpenAdapter12`, and the control on the
+The ABI test loads the built DLL and calls its WDK adapter entry point. Pass
+`--venus` in the guest to require success and check two independent adapter
+lifetimes. On the host without Venus it verifies that a failed open leaves the
+driver handle and callback table empty. The hardware control uses `System32`
+D3D12/DXGI. On 2026-11-23 the MSVC build passed with `/W4 /WX`, the DLL exported
+`OpenAdapter12`, and the control on the
 RTX 2070 (`10DE:1F02`, WDDM `2700`) verified all 65,536 bytes. The final run
 reported a 4.466 ms submit-to-fence interval for a single copy on the host.
 Guest mode on the host correctly failed with `0x887A0002` because the explicit
@@ -105,6 +109,8 @@ passed with both CPU-visible fence values at `1` after release. The probe
 reports the two values even if the event times out. That distinguishes a
 stalled signal from a signal that advanced the fence without waking its
 waiter. Run `d3d12-smoke.exe --fence` on the Entangled adapter.
+Use `--fence-render-context` in the lab to exercise a GPUVA rendering context
+with the same fence sequence and Entangled's empty context-private data.
 
 To prepare a package, pass a base WDDM directory containing the miniport, INF
 and four x64/x86 UMDs. Staging changes the fourth x64 slot, adds the file to
@@ -130,8 +136,7 @@ adapter (`1AF4:1050`) and `entangled_d3d10.dll` in the D3D12 slot. The
 virtual context was created, followed by `STATUS_INVALID_PARAMETER`
 (`0xC000000D`) at monitored fence creation. `D3D12CreateDevice` for feature
 level 11_0 returned `DXGI_ERROR_UNSUPPORTED` (`0x887A0004`). This measured the
-installed baseline package. The experimental UMD's runtime callback order
-still needs to be captured in the guest.
+installed baseline package.
 
 The first miniport change gives DXGK distinct device and context objects.
 Present and render use the context's owning device. Queued legacy commands
@@ -150,9 +155,10 @@ the experimental miniport for the disposable guest. The GPUVA description
 uses four 4 KiB tables per address walk, with 256 entries per table and a
 44-bit virtual address. VidMm allocates the tables in system memory. The
 miniport stores the root on each DXGK context and applies CPU-virtual page
-table updates, including repeated entries and bounds checks. On the single
-execution node it uses the existing command queue to retire empty virtual
-packets. Nonempty virtual DMA still needs a page-table walk and command
+table updates, including repeated entries and bounds checks. The lab exposes a
+physical-address node for paging and GDI and a GPUVA node for application
+rendering. The nodes share the backend command queue and track completion
+fences separately. Nonempty virtual DMA still needs a page-table walk and command
 execution path. The lab returns `STATUS_INVALID_PARAMETER` for those packets
 and tracks their fence in order without reporting a successful execution
 interrupt. [GpuMmu model](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpummu-model),
@@ -188,13 +194,36 @@ WDDM 2.0 lab miniports both built with WDK 10.0.26100.0.
 On reboot, the WDDM 2.0 miniport again reached system process creation. The
 desktop scanout remained black while the serial log showed DWM failing to
 resolve allocation handles for its escapes. A framebuffer-only boot let us
-remove the experimental packages and the lab kernel debug flag. The package
-with `entangled_d3d12.dll` in the fourth slot was signed and copied to the
-guest, but installation and runtime entry were unverified in this trial.
+remove the experimental packages and the lab kernel debug flag.
 After restoring `oem58.inf` and booting with Venus again, the Entangled
 adapter reported WDDM `1300`. The D3D11 regression presented 300 frames and
 verified the readback via the copying swap chain. The diagnostic fence probe
 reproduced `0xC000000D` at monitored fence creation on that restored baseline.
+
+With the experimental UMD installed, the synchronization-only probe read
+`gate=1 completion=0`. DxgKrnl ETW recorded that it unblocked the wait packet
+on the CPU signal. There was no corresponding completion of the queued signal.
+The probe did not finish tearing down its DXGK objects, and a D3D11 regression
+launched in that session also timed out. The separate rendering-context probe
+initially returned `0xC000000D` before reaching the KMD. The kernel checks
+GPUVA support for the requested node, in addition to the adapter-wide caps.
+
+Advertising GPUVA on the only node caused Windows to create virtual system
+and GDI contexts. During the install, the guest bugchecked with `0x3B` and
+`0xC0000005`. The minidump matches a null dereference in
+`VIDMM_DMA_POOL::AddDmaBufferToPool` on its way to committing GPU VA. The lab
+now keeps the system paging and GDI node on the legacy path and reserves a
+separate node for GPUVA rendering.
+
+The two-node build started after it initialized the full per-node history
+precision array. Signed build `22.57.31.732` created a virtual render context
+on node `1`, then completed the wait and signal in order. The probe read
+`gate=1 completion=1` and exited. DxgKrnl ETW recorded the wait and signal
+packets completing on that context. A follow-up `D3DKMTSubmitCommand` with no
+command bytes succeeded at the thunk and generated no DMA packet in ETW for
+that context. The D3D11 regression on the same build presented 300 frames
+through the copying swap chain and verified the readback. The lab restored
+`oem58.inf` afterward.
 
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest

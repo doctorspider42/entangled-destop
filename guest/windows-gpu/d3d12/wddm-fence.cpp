@@ -42,7 +42,7 @@ static void destroy_fence(D3DKMT_HANDLE fence)
     require_success(D3DKMTDestroySynchronizationObject(&destroy), "destroy monitored fence");
 }
 
-void verify_wddm_fence(LUID luid)
+void verify_wddm_fence(LUID luid, bool synchronization_only)
 {
     D3DKMT_OPENADAPTERFROMLUID adapter = {};
     adapter.AdapterLuid = luid;
@@ -54,9 +54,12 @@ void verify_wddm_fence(LUID luid)
 
     D3DKMT_CREATECONTEXTVIRTUAL context = {};
     context.hDevice = device.hDevice;
-    context.Flags.SynchronizationOnly = 1;
+    // The lab's second engine node owns GPUVA. Node zero remains the paging/display node.
+    context.NodeOrdinal = synchronization_only ? 0 : 1;
+    context.Flags.SynchronizationOnly = synchronization_only;
     context.ClientHint = D3DKMT_CLIENTHINT_DX12;
     require_success(D3DKMTCreateContextVirtual(&context), "create virtual D3D12 context");
+    std::fprintf(stderr, "WDDM fence context: %s\n", synchronization_only ? "synchronization only" : "render");
 
     const MonitoredFence gate = monitored_fence(device.hDevice);
     const MonitoredFence complete = monitored_fence(device.hDevice);
