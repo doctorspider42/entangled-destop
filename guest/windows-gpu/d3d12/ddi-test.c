@@ -55,10 +55,22 @@ static int check_adapter(PFND3D12DDI_OPENADAPTER open_adapter, BOOL require_venu
     create.hDrvDevice.pDrvPrivate = HeapAlloc(GetProcessHeap(), 0, device_size);
     CHECK(create.hDrvDevice.pDrvPrivate);
     const HRESULT device_status = functions.pfnCreateDevice(args.hAdapter, &create);
-    if (SUCCEEDED(device_status))
-        functions.pfnDestroyDevice(create.hDrvDevice);
-    HeapFree(GetProcessHeap(), 0, create.hDrvDevice.pDrvPrivate);
     CHECK(device_status == S_OK);
+#ifdef ENTANGLED_D3D12_PROBE_DDI
+    D3D12DDI_EXTENDED_FEATURES_FUNCS_0021 extended = {0};
+    const D3D12DDI_HRTTABLE features_table = {0};
+    CHECK(functions.pfnFillDDITable(args.hAdapter, D3D12DDI_TABLE_TYPE_0020_EXTENDED_FEATURES,
+                                    &extended, sizeof(extended) - 1, 0, features_table) == E_INVALIDARG);
+    CHECK(functions.pfnFillDDITable(args.hAdapter, D3D12DDI_TABLE_TYPE_0020_EXTENDED_FEATURES,
+                                    &extended, sizeof(extended), 0, features_table) == S_OK);
+    CHECK(extended.pfnGetSupportedExtendedFeatures && extended.pfnGetSupportedExtendedFeatureVersions);
+    CHECK(extended.pfnEnableExtendedFeature && extended.pfnSetExtendedFeatureCallbacks);
+    UINT32 feature_count = 1;
+    CHECK(extended.pfnGetSupportedExtendedFeatures(create.hDrvDevice, &feature_count, NULL) == S_OK);
+    CHECK(feature_count == 0);
+#endif
+    functions.pfnDestroyDevice(create.hDrvDevice);
+    HeapFree(GetProcessHeap(), 0, create.hDrvDevice.pDrvPrivate);
 
     UINT32 count = UINT32_MAX;
     CHECK(functions.pfnGetSupportedVersions(args.hAdapter, &count, NULL) == S_OK);

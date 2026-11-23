@@ -26,6 +26,53 @@ static HRESULT write_probe_caps(const D3D12DDIARG_GETCAPS *args, const void *dat
     memcpy(args->pData, data, size);
     return S_OK;
 }
+
+static HRESULT APIENTRY get_supported_extended_features(D3D12DDI_HDEVICE device, UINT32 *count,
+                                                         D3D12DDI_FEATURE_0020 *features)
+{
+    (void)features;
+    if (!device.pDrvPrivate || !count)
+        return E_INVALIDARG;
+    *count = 0;
+    trace_ddi("GetSupportedExtendedFeatures", 0, 0);
+    return S_OK;
+}
+
+static HRESULT APIENTRY get_extended_feature_versions(D3D12DDI_HDEVICE device, D3D12DDI_FEATURE_0020 feature,
+                                                        UINT32 *count, UINT32 *versions)
+{
+    (void)feature;
+    (void)versions;
+    if (!device.pDrvPrivate || !count)
+        return E_INVALIDARG;
+    *count = 0;
+    return DXGI_ERROR_UNSUPPORTED;
+}
+
+static HRESULT APIENTRY enable_extended_feature(D3D12DDI_HDEVICE device, D3D12DDI_FEATURE_0020 feature,
+                                                UINT32 version)
+{
+    (void)device;
+    (void)feature;
+    (void)version;
+    return DXGI_ERROR_UNSUPPORTED;
+}
+
+static HRESULT APIENTRY set_extended_feature_callbacks(D3D12DDI_HDEVICE device, D3D12DDI_TABLE_TYPE type,
+                                                       const void *table, SIZE_T size)
+{
+    (void)device;
+    (void)table;
+    trace_ddi("SetExtendedFeatureCallbacks", type, size);
+    return DXGI_ERROR_UNSUPPORTED;
+}
+
+static const D3D12DDI_EXTENDED_FEATURES_FUNCS_0021 extended_features = {
+    .pfnGetSupportedExtendedFeatures = get_supported_extended_features,
+    .pfnGetSupportedExtendedFeatureVersions = get_extended_feature_versions,
+    .pfnEnableExtendedFeature = enable_extended_feature,
+    .pfnSetExtendedFeatureCallbacks = set_extended_feature_callbacks,
+};
 #endif
 
 static SIZE_T APIENTRY private_device_size(D3D12DDI_HADAPTER adapter,
@@ -144,6 +191,13 @@ static HRESULT APIENTRY fill_table(D3D12DDI_HADAPTER adapter, D3D12DDI_TABLE_TYP
 {
 #ifdef ENTANGLED_D3D12_PROBE_DDI
     trace_ddi("FillDDITable", type, size);
+    trace_ddi("FillDDITable index", type, index);
+    if (type == D3D12DDI_TABLE_TYPE_0020_EXTENDED_FEATURES) {
+        if (!adapter.pDrvPrivate || !table || size != sizeof(extended_features) || index)
+            return E_INVALIDARG;
+        memcpy(table, &extended_features, sizeof(extended_features));
+        return S_OK;
+    }
 #endif
     (void)adapter;
     (void)type;

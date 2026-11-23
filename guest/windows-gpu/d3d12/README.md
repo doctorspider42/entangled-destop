@@ -271,6 +271,19 @@ properties. The system runtime still receives the core-table refusal while
 the rest of the device DDI is under construction. The guest and host logs
 are in `F:/VMs/Entangled/d3d12-lab/share/ddi40-ddi-buffer/`.
 
+Two debugger-only builds used typed stop callbacks for the unfinished
+table slots and advertised the revision only in the smoke test process.
+Windows 10 requested the 768-byte core, two 464-byte command-list tables
+at indices 0 and 1, the 56-byte queue table and the 32-byte extended-feature
+table. Build `0.35.9.973` refused the last table and device creation returned
+`0x887A0004`. Build `0.36.49.221` provided `_0021` extended-feature
+enumeration with zero features. The runtime accepted that response and
+requested the 40-byte `D3D12DDICAPS_TYPE_SHADER` payload. The current
+diagnostic stops there with `0x887A0020`. The traces are in
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-tables/` and
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-extended/`. The stop
+callbacks are outside the driver source and package.
+
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest
 fence. For presentation, separately measure GPU work, `Present` and the time
