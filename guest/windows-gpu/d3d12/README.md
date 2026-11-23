@@ -83,10 +83,11 @@ and features in the guest before considering that backend.
 From the repository root on Windows with MSVC Build Tools and SDK 10.0.26100.0:
 
 ```powershell
-$probeOut = Join-Path $env:LOCALAPPDATA 'entangled-target-entangled-d3d12'
+$probeOut = 'F:\entangled-targets\d3d12'
 & .\guest\windows-gpu\d3d12\build.cmd $probeOut
 & "$probeOut\ddi-test.exe"
 & "$probeOut\d3d12-smoke.exe" --hardware
+& "$probeOut\d3d12-smoke.exe" --hardware --fence
 ```
 
 The ABI test loads the built DLL and calls its WDK adapter entry point. The
@@ -96,6 +97,13 @@ RTX 2070 (`10DE:1F02`, WDDM `2700`) verified all 65,536 bytes. The final run
 reported a 4.466 ms submit-to-fence interval for a single copy on the host.
 Guest mode on the host correctly failed with `0x887A0002` because the explicit
 Entangled adapter was absent. An invalid argument returned exit code 2.
+
+`--fence` tests the WDDM kernel path through D3DKMT. It creates a virtual
+synchronization-only context, queues a wait followed by a completion signal,
+then releases the wait from the CPU. The completion event must stay quiet
+before that release and arrive afterward. The RTX 2070 at WDDM `2700`
+passed. Run `d3d12-smoke.exe --fence` on the Entangled adapter to identify
+the first unsupported operation in the guest's miniport.
 
 To prepare a package, pass a base WDDM directory containing the miniport, INF
 and four x64/x86 UMDs. Staging changes the fourth x64 slot, adds the file to
@@ -113,10 +121,16 @@ In the isolated guest, enable Venus and the render node, verify that the
 catalog and display driver are selected, then run `d3d12-smoke.exe` with no
 arguments. Check the printed WDDM version, the registered UMD and debug output
 independently. While the miniport advertises WDDM 1.3 and the UMD offers zero
-DDI versions, native D3D12 device creation remains incomplete. The parallel
-main integration was active during this slice, so the lab package was never
-installed or booted, and the guest-side return code and callback order remain
-unmeasured.
+DDI versions, native D3D12 device creation remains incomplete.
+
+The isolated Windows 10 baseline booted headless with Venus and the render
+node enabled on 2026-11-23. `dxgkrnl` reported WDDM `1300` for the Entangled
+adapter (`1AF4:1050`) and `entangled_d3d10.dll` in the D3D12 slot. The
+virtual context was created, followed by `STATUS_INVALID_PARAMETER`
+(`0xC000000D`) at monitored fence creation. `D3D12CreateDevice` for feature
+level 11_0 returned `DXGI_ERROR_UNSUPPORTED` (`0x887A0004`). This measured the
+installed baseline package. The experimental UMD's runtime callback order
+still needs to be captured in the guest.
 
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest
