@@ -262,6 +262,15 @@ refusal and restored `oem58.inf`. The guest debugger and host logs are in
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-venus-copy/`. The default build
 passed the adapter-decline test on the Windows host.
 
+Build `0.31.11.202` repeated the copy using the WDK `_0030` heap and
+resource callbacks. The probe exercised separate runtime-private heap and
+resource objects, mapped both heaps, submitted the transfer and destroyed
+the objects after verification. The callbacks currently accept unprotected
+committed system-memory buffers with write-combine or write-back page
+properties. The system runtime still receives the core-table refusal while
+the rest of the device DDI is under construction. The guest and host logs
+are in `F:/VMs/Entangled/d3d12-lab/share/ddi40-ddi-buffer/`.
+
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest
 fence. For presentation, separately measure GPU work, `Present` and the time

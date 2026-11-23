@@ -116,9 +116,10 @@ HRESULT record_venus_buffer_copy(VkCommandBuffer command, const VenusTransferBuf
 }
 
 #ifdef ENTANGLED_D3D12_PROBE_COPY
-static HRESULT execute_probe_copy(const VenusDevice *device, const VenusTransferBuffer *dst,
-                                  const VenusTransferBuffer *src, VkBufferCopy region)
+HRESULT execute_venus_probe_copy(const VenusTransferBuffer *dst, const VenusTransferBuffer *src,
+                                 VkBufferCopy region)
 {
+    const VenusDevice *device = src->device;
     const PFN_vkCreateCommandPool create_pool = DEVICE_FN(device, vkCreateCommandPool);
     const PFN_vkDestroyCommandPool destroy_pool = DEVICE_FN(device, vkDestroyCommandPool);
     const PFN_vkAllocateCommandBuffers allocate = DEVICE_FN(device, vkAllocateCommandBuffers);
@@ -209,38 +210,6 @@ static HRESULT execute_probe_copy(const VenusDevice *device, const VenusTransfer
 
 release_pool:
     destroy_pool(device->handle, pool, NULL);
-    return status;
-}
-
-HRESULT probe_venus_buffer_copy(const VenusDevice *device)
-{
-    const VkBufferCopy region = { .srcOffset = 16, .dstOffset = 32, .size = 64 * 1024 };
-    const VkDeviceSize size = region.dstOffset + region.size + 16;
-    VenusTransferBuffer upload = {0}, readback = {0};
-    HRESULT status = create_venus_transfer_buffer(device, size, FALSE, &upload);
-    if (SUCCEEDED(status))
-        status = create_venus_transfer_buffer(device, size, TRUE, &readback);
-    if (SUCCEEDED(status)) {
-        BYTE *src = upload.mapped;
-        BYTE *dst = readback.mapped;
-        for (VkDeviceSize i = 0; i < size; ++i) {
-            src[i] = (BYTE)(i * 31 + (i >> 8));
-            dst[i] = 0xfa;
-        }
-        status = execute_probe_copy(device, &readback, &upload, region);
-        if (SUCCEEDED(status)) {
-            for (VkDeviceSize i = 0; i < size; ++i) {
-                const BYTE expected = i >= region.dstOffset && i - region.dstOffset < region.size
-                    ? src[i - region.dstOffset + region.srcOffset] : 0xfa;
-                if (dst[i] != expected) {
-                    status = HRESULT_FROM_WIN32(ERROR_CRC);
-                    break;
-                }
-            }
-        }
-    }
-    destroy_venus_transfer_buffer(&readback);
-    destroy_venus_transfer_buffer(&upload);
     return status;
 }
 #endif

@@ -18,5 +18,6 @@ HRESULT record_venus_buffer_copy(VkCommandBuffer command, const VenusTransferBuf
                                  const VenusTransferBuffer *src, VkBufferCopy region);
 
 #ifdef ENTANGLED_D3D12_PROBE_COPY
-HRESULT probe_venus_buffer_copy(const VenusDevice *device);
+HRESULT execute_venus_probe_copy(const VenusTransferBuffer *dst, const VenusTransferBuffer *src,
+                                 VkBufferCopy region);
 #endif

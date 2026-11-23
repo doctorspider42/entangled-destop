@@ -4,8 +4,12 @@
 #include <dxgi.h>
 #include <stdio.h>
 #include <string.h>
-#include "venus-adapter.h"
 #include "venus-transfer.h"
+
+#ifdef ENTANGLED_D3D12_PROBE_COPY
+/* The WDK DDI headers define external C constants. Keep the callbacks in this translation unit. */
+#include "ddi-buffer.inc"
+#endif
 
 #ifdef ENTANGLED_D3D12_PROBE_DDI
 static void trace_ddi(const char *operation, UINT code, SIZE_T value)
@@ -53,7 +57,7 @@ static HRESULT APIENTRY create_device(D3D12DDI_HADAPTER adapter, const D3D12DDIA
 #ifdef ENTANGLED_D3D12_PROBE_COPY
     if (SUCCEEDED(result)) {
         trace_ddi("Venus copy begin", 0, 64 * 1024);
-        result = probe_venus_buffer_copy(device);
+        result = probe_d3d12_buffer_ddi(args->hDrvDevice);
         trace_ddi("Venus copy result", (UINT)result, 64 * 1024);
         if (FAILED(result))
             destroy_venus_device(device);
