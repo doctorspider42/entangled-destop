@@ -1,0 +1,97 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+#include <windows.h>
+#include <d3d12umddi.h>
+#include <dxgi.h>
+
+/* There is no per-adapter state until we bind a Venus physical device. */
+static char adapter_handle;
+
+static SIZE_T APIENTRY private_device_size(D3D12DDI_HADAPTER adapter,
+                                           const D3D12DDIARG_CALCPRIVATEDEVICESIZE *args)
+{
+    (void)adapter;
+    (void)args;
+    return 0;
+}
+
+static HRESULT APIENTRY create_device(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_CREATEDEVICE_0003 *args)
+{
+    (void)adapter;
+    (void)args;
+    return DXGI_ERROR_UNSUPPORTED;
+}
+
+static HRESULT APIENTRY get_supported_versions(D3D12DDI_HADAPTER adapter,
+                                                UINT32 *count, UINT64 *versions)
+{
+    (void)versions;
+    if (adapter.pDrvPrivate != &adapter_handle || !count)
+        return E_INVALIDARG;
+
+    /* A version commits us to its device and command-list tables. */
+    *count = 0;
+    OutputDebugStringA("Entangled D3D12: GetSupportedVersions (no device DDI yet)\n");
+    return S_OK;
+}
+
+static HRESULT APIENTRY close_adapter(D3D12DDI_HADAPTER adapter)
+{
+    return adapter.pDrvPrivate == &adapter_handle ? S_OK : E_INVALIDARG;
+}
+
+static HRESULT APIENTRY get_caps(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_GETCAPS *args)
+{
+    if (adapter.pDrvPrivate != &adapter_handle || !args)
+        return E_INVALIDARG;
+
+    return DXGI_ERROR_UNSUPPORTED;
+}
+
+static HRESULT APIENTRY get_optional_tables(D3D12DDI_HADAPTER adapter,
+                                             UINT32 *count, D3D12DDI_TABLE_REQUEST *tables)
+{
+    (void)tables;
+    if (adapter.pDrvPrivate != &adapter_handle || !count)
+        return E_INVALIDARG;
+    *count = 0;
+    return S_OK;
+}
+
+static HRESULT APIENTRY fill_table(D3D12DDI_HADAPTER adapter, D3D12DDI_TABLE_TYPE type, void *table,
+                                   SIZE_T size, UINT index, D3D12DDI_HRTTABLE runtime_table)
+{
+    (void)adapter;
+    (void)type;
+    (void)table;
+    (void)size;
+    (void)index;
+    (void)runtime_table;
+    return DXGI_ERROR_UNSUPPORTED;
+}
+
+static void APIENTRY destroy_device(D3D12DDI_HDEVICE device)
+{
+    (void)device;
+}
+
+static const D3D12DDI_ADAPTERFUNCS adapter_functions = {
+    .pfnCalcPrivateDeviceSize = private_device_size,
+    .pfnCreateDevice = create_device,
+    .pfnCloseAdapter = close_adapter,
+    .pfnGetSupportedVersions = get_supported_versions,
+    .pfnGetCaps = get_caps,
+    .pfnGetOptionalDDITables = get_optional_tables,
+    .pfnFillDDITable = fill_table,
+    .pfnDestroyDevice = destroy_device,
+};
+
+__declspec(dllexport) HRESULT APIENTRY OpenAdapter12(D3D12DDIARG_OPENADAPTER *args)
+{
+    if (!args || !args->pAdapterFuncs || !args->pAdapterCallbacks)
+        return E_INVALIDARG;
+
+    args->hAdapter.pDrvPrivate = &adapter_handle;
+    *args->pAdapterFuncs = adapter_functions;
+    OutputDebugStringA("Entangled D3D12: OpenAdapter12\n");
+    return S_OK;
+}
