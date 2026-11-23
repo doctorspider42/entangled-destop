@@ -16,6 +16,6 @@ cl /nologo /std:c11 /W4 /WX /O2 /MT /LD "%SRC%entangled_d3d12.c" ^
 if errorlevel 1 exit /b 1
 cl /nologo /std:c11 /W4 /WX /O2 /MT "%SRC%ddi-test.c" /Fo"%OUT%\ddi-test.obj" /Fe"%OUT%\ddi-test.exe"
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc "%SRC%d3d12-smoke.cpp" ^
-    /Fo"%OUT%\d3d12-smoke.obj" /Fe"%OUT%\d3d12-smoke.exe" /link /DEPENDENTLOADFLAG:0x800 d3d12.lib dxgi.lib gdi32.lib
+cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc "%SRC%d3d12-smoke.cpp" "%SRC%wddm-fence.cpp" ^
+    /Fo"%OUT%\\" /Fe"%OUT%\d3d12-smoke.exe" /link /DEPENDENTLOADFLAG:0x800 d3d12.lib dxgi.lib gdi32.lib
 exit /b %errorlevel%

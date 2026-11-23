@@ -15,6 +15,8 @@
 
 using Microsoft::WRL::ComPtr;
 
+void verify_wddm_fence(LUID luid);
+
 static void check(HRESULT result, const char *operation)
 {
     if (FAILED(result)) {
@@ -64,7 +66,12 @@ static void print_wddm_info(LUID luid)
     }
 }
 
-static ComPtr<ID3D12Device> create_device(bool hardware_control)
+struct Adapter {
+    ComPtr<IDXGIAdapter1> dxgi;
+    LUID luid;
+};
+
+static Adapter select_adapter(bool hardware_control)
 {
     ComPtr<IDXGIFactory1> factory;
     check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "CreateDXGIFactory1");
@@ -91,21 +98,24 @@ static ComPtr<ID3D12Device> create_device(bool hardware_control)
                      desc.AdapterLuid.LowPart);
         print_wddm_info(desc.AdapterLuid);
         std::fflush(stdout);
-        ComPtr<ID3D12Device> device;
-        check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
-              "D3D12CreateDevice (feature level 11_0)");
-        const auto actual_luid = device->GetAdapterLuid();
-        if (actual_luid.LowPart != desc.AdapterLuid.LowPart ||
-            actual_luid.HighPart != desc.AdapterLuid.HighPart) {
-            check(E_FAIL, "device LUID differs from the explicit DXGI adapter");
-        }
-        if (!hardware_control && !GetModuleHandleW(L"entangled_d3d12.dll"))
-            check(E_FAIL, "Entangled D3D12 UMD is missing from the runtime process");
-        return device;
+        return {adapter, desc.AdapterLuid};
     }
     check(DXGI_ERROR_NOT_FOUND, hardware_control ? "find a hardware D3D12 adapter" :
                                                  "find the Entangled WDDM adapter");
     return {};
+}
+
+static ComPtr<ID3D12Device> create_device(const Adapter &adapter, bool hardware_control)
+{
+    ComPtr<ID3D12Device> device;
+    check(D3D12CreateDevice(adapter.dxgi.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)),
+          "D3D12CreateDevice (feature level 11_0)");
+    const auto actual_luid = device->GetAdapterLuid();
+    if (actual_luid.LowPart != adapter.luid.LowPart || actual_luid.HighPart != adapter.luid.HighPart)
+        check(E_FAIL, "device LUID differs from the explicit DXGI adapter");
+    if (!hardware_control && !GetModuleHandleW(L"entangled_d3d12.dll"))
+        check(E_FAIL, "Entangled D3D12 UMD is missing from the runtime process");
+    return device;
 }
 
 static ComPtr<ID3D12Resource> buffer(ID3D12Device *device, UINT64 size, D3D12_HEAP_TYPE type,
@@ -185,11 +195,22 @@ static void copy_and_verify(ID3D12Device *device)
 
 int wmain(int argc, wchar_t **argv)
 {
-    const bool hardware_control = argc == 2 && std::wcscmp(argv[1], L"--hardware") == 0;
-    if (argc != 1 && !hardware_control) {
-        std::fputs("usage: d3d12-smoke.exe [--hardware]\n", stderr);
-        return 2;
+    bool hardware_control = false;
+    bool fence_only = false;
+    for (int i = 1; i < argc; ++i) {
+        if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
+            hardware_control = true;
+        else if (!fence_only && std::wcscmp(argv[i], L"--fence") == 0)
+            fence_only = true;
+        else {
+            std::fputs("usage: d3d12-smoke.exe [--hardware] [--fence]\n", stderr);
+            return 2;
+        }
     }
-    copy_and_verify(create_device(hardware_control).Get());
+    const auto adapter = select_adapter(hardware_control);
+    if (fence_only)
+        verify_wddm_fence(adapter.luid);
+    else
+        copy_and_verify(create_device(adapter, hardware_control).Get());
     return 0;
 }
