@@ -82,6 +82,11 @@ checkout that still has it.
   retired scheduler fence on the single execution node. The default package
   continues to advertise WDDM 1.3.
 
+- `0010-lab-wddm2-clock-ddis.patch` registers the clock calibration and stable
+  power callbacks required to start the WDDM 2.0 adapter on the lab's Windows
+  10 build. It also logs device and context creation, root table size requests
+  and failed page table updates in serial diagnostic builds.
+
 ## The user-mode driver
 
 `entangled_d3d10.dll` is built from Mesa (MIT), not from virtio-win:

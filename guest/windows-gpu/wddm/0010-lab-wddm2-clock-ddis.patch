@@ -1,0 +1,95 @@
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index eae05ca..705b5da 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -38,6 +38,8 @@ static DXGKDDI_SETROOTPAGETABLE EntangledSetRootPageTable;
+ static DXGKDDI_GETROOTPAGETABLESIZE EntangledGetRootPageTableSize;
+ static DXGKDDI_SUBMITCOMMANDVIRTUAL EntangledSubmitCommandVirtual;
+ static DXGKDDI_FORMATHISTORYBUFFER EntangledFormatHistoryBuffer;
++static DXGKDDI_CALIBRATEGPUCLOCK EntangledCalibrateGpuClock;
++static DXGKDDI_SETSTABLEPOWERSTATE EntangledSetStablePowerState;
+ static DXGKDDI_CREATEPROCESS EntangledCreateProcess;
+ static DXGKDDI_DESTROYPROCESS EntangledDestroyProcess;
+ #endif
+@@ -98,6 +100,8 @@ extern "C" NTSTATUS DriverEntry(_In_ DRIVER_OBJECT *pDriverObject, _In_ UNICODE_
+     InitialData.DxgkDdiGetRootPageTableSize = EntangledGetRootPageTableSize;
+     InitialData.DxgkDdiSubmitCommandVirtual = EntangledSubmitCommandVirtual;
+     InitialData.DxgkDdiFormatHistoryBuffer = EntangledFormatHistoryBuffer;
++    InitialData.DxgkDdiCalibrateGpuClock = EntangledCalibrateGpuClock;
++    InitialData.DxgkDdiSetStablePowerState = EntangledSetStablePowerState;
+     InitialData.DxgkDdiCreateProcess = EntangledCreateProcess;
+     InitialData.DxgkDdiDestroyProcess = EntangledDestroyProcess;
+ #else
+@@ -568,7 +572,14 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
+     {
+ #ifdef ENTANGLED_WDDM2_LAB
+         case DXGK_OPERATION_UPDATE_PAGE_TABLE:
+-            return EntangledUpdatePageTable(pBuildPagingBuffer->UpdatePageTable);
++        {
++            const auto &update = pBuildPagingBuffer->UpdatePageTable;
++            const NTSTATUS status = EntangledUpdatePageTable(update);
++            if (!NT_SUCCESS(status))
++                DbgPrint(TRACE_LEVEL_ERROR, ("WDDM2 lab UpdatePageTable level=%u mode=%u status=%x\n",
++                                            update.PageTableLevel, update.UpdateMode, status));
++            return status;
++        }
+         case DXGK_OPERATION_FLUSH_TLB:
+             // The software page tables have no translation cache.
+             KeMemoryBarrier();
+@@ -677,6 +688,24 @@ static NTSTATUS APIENTRY EntangledFormatHistoryBuffer(HANDLE context, DXGKARG_FO
+     return STATUS_NOT_SUPPORTED;
+ }
+
++static NTSTATUS APIENTRY EntangledCalibrateGpuClock(HANDLE adapter, UINT32 node, UINT32 engine,
++                                                   DXGKARG_CALIBRATEGPUCLOCK *calibration)
++{
++    UNREFERENCED_PARAMETER(adapter);
++    UNREFERENCED_PARAMETER(node);
++    UNREFERENCED_PARAMETER(engine);
++    UNREFERENCED_PARAMETER(calibration);
++    // The host GPU's timestamp domain is unavailable through the miniport.
++    return STATUS_NOT_SUPPORTED;
++}
++
++static VOID APIENTRY EntangledSetStablePowerState(HANDLE adapter, const DXGKARG_SETSTABLEPOWERSTATE *args)
++{
++    UNREFERENCED_PARAMETER(adapter);
++    UNREFERENCED_PARAMETER(args);
++    // The virtual adapter leaves physical GPU clock and power policy to the host.
++}
++
+ static VOID APIENTRY EntangledSetRootPageTable(HANDLE adapter, const DXGKARG_SETROOTPAGETABLE *args)
+ {
+     UNREFERENCED_PARAMETER(adapter);
+@@ -687,6 +716,8 @@ static VOID APIENTRY EntangledSetRootPageTable(HANDLE adapter, const DXGKARG_SET
+ static SIZE_T APIENTRY EntangledGetRootPageTableSize(HANDLE adapter, DXGKARG_GETROOTPAGETABLESIZE *args)
+ {
+     UNREFERENCED_PARAMETER(adapter);
++    DbgPrint(TRACE_LEVEL_ERROR, ("WDDM2 lab GetRootPageTableSize adapter=%u entries=%u\n",
++                               args->PhysicalAdapterIndex, args->NumberOfPte));
+     if (args->PhysicalAdapterIndex != 0 || args->NumberOfPte > ENTANGLED_GPU_PAGE_TABLE_ENTRIES)
+         return 0;
+     args->NumberOfPte = ENTANGLED_GPU_PAGE_TABLE_ENTRIES;
+@@ -726,6 +757,10 @@ VioGpu3DCreateDevice(_In_ CONST HANDLE hAdapter, _Inout_ DXGKARG_CREATEDEVICE *p
+     VIOGPU_ASSERT_CHK(hAdapter != NULL);
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+
++#ifdef ENTANGLED_WDDM2_LAB
++    DbgPrint(TRACE_LEVEL_ERROR, ("WDDM2 lab CreateDevice flags=%x\n", pCreateDevice->Flags.Value));
++#endif
++
+     VioGpuAdapter *pAdapter = reinterpret_cast<VioGpuAdapter *>(hAdapter);
+     if (!pAdapter->IsDriverActive())
+     {
+@@ -770,6 +805,11 @@ VioGpu3DDdiCreateContext(_In_ CONST HANDLE hDevice, _Inout_ DXGKARG_CREATECONTEX
+
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+
++#ifdef ENTANGLED_WDDM2_LAB
++    DbgPrint(TRACE_LEVEL_ERROR, ("WDDM2 lab CreateContext node=%u flags=%x\n",
++                               pCreateContext->NodeOrdinal, pCreateContext->Flags.Value));
++#endif
++
+     auto *context = new (NonPagedPoolNx) VioGpuContext(static_cast<VioGpuDevice *>(hDevice));
+     if (!context)
+     {

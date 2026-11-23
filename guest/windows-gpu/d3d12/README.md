@@ -9,7 +9,7 @@ in [ADR-0009](../../../docs/adr/0009-own-windows-gpu-driver.md),
 [ADR-0010](../../../docs/adr/0010-wddm-desktop-on-the-gpu.md) and
 [ADR-0011](../../../docs/adr/0011-direct3d-9-driver.md).
 
-## Kernel driver blocks native device creation
+## Kernel contract for native device creation
 
 The display miniport pins viogpu3d at `9ed3aab11fb46e55dc835ff008008623b290a6cf`.
 Its `viogpu/viogpu3d/driver.cpp` sets `InitialData.Version` to
@@ -21,14 +21,13 @@ UMD in the fourth INF slot can change the reported DLL path while this kernel
 contract is still missing. See the [pinned miniport](https://github.com/max8rr8/kvm-guest-drivers-windows/tree/9ed3aab11fb46e55dc835ff008008623b290a6cf/viogpu/viogpu3d)
 and [Microsoft's D3D12 requirements](https://learn.microsoft.com/en-us/windows/win32/direct3d12/directx-12-getting-started).
 
-The next kernel milestone is a WDDM 2.x adapter that starts, reports its model
-through `KMTQAITYPE_DRIVERVERSION`, and completes a monitored fence in a real
-context on a disposable guest. A WDDM 2.x version bump requires implementing the
-matching kernel contract. Validate the GPUVA and residency model, context and
-paging queue creation, virtual submission, and fence ordering before exposing
-D3D12 caps. Windows can queue monitored fence signals when the engine cannot
-write the fence directly. In this design the signal must follow actual Venus
-completion. [GPU virtual memory](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpu-virtual-memory-in-wddm-2-0),
+The lab miniport starts as WDDM 2.0 and creates a virtual synchronization
+context and monitored fences. The queued completion still times out after the
+CPU releases the gate. Validate GPUVA updates, residency, virtual submission
+and fence ordering before exposing D3D12 caps. Windows can queue monitored
+fence signals when the engine cannot write the fence directly. For submitted
+GPU work the signal must follow actual Venus completion.
+[GPU virtual memory](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpu-virtual-memory-in-wddm-2-0),
 [WDDM residency](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/driver-residency-in-wddm-2-0),
 [monitored fence callback](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dumddi/nc-d3dumddi-pfnd3dddi_signalsynchronizationobjectfromgpucb).
 
@@ -157,17 +156,32 @@ and tracks their fence in order without reporting a successful execution
 interrupt. [GpuMmu model](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpummu-model),
 [virtual DMA callback contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/nc-d3dkmddi-dxgkddi_submitcommandvirtual).
 
-The signed lab builds reached `DxgkInitialize` and `DxgkDdiStartDevice` with
-`STATUS_SUCCESS` on Windows 10. The first diagnostic build identified two
-queries to add for display capabilities and history buffer precision. After
-adding those answers, every observed miniport capability query succeeded.
-The DxgKrnl trace shows VidMm creating its system GPUVA allocator and an
-internal fence, then destroying both immediately before releasing the
-miniport. Device Manager reported Code 43. Registering the process and
-root-size callbacks still produced the same post-start removal and the
-trace did not reach the process callback. The user-mode fence probe could
-not find the failed adapter. The lab reverted to the verified `oem58.inf`
-WDDM 1.3 package for further tests.
+The first lab builds reached `DxgkInitialize` and `DxgkDdiStartDevice` with
+`STATUS_SUCCESS` on Windows 10. The diagnostic trace identified two missing
+answers for display capabilities and history buffer precision. With both in
+place, every observed capability query succeeded. DxgKrnl then created its
+system GPUVA allocator and an internal fence, destroyed both and removed the
+adapter with Code 43. Setting `PageTableAlignmentInBytes` to 4096 and then
+moving the paging buffer from the aperture to system memory produced the same
+result. No process, device or context creation was seen in those trials.
+
+On build 19041, the Watchdog error log recorded diagnostic `0x1DD6` from
+`DXGADAPTER::Initialize`, followed by `STATUS_INVALID_PARAMETER` in the start
+path. The failing check requires `DxgkDdiCalibrateGpuClock` and
+`DxgkDdiSetStablePowerState` for this adapter. The lab registers both. Clock
+calibration returns `STATUS_NOT_SUPPORTED` because the miniport has no host GPU
+timestamp source. The stable-power callback leaves physical clocks under host
+control. [WDDM debugging tips](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/debugging-tips-for-wddm-drivers),
+[clock calibration contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/nc-d3dkmddi-dxgkddi_calibrategpuclock).
+
+The signed build `22.19.8.198` started the adapter as `oem11.inf`. DxgKrnl
+called `CreateProcess` for its system process, and the D3DKMT test reported
+WDDM `2000` on the Entangled DXGI adapter. Monitored fence creation and the
+CPU signal passed. The queued completion stayed quiet before gate release and
+still had no event after 10 seconds (`WAIT_TIMEOUT`, `0x102`). The stock UMD
+was registered in the fourth INF slot for this test. `D3D12CreateDevice`
+returned `0x887A0004` at feature level 11_0. The default WDDM 1.3 and the
+WDDM 2.0 lab miniports both built with WDK 10.0.26100.0.
 
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest
