@@ -1300,6 +1300,7 @@ fn spawn_control_channel(
     lifecycle: Arc<Lifecycle>,
     snapshot: Option<PathBuf>,
     display: display::DisplayHandle,
+    display_adapter: control_api::DisplayAdapter,
     typist: virtio_input::Typist,
     exec: Option<Arc<clipboard_bridge::Exec>>,
 ) {
@@ -1338,6 +1339,10 @@ fn spawn_control_channel(
                             Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
                         });
                         match size {
+                            Some(_) if display_adapter == control_api::DisplayAdapter::Framebuffer => {
+                                println!("{CONTROL_PREFIX} error display requires a virtio display adapter");
+                                continue;
+                            }
                             Some((w, h)) => {
                                 display.request_guest_resolution(w, h);
                             }
@@ -2034,6 +2039,7 @@ pub fn run_with(
             Arc::clone(&lifecycle),
             snapshot.clone(),
             display_handle.clone(),
+            cfg.display.adapter,
             typist,
             agent_exec,
         );

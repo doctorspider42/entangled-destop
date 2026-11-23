@@ -860,8 +860,12 @@ size the machine starts at. To keep it fixed whatever the window does:
 follow_window = false
 ```
 
-A headless machine can be asked the same way over the control channel:
-`display 1600x900`.
+A headless VM with a virtio display adapter accepts the same request over the
+control channel with `display 1600x900`. The reply `ok display` means the host
+accepted the request. The guest driver and desktop must apply it. On Windows,
+the display-only `viogpudo` driver and the `viogpuap` helper running in the
+logged-on user's session support this path. The `framebuffer` adapter rejects
+live resolution requests. Set its starting resolution in the VM profile.
 
 **The quick-actions bar** slides in when the pointer touches the top edge of a
 fullscreen window, or of a windowed one whose input is grabbed (the pointer is

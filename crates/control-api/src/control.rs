@@ -59,7 +59,9 @@ pub fn serial_key_bytes(key: &str) -> Option<&'static [u8]> {
 /// caller that must have it stopped follows up with its own deadline.
 pub const CMD_SHUTDOWN: &str = "shutdown";
 /// Ask the guest for another desktop resolution, `display WIDTHxHEIGHT`: what
-/// resizing the window does, for a headless VM or a test.
+/// resizing the window does, for a headless VM or a test. Requires a virtio
+/// display adapter. `ok display` acknowledges the request; the guest driver
+/// and desktop decide whether to apply the mode.
 pub const CMD_DISPLAY: &str = "display";
 /// Write a small PNG of the guest's screen, `thumbnail [path]`; without a path
 /// it goes to [`thumbnail_path`] of the VM's snapshot location. Silent on
