@@ -1,0 +1,160 @@
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index 9b20262..b11f6c9 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -656,8 +656,12 @@ VioGpu3DDdiCreateContext(_In_ CONST HANDLE hDevice, _Inout_ DXGKARG_CREATECONTEX
+
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+
+-    // We currently don't have sepraration between context and device
+-    pCreateContext->hContext = hDevice;
++    auto *context = new (NonPagedPoolNx) VioGpuContext(static_cast<VioGpuDevice *>(hDevice));
++    if (!context)
++    {
++        return STATUS_NO_MEMORY;
++    }
++    pCreateContext->hContext = context;
+
+     pCreateContext->ContextInfo.DmaBufferSegmentSet = 0;
+     pCreateContext->ContextInfo.DmaBufferSize = 256 * 1024;
+@@ -675,7 +679,7 @@ VioGpu3DDdiDestroyContext(_In_ CONST HANDLE hContext)
+ {
+     PAGED_CODE();
+
+-    UNREFERENCED_PARAMETER(hContext);
++    delete static_cast<VioGpuContext *>(hContext);
+
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+
+@@ -684,26 +688,24 @@ VioGpu3DDdiDestroyContext(_In_ CONST HANDLE hContext)
+
+ NTSTATUS
+ APIENTRY
+-VioGpu3DPresent(_In_ CONST HANDLE hDevice, _Inout_ DXGKARG_PRESENT *pPresent)
++VioGpu3DPresent(_In_ CONST HANDLE hContext, _Inout_ DXGKARG_PRESENT *pPresent)
+ {
+     PAGED_CODE();
+-    VIOGPU_ASSERT_CHK(hDevice != NULL);
++    VIOGPU_ASSERT_CHK(hContext != NULL);
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+
+-    VioGpuDevice *pDxContext = reinterpret_cast<VioGpuDevice *>(hDevice);
+-    return pDxContext->Present(pPresent);
++    return static_cast<VioGpuContext *>(hContext)->GetDevice()->Present(pPresent);
+ }
+
+ NTSTATUS
+ APIENTRY
+-VioGpu3DRender(_In_ CONST HANDLE hDevice, _Inout_ DXGKARG_RENDER *pRender)
++VioGpu3DRender(_In_ CONST HANDLE hContext, _Inout_ DXGKARG_RENDER *pRender)
+ {
+     PAGED_CODE();
+-    VIOGPU_ASSERT_CHK(hDevice != NULL);
++    VIOGPU_ASSERT_CHK(hContext != NULL);
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+
+-    VioGpuDevice *pDxContext = reinterpret_cast<VioGpuDevice *>(hDevice);
+-    return pDxContext->Render(pRender);
++    return static_cast<VioGpuContext *>(hContext)->GetDevice()->Render(pRender);
+ }
+
+ NTSTATUS
+diff --git a/viogpu/viogpu3d/viogpu_command.cpp b/viogpu/viogpu3d/viogpu_command.cpp
+index fe87fbe..2afdd32 100644
+--- a/viogpu/viogpu3d/viogpu_command.cpp
++++ b/viogpu/viogpu3d/viogpu_command.cpp
+@@ -12,7 +12,7 @@ VioGpuCommand::VioGpuCommand(VioGpuAdapter *adapter)
+
+     m_pAdapter = adapter;
+     m_pCommander = &adapter->commander;
+-    m_pContext = NULL;
++    m_contextId = 0;
+
+     m_FenceId = 0;
+     m_pDmaBuffer = NULL;
+@@ -43,7 +43,10 @@ void VioGpuCommand::PrepareSubmit(const DXGKARG_SUBMITCOMMAND *pSubmitCommand)
+         m_pCommand = (char *)m_pDmaBuffer + pSubmitCommand->DmaBufferSubmissionStartOffset;
+         m_pEnd = (char *)m_pDmaBuffer + pSubmitCommand->DmaBufferSubmissionEndOffset;
+     }
+-    m_pContext = reinterpret_cast<VioGpuDevice *>(pSubmitCommand->hContext);
++    // Paging packets may have no context. Keep the legacy virgl ID with the
++    // queued packet, since the worker has no need for the DXGKRNL handle.
++    const auto *context = static_cast<const VioGpuContext *>(pSubmitCommand->hContext);
++    m_contextId = context ? context->GetDevice()->GetId() : 0;
+ }
+
+ #pragma code_seg(pop)
+@@ -131,7 +134,7 @@ void VioGpuCommand::Run()
+
+                     m_pAdapter->ctrlQueue.SubmitCommand(submitCmd,
+                                                         cmdHdr->size,
+-                                                        m_pContext->GetId(),
++                                                        m_contextId,
+                                                         VioGpuCommand::QueueRunningCb,
+                                                         this);
+                     return;
+@@ -143,7 +146,7 @@ void VioGpuCommand::Run()
+                     VIOGPU_TRANSFER_CMD *transferCmd = (VIOGPU_TRANSFER_CMD *)cmdBody;
+
+                     m_pAdapter->ctrlQueue.TransferHostCmd(cmdHdr->type == VIOGPU_CMD_TRANSFER_TO_HOST,
+-                                                          m_pContext->GetId(),
++                                                          m_contextId,
+                                                           transferCmd,
+                                                           VioGpuCommand::QueueRunningCb,
+                                                           this);
+diff --git a/viogpu/viogpu3d/viogpu_command.h b/viogpu/viogpu3d/viogpu_command.h
+index 7539de8..719295c 100644
+--- a/viogpu/viogpu3d/viogpu_command.h
++++ b/viogpu/viogpu3d/viogpu_command.h
+@@ -5,7 +5,6 @@
+ #define VIOGPU_MAX_RUNNING 1
+
+ class VioGpuAdapter;
+-class VioGpuDevice;
+ class VioGpuAllocation;
+ class VioGpuCommander;
+
+@@ -33,7 +32,7 @@ class VioGpuCommand
+   private:
+     VioGpuAdapter *m_pAdapter;
+     VioGpuCommander *m_pCommander;
+-    VioGpuDevice *m_pContext;
++    ULONG m_contextId;
+
+     UINT m_FenceId;
+
+diff --git a/viogpu/viogpu3d/viogpu_device.h b/viogpu/viogpu3d/viogpu_device.h
+index f83c7db..5b56302 100644
+--- a/viogpu/viogpu3d/viogpu_device.h
++++ b/viogpu/viogpu3d/viogpu_device.h
+@@ -6,7 +6,7 @@ class VioGpuAdapter;
+ class VioGpuAllocation;
+ class CtrlQueue;
+
+-// Class that represents DXGKRNL Context, often passed as hContext
++// DXGKRNL device. Legacy virgl keeps one virtio context per device.
+ class VioGpuDevice
+ {
+   public:
+@@ -32,6 +32,21 @@ class VioGpuDevice
+     ULONG m_id;
+ };
+
++// DXGKRNL can create several independently scheduled contexts on a device.
++class VioGpuContext
++{
++  public:
++    explicit VioGpuContext(VioGpuDevice *device) : m_device(device) {}
++
++    VioGpuDevice *GetDevice() const
++    {
++        return m_device;
++    }
++
++  private:
++    VioGpuDevice *const m_device;
++};
++
+ class VioGpuDeviceAllocation
+ {
+   public:

@@ -73,6 +73,10 @@ checkout that still has it.
   opened the allocation reads them out, with a write count so an unchanged
   frame is not copied. How a window's frame crosses to DWM (ADR-0010).
 
+- `0008-separate-device-and-context-handles.patch` gives each DXGK context its
+  own lifetime. Present and render follow the context to its owning device.
+  A queued legacy command carries the device's virtio context ID by value.
+
 ## The user-mode driver
 
 `entangled_d3d10.dll` is built from Mesa (MIT), not from virtio-win:

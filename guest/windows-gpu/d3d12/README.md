@@ -132,6 +132,16 @@ level 11_0 returned `DXGI_ERROR_UNSUPPORTED` (`0x887A0004`). This measured the
 installed baseline package. The experimental UMD's runtime callback order
 still needs to be captured in the guest.
 
+The first miniport change gives DXGK distinct device and context objects.
+Present and render use the context's owning device. Queued legacy commands
+carry the virtio context ID by value. After a cold boot the lab guest ran
+version `21.20.10.383` from `oem58.inf`. The active DriverStore image matched
+the signed build by SHA-256. On that adapter `d3d11-test` presented 300 frames
+through the copying swap chain and verified the readback. The fence probe
+still reached monitored fence creation and got `0xC000000D` on WDDM `1300`.
+Both PCI functions reported no PnP problems. The render node also completed
+the Venus ring and reply-blob exchange in `gpu-test.exe venus`.
+
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest
 fence. For presentation, separately measure GPU work, `Present` and the time
