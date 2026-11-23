@@ -329,6 +329,7 @@ fn prepare(args: &InstallArgs) -> Result<Plan, String> {
         ignore_msrs: true,
         hyperv_enlightenments: false,
         guest_agent: false,
+        guest_exec: false,
     };
     let mut install = installed.clone();
     install.boot.floppy = Some(floppy.clone());
