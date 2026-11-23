@@ -247,6 +247,21 @@ The public `D3D12CreateDevice` also returned `0x887A0004`. The log establishes
 the point at which the resource, command queue and command list DDIs are
 needed for the offscreen copy to become reachable.
 
+Add `ENTANGLED_D3D12_PROBE_COPY=1` to the lab build to exercise the Venus
+transfer inside `CreateDevice`. The probe uses independent coherent upload
+and readback allocations, records one buffer copy and a host-read barrier,
+submits to the graphics queue and waits on a Vulkan fence. It verifies all
+64 KiB and both guard regions. Keep this diagnostic off during normal device
+creation and latency measurements.
+
+Signed build `0.25.50.851` passed that probe on Windows 10 build 19041.
+The host log connects two 69,632-byte mapped allocations and a ring fence to
+Venus context `1240065` on the physical RTX 2070. The readback in the guest
+passed after the Vulkan wait. The guest then reached the same core-table
+refusal and restored `oem58.inf`. The guest debugger and host logs are in
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-venus-copy/`. The default build
+passed the adapter-decline test on the Windows host.
+
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest
 fence. For presentation, separately measure GPU work, `Present` and the time

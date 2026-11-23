@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "venus-adapter.h"
+#include "venus-transfer.h"
 
 #ifdef ENTANGLED_D3D12_PROBE_DDI
 static void trace_ddi(const char *operation, UINT code, SIZE_T value)
@@ -48,7 +49,16 @@ static HRESULT APIENTRY create_device(D3D12DDI_HADAPTER adapter, const D3D12DDIA
     if (!device)
         return E_INVALIDARG;
     *device = (VenusDevice){0};
-    const HRESULT result = create_venus_device(venus, device);
+    HRESULT result = create_venus_device(venus, device);
+#ifdef ENTANGLED_D3D12_PROBE_COPY
+    if (SUCCEEDED(result)) {
+        trace_ddi("Venus copy begin", 0, 64 * 1024);
+        result = probe_venus_buffer_copy(device);
+        trace_ddi("Venus copy result", (UINT)result, 64 * 1024);
+        if (FAILED(result))
+            destroy_venus_device(device);
+    }
+#endif
 #ifdef ENTANGLED_D3D12_PROBE_DDI
     trace_ddi("CreateDevice result", (UINT)result, sizeof(*device));
 #endif

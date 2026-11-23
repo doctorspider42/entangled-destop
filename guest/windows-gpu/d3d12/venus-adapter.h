@@ -19,9 +19,12 @@ typedef struct VenusDevice {
     VkQueue graphics_queue;
     PFN_vkGetDeviceProcAddr proc_addr;
     PFN_vkDestroyDevice destroy;
+    UINT32 graphics_queue_family;
+    VkPhysicalDeviceMemoryProperties memory;
 } VenusDevice;
 
 HRESULT open_venus_adapter(VenusAdapter *adapter);
 void close_venus_adapter(VenusAdapter *adapter);
 HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device);
 void destroy_venus_device(VenusDevice *device);
+HRESULT venus_hresult(VkResult result);

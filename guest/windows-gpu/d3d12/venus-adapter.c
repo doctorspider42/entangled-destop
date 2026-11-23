@@ -121,6 +121,18 @@ void close_venus_adapter(VenusAdapter *adapter)
         FreeLibrary(adapter->loader);
 }
 
+HRESULT venus_hresult(VkResult result)
+{
+    switch (result) {
+    case VK_SUCCESS: return S_OK;
+    case VK_TIMEOUT: return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+    case VK_ERROR_OUT_OF_HOST_MEMORY:
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY: return E_OUTOFMEMORY;
+    case VK_ERROR_DEVICE_LOST: return DXGI_ERROR_DEVICE_REMOVED;
+    default: return E_FAIL;
+    }
+}
+
 HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
 {
     const PFN_vkCreateDevice create = (PFN_vkCreateDevice)
@@ -129,7 +141,9 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
         adapter->instance_proc_addr(adapter->instance, "vkGetDeviceProcAddr");
     const PFN_vkDestroyDevice destroy = (PFN_vkDestroyDevice)
         adapter->instance_proc_addr(adapter->instance, "vkDestroyDevice");
-    if (!create || !proc_addr || !destroy)
+    const PFN_vkGetPhysicalDeviceMemoryProperties get_memory = (PFN_vkGetPhysicalDeviceMemoryProperties)
+        adapter->instance_proc_addr(adapter->instance, "vkGetPhysicalDeviceMemoryProperties");
+    if (!create || !proc_addr || !destroy || !get_memory)
         return E_FAIL;
 
     const float priority = 1.0f;
@@ -146,12 +160,8 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
     };
     VkDevice handle;
     const VkResult result = create(adapter->physical_device, &info, NULL, &handle);
-    if (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY)
-        return E_OUTOFMEMORY;
-    if (result == VK_ERROR_DEVICE_LOST)
-        return DXGI_ERROR_DEVICE_REMOVED;
     if (result != VK_SUCCESS)
-        return E_FAIL;
+        return venus_hresult(result);
 
     const PFN_vkGetDeviceQueue get_queue = (PFN_vkGetDeviceQueue)proc_addr(handle, "vkGetDeviceQueue");
     if (!get_queue) {
@@ -166,7 +176,14 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
         return E_FAIL;
     }
 
-    *device = (VenusDevice){ .handle = handle, .graphics_queue = queue, .proc_addr = proc_addr, .destroy = destroy };
+    *device = (VenusDevice){
+        .handle = handle,
+        .graphics_queue = queue,
+        .proc_addr = proc_addr,
+        .destroy = destroy,
+        .graphics_queue_family = adapter->graphics_queue_family,
+    };
+    get_memory(adapter->physical_device, &device->memory);
     return S_OK;
 }
 
