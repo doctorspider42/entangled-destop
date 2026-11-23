@@ -101,8 +101,10 @@ Entangled adapter was absent. An invalid argument returned exit code 2.
 synchronization-only context, queues a wait followed by a completion signal,
 then releases the wait from the CPU. The completion event must stay quiet
 before that release and arrive afterward. The RTX 2070 at WDDM `2700`
-passed. Run `d3d12-smoke.exe --fence` on the Entangled adapter to identify
-the first unsupported operation in the guest's miniport.
+passed with both CPU-visible fence values at `1` after release. The probe
+reports the two values even if the event times out. That distinguishes a
+stalled signal from a signal that advanced the fence without waking its
+waiter. Run `d3d12-smoke.exe --fence` on the Entangled adapter.
 
 To prepare a package, pass a base WDDM directory containing the miniport, INF
 and four x64/x86 UMDs. Staging changes the fourth x64 slot, adds the file to
@@ -182,6 +184,17 @@ still had no event after 10 seconds (`WAIT_TIMEOUT`, `0x102`). The stock UMD
 was registered in the fourth INF slot for this test. `D3D12CreateDevice`
 returned `0x887A0004` at feature level 11_0. The default WDDM 1.3 and the
 WDDM 2.0 lab miniports both built with WDK 10.0.26100.0.
+
+On reboot, the WDDM 2.0 miniport again reached system process creation. The
+desktop scanout remained black while the serial log showed DWM failing to
+resolve allocation handles for its escapes. A framebuffer-only boot let us
+remove the experimental packages and the lab kernel debug flag. The package
+with `entangled_d3d12.dll` in the fourth slot was signed and copied to the
+guest, but installation and runtime entry were unverified in this trial.
+After restoring `oem58.inf` and booting with Venus again, the Entangled
+adapter reported WDDM `1300`. The D3D11 regression presented 300 frames and
+verified the readback via the copying swap chain. The diagnostic fence probe
+reproduced `0xC000000D` at monitored fence creation on that restored baseline.
 
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest

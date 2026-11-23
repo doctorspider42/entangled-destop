@@ -18,13 +18,22 @@ static void require_success(NTSTATUS status, const char *operation)
         fail(operation, static_cast<unsigned long>(status));
 }
 
-static D3DKMT_HANDLE monitored_fence(D3DKMT_HANDLE device)
+struct MonitoredFence {
+    D3DKMT_HANDLE handle;
+    const volatile LONG64 *cpu_value;
+};
+
+static MonitoredFence monitored_fence(D3DKMT_HANDLE device)
 {
     D3DKMT_CREATESYNCHRONIZATIONOBJECT2 create = {};
     create.hDevice = device;
     create.Info.Type = D3DDDI_MONITORED_FENCE;
     require_success(D3DKMTCreateSynchronizationObject2(&create), "create monitored fence");
-    return create.hSyncObject;
+    const auto *cpu_value = static_cast<const volatile LONG64 *>(
+        create.Info.MonitoredFence.FenceValueCPUVirtualAddress);
+    if (!cpu_value)
+        fail("map monitored fence for CPU read", ERROR_INVALID_ADDRESS);
+    return {create.hSyncObject, cpu_value};
 }
 
 static void destroy_fence(D3DKMT_HANDLE fence)
@@ -49,8 +58,8 @@ void verify_wddm_fence(LUID luid)
     context.ClientHint = D3DKMT_CLIENTHINT_DX12;
     require_success(D3DKMTCreateContextVirtual(&context), "create virtual D3D12 context");
 
-    const D3DKMT_HANDLE gate = monitored_fence(device.hDevice);
-    const D3DKMT_HANDLE complete = monitored_fence(device.hDevice);
+    const MonitoredFence gate = monitored_fence(device.hDevice);
+    const MonitoredFence complete = monitored_fence(device.hDevice);
     constexpr UINT64 target = 1;
     const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!event)
@@ -59,7 +68,7 @@ void verify_wddm_fence(LUID luid)
     D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU event_wait = {};
     event_wait.hDevice = device.hDevice;
     event_wait.ObjectCount = 1;
-    event_wait.ObjectHandleArray = &complete;
+    event_wait.ObjectHandleArray = &complete.handle;
     event_wait.FenceValueArray = &target;
     event_wait.hAsyncEvent = event;
     require_success(D3DKMTWaitForSynchronizationObjectFromCpu(&event_wait), "register CPU completion wait");
@@ -67,14 +76,14 @@ void verify_wddm_fence(LUID luid)
     D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMGPU queue_wait = {};
     queue_wait.hContext = context.hContext;
     queue_wait.ObjectCount = 1;
-    queue_wait.ObjectHandleArray = &gate;
+    queue_wait.ObjectHandleArray = &gate.handle;
     queue_wait.MonitoredFenceValueArray = &target;
     require_success(D3DKMTWaitForSynchronizationObjectFromGpu(&queue_wait), "queue wait for gate");
 
     D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMGPU queue_signal = {};
     queue_signal.hContext = context.hContext;
     queue_signal.ObjectCount = 1;
-    queue_signal.ObjectHandleArray = &complete;
+    queue_signal.ObjectHandleArray = &complete.handle;
     queue_signal.MonitoredFenceValueArray = &target;
     require_success(D3DKMTSignalSynchronizationObjectFromGpu(&queue_signal), "queue completion signal");
 
@@ -83,23 +92,31 @@ void verify_wddm_fence(LUID luid)
         fail("wait before releasing gate", GetLastError());
     if (before != WAIT_TIMEOUT)
         fail("completion overtook the queued wait", before);
+    if (static_cast<UINT64>(ReadAcquire64(complete.cpu_value)) >= target)
+        fail("completion fence advanced before gate release", ERROR_INVALID_DATA);
 
     D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMCPU release = {};
     release.hDevice = device.hDevice;
     release.ObjectCount = 1;
-    release.ObjectHandleArray = &gate;
+    release.ObjectHandleArray = &gate.handle;
     release.FenceValueArray = &target;
     require_success(D3DKMTSignalSynchronizationObjectFromCpu(&release), "signal gate from CPU");
 
     const DWORD after = WaitForSingleObject(event, 10000);
     if (after == WAIT_FAILED)
         fail("wait after releasing gate", GetLastError());
+    const auto gate_value = static_cast<UINT64>(ReadAcquire64(gate.cpu_value));
+    const auto complete_value = static_cast<UINT64>(ReadAcquire64(complete.cpu_value));
+    std::fprintf(stderr, "WDDM fence values after release: gate=%llu completion=%llu\n",
+                 gate_value, complete_value);
     if (after != WAIT_OBJECT_0)
         fail("completion failed after releasing gate", after);
+    if (gate_value < target || complete_value < target)
+        fail("fence event arrived before the monitored values", ERROR_INVALID_DATA);
     CloseHandle(event);
 
-    destroy_fence(complete);
-    destroy_fence(gate);
+    destroy_fence(complete.handle);
+    destroy_fence(gate.handle);
     const D3DKMT_DESTROYCONTEXT destroy_context = {context.hContext};
     require_success(D3DKMTDestroyContext(&destroy_context), "destroy virtual context");
     const D3DKMT_DESTROYDEVICE destroy_device = {device.hDevice};
