@@ -489,6 +489,10 @@ pub struct InstallArgs {
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
+        // The runner can redirect both streams to the same file. If that disk
+        // fills up, the subscriber's stderr fallback (eprintln!) can panic
+        // while a VM device holds its transport lock.
+        .log_internal_errors(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )

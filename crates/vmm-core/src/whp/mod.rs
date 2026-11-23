@@ -50,6 +50,10 @@ mod regs;
 mod snapshot;
 mod vcpu;
 
+// WHP on Windows 10 allows only one mapped test partition per process.
+#[cfg(test)]
+static TEST_PARTITION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub use cpuid::{tsc_crystal_ratio, CpuidPolicy, CpuidResult, GuestClocks, CPUID_EXIT_LEAVES};
 pub use interrupt::{HaltGate, WhpInterruptDelivery, HALT_POLL};
 pub use partition::{

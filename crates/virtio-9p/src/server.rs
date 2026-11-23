@@ -279,6 +279,10 @@ impl Server {
         self.fids.len()
     }
 
+    pub(crate) fn fid_path(&self, fid: u32) -> Result<&[String], u32> {
+        Ok(&self.fid(fid)?.path)
+    }
+
     /// Forgets every fid — a device reset.
     pub fn reset(&mut self) {
         self.fids.clear();

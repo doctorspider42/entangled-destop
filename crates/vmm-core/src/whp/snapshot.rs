@@ -58,6 +58,9 @@ use crate::hv::{
 use crate::whp::regs::{zeroed_value, Aligned16};
 use crate::whp::vcpu::WhpVcpu;
 
+pub(super) const MSR_IA32_TSC: u32 = 0x0000_0010;
+pub(super) const MSR_IA32_TSC_ADJUST: u32 = 0x0000_003b;
+
 /// Every MSR WHP names, with the architectural index the snapshot records it
 /// under.
 ///
@@ -65,8 +68,8 @@ use crate::whp::vcpu::WhpVcpu;
 /// EFER is here as well because writing the same value twice is free and the
 /// list is meant to be the whole MSR story on its own.
 const MSRS: &[(u32, WHV_REGISTER_NAME)] = &[
-    (0x0000_0010, WHvX64RegisterTsc),
-    (0x0000_003b, WHvX64RegisterTscAdjust),
+    (MSR_IA32_TSC, WHvX64RegisterTsc),
+    (MSR_IA32_TSC_ADJUST, WHvX64RegisterTscAdjust),
     (0x0000_0048, WHvX64RegisterSpecCtrl),
     (0x0000_00fe, WHvX64RegisterMsrMtrrCap),
     (0x0000_0174, WHvX64RegisterSysenterCs),
@@ -641,6 +644,45 @@ fn events_to_whp(events: &X86PendingEvents) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_restore_still_restores_the_saved_tsc() {
+        use crate::whp::{WhpHypervisor, WhpOptions, WhpPartition};
+        use crate::MachineConfig;
+
+        let _guard = crate::whp::TEST_PARTITION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(hv) = WhpHypervisor::open() else {
+            eprintln!("skipping: WHP unavailable");
+            return;
+        };
+        let config = MachineConfig {
+            memory_mib: 16,
+            vcpu_count: 1,
+        };
+        let mut partition =
+            WhpPartition::with_options(&hv, &config, WhpOptions::for_guest()).unwrap();
+        let mut vcpu = partition.take_vcpus().pop().unwrap();
+        let tsc = |data| X86Msr {
+            index: MSR_IA32_TSC,
+            data,
+        };
+        let read_tsc = |vcpu: &WhpVcpu| vcpu.read_u64s(&[WHvX64RegisterTsc]).unwrap()[0];
+        assert!(vcpu.write_msrs(&[tsc(100_000_000)]).is_empty());
+        let saved = vcpu.snapshot().unwrap();
+        let saved_tsc = saved
+            .msrs
+            .iter()
+            .find(|msr| msr.index == MSR_IA32_TSC)
+            .unwrap()
+            .data;
+        assert_eq!(saved_tsc, 100_000_000);
+        assert!(vcpu.write_msrs(&[tsc(300_000_000)]).is_empty());
+        assert_eq!(read_tsc(&vcpu), 300_000_000);
+        vcpu.restore(&saved).unwrap();
+        assert_eq!(read_tsc(&vcpu), saved_tsc);
+    }
 
     /// Every MSR is listed once, and the architectural indices are the ones
     /// the file will carry.

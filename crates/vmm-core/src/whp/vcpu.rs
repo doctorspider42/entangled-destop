@@ -116,7 +116,18 @@ impl WhpVcpu {
     /// deleting and re-creating the VP.
     fn capture_pristine(&self) -> Option<Box<X86CpuState>> {
         match self.snapshot() {
-            Ok(state) => Some(Box::new(state)),
+            Ok(mut state) => {
+                use super::snapshot::{MSR_IA32_TSC, MSR_IA32_TSC_ADJUST};
+
+                // WHP starts the VPs with a shared TSC epoch. Setting each VP's
+                // old TSC at a different instant gives it a different offset.
+                // Leave the running TSC and its adjustment intact on a warm
+                // reset. Suspend/restore still uses the full snapshot.
+                state
+                    .msrs
+                    .retain(|msr| !matches!(msr.index, MSR_IA32_TSC | MSR_IA32_TSC_ADJUST));
+                Some(Box::new(state))
+            }
             Err(e) => {
                 tracing::debug!(
                     vcpu = self.index,
@@ -1450,6 +1461,69 @@ fn join_outcome(handle: JoinHandle<Result<RunOutcome, VmmError>>) -> Result<RunO
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_reset_preserves_the_running_partition_tsc() {
+        use crate::whp::{WhpHypervisor, WhpOptions, WhpPartition};
+        use crate::MachineConfig;
+        use vm_memory::{Bytes, GuestAddress};
+        use windows::Win32::System::Hypervisor::WHvRegisterInternalActivityState;
+
+        let _guard = crate::whp::TEST_PARTITION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(hv) = WhpHypervisor::open() else {
+            eprintln!("skipping: WHP unavailable");
+            return;
+        };
+        let options = WhpOptions {
+            hyperv: true,
+            ..WhpOptions::for_guest()
+        };
+        let config = MachineConfig {
+            memory_mib: 16,
+            vcpu_count: 6,
+        };
+        let mut partition = WhpPartition::with_options(&hv, &config, options).unwrap();
+        // rdtsc; out 0xe9, al. Read the guest's actual TSC at an I/O exit.
+        partition
+            .memory()
+            .write_slice(&[0x0f, 0x31, 0xe6, 0xe9], GuestAddress(0x1000))
+            .unwrap();
+        let mut vcpus = partition.take_vcpus();
+        let sample = |vcpu: &WhpVcpu| {
+            let mut sregs = vcpu.get_special_registers().unwrap();
+            sregs.cs.base = 0;
+            sregs.cs.selector = 0;
+            vcpu.set_special_registers(&sregs).unwrap();
+            let mut regs = vcpu.get_registers().unwrap();
+            regs.rip = 0x1000;
+            vcpu.set_registers(&regs).unwrap();
+            // Start each AP directly without a firmware SIPI trampoline.
+            let activity = Aligned16([zeroed_value(); 1]);
+            vcpu.set_raw(&[WHvRegisterInternalActivityState], &activity.0)
+                .unwrap();
+            let exit = vcpu.run_once().unwrap();
+            assert_eq!(exit.ExitReason, WHvRunVpExitReasonX64IoPortAccess);
+            let regs = vcpu.get_registers().unwrap();
+            (regs.rdx << 32) | regs.rax
+        };
+        std::thread::sleep(Duration::from_millis(30));
+        let before: Vec<_> = vcpus.iter().map(sample).collect();
+        for (index, vcpu) in vcpus.iter_mut().enumerate() {
+            vcpu.reset_arch_state(index == 0).unwrap();
+        }
+        let after: Vec<_> = vcpus.iter().map(sample).collect();
+        assert!(
+            before
+                .iter()
+                .zip(&after)
+                .all(|(before, after)| before <= after)
+                && after.windows(2).all(|pair| pair[0] <= pair[1]),
+            "TSC went backward across warm reset: before {before:?}, after {after:?}",
+        );
+        println!("TSC across warm reset: before {before:?}, after {after:?}");
+    }
 
     /// The `WHV_X64_IO_PORT_ACCESS_INFO` bit layout, pinned against
     /// hand-computed values.
