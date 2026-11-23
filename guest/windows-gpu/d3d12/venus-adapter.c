@@ -57,7 +57,13 @@ static HRESULT select_physical_device(VenusAdapter *adapter)
                 properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
                 continue;
 
-            VkPhysicalDeviceDriverProperties driver = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+            VkPhysicalDeviceSubgroupProperties subgroup = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+            };
+            VkPhysicalDeviceDriverProperties driver = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+                .pNext = &subgroup,
+            };
             properties.pNext = &driver;
             get_properties(devices[i], &properties);
             if (driver.driverID != VK_DRIVER_ID_MESA_VENUS)
@@ -68,6 +74,7 @@ static HRESULT select_physical_device(VenusAdapter *adapter)
                 continue;
             if (SUCCEEDED(result)) {
                 adapter->physical_device = devices[i];
+                adapter->subgroup_size = subgroup.subgroupSize;
                 char message[384];
                 snprintf(message, sizeof(message), "Entangled D3D12: Venus device %04x:%04x %s, graphics queue %u\n",
                          properties.properties.vendorID, properties.properties.deviceID,

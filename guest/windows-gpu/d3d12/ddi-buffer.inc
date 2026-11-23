@@ -82,6 +82,8 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_buffer_ddi = {
     .pfnDestroyHeapAndResource = destroy_committed_buffer,
     .pfnMapHeap = map_buffer_heap,
     .pfnUnmapHeap = unmap_buffer_heap,
+    .pfnGetImplicitPhysicalAdapterMask = implicit_physical_adapter_mask,
+    .pfnQueryNodeMap = query_node_map,
 };
 
 static HRESULT probe_d3d12_buffer_ddi(D3D12DDI_HDEVICE device)

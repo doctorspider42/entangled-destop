@@ -55,6 +55,8 @@ static int check_adapter(PFND3D12DDI_OPENADAPTER open_adapter, BOOL require_venu
     create.hDrvDevice.pDrvPrivate = HeapAlloc(GetProcessHeap(), 0, device_size);
     CHECK(create.hDrvDevice.pDrvPrivate);
     const HRESULT device_status = functions.pfnCreateDevice(args.hAdapter, &create);
+    if (FAILED(device_status))
+        HeapFree(GetProcessHeap(), 0, create.hDrvDevice.pDrvPrivate);
     CHECK(device_status == S_OK);
 #ifdef ENTANGLED_D3D12_PROBE_DDI
     D3D12DDI_EXTENDED_FEATURES_FUNCS_0021 extended = {0};
@@ -106,6 +108,29 @@ static int check_adapter(PFND3D12DDI_OPENADAPTER open_adapter, BOOL require_venu
     CHECK(functions.pfnGetCaps(args.hAdapter, &caps) == S_OK);
     CHECK(options.ResourceBindingTier == D3D12DDI_RESOURCE_BINDING_TIER_1);
     CHECK(options.ResourceHeapTier == D3D12DDI_RESOURCE_HEAP_TIER_1);
+    D3D12DDI_SHADER_CAPS_0015 shader;
+    caps = (D3D12DDIARG_GETCAPS){D3D12DDICAPS_TYPE_SHADER, NULL, &shader, sizeof(shader) - 1};
+    CHECK(functions.pfnGetCaps(args.hAdapter, &caps) == E_INVALIDARG);
+    caps.DataSize = sizeof(shader);
+    CHECK(functions.pfnGetCaps(args.hAdapter, &caps) == S_OK);
+    CHECK(shader.MinPrecision == D3D12DDI_SHADER_MIN_PRECISION_NONE && !shader.WaveOps &&
+          !shader.DoubleOps && !shader.Int64Ops);
+    CHECK(shader.WaveLaneCountMin > 0 && shader.WaveLaneCountMin == shader.WaveLaneCountMax &&
+          shader.WaveLaneCountMax == shader.TotalLaneCount);
+    UINT model_count = 0;
+    D3D12DDI_D3D12_SHADER_MODELS_DATA_0011 models = { &model_count, NULL };
+    caps = (D3D12DDIARG_GETCAPS){D3D12DDICAPS_TYPE_0011_SHADER_MODELS, NULL, &models, sizeof(models)};
+    CHECK(functions.pfnGetCaps(args.hAdapter, &caps) == S_OK && model_count == 1);
+    D3D12DDI_SHADER_MODEL model = 0;
+    models.pShaderModelsSupported = &model;
+    CHECK(functions.pfnGetCaps(args.hAdapter, &caps) == S_OK && model_count == 1);
+    CHECK(model == D3D12DDI_SHADER_MODEL_5_1_RELEASE_0011);
+    D3D12DDICAPS_UMD_BASED_COMMAND_QUEUE_PRIORITY_DATA_0023 priority;
+    caps = (D3D12DDIARG_GETCAPS){
+        D3D12DDICAPS_TYPE_0023_UMD_BASED_COMMAND_QUEUE_PRIORITY, NULL, &priority, sizeof(priority),
+    };
+    CHECK(functions.pfnGetCaps(args.hAdapter, &caps) == S_OK);
+    CHECK(priority.SupportedQueueFlagsForGlobalRealtimeQueues == D3D12DDI_COMMAND_QUEUE_FLAG_NONE);
 #else
     CHECK(functions.pfnGetCaps(args.hAdapter, &caps) == DXGI_ERROR_UNSUPPORTED);
     CHECK(depth == UINT_MAX);

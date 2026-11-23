@@ -12,6 +12,7 @@ typedef struct VenusAdapter {
     VkInstance instance;
     VkPhysicalDevice physical_device;
     UINT32 graphics_queue_family;
+    UINT32 subgroup_size;
 } VenusAdapter;
 
 typedef struct VenusDevice {

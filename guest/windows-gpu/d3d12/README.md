@@ -279,10 +279,40 @@ table. Build `0.35.9.973` refused the last table and device creation returned
 `0x887A0004`. Build `0.36.49.221` provided `_0021` extended-feature
 enumeration with zero features. The runtime accepted that response and
 requested the 40-byte `D3D12DDICAPS_TYPE_SHADER` payload. The current
-diagnostic stops there with `0x887A0020`. The traces are in
+driver source returns the extended-feature table. The traces are in
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-tables/` and
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-extended/`. The stop
-callbacks are outside the driver source and package.
+callbacks live in the separate scratch builds.
+
+Windows 10 rejects a zero `_0015` shader payload even when wave operations
+are disabled. The Direct3D 12 ETW event in
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-shader-diag/d3d12.xml`
+names the wave and total lane counts. The lab uses the Vulkan subgroup
+size as a conservative floor. The RTX 2070 reports 32. This allows the
+runtime to query architecture information and then the format callback
+for `R8G8_UINT` and `R8_UINT`. Reporting no optional format operations
+in the debugger-only build allowed the two-phase shader model query.
+The lab advertises shader model 5.1 for the initialization test. Shader
+translation remains to be implemented.
+
+Build `0.46.16.21` reached the UMD queue priority query. After the test
+script restored `oem58.inf`, the installed host engine ended with
+`0xC0000005`. The preceding several driver swaps left the host log
+counting 51 Venus contexts. The faulting module and cause are unverified.
+The probe trace, rollback log and host exit log are in
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-model/`.
+
+On a fresh boot, build `0.47.24.485` passed the queue priority query with
+no global real-time queues and reached `pfnCheckMultisampleQualityLevels`.
+The next scratch build answered the format and sample-count queries with
+single-sample diagnostic values and reached `pfnQueryNodeMap`. Build
+`0.52.20.501` returned one physical adapter at index zero. That index
+is separate from WDDM engine ordinal one used for the render context.
+The runtime then requested the 20-byte `_0026` texture-layout payload.
+ETW recorded this request as the next initialization failure. The source
+now provides the provisional layout payload without optional swizzles or
+row-major textures. The trace and the subsequent rollback stall are in
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-node-map/`.
 
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest

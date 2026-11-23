@@ -6,11 +6,6 @@
 #include <string.h>
 #include "venus-transfer.h"
 
-#ifdef ENTANGLED_D3D12_PROBE_COPY
-/* The WDK DDI headers define external C constants. Keep the callbacks in this translation unit. */
-#include "ddi-buffer.inc"
-#endif
-
 #ifdef ENTANGLED_D3D12_PROBE_DDI
 static void trace_ddi(const char *operation, UINT code, SIZE_T value)
 {
@@ -24,6 +19,22 @@ static HRESULT write_probe_caps(const D3D12DDIARG_GETCAPS *args, const void *dat
     if (!args->pData || args->DataSize != size)
         return E_INVALIDARG;
     memcpy(args->pData, data, size);
+    return S_OK;
+}
+
+static HRESULT write_probe_shader_models(const D3D12DDIARG_GETCAPS *args)
+{
+    const D3D12DDI_D3D12_SHADER_MODELS_DATA_0011 *models = args->pData;
+    if (!models || args->DataSize != sizeof(*models) || !models->pNumShaderModelsSupported)
+        return E_INVALIDARG;
+    UINT *count = models->pNumShaderModelsSupported;
+    const UINT capacity = models->pShaderModelsSupported ? *count : 0;
+    *count = 1;
+    if (models->pShaderModelsSupported) {
+        if (capacity < *count)
+            return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+        models->pShaderModelsSupported[0] = D3D12DDI_SHADER_MODEL_5_1_RELEASE_0011;
+    }
     return S_OK;
 }
 
@@ -73,6 +84,24 @@ static const D3D12DDI_EXTENDED_FEATURES_FUNCS_0021 extended_features = {
     .pfnEnableExtendedFeature = enable_extended_feature,
     .pfnSetExtendedFeatureCallbacks = set_extended_feature_callbacks,
 };
+#endif
+
+#ifdef ENTANGLED_D3D12_PROBE_COPY
+static UINT APIENTRY implicit_physical_adapter_mask(D3D12DDI_HDEVICE device)
+{
+    return device.pDrvPrivate ? 1 : 0;
+}
+
+static void APIENTRY query_node_map(D3D12DDI_HDEVICE device, UINT physical_adapters, UINT *map)
+{
+    /* The render engine ordinal is separate from the physical adapter index. */
+    trace_ddi("QueryNodeMap", physical_adapters, implicit_physical_adapter_mask(device));
+    for (UINT i = 0; i < physical_adapters; ++i)
+        map[i] = i == 0 && device.pDrvPrivate ? 0 : D3D12DDI_NODE_MAP_HIDE_NODE;
+}
+
+/* The WDK DDI headers define external C constants. Keep the callbacks in this translation unit. */
+#include "ddi-buffer.inc"
 #endif
 
 static SIZE_T APIENTRY private_device_size(D3D12DDI_HADAPTER adapter,
@@ -168,6 +197,44 @@ static HRESULT APIENTRY get_caps(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_GE
             .ResourceHeapTier = D3D12DDI_RESOURCE_HEAP_TIER_1,
         };
         return write_probe_caps(args, &options, sizeof(options));
+    }
+    if (args->Type == D3D12DDICAPS_TYPE_SHADER) {
+        const VenusAdapter *venus = adapter.pDrvPrivate;
+        if (!venus->subgroup_size)
+            return DXGI_ERROR_UNSUPPORTED;
+        /* Windows 10 requires nonzero lane counts even with WaveOps disabled.
+           Use one Vulkan subgroup as a conservative floor for the lab only. */
+        const D3D12DDI_SHADER_CAPS_0015 shader = {
+            .WaveLaneCountMin = venus->subgroup_size,
+            .WaveLaneCountMax = venus->subgroup_size,
+            .TotalLaneCount = venus->subgroup_size,
+        };
+        trace_ddi("Shader subgroup size", 0, venus->subgroup_size);
+        return write_probe_caps(args, &shader, sizeof(shader));
+    }
+    if (args->Type == D3D12DDICAPS_TYPE_0011_SHADER_MODELS)
+        return write_probe_shader_models(args);
+    if (args->Type == D3D12DDICAPS_TYPE_ARCHITECTURE_INFO) {
+        /* Provisional RTX lab capability. */
+        const D3D12DDI_ARCHITECTURE_INFO_DATA architecture = {0};
+        return write_probe_caps(args, &architecture, sizeof(architecture));
+    }
+    if (args->Type == D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE) {
+        /* The lab targets a single discrete adapter. */
+        if (!args->pInfo || *(const UINT *)args->pInfo != 0)
+            return E_INVALIDARG;
+        const D3D12DDI_MEMORY_ARCHITECTURE_CAPS memory = {0};
+        return write_probe_caps(args, &memory, sizeof(memory));
+    }
+    if (args->Type == D3D12DDICAPS_TYPE_0023_UMD_BASED_COMMAND_QUEUE_PRIORITY) {
+        const D3D12DDICAPS_UMD_BASED_COMMAND_QUEUE_PRIORITY_DATA_0023 priority = {
+            .SupportedQueueFlagsForGlobalRealtimeQueues = D3D12DDI_COMMAND_QUEUE_FLAG_NONE,
+        };
+        return write_probe_caps(args, &priority, sizeof(priority));
+    }
+    if (args->Type == D3D12DDICAPS_TYPE_0022_TEXTURE_LAYOUT && !args->pInfo) {
+        const D3D12DDI_TEXTURE_LAYOUT_CAPS_0026 layout = {0};
+        return write_probe_caps(args, &layout, sizeof(layout));
     }
 #endif
     return DXGI_ERROR_UNSUPPORTED;
