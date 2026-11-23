@@ -1299,11 +1299,11 @@ fn spawn_control_channel(
     requests: Arc<LifecycleRequests>,
     lifecycle: Arc<Lifecycle>,
     snapshot: Option<PathBuf>,
-    display: display::DisplayHandle,
-    display_adapter: control_api::DisplayAdapter,
+    display: (display::DisplayHandle, control_api::DisplayAdapter),
     typist: virtio_input::Typist,
     exec: Option<Arc<clipboard_bridge::Exec>>,
 ) {
+    let (display, display_adapter) = display;
     let spawned = std::thread::Builder::new()
         .name("control".into())
         .spawn(move || {
@@ -2038,8 +2038,7 @@ pub fn run_with(
             Arc::clone(&requests),
             Arc::clone(&lifecycle),
             snapshot.clone(),
-            display_handle.clone(),
-            cfg.display.adapter,
+            (display_handle.clone(), cfg.display.adapter),
             typist,
             agent_exec,
         );
