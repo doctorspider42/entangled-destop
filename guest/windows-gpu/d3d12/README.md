@@ -39,7 +39,9 @@ GPU work the signal must follow actual Venus completion.
   instance. It selects a non-CPU Mesa Venus physical device with a graphics
   queue through the system Vulkan loader and releases the instance on close.
   The runtime trace selected the host RTX 2070 through Venus, queue family `0`.
-  The adapter currently reports zero supported DDI versions.
+  The default build reports zero supported DDI versions. The disposable
+  runtime probe negotiates `_0040` and creates a logical Vulkan device and
+  graphics queue in the D3D12 driver's `CreateDevice` callback.
   [Microsoft's DDI overview](https://microsoft.github.io/DirectX-Specs/d3d/CPUEfficiency.html#initialization).
 - The first workload requests feature level 11_0 and uses a DIRECT queue,
   allocator, command list, upload and readback buffers, `CopyBufferRegion`,
@@ -92,7 +94,8 @@ $probeOut = 'F:\entangled-targets\d3d12'
 
 The ABI test loads the built DLL and calls its WDK adapter entry point. Pass
 `--venus` in the guest to require success and check two independent adapter
-lifetimes. On the host without Venus it verifies that a failed open leaves the
+lifetimes and logical device creation and destruction. On the host without
+Venus it verifies that a failed open leaves the
 driver handle and callback table empty. The hardware control uses `System32`
 D3D12/DXGI. On 2026-11-23 the MSVC build passed with `/W4 /WX`, the DLL exported
 `OpenAdapter12`, and the control on the
@@ -224,6 +227,25 @@ command bytes succeeded at the thunk and generated no DMA packet in ETW for
 that context. The D3D11 regression on the same build presented 300 frames
 through the copying swap chain and verified the readback. The lab restored
 `oem58.inf` afterward.
+
+## Runtime device initialization
+
+Build with `ENTANGLED_D3D12_PROBE_DDI=1` for the disposable guest. This
+enables the provisional `_0040` DDI handshake and reports feature level
+11_0 and tier 1 heap and resource binding values to advance the runtime's
+initialization. The probe rejects function table requests while the command
+and resource DDIs are incomplete. Keep this build out of the regular driver
+package.
+
+On Windows 10 build 19041, `D3D12Core.dll` called `CalcPrivateDeviceSize`
+and `CreateDevice` with interface `0x000C0028`. `CreateDevice` opened a
+logical device and graphics queue through Venus on the host RTX 2070 and
+returned `S_OK`. The runtime queried the 52-byte `_0033` options structure,
+then requested the 768-byte `_0040` device-core table. That request returned
+`DXGI_ERROR_UNSUPPORTED`, after which the runtime called `DestroyDevice`.
+The public `D3D12CreateDevice` also returned `0x887A0004`. The log establishes
+the point at which the resource, command queue and command list DDIs are
+needed for the offscreen copy to become reachable.
 
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest

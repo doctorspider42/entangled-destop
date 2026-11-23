@@ -120,3 +120,59 @@ void close_venus_adapter(VenusAdapter *adapter)
     if (adapter->loader)
         FreeLibrary(adapter->loader);
 }
+
+HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
+{
+    const PFN_vkCreateDevice create = (PFN_vkCreateDevice)
+        adapter->instance_proc_addr(adapter->instance, "vkCreateDevice");
+    const PFN_vkGetDeviceProcAddr proc_addr = (PFN_vkGetDeviceProcAddr)
+        adapter->instance_proc_addr(adapter->instance, "vkGetDeviceProcAddr");
+    const PFN_vkDestroyDevice destroy = (PFN_vkDestroyDevice)
+        adapter->instance_proc_addr(adapter->instance, "vkDestroyDevice");
+    if (!create || !proc_addr || !destroy)
+        return E_FAIL;
+
+    const float priority = 1.0f;
+    const VkDeviceQueueCreateInfo queue_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = adapter->graphics_queue_family,
+        .queueCount = 1,
+        .pQueuePriorities = &priority,
+    };
+    const VkDeviceCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .queueCreateInfoCount = 1,
+        .pQueueCreateInfos = &queue_info,
+    };
+    VkDevice handle;
+    const VkResult result = create(adapter->physical_device, &info, NULL, &handle);
+    if (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+        return E_OUTOFMEMORY;
+    if (result == VK_ERROR_DEVICE_LOST)
+        return DXGI_ERROR_DEVICE_REMOVED;
+    if (result != VK_SUCCESS)
+        return E_FAIL;
+
+    const PFN_vkGetDeviceQueue get_queue = (PFN_vkGetDeviceQueue)proc_addr(handle, "vkGetDeviceQueue");
+    if (!get_queue) {
+        destroy(handle, NULL);
+        return E_FAIL;
+    }
+
+    VkQueue queue = VK_NULL_HANDLE;
+    get_queue(handle, adapter->graphics_queue_family, 0, &queue);
+    if (!queue) {
+        destroy(handle, NULL);
+        return E_FAIL;
+    }
+
+    *device = (VenusDevice){ .handle = handle, .graphics_queue = queue, .proc_addr = proc_addr, .destroy = destroy };
+    return S_OK;
+}
+
+void destroy_venus_device(VenusDevice *device)
+{
+    if (device->handle)
+        device->destroy(device->handle, NULL);
+    *device = (VenusDevice){0};
+}
