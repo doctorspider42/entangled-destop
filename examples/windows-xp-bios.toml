@@ -1,0 +1,31 @@
+# A machine that boots through the built-in BIOS (ADR-0012), for guests with
+# no EFI loader. Windows XP is the one this exists for:
+#
+#   entangled disk create xp.raw --size 8G
+#   entangled run examples\windows-xp-bios.toml
+#
+# Where it stands (phase X1): the BIOS boots the CD and text-mode Setup runs
+# — its screens, the keyboard, the disk on the IDE controller. GUI-mode
+# Setup, after the first restart, draws in a VGA graphics mode this machine
+# does not have yet, so an installation cannot be finished with it today.
+#
+# The BIOS boots the first bootable [[optical]] disc, then the first [[disk]]
+# with a boot sector. The guest then finds both on an IDE controller: disks on
+# the primary channel, discs on the secondary, two of each at most. The ISO is yours to supply.
+name = "winxp"
+memory_mib = 512
+vcpus = 1
+transport = "pci"
+# XP probes model-specific registers the hypervisor does not implement.
+ignore_msrs = true
+
+[boot]
+mode = "bios"
+cmdline = ""
+
+[[disk]]
+path = "xp.raw"
+writable = true
+
+[[optical]]
+path = "en_windows_xp_professional_with_service_pack_3_x86_cd_vl_x14-73974.iso"

@@ -33,11 +33,21 @@
 //! `0x20`/`0xa0` reads report the IRR or the ISR. Plus the ELCR pair at
 //! `0x4d0`/`0x4d1`, which Linux reads to learn each ISA line's trigger mode.
 //!
-//! **No delivery.** [`Pic8259::has_input`] is always false because nothing raises
-//! a PIC input line; there is deliberately no path from here to a vCPU. If a
-//! future device ever needs 8259-routed ExtINT delivery (a guest that boots
-//! without ACPI, say), this is where the IRR/ISR priority resolution and the
-//! `LINT0` injection would go — the register state it would need is already here.
+//! **Delivery is off unless the machine asks for it.** A guest that boots
+//! through a BIOS (ADR-0012) runs with the 8259s as its only interrupt
+//! controller until its kernel programs the IOAPIC: Windows XP's loader waits
+//! for the timer tick on IRQ 0 before it does anything else. For such a
+//! machine `UserspaceIrqChip::enable_legacy_interrupts` wires the 8254 to
+//! [`Pic8259::pulse`], and the chip pair resolves priority
+//! ([`Pic8259::pending`]) and answers the acknowledge cycle
+//! ([`Pic8259::acknowledge`]) for the run loop that injects the vector. On
+//! every other machine nothing pulses a line and [`Pic8259::has_input`]
+//! stays false, exactly as before.
+//!
+//! Modelled for delivery: edge-triggered requests, the mask, fully nested
+//! priority, the cascade on IR 2, auto-EOI, and the specific and
+//! non-specific EOI commands. Not modelled: priority rotation, special mask
+//! mode, poll mode, level-triggered lines.
 
 /// Ports the PIC pair owns: command/data of each chip, and the ELCR pair.
 pub const PIC_MASTER_COMMAND: u16 = 0x20;
@@ -53,6 +63,11 @@ const ICW1_INIT: u8 = 0x10;
 const ICW1_ICW4: u8 = 0x01;
 /// ICW1 bit 1: single mode, i.e. no ICW3.
 const ICW1_SINGLE: u8 = 0x02;
+
+/// ICW4 bit 1: the chip ends an interrupt at its acknowledge.
+const ICW4_AUTO_EOI: u8 = 0x02;
+/// The master's input the slave's output is wired to.
+const CASCADE_LINE: u8 = 2;
 
 /// OCW3 selects itself with bit 3 set, bit 4 clear.
 const OCW3_SELECT: u8 = 0x08;
@@ -174,17 +189,52 @@ impl PicChip {
             self.expect_icw3 = value & ICW1_SINGLE == 0;
             self.step = InitStep::Icw2;
             self.imr = 0;
+            self.irr = 0;
+            self.isr = 0;
             self.read_isr = false;
             return;
         }
-        // OCW3. Only the read-register select has an observable effect here; the
-        // special-mask and poll bits would need real delivery. Anything else is
-        // OCW2 — EOI and rotate commands. With nothing ever in service there is
-        // no state to clear, but accepting the write is what keeps
-        // `init_8259A(auto_eoi)`'s trailing EOIs from looking like errors.
-        if value & OCW3_SELECT != 0 && value & OCW3_READ_REGISTER != 0 {
-            self.read_isr = value & OCW3_READ_ISR != 0;
+        if value & OCW3_SELECT != 0 {
+            // OCW3. Only the read-register select is modelled; the
+            // special-mask and poll bits are not.
+            if value & OCW3_READ_REGISTER != 0 {
+                self.read_isr = value & OCW3_READ_ISR != 0;
+            }
+            return;
         }
+        // OCW2: end of interrupt. Non-specific ends the highest-priority line
+        // in service, specific names its line. The rotate commands are
+        // accepted and do nothing.
+        match value & 0xe0 {
+            0x20 => self.isr &= self.isr.wrapping_sub(1),
+            0x60 => self.isr &= !(1 << (value & 7)),
+            _ => {}
+        }
+    }
+
+    /// The line this chip would interrupt for: the highest-priority one that
+    /// is requested and unmasked, unless a line of that priority or higher is
+    /// still in service. `extra` is a request from outside the chip's own
+    /// register — the slave's output on the master's cascade input.
+    fn pending_line(&self, extra: u8) -> Option<u8> {
+        let requests = (self.irr | extra) & !self.imr;
+        if requests == 0 {
+            return None;
+        }
+        let line = requests.trailing_zeros() as u8;
+        let at_or_above = (1u16 << (line + 1)) - 1;
+        (u16::from(self.isr) & at_or_above == 0).then_some(line)
+    }
+
+    /// The acknowledge cycle for `line`: its request is consumed, it is in
+    /// service (unless the chip ends interrupts by itself), and the vector
+    /// is the base ICW2 set plus the line.
+    fn acknowledge(&mut self, line: u8) -> u8 {
+        self.irr &= !(1 << line);
+        if self.icw4 & ICW4_AUTO_EOI == 0 {
+            self.isr |= 1 << line;
+        }
+        (self.vector_base & 0xf8) | line
     }
 
     /// Write to the data port (`0x21` / `0xa1`).
@@ -285,11 +335,48 @@ impl Pic8259 {
         self.slave.load_state(&state.slave)
     }
 
-    /// Whether any line is asserted on either chip. Always false — see the
-    /// module docs. Exists so a caller that wants to assert "the PIC never has
-    /// anything to deliver" can, instead of taking it on trust.
+    /// Whether any line is requested on either chip. False on every machine
+    /// that has not enabled legacy interrupts — see the module docs — so a
+    /// caller that wants to assert "the PIC never has anything to deliver"
+    /// can, instead of taking it on trust.
     pub fn has_input(&self) -> bool {
         self.master.irr != 0 || self.slave.irr != 0
+    }
+
+    /// One edge on interrupt line `irq` (0–15): the request is latched until
+    /// it is acknowledged.
+    pub fn pulse(&mut self, irq: u8) {
+        match irq {
+            0..=7 => self.master.irr |= 1 << irq,
+            8..=15 => self.slave.irr |= 1 << (irq - 8),
+            _ => {}
+        }
+    }
+
+    fn cascade_request(&self) -> u8 {
+        u8::from(self.slave.pending_line(0).is_some()) << CASCADE_LINE
+    }
+
+    /// The pair's `INTR` output: there is an interrupt the CPU should take.
+    pub fn pending(&self) -> bool {
+        self.master.pending_line(self.cascade_request()).is_some()
+    }
+
+    /// The acknowledge cycle. Returns the vector of the interrupt now in
+    /// service, or `None` when nothing is pending.
+    pub fn acknowledge(&mut self) -> Option<u8> {
+        let cascade = self.cascade_request();
+        let line = self.master.pending_line(cascade)?;
+        if line == CASCADE_LINE && self.master.irr & (1 << CASCADE_LINE) == 0 {
+            // The request came through the cascade: the slave names the
+            // vector, and the master holds the cascade line in service.
+            let slave_line = self.slave.pending_line(0)?;
+            if self.master.icw4 & ICW4_AUTO_EOI == 0 {
+                self.master.isr |= 1 << CASCADE_LINE;
+            }
+            return Some(self.slave.acknowledge(slave_line));
+        }
+        Some(self.master.acknowledge(line))
     }
 
     pub fn io_write(&mut self, port: u16, value: u8) {
@@ -320,6 +407,96 @@ impl Pic8259 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pair as a PC BIOS leaves it: vectors 08h and 70h, the slave on
+    /// IR 2, 8086 mode, and `mask` on the master.
+    fn initialised(master_mask: u8, slave_mask: u8) -> Pic8259 {
+        let mut pic = Pic8259::new();
+        for (port, value) in [
+            (PIC_MASTER_COMMAND, 0x11),
+            (PIC_SLAVE_COMMAND, 0x11),
+            (PIC_MASTER_DATA, 0x08),
+            (PIC_SLAVE_DATA, 0x70),
+            (PIC_MASTER_DATA, 0x04),
+            (PIC_SLAVE_DATA, 0x02),
+            (PIC_MASTER_DATA, 0x01),
+            (PIC_SLAVE_DATA, 0x01),
+            (PIC_MASTER_DATA, master_mask),
+            (PIC_SLAVE_DATA, slave_mask),
+        ] {
+            pic.io_write(port, value);
+        }
+        pic
+    }
+
+    #[test]
+    fn an_unmasked_edge_is_delivered_once_with_its_vector() {
+        let mut pic = initialised(0xfe, 0xff);
+        assert!(!pic.pending());
+        pic.pulse(0);
+        assert!(pic.pending());
+        assert_eq!(pic.acknowledge(), Some(0x08));
+        // In service now: the request is consumed.
+        assert!(!pic.pending());
+        assert_eq!(pic.acknowledge(), None);
+    }
+
+    #[test]
+    fn a_masked_line_waits_for_the_mask_to_open() {
+        let mut pic = initialised(0xff, 0xff);
+        pic.pulse(0);
+        assert!(!pic.pending());
+        pic.io_write(PIC_MASTER_DATA, 0xfe);
+        assert!(pic.pending());
+    }
+
+    #[test]
+    fn a_line_in_service_holds_back_itself_and_lower_priorities_until_eoi() {
+        let mut pic = initialised(0x00, 0xff);
+        pic.pulse(1);
+        assert_eq!(pic.acknowledge(), Some(0x09));
+        // A second edge on the same line, and one on a lower-priority line.
+        pic.pulse(1);
+        pic.pulse(3);
+        assert!(!pic.pending());
+        // A higher-priority line still gets through.
+        pic.pulse(0);
+        assert_eq!(pic.acknowledge(), Some(0x08));
+        // Non-specific EOI ends the highest priority in service: line 0.
+        pic.io_write(PIC_MASTER_COMMAND, 0x20);
+        assert!(!pic.pending(), "line 1 is still in service");
+        pic.io_write(PIC_MASTER_COMMAND, 0x20);
+        assert_eq!(pic.acknowledge(), Some(0x09));
+        // A specific EOI names its line.
+        pic.io_write(PIC_MASTER_COMMAND, 0x61);
+        assert_eq!(pic.acknowledge(), Some(0x0b));
+    }
+
+    #[test]
+    fn a_slave_line_comes_through_the_cascade_with_the_slaves_vector() {
+        let mut pic = initialised(0xfb, 0xfe);
+        pic.pulse(8);
+        assert!(pic.pending());
+        assert_eq!(pic.acknowledge(), Some(0x70));
+        assert!(!pic.pending());
+        // Both chips need their EOI before line 8 can interrupt again.
+        pic.pulse(8);
+        pic.io_write(PIC_SLAVE_COMMAND, 0x20);
+        assert!(!pic.pending(), "the master still holds the cascade");
+        pic.io_write(PIC_MASTER_COMMAND, 0x20);
+        assert_eq!(pic.acknowledge(), Some(0x70));
+        // With the cascade input masked on the master, nothing arrives.
+        let mut pic = initialised(0xff, 0xfe);
+        pic.pulse(8);
+        assert!(!pic.pending());
+    }
+
+    #[test]
+    fn nothing_is_pending_on_a_pair_nobody_pulsed() {
+        let pic = initialised(0x00, 0x00);
+        assert!(!pic.pending());
+        assert!(!pic.has_input());
+    }
 
     /// The whole reason this module exists: `probe_8259A()` must conclude that a
     /// PIC is present, or the machine quietly loses `nr_legacy_irqs()` and with

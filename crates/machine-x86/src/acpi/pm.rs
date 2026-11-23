@@ -91,6 +91,9 @@ const SLEEP_CTL_SLP_EN: u8 = 1 << 5;
 /// `PWRBTN_STS` in `PM1a_STS` and `PWRBTN_EN` in `PM1a_EN` (ACPI 6.5 tables
 /// 4.13/4.14): the fixed-feature power button.
 const PM1_PWRBTN: u16 = 1 << 8;
+/// `TMR_STS` / `TMR_EN`: set each time the PM timer's most significant bit
+/// changes.
+const PM1_TMR: u16 = 1 << 0;
 
 /// `WAK_STS` of `SLEEP_STATUS_REG`, write-1-to-clear.
 const SLEEP_STS_WAK: u8 = 1 << 7;
@@ -151,6 +154,17 @@ impl AcpiPmTimer {
 
     /// Ticks since the VM started, wrapped to the counter width.
     pub fn ticks(&self) -> u32 {
+        (self.ticks_unwrapped() as u32) & ACPI_PM_TIMER_MASK
+    }
+
+    /// How many times the counter's most significant bit has changed since
+    /// the VM started: what `TMR_STS` reports, one event per change.
+    fn carries(&self) -> u64 {
+        self.ticks_unwrapped() >> (ACPI_PM_TIMER_MASK.count_ones() - 1)
+    }
+
+    /// Ticks since the VM started, not wrapped.
+    fn ticks_unwrapped(&self) -> u64 {
         let state = self.state();
         let elapsed = match state.paused_at {
             Some(at) => at.saturating_duration_since(state.origin),
@@ -163,7 +177,7 @@ impl AcpiPmTimer {
             .as_micros()
             .saturating_mul(u128::from(ACPI_PM_TIMER_HZ))
             / 1_000_000;
-        (ticks as u32) & ACPI_PM_TIMER_MASK
+        ticks as u64
     }
 
     /// Freezes the counter (ADR-0005). Idempotent.
@@ -222,6 +236,9 @@ struct PmRegisters {
     gpe0_en: u16,
     sleep_control: u8,
     sleep_status: u8,
+    /// The PM timer's carries already turned into `TMR_STS`
+    /// ([`AcpiPmBlock::sync_timer_status`]).
+    timer_carries: u64,
 }
 
 /// The ACPI fixed-feature register block.
@@ -371,6 +388,8 @@ impl AcpiPmBlock {
             regs.sleep_status = state.sleep_status;
         }
         self.timer.restore(state.timer_ticks);
+        // The carries before the snapshot are in `pm1a_sts` already.
+        self.regs().timer_carries = self.timer.carries();
         self.shutdown
             .store(state.shutdown_requested, Ordering::Release);
     }
@@ -410,6 +429,7 @@ impl AcpiPmBlock {
         // exact carry tears them) and common when it is loaded, because then
         // the exit handler itself can be preempted between two bytes.
         let ticks = self.timer.ticks();
+        self.sync_timer_status();
         for (i, byte) in data.iter_mut().enumerate() {
             let Ok(at) = u16::try_from(usize::from(offset) + i) else {
                 return;
@@ -436,6 +456,33 @@ impl AcpiPmBlock {
                 return;
             }
             self.write_byte(at, *byte);
+        }
+    }
+
+    /// Turns the PM timer's carries into `TMR_STS`.
+    ///
+    /// ACPI sets that status bit whenever the counter's most significant bit
+    /// changes (every 2.3 s for this 24-bit counter), and raises the SCI if
+    /// `TMR_EN` is set. Windows XP's ACPI HAL waits for the bit during
+    /// start-up, with interrupts off, polling the status register; no guest
+    /// before it looked. There is no thread behind the counter, so the bit is
+    /// brought up to date when the guest reads the block — which is every
+    /// time it could tell. A guest that enables `TMR_EN` and then waits for
+    /// the SCI without reading anything would wait for ever; none does that
+    /// either, because the interrupt only exists to be confirmed by a read.
+    fn sync_timer_status(&self) {
+        let carries = self.timer.carries();
+        let raise = {
+            let mut regs = self.regs();
+            if regs.timer_carries == carries {
+                return;
+            }
+            regs.timer_carries = carries;
+            regs.pm1a_sts |= PM1_TMR;
+            regs.pm1a_en & PM1_TMR != 0
+        };
+        if raise {
+            self.raise_sci();
         }
     }
 

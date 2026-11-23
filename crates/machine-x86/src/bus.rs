@@ -86,6 +86,67 @@ pub struct MachineBus {
     /// its interrupt ([`Self::with_keyboard`]). `None` leaves `0x60`/`0x64` as
     /// they were: reads float, and only the reset pulse is decoded.
     keyboard: Option<Arc<Mutex<crate::i8042::I8042>>>,
+    /// The BIOS behind the interrupt stubs of a `mode = "bios"` machine
+    /// (ADR-0012). `None` leaves its two ports undecoded, as they were.
+    bios: Option<Arc<Mutex<pc_bios::Bios>>>,
+    /// The IDE controller of a BIOS-era machine (ADR-0012), at the fixed
+    /// ports `0x1f0`/`0x3f6` and `0x170`/`0x376`. `None` leaves them
+    /// undecoded.
+    ide: Option<Arc<Mutex<ide::Controller>>>,
+    /// The VGA's registers on a BIOS-era machine (ADR-0012). `None` leaves
+    /// `0x3c0..0x3df` undecoded, as on every other machine.
+    vga: Option<Arc<Mutex<crate::vga::Vga>>>,
+    /// How the VGA's memory window is taken from the guest while a mode
+    /// needs the planes, on a host that can; and whether it is now.
+    vga_trap: Option<Arc<dyn vmm_core::hv::RamTrap>>,
+    vga_trapped: Arc<std::sync::atomic::AtomicBool>,
+    /// IRQ 12 for a PS/2 mouse on the keyboard controller's second port
+    /// (ADR-0012); given to the controller when both exist.
+    mouse_line: Option<Arc<dyn virtio_core::interrupt::IrqLine>>,
+}
+
+/// Traps the VGA's memory window or hands it back, if that is a change.
+fn sync_vga_window(
+    trap: Option<&Arc<dyn vmm_core::hv::RamTrap>>,
+    trapped: &std::sync::atomic::AtomicBool,
+    wanted: bool,
+) {
+    use std::sync::atomic::Ordering;
+    let Some(trap) = trap else {
+        return;
+    };
+    if trapped.load(Ordering::Acquire) == wanted {
+        return;
+    }
+    match trap.set_trapped(wanted) {
+        Ok(()) => trapped.store(wanted, Ordering::Release),
+        Err(error) => tracing::warn!(%error, wanted, "cannot switch the VGA memory window"),
+    }
+}
+
+/// The VGA, for the BIOS's mode sets ([`MachineBus::vga_bios_modes`]): the
+/// registers come from the VGA's own mode tables, and the memory window is
+/// trapped or released to match, as it is when the guest programs them.
+pub struct VgaBiosModes {
+    vga: Arc<Mutex<crate::vga::Vga>>,
+    trap: Option<Arc<dyn vmm_core::hv::RamTrap>>,
+    trapped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl pc_bios::VideoModes for VgaBiosModes {
+    fn set_mode(&mut self, mode: u8, clear: bool) -> bool {
+        let wanted = match self.vga.lock() {
+            Ok(mut vga) => vga.set_bios_mode(mode, clear).then(|| vga.wants_trap()),
+            Err(_) => None,
+        };
+        match wanted {
+            Some(wanted) => {
+                sync_vga_window(self.trap.as_ref(), &self.trapped, wanted);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -105,6 +166,12 @@ impl MachineBus {
             reset: Arc::new(ResetControl::new()),
             rtc_timer: None,
             keyboard: None,
+            bios: None,
+            ide: None,
+            vga: None,
+            vga_trap: None,
+            vga_trapped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mouse_line: None,
         }
     }
 
@@ -122,6 +189,96 @@ impl MachineBus {
         Self {
             pci: Some(Arc::new(pci)),
             ..Self::new(serial)
+        }
+    }
+
+    /// Gives the machine a BIOS (ADR-0012): the two ports its interrupt stubs
+    /// write are answered by `bios`.
+    pub fn with_bios(mut self, bios: Arc<Mutex<pc_bios::Bios>>) -> Self {
+        self.bios = Some(bios);
+        self
+    }
+
+    /// Gives the machine an IDE controller (ADR-0012), already wired to its
+    /// two interrupts.
+    pub fn with_ide(mut self, ide: ide::Controller) -> Self {
+        self.ide = Some(Arc::new(Mutex::new(ide)));
+        self
+    }
+
+    /// Gives the machine a VGA (ADR-0012). `trap` is the host's way of
+    /// taking `0xa0000..0xbffff` from the guest while a mode needs the
+    /// planes; without one the machine has text mode only.
+    pub fn with_vga(mut self, trap: Option<Arc<dyn vmm_core::hv::RamTrap>>) -> Self {
+        self.vga = Some(Arc::new(Mutex::new(crate::vga::Vga::new())));
+        self.vga_trap = trap;
+        self
+    }
+
+    /// Makes the hypervisor's mapping of the VGA window agree with what the
+    /// registers now ask for.
+    fn sync_vga_trap(&self, wanted: bool) {
+        sync_vga_window(self.vga_trap.as_ref(), &self.vga_trapped, wanted);
+    }
+
+    /// The machine's VGA as the BIOS sets modes on it (`int 10h, AH=00h`),
+    /// when the machine has one.
+    pub fn vga_bios_modes(&self) -> Option<VgaBiosModes> {
+        Some(VgaBiosModes {
+            vga: Arc::clone(self.vga.as_ref()?),
+            trap: self.vga_trap.clone(),
+            trapped: Arc::clone(&self.vga_trapped),
+        })
+    }
+
+    /// A guest access to `0xa0000..0xbffff` that exited: the window is
+    /// trapped, so it belongs to the VGA's planes.
+    fn vga_memory(&self, addr: u64) -> Option<&Arc<Mutex<crate::vga::Vga>>> {
+        (0x000a_0000..0x000c_0000)
+            .contains(&addr)
+            .then_some(self.vga.as_ref())
+            .flatten()
+    }
+
+    /// The machine's VGA, when it has one: what a presenter draws text mode
+    /// from.
+    pub fn vga(&self) -> Option<&Arc<Mutex<crate::vga::Vga>>> {
+        self.vga.as_ref()
+    }
+
+    /// The machine's BIOS, when it has one.
+    pub fn bios(&self) -> Option<&Arc<Mutex<pc_bios::Bios>>> {
+        self.bios.as_ref()
+    }
+
+    /// One BIOS port write. Before a call runs, the bytes waiting in the
+    /// keyboard controller go to the BIOS: it takes no keyboard interrupt, so this is
+    /// how `int 16h` gets its keys.
+    fn bios_write(
+        &self,
+        bios: &Mutex<pc_bios::Bios>,
+        port: u16,
+        data: &[u8],
+        paging: Option<pc_bios::Paging>,
+    ) {
+        let mut codes = [0u8; 16];
+        let mut count = 0;
+        if port == pc_bios::rom::PORT_CALL {
+            if let Some(Ok(mut keyboard)) = self.keyboard.as_ref().map(|k| k.lock()) {
+                while count < codes.len() && keyboard.io_read(crate::i8042::PORT_COMMAND) & 1 != 0 {
+                    codes[count] = keyboard.io_read(crate::i8042::PORT_DATA);
+                    count += 1;
+                }
+            }
+        }
+        match bios.lock() {
+            Ok(mut bios) => {
+                for &code in &codes[..count] {
+                    bios.scancode(code);
+                }
+                bios.io_out(port, data, paging);
+            }
+            Err(_) => tracing::error!("the BIOS lock is poisoned; dropping a BIOS call"),
         }
     }
 
@@ -149,7 +306,22 @@ impl MachineBus {
     /// Puts the 8042 keyboard controller on `0x60`/`0x64`, raising `line`
     /// (IRQ 1).
     pub fn with_keyboard(mut self, line: Arc<dyn virtio_core::interrupt::IrqLine>) -> Self {
-        self.keyboard = Some(Arc::new(Mutex::new(crate::i8042::I8042::new(line))));
+        let mut controller = crate::i8042::I8042::new(line);
+        if let Some(mouse) = &self.mouse_line {
+            controller.connect_mouse(Arc::clone(mouse));
+        }
+        self.keyboard = Some(Arc::new(Mutex::new(controller)));
+        self
+    }
+
+    /// Plugs a PS/2 mouse into the keyboard controller's second port,
+    /// raising `line` (IRQ 12). In either order with
+    /// [`Self::with_keyboard`].
+    pub fn with_mouse(mut self, line: Arc<dyn virtio_core::interrupt::IrqLine>) -> Self {
+        if let Some(Ok(mut controller)) = self.keyboard.as_ref().map(|k| k.lock()) {
+            controller.connect_mouse(Arc::clone(&line));
+        }
+        self.mouse_line = Some(line);
         self
     }
 
@@ -229,6 +401,12 @@ impl MachineBus {
     /// stops making progress.
     pub fn virtio(&self) -> &VirtioMmioBus {
         &self.virtio
+    }
+
+    /// The PCI bus, shared: for something that outlives a borrow of the
+    /// machine bus (the BIOS's VBE display).
+    pub fn pci_shared(&self) -> Option<Arc<VirtioPciBus>> {
+        self.pci.clone()
     }
 
     /// The PCI bus behind this machine, if the VM uses the pci transport.
@@ -488,6 +666,17 @@ impl MachineBus {
         if let Some(pci) = &self.pci {
             pci.reset();
         }
+        if let Some(Ok(mut vga)) = self.vga.as_ref().map(|vga| vga.lock()) {
+            vga.reset();
+        }
+        // Text mode again: the window is RAM.
+        self.sync_vga_trap(false);
+        if let Some(ide) = &self.ide {
+            match ide.lock() {
+                Ok(mut ide) => ide.reset(),
+                Err(_) => tracing::error!("the IDE lock is poisoned; the controller is not reset"),
+            }
+        }
         match self.serial.lock() {
             Ok(mut serial) => serial.reset(),
             Err(_) => tracing::error!("serial lock is poisoned; the UART is not reset"),
@@ -521,8 +710,73 @@ impl MachineBus {
     }
 }
 
+/// The debug console port a guest driver of ours writes its log to, a byte
+/// at a time, before it has any device of its own to write through (the
+/// port Bochs made the convention). A line feed ends a line.
+const DEBUG_CONSOLE_PORT: u16 = 0xe9;
+
+/// One byte of the debug console; logs the line when it ends. The text is
+/// the guest's: unprintable bytes are replaced and lines cut at 200.
+fn debug_console(byte: u8) {
+    static LINE: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+    let mut line = LINE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if byte != b'\n' {
+        line.push(if byte.is_ascii_graphic() || byte == b' ' {
+            byte
+        } else {
+            b'?'
+        });
+    }
+    if byte == b'\n' || line.len() >= 200 {
+        tracing::info!(target: "guest_driver", "{}", String::from_utf8_lossy(&line));
+        line.clear();
+    }
+}
+
 impl ExitHandler for MachineBus {
     fn io_out(&mut self, port: u16, data: &[u8]) {
+        if port == DEBUG_CONSOLE_PORT {
+            if let [byte] = data {
+                debug_console(*byte);
+            }
+            return;
+        }
+        if let Some(vga) = &self.vga {
+            if crate::vga::contains(port) {
+                let wanted = match vga.lock() {
+                    Ok(mut vga) => {
+                        // `out dx, ax` on an index port writes the data
+                        // port too.
+                        for (n, &byte) in data.iter().enumerate() {
+                            vga.write(port.wrapping_add(n as u16), byte);
+                        }
+                        Some(vga.wants_trap())
+                    }
+                    Err(_) => None,
+                };
+                if let Some(wanted) = wanted {
+                    self.sync_vga_trap(wanted);
+                }
+                return;
+            }
+        }
+        if let Some(ide) = &self.ide {
+            if ide::Controller::contains(port) {
+                match ide.lock() {
+                    Ok(mut ide) => ide.io_write(port, data),
+                    Err(_) => tracing::error!("the IDE lock is poisoned; dropping guest write"),
+                }
+                return;
+            }
+        }
+        if let Some(bios) = &self.bios {
+            if pc_bios::Bios::contains(port) {
+                self.bios_write(bios, port, data, None);
+                return;
+            }
+        }
         if let Some(keyboard) = &self.keyboard {
             if crate::i8042::I8042::contains(port) {
                 let pulse = match keyboard.lock() {
@@ -570,6 +824,12 @@ impl ExitHandler for MachineBus {
                 pci.io_write(port, data);
                 return;
             }
+            // A function with an I/O BAR (the RTL8139), wherever the guest
+            // put it.
+            if let Some((nic, offset)) = pci.nic_port(port) {
+                nic.write(offset, data);
+                return;
+            }
         }
         if let Some(platform) = &self.platform {
             if FirmwarePlatform::contains(port) {
@@ -586,7 +846,60 @@ impl ExitHandler for MachineBus {
         }
     }
 
+    /// A BIOS call needs to know how its caller translates addresses: one
+    /// made from virtual 8086 mode (Windows calling the video BIOS) names
+    /// its buffers by linear addresses under the guest's page tables.
+    fn io_out_from(&mut self, port: u16, data: &[u8], cpu: &dyn vmm_core::hv::GuestCpu) {
+        if let Some(bios) = &self.bios {
+            if port == pc_bios::rom::PORT_CALL {
+                const CR0_PG: u64 = 1 << 31;
+                const CR4_PAE: u64 = 1 << 5;
+                let paging =
+                    cpu.paging()
+                        .filter(|p| p.cr0 & CR0_PG != 0)
+                        .map(|p| pc_bios::Paging {
+                            cr3: p.cr3,
+                            pae: p.cr4 & CR4_PAE != 0,
+                        });
+                self.bios_write(bios, port, data, paging);
+                return;
+            }
+        }
+        self.io_out(port, data);
+    }
+
     fn io_in(&mut self, port: u16, data: &mut [u8]) {
+        if let Some(vga) = &self.vga {
+            if crate::vga::contains(port) {
+                match vga.lock() {
+                    Ok(mut vga) => {
+                        for (n, byte) in data.iter_mut().enumerate() {
+                            *byte = vga.read(port.wrapping_add(n as u16));
+                        }
+                    }
+                    Err(_) => data.fill(0xff),
+                }
+                return;
+            }
+        }
+        if let Some(ide) = &self.ide {
+            if ide::Controller::contains(port) {
+                match ide.lock() {
+                    Ok(mut ide) => ide.io_read(port, data),
+                    Err(_) => data.fill(0xff),
+                }
+                return;
+            }
+        }
+        if let Some(bios) = &self.bios {
+            if pc_bios::Bios::contains(port) {
+                match bios.lock() {
+                    Ok(mut bios) => bios.io_in(port, data),
+                    Err(_) => data.fill(0xff),
+                }
+                return;
+            }
+        }
         if let Some(keyboard) = &self.keyboard {
             if crate::i8042::I8042::contains(port) {
                 if let Ok(mut keyboard) = keyboard.lock() {
@@ -626,6 +939,10 @@ impl ExitHandler for MachineBus {
                 pci.io_read(port, data);
                 return;
             }
+            if let Some((nic, offset)) = pci.nic_port(port) {
+                nic.read(offset, data);
+                return;
+            }
         }
         if let Some(platform) = &self.platform {
             if FirmwarePlatform::contains(port) {
@@ -640,6 +957,14 @@ impl ExitHandler for MachineBus {
     }
 
     fn mmio_write(&mut self, addr: u64, data: &[u8]) {
+        if let Some(vga) = self.vga_memory(addr) {
+            if let Ok(mut vga) = vga.lock() {
+                for (n, &byte) in data.iter().enumerate() {
+                    vga.mem_write(addr.wrapping_add(n as u64), byte);
+                }
+            }
+            return;
+        }
         if let Some(pflash) = &self.pflash {
             match pflash.lock() {
                 Ok(mut flash) if flash.contains(addr) => {
@@ -686,6 +1011,17 @@ impl ExitHandler for MachineBus {
     }
 
     fn mmio_read(&mut self, addr: u64, data: &mut [u8]) {
+        if let Some(vga) = self.vga_memory(addr) {
+            match vga.lock() {
+                Ok(mut vga) => {
+                    for (n, byte) in data.iter_mut().enumerate() {
+                        *byte = vga.mem_read(addr.wrapping_add(n as u64));
+                    }
+                }
+                Err(_) => data.fill(0xff),
+            }
+            return;
+        }
         data.fill(0);
         if let Some(pflash) = &self.pflash {
             match pflash.lock() {
@@ -747,5 +1083,24 @@ impl ExitHandler for MachineBus {
         if let Some(irqchip) = &self.irqchip {
             irqchip.eoi(vector);
         }
+    }
+
+    /// The VGA's memory window, while a mode needs the planes.
+    fn ram_is_trapped(&self, gpa: u64) -> bool {
+        (0x000a_0000..0x000c_0000).contains(&gpa)
+            && self.vga.is_some()
+            && self.vga_trapped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The userspace 8259 pair's `INTR` line (ADR-0012); never set on a
+    /// machine that did not enable legacy interrupts.
+    fn ext_interrupt_pending(&self) -> bool {
+        self.irqchip
+            .as_ref()
+            .is_some_and(|irqchip| irqchip.ext_interrupt_pending())
+    }
+
+    fn ext_interrupt_ack(&mut self) -> Option<u8> {
+        self.irqchip.as_ref()?.ext_interrupt_ack()
     }
 }

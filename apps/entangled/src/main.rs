@@ -37,6 +37,7 @@ mod install_other;
 mod install_ubuntu;
 #[cfg(any(target_os = "linux", windows))]
 mod install_windows;
+mod install_winxp;
 #[cfg_attr(all(target_os = "macos", target_arch = "aarch64"), allow(dead_code))]
 mod paths;
 #[cfg(any(

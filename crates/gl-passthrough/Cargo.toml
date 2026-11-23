@@ -1,0 +1,19 @@
+[package]
+name = "gl-passthrough"
+description = "Runs a guest's OpenGL 1.1 command stream on the host's OpenGL (ADR-0013)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Portable: the wire format and every size check build and test anywhere. The
+# host OpenGL itself is reached through the system's own library — WGL in
+# opengl32.dll on Windows, declared by hand in `src/wgl.rs`, so nothing new
+# enters the dependency graph.
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

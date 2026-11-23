@@ -1,0 +1,17 @@
+[package]
+name = "ide"
+description = "A dual-channel IDE controller with ATA disks and ATAPI drives, PIO only (ADR-0012)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tracing.workspace = true
+# The ATAPI drive: the packet command set is the AHCI controller's.
+ahci.workspace = true
+virtio-core.workspace = true
+
+[lints]
+workspace = true

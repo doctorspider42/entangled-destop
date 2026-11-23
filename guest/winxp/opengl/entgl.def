@@ -1,0 +1,20 @@
+LIBRARY entgl.dll
+EXPORTS
+DrvCopyContext=_DrvCopyContext@12
+DrvCreateContext=_DrvCreateContext@4
+DrvCreateLayerContext=_DrvCreateLayerContext@8
+DrvDeleteContext=_DrvDeleteContext@4
+DrvDescribeLayerPlane=_DrvDescribeLayerPlane@20
+DrvDescribePixelFormat=_DrvDescribePixelFormat@16
+DrvGetLayerPaletteEntries=_DrvGetLayerPaletteEntries@20
+DrvGetProcAddress=_DrvGetProcAddress@4
+DrvRealizeLayerPalette=_DrvRealizeLayerPalette@12
+DrvReleaseContext=_DrvReleaseContext@4
+DrvSetCallbackProcs=_DrvSetCallbackProcs@8
+DrvSetContext=_DrvSetContext@12
+DrvSetLayerPaletteEntries=_DrvSetLayerPaletteEntries@20
+DrvSetPixelFormat=_DrvSetPixelFormat@8
+DrvShareLists=_DrvShareLists@8
+DrvSwapBuffers=_DrvSwapBuffers@4
+DrvSwapLayerBuffers=_DrvSwapLayerBuffers@8
+DrvValidateVersion=_DrvValidateVersion@4

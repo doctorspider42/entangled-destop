@@ -181,6 +181,50 @@ pub struct InterruptRequest {
 /// callers are vCPU threads inside an exit and the PIT's timer thread.
 pub trait InterruptDelivery: Send + Sync {
     fn request(&self, interrupt: &InterruptRequest) -> Result<(), HvError>;
+
+    /// Gets `vcpu` out of the guest (or out of its halt) so its run loop
+    /// looks at [`ExitHandler::ext_interrupt_pending`] again. For the one
+    /// interrupt source that is not a request to a local APIC: the 8259's
+    /// `INTR` line. A backend whose hypervisor owns the 8259 needs nothing
+    /// here, which is the default.
+    fn kick(&self, vcpu: u32) {
+        let _ = vcpu;
+    }
+}
+
+/// How the vCPU that took an exit translates addresses, for the one
+/// handler that has to follow a guest pointer: a BIOS called from virtual
+/// 8086 mode (`pc_bios`), whose `segment:offset` addresses are linear ones
+/// under the guest's page tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestPaging {
+    pub cr0: u64,
+    pub cr3: u64,
+    pub cr4: u64,
+}
+
+/// The vCPU behind an exit, as far as a handler may ask about it.
+pub trait GuestCpu {
+    /// The control registers that decide address translation, or `None` when
+    /// the backend cannot say.
+    fn paging(&self) -> Option<GuestPaging>;
+}
+
+/// A range of guest RAM the machine can take away from the guest and hand
+/// back.
+///
+/// While it is trapped the guest's accesses to the range leave the guest as
+/// memory-mapped I/O (`ExitHandler::mmio_read`/`mmio_write`) instead of
+/// reaching the RAM behind it; the host's own view of that RAM
+/// (`GuestMem`) is unchanged throughout. The one user is the VGA
+/// (`machine_x86::vga`): `0xa0000..0xbffff` is RAM in text mode and four
+/// planes behind write logic in the 16-colour modes.
+///
+/// A capability, not part of every backend: a host that cannot split its
+/// RAM mapping simply offers none, and the machine then has no planar modes.
+pub trait RamTrap: Send + Sync {
+    /// Traps the range, or gives it back to the guest. Idempotent.
+    fn set_trapped(&self, trapped: bool) -> Result<(), HvError>;
 }
 
 /// What a single step of guest execution produced, hypervisor-neutral.
@@ -237,9 +281,27 @@ pub enum RunOutcome {
 /// small recording handlers. Shared by both backends.
 pub trait ExitHandler: Send {
     fn io_out(&mut self, port: u16, data: &[u8]);
+
+    /// [`Self::io_out`] for a backend that can say which vCPU wrote and how
+    /// it translates addresses. The default ignores that, which is right
+    /// for every port whose handler follows no guest pointer.
+    fn io_out_from(&mut self, port: u16, data: &[u8], cpu: &dyn GuestCpu) {
+        let _ = cpu;
+        self.io_out(port, data);
+    }
     fn io_in(&mut self, port: u16, data: &mut [u8]);
     fn mmio_write(&mut self, addr: u64, data: &[u8]);
     fn mmio_read(&mut self, addr: u64, data: &mut [u8]);
+
+    /// True when `gpa` is guest RAM the machine has taken from the guest
+    /// ([`RamTrap`]): an access there belongs to [`Self::mmio_read`] /
+    /// [`Self::mmio_write`] although the host still holds the pages. A
+    /// backend that emulates an instruction's memory operands itself asks
+    /// before it touches RAM. The default is `false`: no trapped RAM.
+    fn ram_is_trapped(&self, gpa: u64) -> bool {
+        let _ = gpa;
+        false
+    }
 
     /// True once a device has asked the machine to power off — today only the
     /// ACPI PM block (`machine_x86::acpi::pm`), when the guest writes
@@ -254,6 +316,24 @@ pub trait ExitHandler: Send {
     /// the flag it reads is shared by every vCPU's handler clone.
     fn shutdown_requested(&self) -> bool {
         false
+    }
+
+    /// True while the machine's legacy interrupt controller (the 8259 pair)
+    /// holds an interrupt for the boot CPU: its `INTR` output.
+    ///
+    /// Only a host whose hypervisor has no interrupt controller of its own
+    /// asks (WHP); KVM's in-kernel 8259 delivers by itself. The default is
+    /// `false`, which is every machine that routes nothing through an 8259.
+    /// Read before every entry into the guest, so it must be one atomic load.
+    fn ext_interrupt_pending(&self) -> bool {
+        false
+    }
+
+    /// The interrupt acknowledge cycle: the boot CPU can take an external
+    /// interrupt now, so the controller names the vector and marks the line
+    /// in service. `None` when the request went away in the meantime.
+    fn ext_interrupt_ack(&mut self) -> Option<u8> {
+        None
     }
 
     /// True once a device has latched a guest **reset** request — the 0xCF9

@@ -245,6 +245,9 @@ pub struct ShmWindow {
     /// has to stay inside.
     mem_bytes: u64,
     window: Arc<SharedWindow>,
+    /// The window may also be placed in the 32-bit PCI hole
+    /// ([`Self::allow_below_4g`]).
+    below_4g: bool,
 }
 
 impl std::fmt::Debug for ShmWindow {
@@ -283,7 +286,17 @@ impl ShmWindow {
             initial_base,
             mem_bytes,
             window,
+            below_4g: false,
         })
+    }
+
+    /// Lets the window also sit in the 32-bit PCI hole, above the register
+    /// slots at its start. For the one window a 32-bit guest has to reach:
+    /// a BIOS machine's VRAM (ADR-0012), which its guest may move anywhere
+    /// in the root bridge's window below 4 GiB.
+    pub fn allow_below_4g(mut self) -> Self {
+        self.below_4g = true;
+        self
     }
 
     /// Size of the BAR that carries this window.
@@ -437,9 +450,13 @@ impl ShmWindow {
         let Some(end) = base.checked_add(self.bar_size) else {
             return false;
         };
-        base >= layout::pci_mmio64_base(self.mem_bytes)
-            && end <= layout::pci_mmio64_end(self.mem_bytes)
-            && base % vmm_core::shm::SHM_PAGE_SIZE == 0
+        let in_aperture = base >= layout::pci_mmio64_base(self.mem_bytes)
+            && end <= layout::pci_mmio64_end(self.mem_bytes);
+        // The 32-bit hole holds the register BARs in fixed slots at its
+        // start; the rest of it is free for a window that asked.
+        let low_start = layout::PCI_MMIO_BASE + layout::PCI_MMIO_SLOTS * layout::PCI_MMIO_SLOT_SIZE;
+        let in_low_hole = self.below_4g && base >= low_start && end <= layout::PCI_MMIO_END;
+        (in_aperture || in_low_hole) && base % vmm_core::shm::SHM_PAGE_SIZE == 0
     }
 
     fn unplace(&self, why: &str) {

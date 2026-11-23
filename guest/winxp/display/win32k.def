@@ -1,0 +1,10 @@
+LIBRARY win32k.sys
+EXPORTS
+EngAllocMem@12
+EngFreeMem@4
+EngCreatePalette@24
+EngDeletePalette@4
+EngCreateBitmap@24
+EngAssociateSurface@12
+EngDeleteSurface@4
+EngDeviceIoControl@28

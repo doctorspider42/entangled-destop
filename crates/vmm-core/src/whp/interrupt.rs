@@ -36,7 +36,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use windows::Win32::System::Hypervisor::{
-    WHvRequestInterrupt, WHvX64InterruptDestinationModeLogical,
+    WHvCancelRunVirtualProcessor, WHvRequestInterrupt, WHvX64InterruptDestinationModeLogical,
     WHvX64InterruptDestinationModePhysical, WHvX64InterruptTriggerModeEdge,
     WHvX64InterruptTriggerModeLevel, WHvX64InterruptTypeFixed, WHvX64InterruptTypeLowestPriority,
     WHvX64InterruptTypeNmi, WHV_INTERRUPT_CONTROL,
@@ -188,6 +188,19 @@ impl InterruptDelivery for WhpInterruptDelivery {
                 e.code().0 as u32
             ))),
         }
+    }
+
+    fn kick(&self, vcpu: u32) {
+        // SAFETY: the partition is kept alive by our `Arc`, and
+        // `WHvCancelRunVirtualProcessor` is documented as callable from any
+        // thread; a VP that is not running takes the cancellation on its
+        // next run, so the kick is never lost.
+        let cancelled = unsafe { WHvCancelRunVirtualProcessor(self.partition.handle(), vcpu, 0) };
+        if let Err(error) = cancelled {
+            tracing::warn!(vcpu, %error, "cannot kick a vCPU for an 8259 interrupt");
+        }
+        // A halted VP is not inside the run call at all: wake it too.
+        self.gate.notify();
     }
 }
 

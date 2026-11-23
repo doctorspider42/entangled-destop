@@ -48,19 +48,34 @@ pub(super) fn image_base(read: ReadGva<'_>, rip: u64) -> Option<u64> {
     None
 }
 
-/// The export directory of the PE32+ image at `base`: (count, functions,
+/// Whether the image at `base` is a 32-bit one (PE32, not PE32+): a 32-bit
+/// Windows kernel keeps 32-bit words where a 64-bit one keeps 64.
+pub(super) fn is_pe32(read: ReadGva<'_>, base: u64) -> bool {
+    let mut header = [0u8; 0x400];
+    if read(base, &mut header).is_none() {
+        return false;
+    }
+    u32_at(&header, 0x3c)
+        .and_then(|nt| u16_at(&header, nt as usize + 4 + 20))
+        .is_some_and(|magic| magic == 0x10b)
+}
+
+/// The export directory of the PE image at `base`: (count, functions,
 /// names, ordinals), as guest virtual addresses.
 fn export_tables(read: ReadGva<'_>, base: u64) -> Option<(u32, u64, u64, u64)> {
     let mut header = [0u8; 0x400];
     read(base, &mut header)?;
     let nt = u32_at(&header, 0x3c)? as usize;
-    // PE32+ optional header follows the 20-byte file header; the export data
-    // directory is its first entry, 112 bytes in.
+    // The optional header follows the 20-byte file header; the export data
+    // directory is the first entry of its table, 112 bytes in for PE32+ and
+    // 96 for PE32 (a 32-bit Windows).
     let optional = nt + 4 + 20;
-    if u16_at(&header, optional)? != 0x20b {
-        return None;
-    }
-    let export_rva = u32_at(&header, optional + 112)?;
+    let directories = match u16_at(&header, optional)? {
+        0x20b => 112,
+        0x10b => 96,
+        _ => return None,
+    };
+    let export_rva = u32_at(&header, optional + directories)?;
     if export_rva == 0 {
         return None;
     }

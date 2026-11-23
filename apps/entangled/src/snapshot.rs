@@ -32,6 +32,7 @@ pub fn shape(cfg: &VmConfig, devices: Vec<vm_snapshot::DeviceSlot>) -> MachineSh
         boot_mode: match cfg.boot.mode {
             BootMode::DirectLinux => "direct-linux".into(),
             BootMode::Uefi => "uefi".into(),
+            BootMode::Bios => "bios".into(),
         },
         devices,
     }

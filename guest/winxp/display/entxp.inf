@@ -1,0 +1,75 @@
+; The Entangled display driver for Windows XP (ADR-0013): the machine's
+; framebuffer function, PCI 1234:1111.
+
+[Version]
+Signature="$CHICAGO$"
+Provider=%Entangled%
+ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
+Class=Display
+DriverVer=11/12/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir=11
+entxp.Miniport=12
+entxp.Display=11
+
+[SourceDisksNames]
+1=%DiskId%,,,""
+
+[SourceDisksFiles]
+entxp.sys=1
+entxp.dll=1
+entgl.dll=1
+
+[Manufacturer]
+%Entangled%=Entangled.Mfg
+
+[Entangled.Mfg]
+%entxp.DeviceDesc%=entxp,PCI\VEN_1234&DEV_1111
+
+[entxp]
+CopyFiles=entxp.Miniport,entxp.Display
+
+[entxp.Miniport]
+entxp.sys
+
+[entxp.Display]
+entxp.dll
+entgl.dll
+
+[entxp.Services]
+AddService=entxp,0x00000002,entxp_Service_Inst,entxp_EventLog_Inst
+
+[entxp_Service_Inst]
+ServiceType=1
+StartType=1
+ErrorControl=0
+LoadOrderGroup=Video
+ServiceBinary=%12%\entxp.sys
+
+[entxp_EventLog_Inst]
+AddReg=entxp_EventLog_AddReg
+
+[entxp_EventLog_AddReg]
+HKR,,EventMessageFile,0x00020000,"%SystemRoot%\System32\IoLogMsg.dll;%SystemRoot%\System32\drivers\entxp.sys"
+HKR,,TypesSupported,0x00010001,7
+
+[entxp.SoftwareSettings]
+AddReg=entxp_SoftwareDeviceSettings,entxp_OpenGL
+
+; opengl32.dll asks GDI for the display driver's name and looks its OpenGL
+; driver up under that name.
+[entxp_OpenGL]
+HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\OpenGLDrivers\entxp",Dll,0x00000000,"entgl.dll"
+HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\OpenGLDrivers\entxp",DriverVersion,0x00010001,1
+HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\OpenGLDrivers\entxp",Flags,0x00010001,1
+HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\OpenGLDrivers\entxp",Version,0x00010001,2
+
+[entxp_SoftwareDeviceSettings]
+HKR,,InstalledDisplayDrivers,0x00010000,entxp
+HKR,,VgaCompatible,0x00010001,0
+
+[Strings]
+Entangled="Entangled Desktop"
+DiskId="Entangled display driver for Windows XP"
+entxp.DeviceDesc="Entangled Display Adapter"

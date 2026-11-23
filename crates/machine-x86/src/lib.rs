@@ -10,7 +10,11 @@ pub mod boot;
 pub mod bus;
 pub mod hda_function;
 pub mod i8042;
+pub mod ide_function;
 pub mod msi_cap;
+pub mod vbe;
+pub mod vga;
+pub mod vga_planes;
 
 /// The boot framebuffer (ADR-0008 §1): a PCI display with a linear
 /// framebuffer, for guests that draw where the firmware's GOP pointed.
@@ -32,6 +36,7 @@ pub mod platform;
 /// the latch `vmm_core::ExitHandler::reset_requested` reports.
 pub mod reset;
 pub mod rtc;
+pub mod rtl8139_function;
 pub mod serial;
 pub mod shm;
 pub mod state;

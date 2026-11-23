@@ -805,6 +805,37 @@ impl WhpPartition {
         Ok(Arc::new(window))
     }
 
+    /// A trap over `len` bytes of guest RAM at `gpa` (see
+    /// [`crate::hv::RamTrap`]): the range can be unmapped from the partition,
+    /// so the guest's accesses exit as memory accesses, and mapped back.
+    ///
+    /// The range must be page-aligned and inside one RAM region.
+    pub fn ram_trap(&self, gpa: u64, len: u64) -> Result<Arc<dyn crate::hv::RamTrap>, VmmError> {
+        let bad =
+            |why: &str| VmmError::GuestMemory(format!("RAM trap at {gpa:#x}+{len:#x}: {why}"));
+        if gpa % 0x1000 != 0 || len % 0x1000 != 0 || len == 0 {
+            return Err(bad("not page-aligned"));
+        }
+        let memory = self.partition.memory();
+        let region = memory
+            .find_region(vm_memory::GuestAddress(gpa))
+            .ok_or_else(|| bad("not guest RAM"))?;
+        let offset = gpa - region.start_addr().raw_value();
+        if offset.checked_add(len).is_none_or(|end| end > region.len()) {
+            return Err(bad("crosses the end of its RAM region"));
+        }
+        let host = region
+            .get_host_address(MemoryRegionAddress(offset))
+            .map_err(|e| VmmError::GuestMemory(e.to_string()))?;
+        Ok(Arc::new(WhpRamTrap {
+            partition: Arc::clone(&self.partition),
+            gpa,
+            len,
+            host: host as usize,
+            trapped: Mutex::new(false),
+        }))
+    }
+
     /// Moves the vCPUs out for running. Each vCPU is owned by exactly one
     /// thread, because WHP allows only one concurrent
     /// `WHvRunVirtualProcessor` per VP index.
@@ -821,6 +852,67 @@ impl WhpPartition {
 /// dropped by whoever holds it, not by the partition.
 struct WhpGpaMapper {
     partition: Arc<Partition>,
+}
+
+/// [`WhpPartition::ram_trap`]: a page-aligned piece of guest RAM that can be
+/// unmapped from the partition and mapped back.
+struct WhpRamTrap {
+    partition: Arc<Partition>,
+    gpa: u64,
+    len: u64,
+    /// Host address of the RAM behind the range, inside the partition's
+    /// guest memory.
+    host: usize,
+    trapped: Mutex<bool>,
+}
+
+impl crate::hv::RamTrap for WhpRamTrap {
+    fn set_trapped(&self, trapped: bool) -> Result<(), HvError> {
+        let mut state = self
+            .trapped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *state == trapped {
+            return Ok(());
+        }
+        let result = if trapped {
+            // SAFETY: the range is a piece of the guest RAM mapping this
+            // partition made at creation (checked in `ram_trap`) and is
+            // mapped now (`state` is false); the handle is kept alive by
+            // the `Arc`. WHP unmaps page ranges, not whole mappings.
+            unsafe { WHvUnmapGpaRange(self.partition.handle, self.gpa, self.len) }
+        } else {
+            let mut flags =
+                WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute;
+            if self.partition.options().track_dirty {
+                flags |= WHvMapGpaRangeFlagTrackDirtyPages;
+            }
+            // SAFETY: `host` is the address, inside the partition's guest
+            // memory, of exactly the pages this range had before it was
+            // unmapped; that memory is owned by the partition and outlives
+            // it (`Partition`'s docs), and the range is unmapped now, so it
+            // overlaps nothing.
+            unsafe {
+                WHvMapGpaRange(
+                    self.partition.handle,
+                    self.host as *const core::ffi::c_void,
+                    self.gpa,
+                    self.len,
+                    flags,
+                )
+            }
+        };
+        result.map_err(|e| {
+            HvError::Registers(format!(
+                "cannot {} guest RAM at {:#x}: {e} ({:#010x})",
+                if trapped { "trap" } else { "restore" },
+                self.gpa,
+                e.code().0 as u32
+            ))
+        })?;
+        *state = trapped;
+        Ok(())
+    }
 }
 
 impl crate::shm::GpaMapper for WhpGpaMapper {

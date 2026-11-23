@@ -1,0 +1,21 @@
+[package]
+name = "rtl8139"
+description = "A Realtek RTL8139 network card, for guests with no virtio-net driver (ADR-0012)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tracing.workspace = true
+virtio-core.workspace = true
+# The host side of the wire: the same backends virtio-net sends through.
+virtio-net.workspace = true
+vm-memory.workspace = true
+
+[dev-dependencies]
+vm-memory = { workspace = true, features = ["backend-mmap"] }
+
+[lints]
+workspace = true

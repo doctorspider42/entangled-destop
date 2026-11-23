@@ -175,6 +175,8 @@ const BAR_MEMORY_64_PREFETCH_FLAGS: u32 = 0b0100 | 0b1000;
 
 /// Bits of a memory BAR that hold the flags rather than the address.
 const BAR_FLAG_MASK: u32 = 0xf;
+/// Bit 0 of a BAR: the window is in I/O space.
+const BAR_IO_FLAG: u32 = 0x1;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PciError {
@@ -240,6 +242,8 @@ pub struct ConfigSpace {
     regs: [u32; reg::DWORDS],
     write_mask: [u32; reg::DWORDS],
     bars: [Option<MemoryBar>; 6],
+    /// The size, in ports, of each BAR that is an I/O window instead.
+    io_bars: [Option<u16>; 6],
     /// Byte offset where the next capability record goes.
     next_capability: u8,
     /// Byte offset of the most recently added record, so its `cap_next` can be
@@ -273,6 +277,7 @@ impl ConfigSpace {
             regs: [0; reg::DWORDS],
             write_mask: [0; reg::DWORDS],
             bars: [None; 6],
+            io_bars: [None; 6],
             next_capability: reg::FIRST_CAPABILITY,
             last_capability: None,
             intx_enabled: Arc::new(AtomicBool::new(true)),
@@ -353,6 +358,48 @@ impl ConfigSpace {
         // the sizing protocol.
         self.set_mask(register, address_mask);
         Ok(self)
+    }
+
+    /// Programs BAR `index` as an **I/O** window of `size` ports at `base`.
+    ///
+    /// For a function of the port-I/O era (an RTL8139's registers, which its
+    /// in-box Windows XP driver reaches through ports). `size` is a power of
+    /// two from 4 to 256 and `base` is aligned to it; bit 0 of the register
+    /// reads 1, which is what says "I/O" to the guest.
+    pub fn with_io_bar(mut self, index: u8, base: u16, size: u16) -> Result<Self, PciError> {
+        let slot = self
+            .io_bars
+            .get_mut(usize::from(index))
+            .ok_or(PciError::NoSuchBar { index })?;
+        if !(4..=256).contains(&size) || !size.is_power_of_two() {
+            return Err(PciError::BadBarSize {
+                size: u32::from(size),
+            });
+        }
+        if base % size != 0 {
+            return Err(PciError::MisalignedBar {
+                base: u32::from(base),
+                size: u32::from(size),
+            });
+        }
+        *slot = Some(size);
+        let register = reg::BAR0 + index * 4;
+        let address_mask = u32::from(!(size - 1));
+        self.set(register, (u32::from(base) & address_mask) | BAR_IO_FLAG);
+        self.set_mask(register, address_mask);
+        Ok(self)
+    }
+
+    /// The ports I/O BAR `index` currently decodes, as (base, count), or
+    /// `None` when it is not an I/O BAR, is parked at 0, or I/O decoding is
+    /// off.
+    pub fn io_bar_window(&self, index: u8) -> Option<(u16, u16)> {
+        if !self.io_enabled() {
+            return None;
+        }
+        let size = (*self.io_bars.get(usize::from(index))?)?;
+        let base = (self.get(reg::BAR0 + index * 4) & 0xfffc) as u16;
+        (base != 0).then_some((base, size))
     }
 
     /// Programs the BAR *pair* starting at `index` as a **64-bit prefetchable**
@@ -555,6 +602,24 @@ impl ConfigSpace {
             self.command() & command::INTX_DISABLE == 0,
             Ordering::Release,
         );
+        for (register, handle) in &self.mirrors {
+            handle.store(self.regs[Self::index(*register)], Ordering::Release);
+        }
+    }
+
+    /// Makes the function come out of reset decoding its BARs, as it does
+    /// on a machine whose firmware enables every device during POST and
+    /// hands the operating system a bus that is already live (ADR-0012).
+    ///
+    /// Without it a BIOS-era system sees devices its firmware "left
+    /// disabled": Windows XP then treats their BAR assignments as nobody's,
+    /// moves them, and starts a driver before it has switched memory
+    /// decoding on — the driver reads zeroes from its own registers.
+    pub fn decode_from_power_on(&mut self) {
+        let bits = u32::from(command::IO_SPACE | command::MEMORY_SPACE | command::BUS_MASTER);
+        let index = Self::index(reg::COMMAND);
+        self.power_on[index] |= bits;
+        self.regs[index] |= bits;
         for (register, handle) in &self.mirrors {
             handle.store(self.regs[Self::index(*register)], Ordering::Release);
         }
@@ -848,6 +913,16 @@ impl PciRoot {
         }
     }
 
+    /// Every device on the bus decodes its BARs from power-on: what a PC
+    /// BIOS's POST leaves behind. See [`ConfigSpace::decode_from_power_on`].
+    pub fn decode_from_power_on(&mut self) {
+        for function in &mut self.functions {
+            if function.owner.is_some() {
+                function.config.decode_from_power_on();
+            }
+        }
+    }
+
     /// The bus, for a snapshot (ADR-0006): the latched configuration address
     /// and every function's register file, host bridge included.
     pub fn save_state(&self) -> crate::state::SavedPciRoot {
@@ -1026,6 +1101,14 @@ impl PciRoot {
             .config
             .write_dword_bytes(target.register, within, data);
         let after = function.config.decode_state();
+        tracing::debug!(
+            device = target.device,
+            register = format_args!("{:#04x}", target.register),
+            within,
+            data = ?data,
+            now = format_args!("{:#010x}", function.config.read_dword(target.register)),
+            "PCI configuration write"
+        );
         ConfigWrite {
             owner,
             decode_changed: before != after,
@@ -1073,6 +1156,26 @@ impl PciRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bios_machines_devices_decode_from_power_on_and_after_a_reset() {
+        let mut space = ConfigSpace::type0(0x1234, 0x1111, 0x0300_0000, 2)
+            .with_memory_bar(0, 0xc000_8000, 0x1000)
+            .unwrap();
+        space.seal();
+        assert_eq!(space.bar_window(0), None, "disabled, as on a UEFI machine");
+        space.decode_from_power_on();
+        assert_eq!(space.bar_window(0), Some((0xc000_8000, 0x1000)));
+        assert_eq!(
+            space.command() & 0x7,
+            command::IO_SPACE | command::MEMORY_SPACE | command::BUS_MASTER
+        );
+        // The guest switches it off; a reset is a new POST.
+        space.write_dword_bytes(reg::COMMAND, 0, &0u16.to_le_bytes());
+        assert_eq!(space.bar_window(0), None);
+        space.reset();
+        assert_eq!(space.bar_window(0), Some((0xc000_8000, 0x1000)));
+    }
 
     /// A stand-in for a virtio device: one 16 KiB memory BAR in the aperture,
     /// INTA# on the first PCI GSI, and two capability records.
@@ -1370,6 +1473,36 @@ mod tests {
         assert!(!flag.load(Ordering::Acquire));
         cfg_write32(&mut root, 1, reg::COMMAND, u32::from(command::MEMORY_SPACE));
         assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn an_io_bar_sizes_as_ports_and_decodes_only_with_io_enabled() {
+        let mut space = ConfigSpace::type0(0x10ec, 0x8139, 0x0200_0000, 0x10)
+            .with_io_bar(0, 0xc000, 0x100)
+            .unwrap();
+        space.seal();
+        // Bit 0 says I/O, and the address bits are where the host put it.
+        assert_eq!(space.read_dword(reg::BAR0), 0xc001);
+        assert_eq!(
+            space.io_bar_window(0),
+            None,
+            "I/O decoding is off at power-on"
+        );
+        assert_eq!(space.bar_window(0), None, "not a memory BAR");
+        space.write_dword_bytes(reg::COMMAND, 0, &command::IO_SPACE.to_le_bytes());
+        assert_eq!(space.io_bar_window(0), Some((0xc000, 0x100)));
+        // The sizing protocol: all-ones reads back the size mask and the flag.
+        space.write_dword_bytes(reg::BAR0, 0, &u32::MAX.to_le_bytes());
+        assert_eq!(space.read_dword(reg::BAR0), 0xff01);
+        // The guest moves it.
+        space.write_dword_bytes(reg::BAR0, 0, &0xd400u32.to_le_bytes());
+        assert_eq!(space.io_bar_window(0), Some((0xd400, 0x100)));
+        assert!(ConfigSpace::type0(1, 2, 0, 0)
+            .with_io_bar(0, 0xc000, 0x300)
+            .is_err());
+        assert!(ConfigSpace::type0(1, 2, 0, 0)
+            .with_io_bar(0, 0xc080, 0x100)
+            .is_err());
     }
 
     /// `interrupt_line` is host wiring, so nothing the guest writes may change
