@@ -77,6 +77,11 @@ checkout that still has it.
   own lifetime. Present and render follow the context to its owning device.
   A queued legacy command carries the device's virtio context ID by value.
 
+- `0009-lab-wddm2-gpuva-page-tables.patch` adds the experimental GPUVA
+  callbacks, built with `ENTANGLED_WDDM2_LAB=1`, and tracks the most recently
+  retired scheduler fence on the single execution node. The default package
+  continues to advertise WDDM 1.3.
+
 ## The user-mode driver
 
 `entangled_d3d10.dll` is built from Mesa (MIT), not from virtio-win:

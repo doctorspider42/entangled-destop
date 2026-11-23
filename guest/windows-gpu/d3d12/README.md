@@ -15,8 +15,8 @@ The display miniport pins viogpu3d at `9ed3aab11fb46e55dc835ff008008623b290a6cf`
 Its `viogpu/viogpu3d/driver.cpp` sets `InitialData.Version` to
 `DXGKDDI_INTERFACE_VERSION_WDDM1_3` and installs the legacy `Render`, `Patch` and
 `SubmitCommand` callbacks. `viogpu/viogpu3d/viogpu_adapter.cpp` reports
-`DXGKDDI_WDDMv1_3` in `DXGKQAITYPE_DRIVERCAPS`. The Entangled patches keep these
-values. Microsoft's hardware D3D12 path requires WDDM 2.0 or newer. Putting an
+`DXGKDDI_WDDMv1_3` in `DXGKQAITYPE_DRIVERCAPS`. The default miniport build keeps
+these values. Microsoft's hardware D3D12 path requires WDDM 2.0 or newer. Putting an
 UMD in the fourth INF slot can change the reported DLL path while this kernel
 contract is still missing. See the [pinned miniport](https://github.com/max8rr8/kvm-guest-drivers-windows/tree/9ed3aab11fb46e55dc835ff008008623b290a6cf/viogpu/viogpu3d)
 and [Microsoft's D3D12 requirements](https://learn.microsoft.com/en-us/windows/win32/direct3d12/directx-12-getting-started).
@@ -141,6 +141,33 @@ through the copying swap chain and verified the readback. The fence probe
 still reached monitored fence creation and got `0xC000000D` on WDDM `1300`.
 Both PCI functions reported no PnP problems. The render node also completed
 the Venus ring and reply-blob exchange in `gpu-test.exe venus`.
+
+## Experimental WDDM 2.0 miniport
+
+Set `ENTANGLED_WDDM2_LAB=1` for `guest/windows-gpu/wddm/build.cmd` to build
+the experimental miniport for the disposable guest. The GPUVA description
+uses four 4 KiB tables per address walk, with 256 entries per table and a
+44-bit virtual address. VidMm allocates the tables in system memory. The
+miniport stores the root on each DXGK context and applies CPU-virtual page
+table updates, including repeated entries and bounds checks. On the single
+execution node it uses the existing command queue to retire empty virtual
+packets. Nonempty virtual DMA still needs a page-table walk and command
+execution path. The lab returns `STATUS_INVALID_PARAMETER` for those packets
+and tracks their fence in order without reporting a successful execution
+interrupt. [GpuMmu model](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpummu-model),
+[virtual DMA callback contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/nc-d3dkmddi-dxgkddi_submitcommandvirtual).
+
+The signed lab builds reached `DxgkInitialize` and `DxgkDdiStartDevice` with
+`STATUS_SUCCESS` on Windows 10. The first diagnostic build identified two
+queries to add for display capabilities and history buffer precision. After
+adding those answers, every observed miniport capability query succeeded.
+The DxgKrnl trace shows VidMm creating its system GPUVA allocator and an
+internal fence, then destroying both immediately before releasing the
+miniport. Device Manager reported Code 43. Registering the process and
+root-size callbacks still produced the same post-start removal and the
+trace did not reach the process callback. The user-mode fence probe could
+not find the failed adapter. The lab reverted to the verified `oem58.inf`
+WDDM 1.3 package for further tests.
 
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest

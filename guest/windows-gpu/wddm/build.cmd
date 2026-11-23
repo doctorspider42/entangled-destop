@@ -33,6 +33,8 @@ rem A diagnostic build: set ENTANGLED_SERIAL_TRACE to a trace level (2 errors,
 rem 3 warnings, 4 information, 5 everything) and the driver's messages go to
 rem COM1, which the VM's log carries. Never for a package anyone installs.
 if defined ENTANGLED_SERIAL_TRACE set "DEF=%DEF% /DENTANGLED_SERIAL_TRACE=%ENTANGLED_SERIAL_TRACE%"
+rem Build the experimental GPUVA path only for the D3D12 lab VM.
+if "%ENTANGLED_WDDM2_LAB%"=="1" set "DEF=%DEF% /DENTANGLED_WDDM2_LAB=1"
 set "CFLAGS=/nologo /c /kernel /W3 /O2 /Oi /GS /Gy /Gz /Zi /Zp8 /Zc:wchar_t- /GR- /FS %DEF% %INC% /Fd"%OBJ%\entangled-wddm.pdb""
 
 for %%f in (VirtIOPCICommon VirtIOPCILegacy VirtIOPCIModern VirtIORing VirtIORing-Packed) do (
@@ -43,7 +45,7 @@ for %%f in (edid viogpu_idr viogpu_pci viogpu_queue baseobj bitops) do (
   "%BIN%\cl.exe" %CFLAGS% /TP /Fo"%OBJ%\%%f.obj" "%TREE%\viogpu\common\%%f.cpp"
   if errorlevel 1 exit /b 1
 )
-for %%f in (driver viogpu_adapter viogpu_allocation viogpu_command viogpu_device viogpu_vidpn) do (
+for %%f in (driver entangled_wddm2 viogpu_adapter viogpu_allocation viogpu_command viogpu_device viogpu_vidpn) do (
   "%BIN%\cl.exe" %CFLAGS% /TP /Fo"%OBJ%\%%f.obj" "%TREE%\viogpu\viogpu3d\%%f.cpp"
   if errorlevel 1 exit /b 1
 )
