@@ -52,6 +52,8 @@ HRESULT record_venus_color_draw(VkCommandBuffer command, VenusColorImage *image,
                                const VkViewport *viewport, const VkRect2D *scissor,
                                UINT vertex_count, UINT instance_count, UINT first_vertex, UINT first_instance);
 HRESULT prepare_venus_color_copy(VkCommandBuffer command, const VenusColorImage *image, BOOL rendered);
+HRESULT upload_venus_color_image(VkCommandBuffer command, const VenusTransferBuffer *source,
+                                 VkDeviceSize offset, UINT32 row_pitch, const VenusColorImage *destination);
 HRESULT copy_venus_color_to_buffer(VkCommandBuffer command, const VenusColorImage *source,
                                   BOOL rendered, const VenusTransferBuffer *destination, VkDeviceSize offset,
                                   UINT32 row_pitch);

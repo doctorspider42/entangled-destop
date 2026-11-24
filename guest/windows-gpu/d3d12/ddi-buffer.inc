@@ -8,6 +8,7 @@ typedef enum DdiHeapKind {
 typedef struct DdiHeap {
     const VenusDevice *device;
     DdiHeapKind kind;
+    BOOL color_upload;
     union {
         VenusTransferBuffer buffer;
         VenusColorImage image;
@@ -118,7 +119,7 @@ static BOOL supported_color_image(const D3D12DDIARG_CREATERESOURCE_0003 *resourc
            resource->Width && resource->Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
            resource->Height && resource->Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
            resource->DepthOrArraySize == 1 && resource->MipLevels == 1 && resource->SampleDesc.Count == 1 &&
-           !resource->SampleDesc.Quality && (resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET) &&
+           !resource->SampleDesc.Quality && (resource->Flags & allowed) &&
            !(resource->Flags & ~allowed) && !resource->pRowMajorLayout;
 }
 
@@ -282,8 +283,10 @@ static HRESULT APIENTRY create_committed_resource(
     } else if (supported_color_image(resource) && heap->MemoryPool == D3D12DDI_MEMORY_POOL_L1 &&
                heap->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
                resource->Layout == D3D12DDI_TL_ROW_MAJOR) {
-        status = create_venus_color_image(venus, color_image_format(resource->Format), (UINT32)resource->Width,
-                                         resource->Height, &backing->image);
+        backing->color_upload = !(resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET);
+        if (!backing->color_upload || (!primary && resource->InitialResourceState == D3D12DDI_RESOURCE_STATE_COPY_DEST))
+            status = create_venus_color_image(venus, color_image_format(resource->Format), (UINT32)resource->Width,
+                                             resource->Height, &backing->image);
         if (SUCCEEDED(status)) {
             if (heap->ByteSize && heap->ByteSize < backing->image.requirements.size) {
                 destroy_venus_color_image(&backing->image);

@@ -652,6 +652,13 @@ to fence, including readback. The pilot accepts one pixel-stage CBV
 table and allocates up to 64 Vulkan sets per command pool generation.
 See `ddi40-runtime-cbv/` under the lab share.
 
+The `--upload-texture` probe uploads a nonuniform RGBA8 pattern from a
+placed buffer footprint to a committed default texture, then transitions
+the texture and copies it back for verification. Build `4.17.1.982`
+verified all 73 × 41 pixels through the system runtime at 1.248 ms
+submit-to-fence. The pilot accepts one full, single-subresource upload
+per command list. See `ddi40-runtime-texture-upload/` under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

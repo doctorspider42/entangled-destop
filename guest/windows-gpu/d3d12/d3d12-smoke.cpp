@@ -367,9 +367,20 @@ static ComPtr<ID3D12DescriptorHeap> create_rtv_heap(ID3D12Device *device)
     return heap;
 }
 
-static void color_and_verify(ID3D12Device *device, bool programmable, bool use_uniform)
+enum class ColorWork { Clear, Draw, Uniform, Upload };
+
+static std::array<uint8_t, 4> uploaded_pixel(UINT x, UINT y)
+{
+    return {static_cast<uint8_t>(x * 13 + y * 7), static_cast<uint8_t>(y * 17),
+            static_cast<uint8_t>(x ^ y), 255};
+}
+
+static void color_and_verify(ID3D12Device *device, ColorWork work)
 {
     constexpr UINT width = 73, height = 41;
+    const bool upload_texture = work == ColorWork::Upload;
+    const bool use_uniform = work == ColorWork::Uniform;
+    const bool programmable = work == ColorWork::Draw || use_uniform;
     const D3D12_HEAP_PROPERTIES video_memory = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                                 D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
     D3D12_RESOURCE_DESC desc = {};
@@ -380,15 +391,20 @@ static void color_and_verify(ID3D12Device *device, bool programmable, bool use_u
     desc.MipLevels = 1;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    desc.Flags = upload_texture ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
     ComPtr<ID3D12Resource> target;
+    const D3D12_RESOURCE_STATES write_state = upload_texture
+        ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_RENDER_TARGET;
     check(device->CreateCommittedResource(&video_memory, D3D12_HEAP_FLAG_NONE, &desc,
-                                          D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&target)),
-          "CreateCommittedResource (render target)");
-    const auto rtv_heap = create_rtv_heap(device);
-    const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
-    device->CreateRenderTargetView(target.Get(), nullptr, rtv);
+                                          write_state, nullptr, IID_PPV_ARGS(&target)), "CreateCommittedResource (color texture)");
+    ComPtr<ID3D12DescriptorHeap> rtv_heap;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
+    if (!upload_texture) {
+        rtv_heap = create_rtv_heap(device);
+        rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        device->CreateRenderTargetView(target.Get(), nullptr, rtv);
+    }
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
     UINT rows = 0;
@@ -401,7 +417,31 @@ static void color_and_verify(ID3D12Device *device, bool programmable, bool use_u
     const auto commands = begin_recording(device);
     DrawPipeline draw;
     DrawUniform uniform = {};
-    if (programmable) {
+    ComPtr<ID3D12Resource> upload;
+    D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
+    src.pResource = target.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource = readback.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = footprint;
+    const D3D12_RANGE whole = {0, static_cast<SIZE_T>(bytes)}, empty = {};
+    void *mapped = nullptr;
+    if (upload_texture) {
+        upload = buffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        check(upload->Map(0, &empty, &mapped), "Map texture upload");
+        auto *base = static_cast<uint8_t *>(mapped) + footprint.Offset;
+        for (UINT y = 0; y < height; ++y) {
+            auto *row = base + static_cast<SIZE_T>(y) * footprint.Footprint.RowPitch;
+            for (UINT x = 0; x < width; ++x) {
+                const auto color = uploaded_pixel(x, y);
+                std::memcpy(row + 4 * x, color.data(), color.size());
+            }
+        }
+        upload->Unmap(0, &whole);
+        D3D12_TEXTURE_COPY_LOCATION upload_location = dst;
+        upload_location.pResource = upload.Get();
+        commands.list->CopyTextureRegion(&src, 0, 0, 0, &upload_location, nullptr);
+    } else if (programmable) {
         draw = create_draw_pipeline(device, desc.Format, use_uniform);
         if (use_uniform)
             uniform = tint_buffer(device);
@@ -410,18 +450,10 @@ static void color_and_verify(ID3D12Device *device, bool programmable, bool use_u
         const FLOAT red[] = {1.0f, 0.0f, 0.0f, 1.0f};
         commands.list->ClearRenderTargetView(rtv, red, 0, nullptr);
     }
-    transition(commands.list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
-    src.pResource = target.Get();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.pResource = readback.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint = footprint;
+    transition(commands.list.Get(), target.Get(), write_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     commands.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     const auto elapsed = submit_and_wait(device, commands);
 
-    const D3D12_RANGE whole = {0, static_cast<SIZE_T>(bytes)}, empty = {};
-    void *mapped = nullptr;
     check(readback->Map(0, &whole, &mapped), "Map rendered image readback");
     const auto pixels = static_cast<const uint8_t *>(mapped) + footprint.Offset;
     constexpr uint8_t red[] = {255, 0, 0, 255}, green[] = {0, 255, 0, 255}, magenta[] = {255, 0, 255, 255};
@@ -429,13 +461,15 @@ static void color_and_verify(ID3D12Device *device, bool programmable, bool use_u
     for (UINT y = 0; y < height; ++y) {
         const auto row = pixels + static_cast<SIZE_T>(y) * footprint.Footprint.RowPitch;
         for (UINT x = 0; x < width; ++x) {
-            if (std::memcmp(row + 4 * x, expected, sizeof(red)) != 0)
-                check(E_FAIL, "render-target readback differs from expected RGBA pixels");
+            const auto original = uploaded_pixel(x, y);
+            if (std::memcmp(row + 4 * x, upload_texture ? original.data() : expected, sizeof(red)) != 0)
+                check(E_FAIL, "texture readback differs from expected RGBA pixels");
         }
     }
     readback->Unmap(0, &empty);
     std::wprintf(L"D3D12 %ls PASS: %ux%u verified pixels, submit-to-fence %lld us\n",
-                 use_uniform ? L"CBV DRAW" : programmable ? L"DRAW" : L"CLEAR", width, height, elapsed);
+                 upload_texture ? L"TEXTURE UPLOAD" : use_uniform ? L"CBV DRAW" : programmable ? L"DRAW" : L"CLEAR",
+                 width, height, elapsed);
 }
 
 static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
@@ -542,7 +576,7 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, DeviceLocal, Clear, Draw, Cbv, Present, Composition, Fence, RenderFence };
+    enum class Probe { Copy, DeviceLocal, Clear, Draw, Cbv, Upload, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -555,6 +589,8 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Draw;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--cbv") == 0)
             probe = Probe::Cbv;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--upload-texture") == 0)
+            probe = Probe::Upload;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--present") == 0)
             probe = Probe::Present;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--composition") == 0)
@@ -564,8 +600,8 @@ int wmain(int argc, wchar_t **argv)
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence-render-context") == 0)
             probe = Probe::RenderFence;
         else {
-            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --clear | --draw | --cbv | --present | --composition | "
-                       "--fence | --fence-render-context]\n", stderr);
+            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --clear | --draw | --cbv | --upload-texture | "
+                       "--present | --composition | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
     }
@@ -574,8 +610,14 @@ int wmain(int argc, wchar_t **argv)
         verify_wddm_fence(adapter.luid, probe == Probe::Fence);
     else {
         const auto device = create_device(adapter, hardware_control);
-        if (probe == Probe::Clear || probe == Probe::Draw || probe == Probe::Cbv)
-            color_and_verify(device.Get(), probe != Probe::Clear, probe == Probe::Cbv);
+        if (probe == Probe::Clear)
+            color_and_verify(device.Get(), ColorWork::Clear);
+        else if (probe == Probe::Draw)
+            color_and_verify(device.Get(), ColorWork::Draw);
+        else if (probe == Probe::Cbv)
+            color_and_verify(device.Get(), ColorWork::Uniform);
+        else if (probe == Probe::Upload)
+            color_and_verify(device.Get(), ColorWork::Upload);
         else if (probe == Probe::Present || probe == Probe::Composition)
             draw_and_present(device.Get(), probe == Probe::Composition);
         else

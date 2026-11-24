@@ -417,26 +417,60 @@ HRESULT prepare_venus_color_copy(VkCommandBuffer command, const VenusColorImage 
     return S_OK;
 }
 
+static BOOL color_image_buffer_region(const VenusColorImage *image, const VenusTransferBuffer *buffer,
+                                      VkDeviceSize offset, UINT32 row_pitch, VkBufferImageCopy *region)
+{
+    if (image->device != buffer->device || !row_pitch || row_pitch % 4 || offset % 4 ||
+        row_pitch / 4 < image->extent.width || offset >= buffer->size)
+        return FALSE;
+    const UINT64 span = (UINT64)(image->extent.height - 1) * row_pitch + (UINT64)image->extent.width * 4;
+    if (span > buffer->size - offset)
+        return FALSE;
+    *region = (VkBufferImageCopy){
+        .bufferOffset = offset,
+        .bufferRowLength = row_pitch / 4,
+        .imageSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1 },
+        .imageExtent = image->extent,
+    };
+    return TRUE;
+}
+
+HRESULT upload_venus_color_image(VkCommandBuffer command, const VenusTransferBuffer *source,
+                                 VkDeviceSize offset, UINT32 row_pitch, const VenusColorImage *destination)
+{
+    VkBufferImageCopy region;
+    if (!color_image_buffer_region(destination, source, offset, row_pitch, &region))
+        return E_INVALIDARG;
+    const PFN_vkCmdPipelineBarrier barrier = DEVICE_FN(source->device, vkCmdPipelineBarrier);
+    const PFN_vkCmdCopyBufferToImage copy = DEVICE_FN(source->device, vkCmdCopyBufferToImage);
+    if (!barrier || !copy)
+        return E_FAIL;
+    const VkImageMemoryBarrier target = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = destination->handle,
+        .subresourceRange = color_subresource,
+    };
+    barrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            0, NULL, 0, NULL, 1, &target);
+    copy(command, source->handle, destination->handle, target.newLayout, 1, &region);
+    return S_OK;
+}
+
 HRESULT copy_venus_color_to_buffer(VkCommandBuffer command, const VenusColorImage *source,
                                   BOOL rendered, const VenusTransferBuffer *destination, VkDeviceSize offset,
                                   UINT32 row_pitch)
 {
-    if (source->device != destination->device || !row_pitch || row_pitch % 4 || offset % 4 ||
-        row_pitch / 4 < source->extent.width || offset >= destination->size)
+    VkBufferImageCopy region;
+    if (!color_image_buffer_region(source, destination, offset, row_pitch, &region))
         return E_INVALIDARG;
-    const UINT64 span = (UINT64)(source->extent.height - 1) * row_pitch + (UINT64)source->extent.width * 4;
-    if (span > destination->size - offset)
-        return E_INVALIDARG;
-
     const PFN_vkCmdCopyImageToBuffer copy = DEVICE_FN(source->device, vkCmdCopyImageToBuffer);
     if (!copy)
         return E_FAIL;
-    const VkBufferImageCopy region = {
-        .bufferOffset = offset,
-        .bufferRowLength = row_pitch / 4,
-        .imageSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1 },
-        .imageExtent = source->extent,
-    };
     const VkImage handle = rendered ? source->render_handle : source->handle;
     copy(command, handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination->handle, 1, &region);
     return S_OK;
