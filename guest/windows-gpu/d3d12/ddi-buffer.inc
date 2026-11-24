@@ -213,7 +213,64 @@ static void APIENTRY get_debug_allocation_info(D3D12DDI_HDEVICE device, D3D12DDI
     trace_ddi("GetDebugAllocationInfo", object.Type, 0);
 }
 
+#ifdef ENTANGLED_D3D12_PROBE_RUNTIME
+static D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY private_opened_transfer_sizes(
+    D3D12DDI_HDEVICE device, const D3D12DDIARG_OPENHEAP_0003 *args)
+{
+    (void)device;
+    (void)args;
+    return (D3D12DDI_HEAP_AND_RESOURCE_SIZES){0};
+}
+
+static HRESULT APIENTRY open_transfer_heap(D3D12DDI_HDEVICE device, const D3D12DDIARG_OPENHEAP_0003 *args,
+                                          D3D12DDI_HHEAP heap, D3D12DDI_HRTRESOURCE runtime, D3D12DDI_HRESOURCE resource)
+{
+    (void)device;
+    (void)args;
+    (void)heap;
+    (void)runtime;
+    (void)resource;
+    return DXGI_ERROR_UNSUPPORTED;
+}
+
+static void APIENTRY copy_transfer_tiles(D3D12DDI_HCOMMANDLIST list, D3D12DDI_HRESOURCE resource,
+                                         const D3D12DDI_TILED_RESOURCE_COORDINATE *start,
+                                         const D3D12DDI_TILE_REGION_SIZE *region, D3D12DDI_HRESOURCE buffer,
+                                         UINT64 offset, D3D12DDI_TILE_COPY_FLAGS flags)
+{
+    (void)resource;
+    (void)start;
+    (void)region;
+    (void)buffer;
+    (void)offset;
+    (void)flags;
+    require_transfer_state(list, FALSE);
+}
+
+static void APIENTRY check_transfer_format(D3D12DDI_HDEVICE device, DXGI_FORMAT format, UINT *support)
+{
+    (void)device;
+    /* This probe accepts untyped buffers and has no texture format capabilities. */
+    *support = format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM ? D3D12DDI_FORMAT_SUPPORT_NOT_SUPPORTED : 0;
+}
+
+static void APIENTRY check_transfer_samples(D3D12DDI_HDEVICE device, DXGI_FORMAT format, UINT samples,
+                                            D3D12DDI_MULTISAMPLE_QUALITY_LEVEL_FLAGS flags, UINT *levels)
+{
+    (void)device;
+    (void)format;
+    (void)flags;
+    *levels = samples == 1 ? 1 : 0;
+}
+#endif
+
 static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
+#ifdef ENTANGLED_D3D12_PROBE_RUNTIME
+    .pfnCheckFormatSupport = check_transfer_format,
+    .pfnCheckMultisampleQualityLevels = check_transfer_samples,
+    .pfnCalcPrivateOpenedHeapAndResourceSizes = private_opened_transfer_sizes,
+    .pfnOpenHeapAndResource = open_transfer_heap,
+#endif
     .pfnCalcPrivateCommandQueueSize = private_command_queue_size,
     .pfnCreateCommandQueue = create_command_queue,
     .pfnDestroyCommandQueue = destroy_command_queue,
@@ -328,6 +385,9 @@ static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
     .pfnCloseCommandList = close_transfer_list,
     .pfnResetCommandList = reset_command_list,
     .pfnCopyBufferRegion = copy_buffer_region,
+#ifdef ENTANGLED_D3D12_PROBE_RUNTIME
+    .pfnCopyTiles = copy_transfer_tiles,
+#endif
     .pfnSetPredication = set_transfer_predication,
     .pfnIaSetTopology = set_transfer_topology,
     .pfnRsSetViewports = set_transfer_viewports,

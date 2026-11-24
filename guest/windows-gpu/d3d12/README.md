@@ -485,6 +485,18 @@ rendering or presentation timing. See
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-empty-bindings/` and
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-public-copy/`.
 
+Build `2.44.53.466` repeated the public copy with unmodified source and
+tables built by `build.cmd`. It verified all bytes at 1.781 ms submit-to-fence.
+Build `2.41.17.228` had already confirmed that the same process is declined
+when the run flag is absent. The lab uses `ENTANGLED_D3D12_PROBE_DDI=1`,
+`ENTANGLED_D3D12_PROBE_COPY=1`, `ENTANGLED_D3D12_PROBE_RUNTIME=1` and the pinned
+`ENTANGLED_D3D12_SHADER_INCLUDE` described above. Stage the signed UMD and
+converter with the lab WDDM 2.0 miniport, and set `ENTANGLED_RUNTIME_TABLES=1`
+in the test process's environment. The only admitted executable name is
+`d3d12-smoke.exe`. This build exposes the tested transfer contract, with shared
+heap opens and tiled copies explicitly declined. See
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-in-tree-tables/`.
+
 The experimental `_0040` queue and list callbacks now hold a WDDM context
 and Vulkan command pool, serialize recording on the shared pool and select
 the matching runtime table. The transfer submission callback waits for

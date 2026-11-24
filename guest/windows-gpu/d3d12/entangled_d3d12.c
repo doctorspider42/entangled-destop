@@ -4,6 +4,7 @@
 #include <dxgi.h>
 #include <stdio.h>
 #include <string.h>
+#include <wchar.h>
 #include "venus-transfer.h"
 
 typedef struct DdiAdapter {
@@ -24,6 +25,22 @@ static VenusDevice *venus_device(D3D12DDI_HDEVICE handle)
     DdiDevice *device = handle.pDrvPrivate;
     return device ? &device->venus : NULL;
 }
+
+#ifdef ENTANGLED_D3D12_PROBE_RUNTIME
+static BOOL runtime_probe_enabled(void)
+{
+    char enabled[2];
+    if (GetEnvironmentVariableA("ENTANGLED_RUNTIME_TABLES", enabled, sizeof(enabled)) != 1 || enabled[0] != '1')
+        return FALSE;
+
+    WCHAR program[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(NULL, program, _countof(program));
+    if (!length || length >= _countof(program))
+        return FALSE;
+    const WCHAR *filename = wcsrchr(program, L'\\');
+    return filename && !_wcsicmp(filename + 1, L"d3d12-smoke.exe");
+}
+#endif
 
 #ifdef ENTANGLED_D3D12_PROBE_DDI
 static void trace_ddi(const char *operation, UINT code, SIZE_T value)
@@ -179,6 +196,12 @@ static HRESULT APIENTRY get_supported_versions(D3D12DDI_HADAPTER adapter,
         return E_INVALIDARG;
 
 #ifdef ENTANGLED_D3D12_PROBE_DDI
+#ifdef ENTANGLED_D3D12_PROBE_RUNTIME
+    if (!runtime_probe_enabled()) {
+        *count = 0;
+        return S_OK;
+    }
+#endif
     const UINT32 capacity = versions ? *count : 0;
     *count = 1;
     if (versions) {
@@ -211,6 +234,10 @@ static HRESULT APIENTRY get_caps(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_GE
         return E_INVALIDARG;
 
 #ifdef ENTANGLED_D3D12_PROBE_DDI
+#ifdef ENTANGLED_D3D12_PROBE_RUNTIME
+    if (!runtime_probe_enabled())
+        return DXGI_ERROR_UNSUPPORTED;
+#endif
     trace_ddi("GetCaps", args->Type, args->DataSize);
     if (args->Type == D3D12DDICAPS_TYPE_3DPIPELINESUPPORT) {
         /* Let the lab runtime reach device initialization. Function tables still gate creation. */
@@ -325,6 +352,25 @@ static HRESULT APIENTRY fill_table(D3D12DDI_HADAPTER adapter, D3D12DDI_TABLE_TYP
         driver->command_list_table = runtime_table;
 #endif
     trace_ddi("FillDDITable index", type, index);
+#ifdef ENTANGLED_D3D12_PROBE_RUNTIME
+    if (!runtime_probe_enabled())
+        return DXGI_ERROR_UNSUPPORTED;
+    if (type == D3D12DDI_TABLE_TYPE_DEVICE_CORE && !index &&
+        table && size == sizeof(entangled_device_core_ddi)) {
+        memcpy(table, &entangled_device_core_ddi, size);
+        return S_OK;
+    }
+    if (type == D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D && index <= 1 &&
+        table && size == sizeof(entangled_transfer_list_ddi)) {
+        memcpy(table, &entangled_transfer_list_ddi, size);
+        return S_OK;
+    }
+    if (type == D3D12DDI_TABLE_TYPE_COMMAND_QUEUE_3D && !index &&
+        table && size == sizeof(entangled_transfer_queue_ddi)) {
+        memcpy(table, &entangled_transfer_queue_ddi, size);
+        return S_OK;
+    }
+#endif
     if (type == D3D12DDI_TABLE_TYPE_0020_EXTENDED_FEATURES) {
         if (!adapter.pDrvPrivate || !table || size != sizeof(extended_features) || index)
             return E_INVALIDARG;
