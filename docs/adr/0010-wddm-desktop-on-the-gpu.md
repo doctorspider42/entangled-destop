@@ -1345,6 +1345,50 @@ The benchmark patch, host capture, commands and analysis are under
 `fx-pacer`, `fx-pacer3`). Fixture states are under
 `F:/VMs/Entangled/d3d12-lab/share/animation-architecture/`.
 
+#### DWM stages during visible animation stalls
+
+The stock F239 shell ran another four cube rotations, three minimizations
+and three restores. The guest trace used `Microsoft-Windows-Dwm-Core` and
+`Microsoft-Windows-DxgKrnl` (base keywords, verbose level) with a QPC clock
+and zero reported lost events or buffers. The preceding detailed trace
+also showed one DWM draw lasting 1.32 s. The base-keyword repeat excluded
+per-visual tracing and aligned QPC to the host through the lab's UDP
+clock bridge on both ends of the run (minimum round trips of 0.586 and
+0.588 ms). The [ETW header reader](../../tests/windows/etw-display-qpc.cpp)
+uses raw timestamps to avoid the local-time conversion in the XML export.
+Build it with the Windows SDK and link `advapi32.lib`.
+
+All 143 observed full-screen virtio-gpu flushes fell within a DWM `Present`
+interval or within 4 ms of its boundaries. The longest captured restore
+split across stages as follows:
+
+| Stage | Elapsed |
+| --- | ---: |
+| DWM draw (`MILEVENT_MEDIA_UCE_RENDEREVENT`) | 1,283 ms |
+| DWM Present entry after draw exit | 50 ms |
+| DWM Present entry to virtio-gpu flush | 65 ms |
+| virtio-gpu flush to changed pixels in the host window | 8 ms |
+
+There were 77 guest vertical-blank interrupts and 78 Venus ring notifications
+from DWM during that draw, with zero scanout flushes. The longest recorded
+deferred fence response in the 1,398 ms scanout gap was 1.16 ms. Separate
+minimize samples had 1,072 ms and 1,104 ms inside the same draw stage. The
+four cube samples had longest draws of 68–141 ms. Across the 143 DWM
+Present calls, median elapsed time was 17.6 ms, with p95 of 58.7 ms and a
+maximum of 122.4 ms. Present also contributes to the budget.
+
+The draw scope includes UMD work and waits. Ring notifications can carry
+multiple Vulkan operations, and the deferred response timing covers only
+the recorded fenced commands. The evidence puts the largest stall before
+the overlay handoff, inside the guest DWM draw. A simultaneous UMD and
+Venus ring trace can separate CPU-side draw processing, shared-surface
+imports and synchronization during that draw.
+
+Raw ETLs are in `F:/VMs/Entangled/d3d12-lab/share/animation-etw/`
+(`effects-stages.etl`, `effects-lite.etl`). The joined trace,
+`effects-lite-breakdown.txt`, and the matching `fx-lite` host actions and
+pixel capture are in `F:/VMs/Entangled/d3d12-lab/physical-wheel/`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
