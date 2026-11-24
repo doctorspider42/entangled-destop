@@ -595,6 +595,16 @@ headless GPU presenter for the DWM overlay. See
 `ddi40-runtime-present-copy-scanout/guest-desktop.png` and its
 `guest-pixel-verification.log` under the lab share.
 
+The same signed driver and DirectComposition probe ran with a fresh
+headless engine built from this branch, including `6db240a`. Two
+1280 × 720 host scanout captures matched all 76,800 expected pixels
+inside the window. The trace took 2.292 ms submit-to-fence,
+6.915 ms in Present and 57.675 ms in DwmFlush. Host captures verify the
+displayed image. Their sampling interval does not measure time to
+scanout. See `ddi40-runtime-present-headless-current/scanout-2.png`
+and its `host-pixel-verification.log` under the lab share. The installed
+engine was preserved.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a
