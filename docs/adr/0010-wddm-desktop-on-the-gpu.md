@@ -1429,6 +1429,43 @@ window lifecycle and animation geometry. [Capture a window by HWND](https://lear
 The `dcomp-snap` and `dcomp-snap2` host captures and the guest's matching
 results plus `dcomp-minimized` are under the same lab directories as above.
 
+#### Wintanyl lamp trial and pipeline retirement crash
+
+A local Wintanyl F239 variant started a D3D11 window capture off the
+scene thread on focus. It kept the most recent frame in the capture pool,
+copied it to a drawing surface once at minimize, and reused that surface
+on restore. This first trial covered the Explorer's own chrome and kept
+the lamp's 24 projective strips. Windows with separate W4 decorations
+continued to use the stock lamp. The scene-thread copy, including
+composition device binding, ranged from 13 to 129 ms in the lab.
+
+The variant drew both directions with the shared raster, then Wintanyl
+exited with `0xC0000005` on the third minimize in the pixel run and on the
+fourth minimize under CDB. The latter stopped on the Zink submission
+worker. The DLL identities matched the lab build by SHA-256. Its linker
+map and the call site in the DLL place the exception under
+`submit_queue` → `reset_batch_state_internal` →
+`zink_destroy_gfx_program` → Vulkan `DestroyPipeline`. The guest
+`vulkan_virtio.dll` faulted while decrementing a reference reached
+through the pipeline handle. The available trace does not establish
+where that reference became invalid. `ZINK_DEBUG=noopt` in the test
+process, with the same candidate binary, still crashed on the fifth
+minimize. This rules out that switch as a workaround.
+
+The run under CDB also saw later shells, including the stock build, fail
+after `vkAllocateDescriptorSets` referenced a missing descriptor pool
+and the host marked their Venus rings fatal. Those host warnings started
+after the captured pipeline fault. They are a separate recovery symptom
+with unknown cause. A clean restart of the dedicated VM and its renderer
+restored the stock F239 shell on Entangled WDDM/D3D12. Keep the raster
+variant out of release builds until pipeline retirement is stable and
+the result can be benchmarked through repeated full gestures.
+
+The debugger output and minidump are in the lab's `share/animation-architecture`
+directory. `fx-snapshot2` has the host pixel log. The post-crash samples
+include a shell restart and are unsuitable for comparing animation
+cadence. The archived host trace is `run-before-lamp-reset-20261125-004127.log`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
