@@ -1204,6 +1204,84 @@ binary's SHA-256. Probes, installer logs, images and CSVs are under
 `F:/VMs/Entangled/d3d12-lab/present-latency-fix/` and
 `F:/VMs/Entangled/d3d12-lab/share/present-latency-fix/`.
 
+### Amendment, 2026-11-24: animation cadence and the presentation path
+
+In the 1920×1080, 60 Hz Windows 10 lab with the RTX 2070, Wintanyl's
+desktop cube had a 374.9 ms interval without an overlay scanout flush.
+Three-dimensional work still reached the host during that interval. A repeat
+had a 206.1 ms flush gap and a matching 204.4 ms gap in changed pixels in
+the host window. With two windows in the same viewport, Wintanyl's 24-strip
+minimize and restore effect logged 2–3 animation ticks and one return from
+`DwmFlush` across each of eight periods of 281–307 ms. After receiving a
+scanout flush, the host window usually showed changed pixels within 7–10 ms
+(the nearest preceding flush, without an end-to-end frame ID).
+
+There are two distinct handoffs in the GPU presentation path. The D3D12 UMD
+copies a window's back buffer to mapped memory and uses WDDM allocation escapes so
+the guest DWM can import its pixels. Even a scene with no new app pixels
+still requires DWM to compose and copy the desktop into a Venus overlay
+buffer, wait for that copy, then send the scanout through the render-only
+device's serialized control queue. The legacy WDDM flip still runs and
+advances Windows' presentation state. This gives us three different things
+to measure: publication of app surfaces, composition of the desktop, and
+retirement/publication of the resulting overlay. The host window's small
+share of the measured stalls makes work on its present loop a lower
+priority for this workload.
+
+The [DirectComposition cadence probe](../../tests/windows/dcomp-cadence.cpp)
+uploads one 400×384 surface once and varies only how it moves. It runs a
+single visual, 24 independently moving clipped strips of that same surface,
+and a repeat of the single visual. The default mode performs `Commit` and
+`DwmFlush` for each update. `--queued` issues commits on a 60 Hz clock with
+no per-update `DwmFlush`. In both modes the CSV reports guest QPC for the
+start, commit and completion stages, and stderr reports the adapter and
+QPC frequency. Build from an x64 MSVC prompt with the object and executable
+outputs on the scratch drive:
+
+```cmd
+cl /nologo /std:c++17 /O2 /EHsc /MT /W4 /WX tests\windows\dcomp-cadence.cpp /FoF:\scratch\dcomp-cadence.obj /FeF:\scratch\dcomp-cadence.exe d3d11.lib dcomp.lib dwmapi.lib user32.lib gdi32.lib
+```
+
+Verify changing pixels in the benchmark window as well as its timings. A
+hidden run returned from `DwmFlush` about 60 times a second while producing
+zero desktop scanouts. A visible probe and a pixel capture of the Entangled
+window are required for the cadence numbers below. [DwmFlush timing semantics](https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmflush)
+
+With Wintanyl idle in the same guest, the DXGI adapter reported
+`Entangled GPU (virtio-gpu, WDDM)`. Each phase below includes about 4.4 s
+after discarding setup. The pixel column counts changes within a fixed
+region in the captured Entangled window.
+
+| Mode | Visuals | Updates/s | Scanouts/s | Visible changes/s | Median visible gap |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Commit and wait | 1 | 32.6 | 32.6 | 32.1 | 33.34 ms |
+| Commit and wait | 24 | 33.3 | 33.3 | 33.1 | 33.34 ms |
+| Commit and wait | 1, repeat | 31.4 | 31.4 | 30.7 | 33.37 ms |
+| Commit on a 60 Hz clock | 1 | 60.0 | 57.7 | 56.4 | 16.68 ms |
+| Commit on a 60 Hz clock | 24 | 60.2 | 48.9 | 48.9 | 20.82 ms |
+| Commit on a 60 Hz clock | 1, repeat | 60.2 | 50.6 | 49.5 | 16.70 ms |
+
+`Commit` took 0.28–0.36 ms at the median across the visible phases.
+The median `DwmFlush` wait was 30–31 ms in the table. With the final binary,
+a second blocking run had 19 visible changes/s and a 50 ms median visible
+gap in all three phases. The following queued run reached 46–49 visible
+changes/s and a 21 ms median gap. These short runs show variability and a
+consistent advantage for decoupling commits from the synchronous wait.
+
+Wintanyl's scene waits for DWM to wake
+its animation ticks and can hold a pending tick up to 500 ms while waiting
+for an outstanding commit. A controlled pacing comparison in the real
+effects is needed to measure its contribution. The probe uses one static
+surface and does not exercise live thumbnail acquisition or app-to-DWM
+redirection. The 24-strip queued phase falling below 60 also leaves
+guest composition and scanout publication as separate work to measure.
+
+The raw guest timings and clock calibration are under
+`F:/VMs/Entangled/d3d12-lab/share/animation-etw/` (`dcomp4` and `dcompq`,
+then `dcompv` and `dcompqr` on the same binary).
+The correlated results, host trace and window capture are under
+`F:/VMs/Entangled/d3d12-lab/physical-wheel/`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
