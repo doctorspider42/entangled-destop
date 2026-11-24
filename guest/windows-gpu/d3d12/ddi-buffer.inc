@@ -86,6 +86,66 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_buffer_ddi = {
     .pfnQueryNodeMap = query_node_map,
 };
 
+typedef struct DdiTransferList {
+    VenusTransferList venus;
+    HRESULT status;
+} DdiTransferList;
+
+static void APIENTRY copy_buffer_region(D3D12DDI_HCOMMANDLIST list,
+                                       D3D12DDIARG_BUFFER_PLACEMENT dst, D3D12DDIARG_BUFFER_PLACEMENT src,
+                                       UINT64 size)
+{
+    DdiTransferList *transfer = list.pDrvPrivate;
+    if (FAILED(transfer->status) || !size)
+        return;
+    const DdiBufferResource *source = src.BaseAddress.UMD.hResource.pDrvPrivate;
+    const DdiBufferResource *target = dst.BaseAddress.UMD.hResource.pDrvPrivate;
+    if (!source || !target || !source->backing || !target->backing ||
+        source->backing->device != transfer->venus.device ||
+        target->backing->device != transfer->venus.device) {
+        transfer->status = E_INVALIDARG;
+        return;
+    }
+    const VkBufferCopy region = {
+        .srcOffset = src.BaseAddress.UMD.Offset,
+        .dstOffset = dst.BaseAddress.UMD.Offset,
+        .size = size,
+    };
+    transfer->status = record_venus_buffer_copy(transfer->venus.command, target->backing, source->backing, region);
+}
+
+static void APIENTRY close_transfer_list(D3D12DDI_HCOMMANDLIST list)
+{
+    DdiTransferList *transfer = list.pDrvPrivate;
+    if (SUCCEEDED(transfer->status))
+        transfer->status = close_venus_transfer_list(&transfer->venus);
+}
+
+static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
+    .pfnCloseCommandList = close_transfer_list,
+    .pfnCopyBufferRegion = copy_buffer_region,
+};
+
+static HRESULT probe_ddi_transfer_list(D3D12DDI_HDEVICE device, D3D12DDI_HRESOURCE dst, D3D12DDI_HRESOURCE src,
+                                       VkBufferCopy region)
+{
+    DdiTransferList transfer = {0};
+    HRESULT status = begin_venus_transfer_list(device.pDrvPrivate, &transfer.venus);
+    if (FAILED(status))
+        return status;
+
+    const D3D12DDI_HCOMMANDLIST list = { &transfer };
+    const D3D12DDIARG_BUFFER_PLACEMENT src_placement = { .BaseAddress.UMD = {src, region.srcOffset} };
+    const D3D12DDIARG_BUFFER_PLACEMENT dst_placement = { .BaseAddress.UMD = {dst, region.dstOffset} };
+    entangled_transfer_list_ddi.pfnCopyBufferRegion(list, dst_placement, src_placement, region.size);
+    entangled_transfer_list_ddi.pfnCloseCommandList(list);
+    status = transfer.status;
+    if (SUCCEEDED(status))
+        status = submit_venus_transfer_probe(&transfer.venus);
+    destroy_venus_transfer_list(&transfer.venus);
+    return status;
+}
+
 static HRESULT probe_d3d12_buffer_ddi(D3D12DDI_HDEVICE device)
 {
     const VkBufferCopy region = { .srcOffset = 16, .dstOffset = 32, .size = 64 * 1024 };
@@ -141,7 +201,7 @@ static HRESULT probe_d3d12_buffer_ddi(D3D12DDI_HDEVICE device)
             source[i] = (BYTE)(i * 31 + (i >> 8));
             target[i] = 0xfa;
         }
-        status = execute_venus_probe_copy(dst.backing, src.backing, region);
+        status = probe_ddi_transfer_list(device, readback_handle, upload_handle, region);
         if (SUCCEEDED(status)) {
             for (UINT64 i = 0; i < size; ++i) {
                 const BYTE expected = i >= region.dstOffset && i - region.dstOffset < region.size

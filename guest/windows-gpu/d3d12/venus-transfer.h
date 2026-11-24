@@ -18,6 +18,14 @@ HRESULT record_venus_buffer_copy(VkCommandBuffer command, const VenusTransferBuf
                                  const VenusTransferBuffer *src, VkBufferCopy region);
 
 #ifdef ENTANGLED_D3D12_PROBE_COPY
-HRESULT execute_venus_probe_copy(const VenusTransferBuffer *dst, const VenusTransferBuffer *src,
-                                 VkBufferCopy region);
+typedef struct VenusTransferList {
+    const VenusDevice *device;
+    VkCommandPool pool;
+    VkCommandBuffer command;
+} VenusTransferList;
+
+HRESULT begin_venus_transfer_list(const VenusDevice *device, VenusTransferList *list);
+HRESULT close_venus_transfer_list(const VenusTransferList *list);
+HRESULT submit_venus_transfer_probe(const VenusTransferList *list);
+void destroy_venus_transfer_list(VenusTransferList *list);
 #endif

@@ -116,23 +116,13 @@ HRESULT record_venus_buffer_copy(VkCommandBuffer command, const VenusTransferBuf
 }
 
 #ifdef ENTANGLED_D3D12_PROBE_COPY
-HRESULT execute_venus_probe_copy(const VenusTransferBuffer *dst, const VenusTransferBuffer *src,
-                                 VkBufferCopy region)
+HRESULT begin_venus_transfer_list(const VenusDevice *device, VenusTransferList *list)
 {
-    const VenusDevice *device = src->device;
+    *list = (VenusTransferList){0};
     const PFN_vkCreateCommandPool create_pool = DEVICE_FN(device, vkCreateCommandPool);
-    const PFN_vkDestroyCommandPool destroy_pool = DEVICE_FN(device, vkDestroyCommandPool);
     const PFN_vkAllocateCommandBuffers allocate = DEVICE_FN(device, vkAllocateCommandBuffers);
     const PFN_vkBeginCommandBuffer begin = DEVICE_FN(device, vkBeginCommandBuffer);
-    const PFN_vkEndCommandBuffer end = DEVICE_FN(device, vkEndCommandBuffer);
-    const PFN_vkCmdPipelineBarrier barrier = DEVICE_FN(device, vkCmdPipelineBarrier);
-    const PFN_vkCreateFence create_fence = DEVICE_FN(device, vkCreateFence);
-    const PFN_vkDestroyFence destroy_fence = DEVICE_FN(device, vkDestroyFence);
-    const PFN_vkQueueSubmit submit = DEVICE_FN(device, vkQueueSubmit);
-    const PFN_vkWaitForFences wait = DEVICE_FN(device, vkWaitForFences);
-    const PFN_vkQueueWaitIdle idle = DEVICE_FN(device, vkQueueWaitIdle);
-    if (!create_pool || !destroy_pool || !allocate || !begin || !end || !barrier ||
-        !create_fence || !destroy_fence || !submit || !wait || !idle)
+    if (!create_pool || !DEVICE_FN(device, vkDestroyCommandPool) || !allocate || !begin)
         return E_FAIL;
 
     const VkCommandPoolCreateInfo pool_info = {
@@ -144,6 +134,8 @@ HRESULT execute_venus_probe_copy(const VenusTransferBuffer *dst, const VenusTran
     VkResult result = create_pool(device->handle, &pool_info, NULL, &pool);
     if (result != VK_SUCCESS)
         return venus_hresult(result);
+    list->device = device;
+    list->pool = pool;
 
     const VkCommandBufferAllocateInfo command_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -159,39 +151,49 @@ HRESULT execute_venus_probe_copy(const VenusTransferBuffer *dst, const VenusTran
     result = allocate(device->handle, &command_info, &command);
     if (result == VK_SUCCESS)
         result = begin(command, &begin_info);
-    HRESULT status = venus_hresult(result);
-    if (FAILED(status))
-        goto release_pool;
+    if (result == VK_SUCCESS)
+        list->command = command;
+    else
+        destroy_venus_transfer_list(list);
+    return venus_hresult(result);
+}
 
-    status = record_venus_buffer_copy(command, dst, src, region);
-    if (FAILED(status))
-        goto release_pool;
-
-    const VkBufferMemoryBarrier readback = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+HRESULT close_venus_transfer_list(const VenusTransferList *list)
+{
+    const VenusDevice *device = list->device;
+    const PFN_vkEndCommandBuffer end = DEVICE_FN(device, vkEndCommandBuffer);
+    const PFN_vkCmdPipelineBarrier barrier = DEVICE_FN(device, vkCmdPipelineBarrier);
+    if (!end || !barrier)
+        return E_FAIL;
+    const VkMemoryBarrier readback = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = dst->handle,
-        .offset = region.dstOffset,
-        .size = region.size,
     };
-    barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
-            0, NULL, 1, &readback, 0, NULL);
-    status = venus_hresult(end(command));
-    if (FAILED(status))
-        goto release_pool;
+    barrier(list->command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+            1, &readback, 0, NULL, 0, NULL);
+    return venus_hresult(end(list->command));
+}
 
+HRESULT submit_venus_transfer_probe(const VenusTransferList *list)
+{
+    const VenusDevice *device = list->device;
+    const PFN_vkCreateFence create_fence = DEVICE_FN(device, vkCreateFence);
+    const PFN_vkDestroyFence destroy_fence = DEVICE_FN(device, vkDestroyFence);
+    const PFN_vkQueueSubmit submit = DEVICE_FN(device, vkQueueSubmit);
+    const PFN_vkWaitForFences wait = DEVICE_FN(device, vkWaitForFences);
+    const PFN_vkQueueWaitIdle idle = DEVICE_FN(device, vkQueueWaitIdle);
+    if (!create_fence || !destroy_fence || !submit || !wait || !idle)
+        return E_FAIL;
     const VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     VkFence fence;
-    status = venus_hresult(create_fence(device->handle, &fence_info, NULL, &fence));
-    if (FAILED(status))
-        goto release_pool;
+    VkResult result = create_fence(device->handle, &fence_info, NULL, &fence);
+    if (result != VK_SUCCESS)
+        return venus_hresult(result);
     const VkSubmitInfo submission = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
-        .pCommandBuffers = &command,
+        .pCommandBuffers = &list->command,
     };
     /* The probe runs before CreateDevice gives the queue to any other caller. */
     result = submit(device->graphics_queue, 1, &submission, fence);
@@ -205,11 +207,15 @@ HRESULT execute_venus_probe_copy(const VenusTransferBuffer *dst, const VenusTran
             } while (drained != VK_SUCCESS && drained != VK_ERROR_DEVICE_LOST);
         }
     }
-    status = venus_hresult(result);
     destroy_fence(device->handle, fence, NULL);
+    return venus_hresult(result);
+}
 
-release_pool:
-    destroy_pool(device->handle, pool, NULL);
-    return status;
+void destroy_venus_transfer_list(VenusTransferList *list)
+{
+    const VenusDevice *device = list->device;
+    if (device)
+        DEVICE_FN(device, vkDestroyCommandPool)(device->handle, list->pool, NULL);
+    *list = (VenusTransferList){0};
 }
 #endif

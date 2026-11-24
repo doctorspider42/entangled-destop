@@ -314,6 +314,22 @@ now provides the provisional layout payload without optional swizzles or
 row-major textures. The trace and the subsequent rollback stall are in
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-node-map/`.
 
+The recovery boot used the framebuffer profile of the same isolated lab
+disk, removed diagnostic package `oem12.inf`, and verified that
+`oem58.inf` was available. It also removed the twelve temporary lab
+certificates from the guest trust stores. The recovery guest shut down
+cleanly.
+
+Build `0.58.49.775` used the typed command-list
+`pfnCopyBufferRegion` and `pfnCloseCommandList` callbacks in the
+`CreateDevice` diagnostic. They recorded the Vulkan copy and its
+host-read dependency. The queue fence and byte verification passed on the
+RTX 2070. The scratch runtime initialization accepted the texture-layout
+payload and next validated `D3D12DDI_MEMORY_ARCHITECTURE_CAPS`. ETW reports
+that the lab's discrete adapter requires `IOCoherent`. The trace and
+clean rollback are in
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-layout/`.
+
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest
 fence. For presentation, separately measure GPU work, `Present` and the time
