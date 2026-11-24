@@ -893,6 +893,65 @@ The WARP median was 5.9 times the hardware median. The 60 Hz hardware
 run measured a lower median of 54.77 ms. Both capture series include time
 after the UMD handoff. See `ddi40-runtime-wintanyl-refresh239/` under the lab share.
 
+### F239 from host scroll to pixels in the Entangled window
+
+The windowed lab ran the unchanged F239 executable with the 80-file list
+on the RTX 2070 through Venus, using the test-signed lab package installed
+as `oem13.inf`. The Windows 10 guest desktop was 1920×1080 at 60 Hz and
+the host monitor was at 239 Hz. The Windows host window used Mailbox
+presentation. The host probe marked QPC immediately before
+posting one `WM_MOUSEWHEEL` notch to Entangled's HWND. Windows Graphics
+Capture (WGC) captured that window on the host. Each notch was matched
+to the first frame whose file-name pixels matched the settled scroll
+state. The probe inspected file-name luminance to reject cursor and
+hover-only changes. A guest low-level mouse hook marked input receipt.
+The UMD's timing-only messages recorded render retirement and completion
+of its WDDM pixel handoff. A guest screen-region GDI read provided an
+independent observation of the list. UDP exchanges before and after the
+samples aligned the host and guest QPC clocks.
+
+| Host trace setting | Samples | Input to WGC frame timestamp, median (range) | Input to WGC pixel readback, median (range) |
+| --- | ---: | ---: | ---: |
+| Default host log, guest UMD timing enabled | 23 | 74.48 ms (55.58–114.86 ms) | 77.64 ms (60.08–122.09 ms) |
+| Host scanout trace, guest UMD timing enabled | 24 | 62.99 ms (42.76–142.52 ms) | 69.03 ms (46.14–152.34 ms) |
+
+The first run also captured a 671.80 ms pixel-readback outlier with
+252.02 ms between the host post and the guest input hook, along with a
+change in the captured list geometry. All 24 observations including that
+outlier give a 77.84 ms readback median. Both runs keep the UMD timing
+probe enabled. Differences between these runs combine instrumentation,
+window geometry and normal variation.
+
+In the second run, correlate the UMD handoff and the WGC pixel readback
+with the host trace emitted after each full-size 3D `RESOURCE_FLUSH`
+hands off its scanout. Nineteen of the 24 samples had exactly one
+eligible 1920×1080 flush between those endpoints. The other five had
+two eligible flushes and remain in the end-to-end numbers above.
+The 19 matched samples give the following split:
+
+| Interval | Median | Range |
+| --- | ---: | ---: |
+| Posted host scroll to D3D12 UMD handoff into WDDM | 23.20 ms | 10.45–29.35 ms |
+| WDDM handoff to 3D scanout flush on the host, including guest DWM and transport | 23.52 ms | 19.51–66.45 ms |
+| Host scanout flush to WGC frame timestamp | 8.44 ms | 6.05–14.59 ms |
+| Host scanout flush to WGC pixel readback | 14.10 ms | 3.97–23.73 ms |
+| Posted host scroll to WGC pixel readback | 61.52 ms | 46.14–107.36 ms |
+
+Render submission to Venus retirement took 13.15 ms at the median in
+the matched subset and includes the queue and its wait. The
+handoff-to-flush interval includes DWM scheduling and composition,
+the guest display driver's export and transport to Entangled. The
+host-side capture reaches the Windows window compositor and includes
+capture latency. A physical panel measurement would require an optical
+probe. The guest's GDI observation sometimes lagged the host's captured
+pixels, so it is a cross-check rather than the boundary between the
+guest and host. The minimum UDP synchronization envelopes in this run
+were 0.53 ms before and 0.57 ms after the samples.
+
+See [the paired samples](f239-host-scroll.csv) and the raw data and
+probes under `F:/VMs/Entangled/d3d12-lab/host-scroll-latency/` and
+`F:/VMs/Entangled/d3d12-lab/share/host-scroll-latency/`.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

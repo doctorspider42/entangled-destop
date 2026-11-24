@@ -200,8 +200,9 @@ impl AshVulkan {
         Ok(Self {
             entry,
             #[cfg(windows)]
-            wddm_clock: (std::env::var_os("ENTANGLED_WDDM2_GPU_CLOCK").as_deref() == Some("1".as_ref()))
-                .then(wddm_clock::ClockRegistry::default),
+            wddm_clock: (std::env::var_os("ENTANGLED_WDDM2_GPU_CLOCK").as_deref()
+                == Some("1".as_ref()))
+            .then(wddm_clock::ClockRegistry::default),
         })
     }
 
@@ -759,7 +760,8 @@ impl HostVulkan for AshVulkan {
         let (name_ptrs, clock) = {
             let clock = self.wddm_clock.as_ref().and_then(|registry| {
                 let family = request.queues.first()?.family;
-                let capability = wddm_clock::ClockCapability::query(&self.entry, instance, device, family)?;
+                let capability =
+                    wddm_clock::ClockCapability::query(&self.entry, instance, device, family)?;
                 Some((registry, capability))
             });
             let mut name_ptrs = name_ptrs;
