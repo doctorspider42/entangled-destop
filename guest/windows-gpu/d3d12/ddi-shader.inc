@@ -31,14 +31,15 @@ typedef struct DdiShader {
 } DdiShader;
 
 typedef enum DxbcStage {
+    DXBC_PIXEL = D3D10_SB_PIXEL_SHADER,
     DXBC_VERTEX = D3D10_SB_VERTEX_SHADER,
     DXBC_COMPUTE = 5, /* Token value added for Shader Model 5. */
 } DxbcStage;
 
-static const char *vertex_semantic(D3D10_SB_NAME value)
+static const char *shader_semantic(DxbcStage stage, BOOL input, D3D10_SB_NAME value)
 {
     switch (value) {
-    case D3D10_SB_NAME_UNDEFINED: return "TEXCOORD";
+    case D3D10_SB_NAME_UNDEFINED: return stage == DXBC_PIXEL && !input ? "SV_Target" : "TEXCOORD";
     case D3D10_SB_NAME_POSITION: return "SV_Position";
     case D3D10_SB_NAME_VERTEX_ID: return "SV_VertexID";
     case D3D10_SB_NAME_INSTANCE_ID: return "SV_InstanceID";
@@ -46,13 +47,13 @@ static const char *vertex_semantic(D3D10_SB_NAME value)
     }
 }
 
-static BOOL can_write_signature(const D3D12DDIARG_SIGNATURE_ENTRY_0012 *entries, UINT count)
+static BOOL can_write_signature(const D3D12DDIARG_SIGNATURE_ENTRY_0012 *entries, UINT count, DxbcStage stage, BOOL input)
 {
     if (count > 128 || (count && !entries))
         return FALSE;
     for (UINT i = 0; i < count; ++i) {
         if (entries[i].Stream || entries[i].MinPrecision || entries[i].Mask > 0xf ||
-            !vertex_semantic(entries[i].SystemValue))
+            !shader_semantic(stage, input, entries[i].SystemValue))
             return FALSE;
     }
     return TRUE;
@@ -64,7 +65,7 @@ static UINT32 signature_chunk_size(UINT count)
 }
 
 static void write_signature(BYTE *data, const char tag[4], const D3D12DDIARG_SIGNATURE_ENTRY_0012 *entries,
-                             UINT count, BOOL input)
+                            UINT count, DxbcStage stage, BOOL input)
 {
     DxbcChunkHeader *chunk = (void *)data;
     memcpy(chunk->tag, tag, sizeof(chunk->tag));
@@ -76,7 +77,7 @@ static void write_signature(BYTE *data, const char tag[4], const D3D12DDIARG_SIG
     char *names = (void *)(params + count);
     for (UINT i = 0; i < count; ++i) {
         const D3D12DDIARG_SIGNATURE_ENTRY_0012 *entry = &entries[i];
-        const char *semantic = vertex_semantic(entry->SystemValue);
+        const char *semantic = shader_semantic(stage, input, entry->SystemValue);
         params[i] = (DxbcSignatureEntry){
             .name_offset = (UINT32)(names - (char *)header),
             .semantic_index = entry->SystemValue == D3D10_SB_NAME_UNDEFINED ? entry->Register : 0,
@@ -102,8 +103,8 @@ static HRESULT make_legacy_dxbc(const D3D12DDIARG_CREATE_SHADER_0026 *args, Dxbc
     const D3D12DDIARG_STAGE_IO_SIGNATURES empty = {0};
     const D3D12DDIARG_STAGE_IO_SIGNATURES *io = stage == DXBC_COMPUTE ? &empty : args->IOSignatures.Standard;
     if (!io || words < 2 || words > 4 * 1024 * 1024 || args->Flags ||
-        !can_write_signature(io->pInputSignature, io->NumInputSignatureEntries) ||
-        !can_write_signature(io->pOutputSignature, io->NumOutputSignatureEntries))
+        !can_write_signature(io->pInputSignature, io->NumInputSignatureEntries, stage, TRUE) ||
+        !can_write_signature(io->pOutputSignature, io->NumOutputSignatureEntries, stage, FALSE))
         return DXGI_ERROR_UNSUPPORTED;
 
     const UINT32 input = sizeof(DxbcHeader);
@@ -123,8 +124,8 @@ static HRESULT make_legacy_dxbc(const D3D12DDIARG_CREATE_SHADER_0026 *args, Dxbc
         .chunk_offsets = {input, output_sig, code_chunk},
     };
     BYTE *bytes = (void *)blob;
-    write_signature(bytes + input, "ISGN", io->pInputSignature, io->NumInputSignatureEntries, TRUE);
-    write_signature(bytes + output_sig, "OSGN", io->pOutputSignature, io->NumOutputSignatureEntries, FALSE);
+    write_signature(bytes + input, "ISGN", io->pInputSignature, io->NumInputSignatureEntries, stage, TRUE);
+    write_signature(bytes + output_sig, "OSGN", io->pOutputSignature, io->NumOutputSignatureEntries, stage, FALSE);
     DxbcChunkHeader *chunk = (void *)(bytes + code_chunk);
     memcpy(chunk->tag, major == 4 ? "SHDR" : "SHEX", sizeof(chunk->tag));
     chunk->size = code_bytes;
@@ -239,8 +240,10 @@ static HRESULT create_legacy_shader(D3D12DDI_HDEVICE device, const D3D12DDIARG_C
         HeapFree(GetProcessHeap(), 0, blob);
     }
     if (SUCCEEDED(status))
-        shader->stage = stage == DXBC_COMPUTE ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_VERTEX_BIT;
-    trace_ddi(stage == DXBC_COMPUTE ? "CreateComputeShader" : "CreateVertexShader",
+        shader->stage = stage == DXBC_COMPUTE ? VK_SHADER_STAGE_COMPUTE_BIT :
+            stage == DXBC_PIXEL ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+    trace_ddi(stage == DXBC_COMPUTE ? "CreateComputeShader" :
+              stage == DXBC_PIXEL ? "CreatePixelShader" : "CreateVertexShader",
               (UINT)status, shader->module != VK_NULL_HANDLE);
     return status;
 }
@@ -249,6 +252,12 @@ static HRESULT APIENTRY create_vertex_shader(D3D12DDI_HDEVICE device, const D3D1
                                                D3D12DDI_HSHADER handle)
 {
     return create_legacy_shader(device, args, handle, DXBC_VERTEX);
+}
+
+static HRESULT APIENTRY create_pixel_shader(D3D12DDI_HDEVICE device, const D3D12DDIARG_CREATE_SHADER_0026 *args,
+                                            D3D12DDI_HSHADER handle)
+{
+    return create_legacy_shader(device, args, handle, DXBC_PIXEL);
 }
 
 static HRESULT APIENTRY create_compute_shader(D3D12DDI_HDEVICE device, const D3D12DDIARG_CREATE_SHADER_0026 *args,

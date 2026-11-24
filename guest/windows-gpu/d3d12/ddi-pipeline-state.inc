@@ -36,6 +36,8 @@ typedef struct DdiPipeline {
     VkPipeline pipeline;
     VkPipelineBindPoint bind_point;
     VkRenderPass render_pass;
+    VkFormat color_format;
+    VkPipelineLayout layout;
 } DdiPipeline;
 
 static SIZE_T APIENTRY private_pipeline_size(D3D12DDI_HDEVICE device,
@@ -85,6 +87,89 @@ static HRESULT create_compute_pipeline(const VenusDevice *venus, const D3D12DDIA
     return status;
 }
 
+static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG_CREATE_PIPELINE_STATE_0033 *args,
+                                     const DdiShader *vertex, const DdiRootSignature *root, DdiPipeline *state)
+{
+    const DdiShader *pixel = args->hPixelShader.pDrvPrivate;
+    const D3D12DDI_BLEND_DESC_0010 *blend = args->hBlendState.pDrvPrivate;
+    const D3D12DDI_RASTERIZER_DESC_0010 *raster = args->hRasterizerState.pDrvPrivate;
+    const D3D12DDI_DEPTH_STENCIL_DESC_0025 *depth = args->hDepthStencilState.pDrvPrivate;
+    const VkFormat format = color_image_format(args->RTVFormats[0]);
+    if (!venus->dynamic_rendering || !vertex || !vertex->module || vertex->stage != VK_SHADER_STAGE_VERTEX_BIT ||
+        !pixel || !pixel->module || pixel->stage != VK_SHADER_STAGE_FRAGMENT_BIT || !root || !root->empty_layout ||
+        args->hDomainShader.pDrvPrivate || args->hHullShader.pDrvPrivate || args->hGeometryShader.pDrvPrivate ||
+        args->hElementLayout.pDrvPrivate || args->NumRenderTargets != 1 || format == VK_FORMAT_UNDEFINED ||
+        args->DSVFormat != DXGI_FORMAT_UNKNOWN || args->SampleDesc.Count != 1 || args->SampleDesc.Quality ||
+        args->ViewInstancingDesc.ViewInstanceCount || args->NodeMask > 1 ||
+        args->PrimitiveTopologyType != D3D12DDI_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)
+        return DXGI_ERROR_UNSUPPORTED;
+    if (!blend || blend->AlphaToCoverageEnable || blend->RenderTarget[0].BlendEnable ||
+        blend->RenderTarget[0].LogicOpEnable || !raster || raster->FillMode != D3D12DDI_FILL_MODE_SOLID ||
+        raster->CullMode != D3D12DDI_CULL_MODE_NONE || !raster->DepthClipEnable || raster->DepthBias ||
+        raster->SlopeScaledDepthBias || raster->ForcedSampleCount || (depth && (depth->DepthEnable || depth->StencilEnable)))
+        return DXGI_ERROR_UNSUPPORTED;
+
+    const PFN_vkCreateGraphicsPipelines create = (PFN_vkCreateGraphicsPipelines)
+        venus->proc_addr(venus->handle, "vkCreateGraphicsPipelines");
+    const PFN_vkDestroyPipeline destroy = (PFN_vkDestroyPipeline)venus->proc_addr(venus->handle, "vkDestroyPipeline");
+    if (!create || !destroy)
+        return E_FAIL;
+
+    const VkPipelineShaderStageCreateInfo shaders[] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+          .module = vertex->module, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+          .module = pixel->module, .pName = "main" },
+    };
+    const VkPipelineVertexInputStateCreateInfo vertices = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    const VkPipelineInputAssemblyStateCreateInfo assembly = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+    };
+    const VkPipelineViewportStateCreateInfo viewport = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1,
+    };
+    const VkPipelineRasterizationStateCreateInfo rasterization = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f,
+        .frontFace = raster->FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE,
+    };
+    const VkSampleMask sample_mask = args->SampleMask;
+    const VkPipelineMultisampleStateCreateInfo samples = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+        .pSampleMask = &sample_mask,
+    };
+    const VkPipelineColorBlendAttachmentState attachment = { .colorWriteMask = blend->RenderTarget[0].RenderTargetWriteMask };
+    const VkPipelineColorBlendStateCreateInfo blending = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &attachment,
+    };
+    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    const VkPipelineDynamicStateCreateInfo dynamic = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = _countof(dynamic_states),
+        .pDynamicStates = dynamic_states,
+    };
+    const VkPipelineRenderingCreateInfo rendering = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1, .pColorAttachmentFormats = &format,
+    };
+    const VkGraphicsPipelineCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rendering,
+        .stageCount = _countof(shaders), .pStages = shaders, .pVertexInputState = &vertices,
+        .pInputAssemblyState = &assembly, .pViewportState = &viewport, .pRasterizationState = &rasterization,
+        .pMultisampleState = &samples, .pColorBlendState = &blending, .pDynamicState = &dynamic,
+        .layout = root->empty_layout, .basePipelineIndex = -1,
+    };
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult result = create(venus->handle, VK_NULL_HANDLE, 1, &info, NULL, &pipeline);
+    if (result == VK_SUCCESS) {
+        *state = (DdiPipeline){ .device = venus, .pipeline = pipeline, .bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS,
+            .color_format = format, .layout = root->empty_layout };
+    } else if (pipeline) {
+        destroy(venus->handle, pipeline, NULL);
+    }
+    const HRESULT status = venus_hresult(result);
+    trace_ddi("CreateColorPipeline", (UINT)status, format);
+    return status;
+}
+
 static HRESULT APIENTRY create_pipeline(D3D12DDI_HDEVICE device,
                                          const D3D12DDIARG_CREATE_PIPELINE_STATE_0033 *args,
                                          D3D12DDI_HPIPELINESTATE handle, D3D12DDI_HRTPIPELINESTATE runtime)
@@ -99,6 +184,8 @@ static HRESULT APIENTRY create_pipeline(D3D12DDI_HDEVICE device,
         return create_compute_pipeline(venus, args, state);
     const DdiShader *vertex = args->hVertexShader.pDrvPrivate;
     const DdiRootSignature *root = args->hRootSignature.pDrvPrivate;
+    if (args->NumRenderTargets)
+        return create_color_pipeline(venus, args, vertex, root, state);
     /* Windows builds a point pipeline with no attachment or sample state. */
     if (!vertex || !vertex->module || vertex->stage != VK_SHADER_STAGE_VERTEX_BIT ||
         !root || !root->empty_layout || args->hPixelShader.pDrvPrivate ||

@@ -20,6 +20,19 @@ typedef struct DdiCommandQueue {
     HANDLE context;
 } DdiCommandQueue;
 
+typedef struct DdiDrawState {
+    D3D12DDI_PRIMITIVE_TOPOLOGY topology;
+    BOOL has_viewport;
+    BOOL has_scissor;
+    VkViewport viewport;
+    VkRect2D scissor;
+    VenusColorImage *target;
+    VkPipelineLayout root_layout;
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    const DdiPipeline *pipeline;
+#endif
+} DdiDrawState;
+
 typedef struct DdiTransferList {
     VenusTransferList venus;
     HRESULT status;
@@ -28,8 +41,10 @@ typedef struct DdiTransferList {
     DdiCommandPool *pool;
     UINT64 generation;
     BOOL closed;
-    const VenusColorImage *cleared_color;
+    const VenusColorImage *written_color;
     BOOL color_copy_source;
+    BOOL color_rendered;
+    DdiDrawState draw;
 } DdiTransferList;
 
 static void set_command_list_status(DdiTransferList *list, HRESULT status)
@@ -39,21 +54,35 @@ static void set_command_list_status(DdiTransferList *list, HRESULT status)
         list->device->callbacks->pfnSetCommandListErrorCb(list->runtime, status);
 }
 
-static void require_transfer_state(D3D12DDI_HCOMMANDLIST handle, BOOL supported)
+static DdiTransferList *recording_command_list(D3D12DDI_HCOMMANDLIST handle)
 {
     DdiTransferList *list = handle.pDrvPrivate;
     if (!list || FAILED(list->status))
-        return;
-    if (!list->pool || list->closed)
+        return NULL;
+    if (!list->pool || list->closed) {
         set_command_list_status(list, E_INVALIDARG);
-    else if (!supported)
+        return NULL;
+    }
+    return list;
+}
+
+static void require_transfer_state(D3D12DDI_HCOMMANDLIST handle, BOOL supported)
+{
+    DdiTransferList *list = recording_command_list(handle);
+    if (list && !supported)
         set_command_list_status(list, DXGI_ERROR_UNSUPPORTED);
 }
 
 static void APIENTRY set_transfer_topology(D3D12DDI_HCOMMANDLIST list, D3D12DDI_PRIMITIVE_TOPOLOGY topology)
 {
-    /* A copy list has no vertex processing. The runtime clears IA state at reset. */
-    require_transfer_state(list, topology == D3D12DDI_PRIMITIVE_TOPOLOGY_UNDEFINED);
+    DdiTransferList *commands = recording_command_list(list);
+    if (!commands)
+        return;
+    if (topology != D3D12DDI_PRIMITIVE_TOPOLOGY_UNDEFINED && topology != D3D12DDI_PRIMITIVE_TOPOLOGY_TRIANGLELIST) {
+        set_command_list_status(commands, DXGI_ERROR_UNSUPPORTED);
+        return;
+    }
+    commands->draw.topology = topology;
 }
 
 static void APIENTRY set_transfer_descriptor_heaps(D3D12DDI_HCOMMANDLIST list, UINT count,
@@ -102,25 +131,53 @@ static void APIENTRY set_transfer_stream_output(D3D12DDI_HCOMMANDLIST list, UINT
     require_transfer_state(list, TRUE);
 }
 
-static void APIENTRY set_transfer_attachments(D3D12DDI_HCOMMANDLIST list, UINT count,
-                                              const D3D12DDI_CPU_DESCRIPTOR_HANDLE *targets, BOOL contiguous,
-                                              const D3D12DDI_CPU_DESCRIPTOR_HANDLE *depth)
-{
-    (void)targets;
-    (void)contiguous;
-    require_transfer_state(list, !count && (!depth || !depth->ptr));
-}
-
 static void APIENTRY set_transfer_viewports(D3D12DDI_HCOMMANDLIST list, UINT count, const D3D12DDI_VIEWPORT *viewports)
 {
-    (void)viewports;
-    require_transfer_state(list, count == 0);
+    DdiTransferList *commands = recording_command_list(list);
+    if (!commands)
+        return;
+    commands->draw.has_viewport = FALSE;
+    if (!count)
+        return;
+    if (count != 1 || !viewports || !(viewports->Width > 0) || !(viewports->Height > 0) ||
+        !(viewports->MinDepth >= 0 && viewports->MinDepth <= viewports->MaxDepth && viewports->MaxDepth <= 1)) {
+        set_command_list_status(commands, DXGI_ERROR_UNSUPPORTED);
+        return;
+    }
+    commands->draw.viewport = (VkViewport){ .x = viewports->TopLeftX, .y = viewports->TopLeftY + viewports->Height,
+        .width = viewports->Width, .height = -viewports->Height, .minDepth = viewports->MinDepth, .maxDepth = viewports->MaxDepth };
+    commands->draw.has_viewport = TRUE;
 }
 
 static void APIENTRY set_transfer_scissors(D3D12DDI_HCOMMANDLIST list, UINT count, const D3D12DDI_RECT *scissors)
 {
-    (void)scissors;
-    require_transfer_state(list, count == 0);
+    DdiTransferList *commands = recording_command_list(list);
+    if (!commands)
+        return;
+    commands->draw.has_scissor = FALSE;
+    if (!count)
+        return;
+    if (count != 1 || !scissors || scissors->left < 0 || scissors->top < 0 ||
+        scissors->right < scissors->left || scissors->bottom < scissors->top) {
+        set_command_list_status(commands, DXGI_ERROR_UNSUPPORTED);
+        return;
+    }
+    commands->draw.scissor = (VkRect2D){ .offset = {scissors->left, scissors->top},
+        .extent = {(UINT32)(scissors->right - scissors->left), (UINT32)(scissors->bottom - scissors->top)} };
+    commands->draw.has_scissor = TRUE;
+}
+
+static void APIENTRY set_empty_graphics_root(D3D12DDI_HCOMMANDLIST handle, D3D12DDI_HROOTSIGNATURE signature)
+{
+    DdiTransferList *commands = recording_command_list(handle);
+    if (!commands)
+        return;
+    const DdiRootSignature *root = signature.pDrvPrivate;
+    if (root && !root->empty_layout) {
+        set_command_list_status(commands, DXGI_ERROR_UNSUPPORTED);
+        return;
+    }
+    commands->draw.root_layout = root ? root->empty_layout : VK_NULL_HANDLE;
 }
 
 static void APIENTRY set_transfer_blend_factor(D3D12DDI_HCOMMANDLIST list, const FLOAT values[4])
@@ -356,8 +413,10 @@ static void APIENTRY reset_command_list(D3D12DDI_HCOMMANDLIST driver_list, const
     list->pool = NULL;
     list->closed = FALSE;
     list->venus = (VenusTransferList){0};
-    list->cleared_color = NULL;
+    list->written_color = NULL;
     list->color_copy_source = FALSE;
+    list->color_rendered = FALSE;
+    list->draw = (DdiDrawState){0};
     if (!pool || pool->device != list->device || recorder->device != list->device ||
         args->CommandListFlags != D3D12DDI_COMMAND_LIST_FLAG_NONE) {
         set_command_list_status(list, E_INVALIDARG);
@@ -398,8 +457,11 @@ static void APIENTRY set_command_pipeline(D3D12DDI_HCOMMANDLIST driver_list, D3D
     HRESULT status = E_INVALIDARG;
     if (!list->closed && list->generation == list->pool->generation) {
         status = bind ? S_OK : E_FAIL;
-        if (bind)
+        if (bind) {
             bind(list->venus.command, pipeline->bind_point, pipeline->pipeline);
+            if (pipeline->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
+                list->draw.pipeline = pipeline;
+        }
     }
     ReleaseSRWLockExclusive(&list->pool->lock);
     trace_ddi("SetPipelineState", (UINT)status, pipeline->bind_point);

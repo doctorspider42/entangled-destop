@@ -508,6 +508,18 @@ from submit to fence for clear and readback, and 2.243 ms for the separate
 65,536-byte copy regression. See
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-color-clear/`.
 
+Build `3.6.27.946` passed `d3d12-smoke.exe --draw`. The application compiled
+Shader Model 5.1 vertex and pixel programs with FXC and passed them through
+the system D3D12 runtime. The UMD converted the program and signature tokens
+to SPIR-V, built a dynamic Vulkan graphics pipeline and executed a fullscreen
+triangle on the RTX 2070. The application verified 73 × 41 green pixels after
+its WDDM fence. The draw uses a lazily allocated optimal Vulkan color
+attachment, and readback copies directly from that image. The same driver
+passed the clear and buffer-copy regressions. Debugger submit-to-fence
+times were 1.273 ms for draw and readback, 148.274 ms for clear and readback,
+and 1.329 ms for buffer copy. These are individual trace runs. See
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-color-draw/`.
+
 The experimental `_0040` queue and list callbacks now hold a WDDM context
 and Vulkan command pool, serialize recording on the shared pool and select
 the matching runtime table. The transfer submission callback waits for

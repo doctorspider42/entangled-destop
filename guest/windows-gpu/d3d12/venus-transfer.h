@@ -27,6 +27,10 @@ typedef struct VenusColorImage {
     VkSubresourceLayout layout;
     VkExtent3D extent;
     VkFormat format;
+    SRWLOCK render_lock;
+    VkImage render_handle;
+    VkDeviceMemory render_memory;
+    VkImageView render_view;
 } VenusColorImage;
 
 HRESULT venus_color_image_requirements(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
@@ -35,9 +39,13 @@ HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UIN
                                  VenusColorImage *image);
 void destroy_venus_color_image(VenusColorImage *image);
 HRESULT record_venus_clear_color(VkCommandBuffer command, const VenusColorImage *image, const FLOAT color[4]);
-HRESULT prepare_venus_color_copy(VkCommandBuffer command, const VenusColorImage *image);
+HRESULT record_venus_color_draw(VkCommandBuffer command, VenusColorImage *image,
+                               const VkViewport *viewport, const VkRect2D *scissor,
+                               UINT vertex_count, UINT instance_count, UINT first_vertex, UINT first_instance);
+HRESULT prepare_venus_color_copy(VkCommandBuffer command, const VenusColorImage *image, BOOL rendered);
 HRESULT copy_venus_color_to_buffer(VkCommandBuffer command, const VenusColorImage *source,
-                                  const VenusTransferBuffer *destination, VkDeviceSize offset, UINT32 row_pitch);
+                                  BOOL rendered, const VenusTransferBuffer *destination, VkDeviceSize offset,
+                                  UINT32 row_pitch);
 
 HRESULT create_venus_command_pool(const VenusDevice *device, VkCommandPoolCreateFlags flags, VkCommandPool *pool);
 HRESULT reset_venus_command_pool(const VenusDevice *device, VkCommandPool pool);

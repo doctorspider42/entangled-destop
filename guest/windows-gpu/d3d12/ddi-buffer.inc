@@ -18,10 +18,10 @@ typedef struct DdiResource {
     DdiHeap *heap;
 } DdiResource;
 
-static const DdiHeap *resource_heap(const VenusDevice *device, D3D12DDI_HRESOURCE resource)
+static DdiHeap *resource_heap(const VenusDevice *device, D3D12DDI_HRESOURCE resource)
 {
     const DdiResource *object = resource.pDrvPrivate;
-    const DdiHeap *heap = object ? object->heap : NULL;
+    DdiHeap *heap = object ? object->heap : NULL;
     return device && heap && heap->device == device ? heap : NULL;
 }
 
@@ -402,6 +402,7 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     .pfnCalcPrivateShaderSize = private_shader_size,
     .pfnCreateVertexShader = create_vertex_shader,
+    .pfnCreatePixelShader = create_pixel_shader,
     .pfnCreateComputeShader = create_compute_shader,
     .pfnDestroyShader = destroy_shader,
     .pfnCalcPrivatePipelineStateSize = private_pipeline_size,
@@ -499,13 +500,15 @@ static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
     .pfnOmSetBlendFactor = set_transfer_blend_factor,
     .pfnOmSetStencilRef = set_transfer_stencil_reference,
     .pfnSetDescriptorHeaps = set_transfer_descriptor_heaps,
+    .pfnSetGraphicsRootSignature = set_empty_graphics_root,
     .pfnIASetIndexBuffer = set_transfer_index_buffer,
     .pfnIASetVertexBuffers = set_transfer_vertex_buffers,
     .pfnSOSetTargets = set_transfer_stream_output,
-    .pfnOMSetRenderTargets = set_transfer_attachments,
+    .pfnOMSetRenderTargets = set_color_render_targets,
     .pfnClearRootArguments = clear_transfer_root_arguments,
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     .pfnSetPipelineState = set_command_pipeline,
+    .pfnDrawInstanced = draw_color_target,
 #endif
 };
 

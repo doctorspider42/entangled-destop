@@ -25,6 +25,7 @@ typedef struct VenusDevice {
     VkPhysicalDeviceMemoryProperties memory;
     BOOL maintenance5;
     BOOL buffer_device_address;
+    BOOL dynamic_rendering;
 } VenusDevice;
 
 HRESULT open_venus_adapter(VenusAdapter *adapter);

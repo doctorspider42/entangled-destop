@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <windows.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <d3dkmthk.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
@@ -207,7 +208,72 @@ static void copy_and_verify(ID3D12Device *device)
     std::wprintf(L"D3D12 COPY PASS: %zu verified bytes, submit-to-fence %lld us\n", pattern.size(), elapsed);
 }
 
-static void clear_and_verify(ID3D12Device *device)
+static ComPtr<ID3DBlob> compile_shader(const char *source, const char *target)
+{
+    ComPtr<ID3DBlob> bytecode, messages;
+    const HRESULT status = D3DCompile(source, std::strlen(source), nullptr, nullptr, nullptr, "main", target,
+                                      D3DCOMPILE_ENABLE_STRICTNESS, 0, &bytecode, &messages);
+    if (FAILED(status) && messages)
+        std::fputs(static_cast<const char *>(messages->GetBufferPointer()), stderr);
+    check(status, "D3DCompile");
+    return bytecode;
+}
+
+struct DrawPipeline {
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pipeline;
+};
+
+static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT target_format)
+{
+    constexpr char vertex_source[] = R"(
+        float4 main(uint vertex : SV_VertexID) : SV_Position {
+            float2 p = float2(vertex == 1 ? 3 : -1, vertex == 2 ? 3 : -1);
+            return float4(p, 0, 1);
+        }
+    )";
+    constexpr char pixel_source[] = R"(
+        float4 main() : SV_Target0 { return float4(0, 1, 0, 1); }
+    )";
+    const auto vertex = compile_shader(vertex_source, "vs_5_1");
+    const auto pixel = compile_shader(pixel_source, "ps_5_1");
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned_signature = {};
+    versioned_signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    versioned_signature.Desc_1_1 = {};
+    ComPtr<ID3DBlob> root_bytes;
+    check(D3D12SerializeVersionedRootSignature(&versioned_signature, &root_bytes, nullptr),
+          "D3D12SerializeVersionedRootSignature");
+    DrawPipeline draw;
+    check(device->CreateRootSignature(0, root_bytes->GetBufferPointer(), root_bytes->GetBufferSize(),
+                                      IID_PPV_ARGS(&draw.root)), "CreateRootSignature");
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline = {};
+    pipeline.pRootSignature = draw.root.Get();
+    pipeline.VS = {vertex->GetBufferPointer(), vertex->GetBufferSize()};
+    pipeline.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
+    auto &target = pipeline.BlendState.RenderTarget[0];
+    target.SrcBlend = D3D12_BLEND_ONE;
+    target.DestBlend = D3D12_BLEND_ZERO;
+    target.BlendOp = D3D12_BLEND_OP_ADD;
+    target.SrcBlendAlpha = D3D12_BLEND_ONE;
+    target.DestBlendAlpha = D3D12_BLEND_ZERO;
+    target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    target.LogicOp = D3D12_LOGIC_OP_NOOP;
+    target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pipeline.SampleMask = UINT_MAX;
+    pipeline.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pipeline.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pipeline.RasterizerState.DepthClipEnable = TRUE;
+    pipeline.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    pipeline.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pipeline.NumRenderTargets = 1;
+    pipeline.RTVFormats[0] = target_format;
+    pipeline.SampleDesc.Count = 1;
+    check(device->CreateGraphicsPipelineState(&pipeline, IID_PPV_ARGS(&draw.pipeline)), "CreateGraphicsPipelineState");
+    return draw;
+}
+
+static void color_and_verify(ID3D12Device *device, bool programmable)
 {
     constexpr UINT width = 73, height = 41;
     const D3D12_HEAP_PROPERTIES video_memory = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
@@ -243,8 +309,22 @@ static void clear_and_verify(ID3D12Device *device)
     const auto readback = buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
     const auto commands = begin_recording(device);
-    const FLOAT red[] = {1.0f, 0.0f, 0.0f, 1.0f};
-    commands.list->ClearRenderTargetView(rtv, red, 0, nullptr);
+    DrawPipeline draw;
+    if (programmable) {
+        draw = create_draw_pipeline(device, desc.Format);
+        const D3D12_VIEWPORT viewport = {0, 0, static_cast<FLOAT>(width), static_cast<FLOAT>(height), 0, 1};
+        const D3D12_RECT scissor = {0, 0, width, height};
+        commands.list->SetGraphicsRootSignature(draw.root.Get());
+        commands.list->SetPipelineState(draw.pipeline.Get());
+        commands.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        commands.list->RSSetViewports(1, &viewport);
+        commands.list->RSSetScissorRects(1, &scissor);
+        commands.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        commands.list->DrawInstanced(3, 1, 0, 0);
+    } else {
+        const FLOAT red[] = {1.0f, 0.0f, 0.0f, 1.0f};
+        commands.list->ClearRenderTargetView(rtv, red, 0, nullptr);
+    }
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition = {target.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
@@ -261,36 +341,40 @@ static void clear_and_verify(ID3D12Device *device)
 
     const D3D12_RANGE whole = {0, static_cast<SIZE_T>(bytes)}, empty = {};
     void *mapped = nullptr;
-    check(readback->Map(0, &whole, &mapped), "Map cleared image readback");
+    check(readback->Map(0, &whole, &mapped), "Map rendered image readback");
     const auto pixels = static_cast<const uint8_t *>(mapped) + footprint.Offset;
-    constexpr uint8_t expected[] = {255, 0, 0, 255};
+    constexpr uint8_t red[] = {255, 0, 0, 255}, green[] = {0, 255, 0, 255};
+    const uint8_t *expected = programmable ? green : red;
     for (UINT y = 0; y < height; ++y) {
         const auto row = pixels + static_cast<SIZE_T>(y) * footprint.Footprint.RowPitch;
         for (UINT x = 0; x < width; ++x) {
-            if (std::memcmp(row + 4 * x, expected, sizeof(expected)) != 0)
-                check(E_FAIL, "cleared image readback differs from expected RGBA pixels");
+            if (std::memcmp(row + 4 * x, expected, sizeof(red)) != 0)
+                check(E_FAIL, "render-target readback differs from expected RGBA pixels");
         }
     }
     readback->Unmap(0, &empty);
-    std::wprintf(L"D3D12 CLEAR PASS: %ux%u verified pixels, submit-to-fence %lld us\n", width, height, elapsed);
+    std::wprintf(L"D3D12 %ls PASS: %ux%u verified pixels, submit-to-fence %lld us\n",
+                 programmable ? L"DRAW" : L"CLEAR", width, height, elapsed);
 }
 
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, Clear, Fence, RenderFence };
+    enum class Probe { Copy, Clear, Draw, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
             hardware_control = true;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--clear") == 0)
             probe = Probe::Clear;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--draw") == 0)
+            probe = Probe::Draw;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence") == 0)
             probe = Probe::Fence;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence-render-context") == 0)
             probe = Probe::RenderFence;
         else {
-            std::fputs("usage: d3d12-smoke.exe [--hardware] [--clear | --fence | --fence-render-context]\n", stderr);
+            std::fputs("usage: d3d12-smoke.exe [--hardware] [--clear | --draw | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
     }
@@ -299,8 +383,8 @@ int wmain(int argc, wchar_t **argv)
         verify_wddm_fence(adapter.luid, probe == Probe::Fence);
     else {
         const auto device = create_device(adapter, hardware_control);
-        if (probe == Probe::Clear)
-            clear_and_verify(device.Get());
+        if (probe == Probe::Clear || probe == Probe::Draw)
+            color_and_verify(device.Get(), probe == Probe::Draw);
         else
             copy_and_verify(device.Get());
     }

@@ -181,52 +181,70 @@ static UINT32 local_image_memory(const VenusDevice *device, UINT32 types)
     return UINT32_MAX;
 }
 
-HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
-                                 VenusColorImage *image)
+static HRESULT create_local_image(const VenusDevice *device, const VkImageCreateInfo *info,
+                                  VkImage *out_image, VkDeviceMemory *out_memory, VkMemoryRequirements *out_requirements)
 {
-    *image = (VenusColorImage){0};
     const PFN_vkCreateImage create = DEVICE_FN(device, vkCreateImage);
     const PFN_vkGetImageMemoryRequirements requirements = DEVICE_FN(device, vkGetImageMemoryRequirements);
-    const PFN_vkGetImageSubresourceLayout layout = DEVICE_FN(device, vkGetImageSubresourceLayout);
     const PFN_vkAllocateMemory allocate = DEVICE_FN(device, vkAllocateMemory);
     const PFN_vkBindImageMemory bind = DEVICE_FN(device, vkBindImageMemory);
-    if (!create || !requirements || !layout || !allocate || !bind || !DEVICE_FN(device, vkDestroyImage) ||
-        !DEVICE_FN(device, vkFreeMemory))
+    const PFN_vkDestroyImage destroy = DEVICE_FN(device, vkDestroyImage);
+    const PFN_vkFreeMemory free_memory = DEVICE_FN(device, vkFreeMemory);
+    if (!create || !requirements || !allocate || !bind || !destroy || !free_memory)
         return DXGI_ERROR_UNSUPPORTED;
 
-    const VkImageCreateInfo info = color_image_info(format, width, height);
     VkImage handle;
-    VkResult result = create(device->handle, &info, NULL, &handle);
+    VkResult result = create(device->handle, info, NULL, &handle);
     if (result != VK_SUCCESS)
         return venus_hresult(result);
-    *image = (VenusColorImage){ .device = device, .handle = handle, .format = format, .extent = {width, height, 1} };
-    requirements(device->handle, handle, &image->requirements);
-    const UINT32 type = local_image_memory(device, image->requirements.memoryTypeBits);
+    requirements(device->handle, handle, out_requirements);
+    const UINT32 type = local_image_memory(device, out_requirements->memoryTypeBits);
     if (type == UINT32_MAX) {
-        destroy_venus_color_image(image);
+        destroy(device->handle, handle, NULL);
         return DXGI_ERROR_UNSUPPORTED;
     }
 
     const VkMemoryAllocateInfo allocation = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = image->requirements.size,
+        .allocationSize = out_requirements->size,
         .memoryTypeIndex = type,
     };
     VkDeviceMemory memory;
     result = allocate(device->handle, &allocation, NULL, &memory);
     if (result == VK_SUCCESS) {
-        image->memory = memory;
         result = bind(device->handle, handle, memory, 0);
-    }
-    if (result == VK_SUCCESS) {
-        const VkImageSubresource subresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT };
-        layout(device->handle, handle, &subresource, &image->layout);
-        if (image->layout.rowPitch >= (UINT64)width * 4 && image->layout.rowPitch % 256 == 0)
+        if (result == VK_SUCCESS) {
+            *out_image = handle;
+            *out_memory = memory;
             return S_OK;
-        result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+        }
+        free_memory(device->handle, memory, NULL);
     }
-    destroy_venus_color_image(image);
+    destroy(device->handle, handle, NULL);
     return venus_hresult(result);
+}
+
+HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
+                                 VenusColorImage *image)
+{
+    *image = (VenusColorImage){0};
+    const PFN_vkGetImageSubresourceLayout layout = DEVICE_FN(device, vkGetImageSubresourceLayout);
+    if (!layout)
+        return DXGI_ERROR_UNSUPPORTED;
+    const VkImageCreateInfo info = color_image_info(format, width, height);
+    HRESULT status = create_local_image(device, &info, &image->handle, &image->memory, &image->requirements);
+    if (FAILED(status))
+        return status;
+    image->device = device;
+    image->format = format;
+    image->extent = (VkExtent3D){width, height, 1};
+
+    const VkImageSubresource subresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT };
+    layout(device->handle, image->handle, &subresource, &image->layout);
+    if (image->layout.rowPitch >= (UINT64)width * 4 && image->layout.rowPitch % 256 == 0)
+        return S_OK;
+    destroy_venus_color_image(image);
+    return DXGI_ERROR_UNSUPPORTED;
 }
 
 void destroy_venus_color_image(VenusColorImage *image)
@@ -234,6 +252,11 @@ void destroy_venus_color_image(VenusColorImage *image)
     const VenusDevice *device = image->device;
     if (!device)
         return;
+    if (image->render_view) {
+        DEVICE_FN(device, vkDestroyImageView)(device->handle, image->render_view, NULL);
+        DEVICE_FN(device, vkDestroyImage)(device->handle, image->render_handle, NULL);
+        DEVICE_FN(device, vkFreeMemory)(device->handle, image->render_memory, NULL);
+    }
     DEVICE_FN(device, vkDestroyImage)(device->handle, image->handle, NULL);
     if (image->memory)
         DEVICE_FN(device, vkFreeMemory)(device->handle, image->memory, NULL);
@@ -245,6 +268,86 @@ static const VkImageSubresourceRange color_subresource = {
     .levelCount = 1,
     .layerCount = 1,
 };
+
+static HRESULT ensure_color_attachment(VenusColorImage *image)
+{
+    const VenusDevice *device = image->device;
+    const PFN_vkCreateImageView create_view = DEVICE_FN(device, vkCreateImageView);
+    if (!create_view || !DEVICE_FN(device, vkDestroyImageView))
+        return E_FAIL;
+
+    AcquireSRWLockExclusive(&image->render_lock);
+    HRESULT status = S_OK;
+    if (!image->render_view) {
+        VkImageCreateInfo info = color_image_info(image->format, image->extent.width, image->extent.height);
+        info.extent = image->extent;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        VkMemoryRequirements requirements;
+        status = create_local_image(device, &info, &image->render_handle, &image->render_memory, &requirements);
+        if (SUCCEEDED(status)) {
+            const VkImageViewCreateInfo view = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = image->render_handle,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = image->format, .subresourceRange = color_subresource,
+            };
+            status = venus_hresult(create_view(device->handle, &view, NULL, &image->render_view));
+            if (FAILED(status)) {
+                DEVICE_FN(device, vkDestroyImage)(device->handle, image->render_handle, NULL);
+                DEVICE_FN(device, vkFreeMemory)(device->handle, image->render_memory, NULL);
+                image->render_handle = VK_NULL_HANDLE;
+                image->render_memory = VK_NULL_HANDLE;
+                image->render_view = VK_NULL_HANDLE;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&image->render_lock);
+    return status;
+}
+
+HRESULT record_venus_color_draw(VkCommandBuffer command, VenusColorImage *image,
+                               const VkViewport *viewport, const VkRect2D *scissor,
+                               UINT vertex_count, UINT instance_count, UINT first_vertex, UINT first_instance)
+{
+    const VenusDevice *device = image->device;
+    const PFN_vkCmdPipelineBarrier barrier = DEVICE_FN(device, vkCmdPipelineBarrier);
+    const PFN_vkCmdBeginRendering begin = DEVICE_FN(device, vkCmdBeginRendering);
+    const PFN_vkCmdEndRendering end = DEVICE_FN(device, vkCmdEndRendering);
+    const PFN_vkCmdSetViewport set_viewport = DEVICE_FN(device, vkCmdSetViewport);
+    const PFN_vkCmdSetScissor set_scissor = DEVICE_FN(device, vkCmdSetScissor);
+    const PFN_vkCmdDraw draw = DEVICE_FN(device, vkCmdDraw);
+    if (!barrier || !begin || !end || !set_viewport || !set_scissor || !draw)
+        return E_FAIL;
+    HRESULT status = ensure_color_attachment(image);
+    if (FAILED(status))
+        return status;
+
+    const VkImageMemoryBarrier target = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image->render_handle,
+        .subresourceRange = color_subresource,
+    };
+    barrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            0, 0, NULL, 0, NULL, 1, &target);
+    const VkRenderingAttachmentInfo attachment = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = image->render_view,
+        .imageLayout = target.newLayout, .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+    const VkRenderingInfo rendering = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea.extent = {image->extent.width, image->extent.height},
+        .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &attachment,
+    };
+    begin(command, &rendering);
+    set_viewport(command, 0, 1, viewport);
+    set_scissor(command, 0, 1, scissor);
+    draw(command, vertex_count, instance_count, first_vertex, first_instance);
+    end(command);
+    return S_OK;
+}
 
 HRESULT record_venus_clear_color(VkCommandBuffer command, const VenusColorImage *image, const FLOAT color[4])
 {
@@ -269,28 +372,30 @@ HRESULT record_venus_clear_color(VkCommandBuffer command, const VenusColorImage 
     return S_OK;
 }
 
-HRESULT prepare_venus_color_copy(VkCommandBuffer command, const VenusColorImage *image)
+HRESULT prepare_venus_color_copy(VkCommandBuffer command, const VenusColorImage *image, BOOL rendered)
 {
     const PFN_vkCmdPipelineBarrier barrier = DEVICE_FN(image->device, vkCmdPipelineBarrier);
     if (!barrier)
         return E_FAIL;
     const VkImageMemoryBarrier source = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .srcAccessMask = rendered ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .oldLayout = rendered ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = image->handle,
+        .image = rendered ? image->render_handle : image->handle,
         .subresourceRange = color_subresource,
     };
-    barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &source);
+    const VkPipelineStageFlags previous = rendered ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
+    barrier(command, previous, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &source);
     return S_OK;
 }
 
 HRESULT copy_venus_color_to_buffer(VkCommandBuffer command, const VenusColorImage *source,
-                                  const VenusTransferBuffer *destination, VkDeviceSize offset, UINT32 row_pitch)
+                                  BOOL rendered, const VenusTransferBuffer *destination, VkDeviceSize offset,
+                                  UINT32 row_pitch)
 {
     if (source->device != destination->device || !row_pitch || row_pitch % 4 || offset % 4 ||
         row_pitch / 4 < source->extent.width || offset >= destination->size)
@@ -308,7 +413,8 @@ HRESULT copy_venus_color_to_buffer(VkCommandBuffer command, const VenusColorImag
         .imageSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1 },
         .imageExtent = source->extent,
     };
-    copy(command, source->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination->handle, 1, &region);
+    const VkImage handle = rendered ? source->render_handle : source->handle;
+    copy(command, handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination->handle, 1, &region);
     return S_OK;
 }
 

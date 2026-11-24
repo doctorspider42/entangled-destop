@@ -216,6 +216,7 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
     };
     BOOL has_maintenance5 = FALSE;
     BOOL has_buffer_device_address = FALSE;
+    BOOL has_dynamic_rendering = FALSE;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
@@ -229,17 +230,27 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
     }
 #endif
 #ifdef ENTANGLED_D3D12_PROBE_COPY
+    VkPhysicalDeviceDynamicRenderingFeatures rendering = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+    };
     VkPhysicalDeviceBufferDeviceAddressFeatures address = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
     };
     const PFN_vkGetPhysicalDeviceFeatures2 get_features = (PFN_vkGetPhysicalDeviceFeatures2)
         adapter->instance_proc_addr(adapter->instance, "vkGetPhysicalDeviceFeatures2");
     if (adapter->api_version >= VK_API_VERSION_1_2 && get_features) {
+        if (adapter->api_version >= VK_API_VERSION_1_3)
+            address.pNext = &rendering;
         VkPhysicalDeviceFeatures2 features = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
             .pNext = &address,
         };
         get_features(adapter->physical_device, &features);
+        has_dynamic_rendering = rendering.dynamicRendering != VK_FALSE;
+        if (has_dynamic_rendering) {
+            rendering.pNext = (void *)info.pNext;
+            info.pNext = &rendering;
+        }
         has_buffer_device_address = address.bufferDeviceAddress != VK_FALSE;
         if (has_buffer_device_address) {
             address.bufferDeviceAddressCaptureReplay = VK_FALSE;
@@ -275,6 +286,7 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
         .graphics_queue_family = adapter->graphics_queue_family,
         .maintenance5 = has_maintenance5,
         .buffer_device_address = has_buffer_device_address,
+        .dynamic_rendering = has_dynamic_rendering,
     };
     get_memory(adapter->physical_device, &device->memory);
     return S_OK;

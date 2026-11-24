@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-static const VenusColorImage *resource_color(const VenusDevice *device, D3D12DDI_HRESOURCE resource)
+static VenusColorImage *resource_color(const VenusDevice *device, D3D12DDI_HRESOURCE resource)
 {
-    const DdiHeap *heap = resource_heap(device, resource);
+    DdiHeap *heap = resource_heap(device, resource);
     return heap && heap->kind == DDI_HEAP_COLOR_IMAGE ? &heap->image : NULL;
 }
 
@@ -20,6 +20,66 @@ static void APIENTRY create_color_rtv(D3D12DDI_HDEVICE device, const D3D12DDIARG
     trace_ddi("CreateRenderTargetView", args->Format, image->extent.width);
 }
 
+static VenusColorImage *rtv_color(const VenusDevice *device, D3D12DDI_CPU_DESCRIPTOR_HANDLE rtv)
+{
+    const DdiDescriptor *descriptor = (const DdiDescriptor *)rtv.ptr;
+    return descriptor && descriptor->kind == DDI_DESCRIPTOR_RTV
+        ? resource_color(device, descriptor->desc.rtv.hDrvResource) : NULL;
+}
+
+static void APIENTRY set_color_render_targets(D3D12DDI_HCOMMANDLIST handle, UINT count,
+                                              const D3D12DDI_CPU_DESCRIPTOR_HANDLE *targets, BOOL contiguous,
+                                              const D3D12DDI_CPU_DESCRIPTOR_HANDLE *depth)
+{
+    (void)contiguous;
+    DdiTransferList *list = recording_command_list(handle);
+    if (!list)
+        return;
+    list->draw.target = NULL;
+    if (depth && depth->ptr) {
+        set_command_list_status(list, DXGI_ERROR_UNSUPPORTED);
+        return;
+    }
+    if (!count)
+        return;
+    VenusColorImage *image = count == 1 && targets ? rtv_color(list->venus.device, targets[0]) : NULL;
+    if (!image) {
+        set_command_list_status(list, DXGI_ERROR_UNSUPPORTED);
+        return;
+    }
+    list->draw.target = image;
+}
+
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+static void APIENTRY draw_color_target(D3D12DDI_HCOMMANDLIST handle, UINT vertex_count, UINT instance_count,
+                                       UINT first_vertex, UINT first_instance)
+{
+    DdiTransferList *list = recording_command_list(handle);
+    if (!list || !vertex_count || !instance_count)
+        return;
+    const DdiDrawState *draw = &list->draw;
+    VenusColorImage *image = draw->target;
+    if (!image || list->written_color || !draw->pipeline || draw->pipeline->color_format != image->format ||
+        !draw->root_layout || draw->pipeline->layout != draw->root_layout ||
+        draw->topology != D3D12DDI_PRIMITIVE_TOPOLOGY_TRIANGLELIST || !draw->has_viewport || !draw->has_scissor) {
+        set_command_list_status(list, DXGI_ERROR_UNSUPPORTED);
+        return;
+    }
+
+    AcquireSRWLockExclusive(&list->pool->lock);
+    const HRESULT status = list->generation == list->pool->generation
+        ? record_venus_color_draw(list->venus.command, image, &draw->viewport, &draw->scissor,
+                                  vertex_count, instance_count, first_vertex, first_instance) : E_INVALIDARG;
+    if (SUCCEEDED(status)) {
+        list->written_color = image;
+        list->color_rendered = TRUE;
+    }
+    ReleaseSRWLockExclusive(&list->pool->lock);
+    trace_ddi("DrawInstanced", (UINT)status, vertex_count);
+    set_command_list_status(list, status);
+}
+#endif
+
 static void APIENTRY clear_color_rtv(D3D12DDI_HCOMMANDLIST handle, D3D12DDI_CPU_DESCRIPTOR_HANDLE view,
                                     const FLOAT color[4], UINT rect_count, const D3D12DDI_RECT *rects)
 {
@@ -27,10 +87,8 @@ static void APIENTRY clear_color_rtv(D3D12DDI_HCOMMANDLIST handle, D3D12DDI_CPU_
     DdiTransferList *list = handle.pDrvPrivate;
     if (!list || FAILED(list->status))
         return;
-    const DdiDescriptor *descriptor = (const DdiDescriptor *)view.ptr;
-    const VenusColorImage *image = descriptor && descriptor->kind == DDI_DESCRIPTOR_RTV
-        ? resource_color(list->venus.device, descriptor->desc.rtv.hDrvResource) : NULL;
-    if (!list->pool || !image || !color || rect_count || list->cleared_color) {
+    const VenusColorImage *image = rtv_color(list->venus.device, view);
+    if (!list->pool || !image || !color || rect_count || list->written_color) {
         set_command_list_status(list, DXGI_ERROR_UNSUPPORTED);
         return;
     }
@@ -39,7 +97,7 @@ static void APIENTRY clear_color_rtv(D3D12DDI_HCOMMANDLIST handle, D3D12DDI_CPU_
     const HRESULT status = !list->closed && list->generation == list->pool->generation
         ? record_venus_clear_color(list->venus.command, image, color) : E_INVALIDARG;
     if (SUCCEEDED(status))
-        list->cleared_color = image;
+        list->written_color = image;
     ReleaseSRWLockExclusive(&list->pool->lock);
     trace_ddi("ClearRenderTargetView", (UINT)status, image->extent.height);
     set_command_list_status(list, status);
@@ -53,9 +111,9 @@ static HRESULT color_barrier(DdiTransferList *list, const D3D12DDIARG_RESOURCE_B
         (barrier->Transition.Subresource && barrier->Transition.Subresource != D3D12DDI_RESOURCE_BARRIER_ALL_SUBRESOURCES))
         return DXGI_ERROR_UNSUPPORTED;
     const VenusColorImage *image = resource_color(list->venus.device, barrier->Transition.hResource);
-    if (!image || image != list->cleared_color || list->color_copy_source)
+    if (!image || image != list->written_color || list->color_copy_source)
         return DXGI_ERROR_UNSUPPORTED;
-    const HRESULT status = prepare_venus_color_copy(list->venus.command, image);
+    const HRESULT status = prepare_venus_color_copy(list->venus.command, image, list->color_rendered);
     if (SUCCEEDED(status))
         list->color_copy_source = TRUE;
     return status;
@@ -112,7 +170,7 @@ static void APIENTRY copy_color_texture_region(
         !src_placement->BaseAddress.UMD.Offset ? resource_color(list->venus.device, src_placement->BaseAddress.UMD.hResource) : NULL;
     const VenusTransferBuffer *buffer = dst_placement
         ? resource_buffer(list->venus.device, dst_placement->BaseAddress.UMD.hResource) : NULL;
-    if (!list->pool || !image || image != list->cleared_color || !list->color_copy_source || !buffer ||
+    if (!list->pool || !image || image != list->written_color || !list->color_copy_source || !buffer ||
         dst_x || dst_y || dst_z || (box && (box->Left || box->Top || box->Front ||
         box->Right != (LONG)image->extent.width || box->Bottom != (LONG)image->extent.height || box->Back != 1))) {
         trace_ddi("CopyTextureRegion layouts", src_layout.Layout, dst_layout.Layout);
@@ -123,7 +181,8 @@ static void APIENTRY copy_color_texture_region(
     const UINT32 row_pitch = color_copy_row_pitch(dst_layout, image);
     AcquireSRWLockExclusive(&list->pool->lock);
     const HRESULT status = !list->closed && list->generation == list->pool->generation
-        ? copy_venus_color_to_buffer(list->venus.command, image, buffer, dst_placement->BaseAddress.UMD.Offset, row_pitch)
+        ? copy_venus_color_to_buffer(list->venus.command, image, list->color_rendered, buffer,
+                                    dst_placement->BaseAddress.UMD.Offset, row_pitch)
         : E_INVALIDARG;
     ReleaseSRWLockExclusive(&list->pool->lock);
     trace_ddi("CopyTextureRegion", (UINT)status, row_pitch);
