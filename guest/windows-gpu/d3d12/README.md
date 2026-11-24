@@ -554,6 +554,17 @@ captures taken while the probe ran were black. The lab restored
 `oem58.inf` and shut down cleanly. See
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-present-copy/`.
 
+The serial-trace miniport reproduced unresolved Windows allocation handles
+when the Mesa UMD wrote and read shared surfaces during the desktop
+composition path. The WDDM 2.0 lab now uses Dxgk's reference-counted
+allocation lookup around these escape operations. The default WDDM 1.3
+miniport retains its previous lookup path. In the acquire/release run the
+invalid-handle reports disappeared, and the guest's Application Error log
+identified a crash in the older `entangled_d3d10.dll` in the lab package.
+The D3D12 draw and WDDM Present still succeeded, and DWM and scanout failed.
+See `ddi40-runtime-present-dwm/` and `ddi40-runtime-present-dwm-acquire/`
+under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

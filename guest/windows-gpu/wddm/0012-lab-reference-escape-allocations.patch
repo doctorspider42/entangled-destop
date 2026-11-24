@@ -1,0 +1,59 @@
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 61e2924..b53fc6b 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -659,7 +659,23 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+         RtlCopyMemory(&handle, (PUCHAR)pVioGpuEscape + 4, sizeof(handle));
+         RtlCopyMemory(&buffer, (PUCHAR)pVioGpuEscape + 8, sizeof(buffer));
+         RtlCopyMemory(&bytes, (PUCHAR)pVioGpuEscape + 16, sizeof(bytes));
++#ifdef ENTANGLED_WDDM2_LAB
++        // Escapes carry a user-mode handle. Keep the allocation referenced
++        // until all pixel access is finished.
++        if (!m_DxgkInterface.DxgkCbAcquireHandleData || !m_DxgkInterface.DxgkCbReleaseHandleData)
++        {
++            return STATUS_NOT_SUPPORTED;
++        }
++        DXGKARGCB_GETHANDLEDATA lookup = {};
++        lookup.hObject = handle;
++        lookup.Type = DXGK_HANDLE_ALLOCATION;
++        DXGKARGCB_RELEASEHANDLEDATA reference = {};
++        reference.Type = DXGK_HANDLE_ALLOCATION;
++        VioGpuAllocation *allocation = reinterpret_cast<VioGpuAllocation *>(
++            m_DxgkInterface.DxgkCbAcquireHandleData(&lookup, &reference.ReleaseHandle));
++#else
+         VioGpuAllocation *allocation = AllocationFromHandle(handle);
++#endif
+         if (allocation == NULL)
+         {
+             DbgPrint(TRACE_LEVEL_ERROR, ("%s read: handle 0x%x is no allocation\n", __FUNCTION__, handle));
+@@ -690,6 +706,9 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+             DbgPrint(TRACE_LEVEL_ERROR,
+                      ("%s read: allocation %u, %I64u bytes: 0x%x\n", __FUNCTION__, allocation->GetId(), bytes, status));
+         }
++#ifdef ENTANGLED_WDDM2_LAB
++        m_DxgkInterface.DxgkCbReleaseHandleData(reference);
++#endif
+         return status;
+     }
+ 
+@@ -1716,18 +1735,16 @@ void VioGpuAdapter::ConfigChanged(void)
+ 
+ VioGpuAllocation *VioGpuAdapter::AllocationFromHandle(D3DKMT_HANDLE handle)
+ {
+-    DXGKARGCB_GETHANDLEDATA getHandleData;
++    DXGKARGCB_GETHANDLEDATA getHandleData = {};
+     getHandleData.hObject = handle;
+     getHandleData.Type = DXGK_HANDLE_ALLOCATION;
+-    getHandleData.Flags.DeviceSpecific = 0;
+     return reinterpret_cast<VioGpuAllocation *>(m_DxgkInterface.DxgkCbGetHandleData(&getHandleData));
+ }
+ 
+ VioGpuResource *VioGpuAdapter::ResourceFromHandle(D3DKMT_HANDLE handle)
+ {
+-    DXGKARGCB_GETHANDLEDATA getHandleData;
++    DXGKARGCB_GETHANDLEDATA getHandleData = {};
+     getHandleData.hObject = handle;
+     getHandleData.Type = DXGK_HANDLE_RESOURCE;
+-    getHandleData.Flags.DeviceSpecific = 0;
+     return reinterpret_cast<VioGpuResource *>(m_DxgkInterface.DxgkCbGetHandleData(&getHandleData));
+ }
