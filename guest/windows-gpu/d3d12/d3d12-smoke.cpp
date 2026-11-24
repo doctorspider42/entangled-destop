@@ -302,6 +302,115 @@ static ComPtr<ID3DBlob> compile_shader(const char *source, const char *target)
     return bytecode;
 }
 
+static void verify_compute_dispatch(ID3D12Device *device)
+{
+    constexpr char source_code[] = R"(
+        ByteAddressBuffer input : register(t3, space1);
+        RWByteAddressBuffer output : register(u2, space3);
+        cbuffer Mask : register(b0) { uint mask; };
+        cbuffer Addend : register(b1, space2) { uint addend; };
+        [numthreads(8, 1, 1)]
+        void main(uint3 id : SV_DispatchThreadID) {
+            const uint offset = 4 * id.x;
+            output.Store(offset, (input.Load(offset) ^ mask) + addend);
+        }
+    )";
+    const auto shader = compile_shader(source_code, "cs_5_1");
+    const D3D12_DESCRIPTOR_RANGE1 ranges[] = {
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3, 1, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC, 1},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 2, 3, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+         D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
+    };
+    D3D12_ROOT_PARAMETER1 parameters[3] = {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants = {0, 0, 1};
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable = {ARRAYSIZE(ranges), ranges};
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[2].Constants = {1, 2, 1};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature = {};
+    signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    signature.Desc_1_1.NumParameters = ARRAYSIZE(parameters);
+    signature.Desc_1_1.pParameters = parameters;
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeVersionedRootSignature(&signature, &serialized, nullptr), "serialize compute root signature");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&root)),
+          "CreateRootSignature (compute)");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc = {};
+    pipeline_desc.pRootSignature = root.Get();
+    pipeline_desc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(device->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&pipeline)), "CreateComputePipelineState");
+
+    constexpr UINT elements = 64;
+    constexpr UINT bytes = elements * sizeof(UINT32);
+    constexpr UINT mask = 0x35ce00ff, addend = 17;
+    const D3D12_HEAP_PROPERTIES local_heap = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                              D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    const auto input = buffer(device, 2 * bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_RESOURCE_DESC output_desc = buffer_description(2 * bytes);
+    output_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ComPtr<ID3D12Resource> output;
+    check(device->CreateCommittedResource(&local_heap, D3D12_HEAP_FLAG_NONE, &output_desc,
+                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&output)),
+          "CreateCommittedResource (compute output)");
+    const auto upload = buffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    const auto readback = buffer(device, 2 * bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    std::array<UINT32, elements> pattern;
+    for (UINT i = 0; i < elements; ++i)
+        pattern[i] = i * 851u + 702u;
+    const D3D12_RANGE empty = {}, uploaded = {0, bytes}, downloaded = {0, 2 * bytes};
+    void *mapped = nullptr;
+    check(upload->Map(0, &empty, &mapped), "Map compute upload");
+    std::memcpy(mapped, pattern.data(), bytes);
+    upload->Unmap(0, &uploaded);
+
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                                  D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "CreateDescriptorHeap (compute)");
+    const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    const auto gpu = heap->GetGPUDescriptorHandleForHeapStart();
+    const UINT stride = device->GetDescriptorHandleIncrementSize(heap_desc.Type);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer = {elements, elements, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    device->CreateShaderResourceView(input.Get(), &srv, {cpu.ptr + 2 * stride});
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = DXGI_FORMAT_R32_TYPELESS;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer = {elements, elements, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+    device->CreateUnorderedAccessView(output.Get(), nullptr, &uav, {cpu.ptr + 3 * stride});
+    check(device->GetDeviceRemovedReason(), "create compute descriptors");
+
+    const auto commands = begin_recording(device);
+    commands.list->CopyBufferRegion(input.Get(), bytes, upload.Get(), 0, bytes);
+    transition(commands.list.Get(), input.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ID3D12DescriptorHeap *const heaps[] = {heap.Get()};
+    commands.list->SetDescriptorHeaps(1, heaps);
+    commands.list->SetComputeRootSignature(root.Get());
+    commands.list->SetPipelineState(pipeline.Get());
+    commands.list->SetComputeRoot32BitConstant(0, mask, 0);
+    commands.list->SetComputeRootDescriptorTable(1, {gpu.ptr + stride});
+    commands.list->SetComputeRoot32BitConstants(2, 1, &addend, 0);
+    commands.list->Dispatch(elements / 8, 1, 1);
+    transition(commands.list.Get(), output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commands.list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, 2 * bytes);
+    const auto elapsed = submit_and_wait(device, commands);
+    check(readback->Map(0, &downloaded, &mapped), "Map compute readback");
+    const auto *words = static_cast<const UINT32 *>(mapped);
+    for (UINT i = 0; i < elements; ++i) {
+        if (words[i] || words[elements + i] != (pattern[i] ^ mask) + addend)
+            check(E_FAIL, "compute output or guard range mismatch");
+    }
+    readback->Unmap(0, &empty);
+    std::wprintf(L"D3D12 COMPUTE PASS: %u results and %u guard bytes verified, submit-to-fence %lld us\n",
+                 elements, bytes, elapsed);
+}
+
 struct DrawPipeline {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pipeline;
@@ -821,7 +930,7 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, DeviceLocal, Placed, Clear, Draw, Cbv, Upload, Sample, Atlas, Instance, WgpuInit, Present, Composition, Fence, RenderFence };
+    enum class Probe { Copy, DeviceLocal, Placed, Compute, Clear, Draw, Cbv, Upload, Sample, Atlas, Instance, WgpuInit, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -830,6 +939,8 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::DeviceLocal;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--placed-buffer") == 0)
             probe = Probe::Placed;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--compute") == 0)
+            probe = Probe::Compute;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--clear") == 0)
             probe = Probe::Clear;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--draw") == 0)
@@ -855,7 +966,7 @@ int wmain(int argc, wchar_t **argv)
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence-render-context") == 0)
             probe = Probe::RenderFence;
         else {
-            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --placed-buffer | --clear | --draw | --cbv | --upload-texture | "
+            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --placed-buffer | --compute | --clear | --draw | --cbv | --upload-texture | "
                        "--sample-texture | --sample-atlas | --instance | --wgpu-init | --present | --composition | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
@@ -883,6 +994,8 @@ int wmain(int argc, wchar_t **argv)
             verify_wgpu_initialization(device.Get());
         else if (probe == Probe::Placed)
             verify_placed_buffers(device.Get());
+        else if (probe == Probe::Compute)
+            verify_compute_dispatch(device.Get());
         else if (probe == Probe::Present || probe == Probe::Composition)
             draw_and_present(device.Get(), probe == Probe::Composition);
         else

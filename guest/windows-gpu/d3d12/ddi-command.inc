@@ -8,7 +8,7 @@ typedef struct DdiCommandPool {
     SIZE_T used;
     UINT64 generation;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-    VkDescriptorPool pixel_pool;
+    VkDescriptorPool descriptor_pool;
     UINT sampler_count;
     VkSampler samplers[64];
 #endif
@@ -95,6 +95,17 @@ typedef struct DdiDrawState {
 #endif
 } DdiDrawState;
 
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+enum { DDI_ROOT_PARAMETERS = 64 };
+
+typedef struct DdiComputeState {
+    const DdiPipeline *pipeline;
+    const DdiRootSignature *root;
+    D3D12DDI_GPU_DESCRIPTOR_HANDLE tables[DDI_ROOT_PARAMETERS];
+    UINT32 constants[DDI_COMPUTE_CONSTANT_WORDS];
+} DdiComputeState;
+#endif
+
 typedef struct DdiTransferList {
     VenusTransferList venus;
     HRESULT status;
@@ -112,6 +123,9 @@ typedef struct DdiTransferList {
     DdiPresentSurface *present;
 #endif
     DdiDrawState draw;
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    DdiComputeState compute;
+#endif
 } DdiTransferList;
 
 static void set_command_list_status(DdiTransferList *list, HRESULT status)
@@ -196,6 +210,7 @@ static void APIENTRY set_transfer_descriptor_heaps(D3D12DDI_HCOMMANDLIST list, U
     if (commands->draw.resource_heap != resource_heap) {
         commands->draw.uniform = NULL;
         commands->draw.texture = NULL;
+        memset(commands->compute.tables, 0, sizeof(commands->compute.tables));
     }
     if (commands->draw.sampler_heap != sampler_heap)
         commands->draw.sampler = NULL;
@@ -370,6 +385,8 @@ static void APIENTRY clear_transfer_root_arguments(D3D12DDI_HCOMMANDLIST list)
         commands->draw.uniform = NULL;
         commands->draw.texture = NULL;
         commands->draw.sampler = NULL;
+        memset(commands->compute.tables, 0, sizeof(commands->compute.tables));
+        memset(commands->compute.constants, 0, sizeof(commands->compute.constants));
     }
 #else
     require_transfer_state(list, TRUE);
@@ -477,10 +494,10 @@ static void APIENTRY reset_command_pool(D3D12DDI_HDEVICE handle, D3D12DDI_HCOMMA
             pool->used = 0;
             ++pool->generation;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-            if (pool->pixel_pool) {
+            if (pool->descriptor_pool) {
                 const PFN_vkResetDescriptorPool reset = (PFN_vkResetDescriptorPool)
                     device->venus.proc_addr(device->venus.handle, "vkResetDescriptorPool");
-                status = venus_hresult(reset(device->venus.handle, pool->pixel_pool, 0));
+                status = venus_hresult(reset(device->venus.handle, pool->descriptor_pool, 0));
                 if (SUCCEEDED(status))
                     clear_command_samplers(pool);
             }
@@ -499,11 +516,11 @@ static void APIENTRY destroy_command_pool(D3D12DDI_HDEVICE handle, D3D12DDI_HCOM
         return;
     destroy_venus_command_pool(&pool->device->venus, pool->pool);
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-    if (pool->pixel_pool) {
+    if (pool->descriptor_pool) {
         const VenusDevice *venus = &pool->device->venus;
         const PFN_vkDestroyDescriptorPool destroy = (PFN_vkDestroyDescriptorPool)
             venus->proc_addr(venus->handle, "vkDestroyDescriptorPool");
-        destroy(venus->handle, pool->pixel_pool, NULL);
+        destroy(venus->handle, pool->descriptor_pool, NULL);
         clear_command_samplers(pool);
     }
 #endif
@@ -624,6 +641,9 @@ static void APIENTRY reset_command_list(D3D12DDI_HCOMMANDLIST driver_list, const
     list->color_copy_source = NULL;
     list->color_rendered = FALSE;
     list->draw = (DdiDrawState){0};
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    list->compute = (DdiComputeState){0};
+#endif
     if (!pool || pool->device != list->device || recorder->device != list->device ||
         args->CommandListFlags != D3D12DDI_COMMAND_LIST_FLAG_NONE) {
         set_command_list_status(list, E_INVALIDARG);
@@ -668,6 +688,8 @@ static void APIENTRY set_command_pipeline(D3D12DDI_HCOMMANDLIST driver_list, D3D
             bind(list->venus.command, pipeline->bind_point, pipeline->pipeline);
             if (pipeline->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
                 list->draw.pipeline = pipeline;
+            else
+                list->compute.pipeline = pipeline;
         }
     }
     ReleaseSRWLockExclusive(&list->pool->lock);

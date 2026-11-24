@@ -26,6 +26,10 @@ typedef struct VenusDevice {
     BOOL maintenance5;
     BOOL buffer_device_address;
     BOOL dynamic_rendering;
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    BOOL robust_buffer_access;
+    VkPhysicalDeviceLimits limits;
+#endif
 } VenusDevice;
 
 HRESULT open_venus_adapter(VenusAdapter *adapter);

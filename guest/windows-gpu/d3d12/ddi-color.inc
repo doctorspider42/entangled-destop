@@ -118,21 +118,16 @@ static HRESULT create_venus_pixel_sampler(DdiTransferList *list, const D3D12DDI_
     return status;
 }
 
-static HRESULT bind_pixel_descriptors(DdiTransferList *list)
+static HRESULT allocate_command_descriptors(DdiTransferList *list, VkDescriptorSetLayout layout, VkDescriptorSet *set)
 {
-    const DdiDrawState *draw = &list->draw;
     const VenusDevice *device = list->venus.device;
     const PFN_vkCreateDescriptorPool create = (PFN_vkCreateDescriptorPool)
         device->proc_addr(device->handle, "vkCreateDescriptorPool");
     const PFN_vkAllocateDescriptorSets allocate = (PFN_vkAllocateDescriptorSets)
         device->proc_addr(device->handle, "vkAllocateDescriptorSets");
-    const PFN_vkUpdateDescriptorSets update = (PFN_vkUpdateDescriptorSets)
-        device->proc_addr(device->handle, "vkUpdateDescriptorSets");
-    const PFN_vkCmdBindDescriptorSets bind = (PFN_vkCmdBindDescriptorSets)
-        device->proc_addr(device->handle, "vkCmdBindDescriptorSets");
-    if (!create || !allocate || !update || !bind)
+    if (!create || !allocate)
         return E_FAIL;
-    if (!list->pool->pixel_pool) {
+    if (!list->pool->descriptor_pool) {
         if (!device->proc_addr(device->handle, "vkDestroyDescriptorPool") ||
             !device->proc_addr(device->handle, "vkResetDescriptorPool"))
             return E_FAIL;
@@ -141,6 +136,7 @@ static HRESULT bind_pixel_descriptors(DdiTransferList *list)
             { .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = max_sets },
             { .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .descriptorCount = max_sets },
             { .type = VK_DESCRIPTOR_TYPE_SAMPLER, .descriptorCount = max_sets },
+            { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = max_sets * DDI_COMPUTE_BUFFER_BINDINGS },
         };
         const VkDescriptorPoolCreateInfo info = {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = max_sets,
@@ -150,16 +146,29 @@ static HRESULT bind_pixel_descriptors(DdiTransferList *list)
         const VkResult result = create(device->handle, &info, NULL, &pool);
         if (result != VK_SUCCESS)
             return venus_hresult(result);
-        list->pool->pixel_pool = pool;
+        list->pool->descriptor_pool = pool;
     }
     const VkDescriptorSetAllocateInfo allocation = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = list->pool->pixel_pool,
-        .descriptorSetCount = 1, .pSetLayouts = &draw->pixel_set_layout,
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = list->pool->descriptor_pool,
+        .descriptorSetCount = 1, .pSetLayouts = &layout,
     };
+    return venus_hresult(allocate(device->handle, &allocation, set));
+}
+
+static HRESULT bind_pixel_descriptors(DdiTransferList *list)
+{
+    const DdiDrawState *draw = &list->draw;
+    const VenusDevice *device = list->venus.device;
+    const PFN_vkUpdateDescriptorSets update = (PFN_vkUpdateDescriptorSets)
+        device->proc_addr(device->handle, "vkUpdateDescriptorSets");
+    const PFN_vkCmdBindDescriptorSets bind = (PFN_vkCmdBindDescriptorSets)
+        device->proc_addr(device->handle, "vkCmdBindDescriptorSets");
+    if (!update || !bind)
+        return E_FAIL;
     VkDescriptorSet set;
-    const VkResult result = allocate(device->handle, &allocation, &set);
-    if (result != VK_SUCCESS)
-        return venus_hresult(result);
+    const HRESULT allocated = allocate_command_descriptors(list, draw->pixel_set_layout, &set);
+    if (FAILED(allocated))
+        return allocated;
     if (draw->pipeline->pixel_bindings == DDI_PIXEL_CBV) {
         const DdiDescriptor *descriptor = draw->uniform;
         VkDescriptorBufferInfo buffer;
@@ -288,7 +297,11 @@ static VkAccessFlags buffer_access(D3D12DDI_RESOURCE_STATES state)
     const VkAccessFlags index = state & D3D12DDI_RESOURCE_STATE_INDEX_BUFFER ? VK_ACCESS_INDEX_READ_BIT : 0;
     const VkAccessFlags read = state & D3D12DDI_RESOURCE_STATE_COPY_SOURCE ? VK_ACCESS_TRANSFER_READ_BIT : 0;
     const VkAccessFlags write = state & D3D12DDI_RESOURCE_STATE_COPY_DEST ? VK_ACCESS_TRANSFER_WRITE_BIT : 0;
-    return vertex | index | read | write;
+    const VkAccessFlags shader_read =
+        state & (D3D12DDI_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12DDI_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                 D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS) ? VK_ACCESS_SHADER_READ_BIT : 0;
+    const VkAccessFlags shader_write = state & D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS ? VK_ACCESS_SHADER_WRITE_BIT : 0;
+    return vertex | index | read | write | shader_read | shader_write;
 }
 
 static HRESULT transition_resource(DdiTransferList *list, const D3D12DDIARG_RESOURCE_BARRIER_0022 *barrier)
@@ -305,7 +318,8 @@ static HRESULT transition_resource(DdiTransferList *list, const D3D12DDIARG_RESO
     if (buffer) {
         const D3D12DDI_RESOURCE_STATES supported = D3D12DDI_RESOURCE_STATE_COPY_SOURCE |
             D3D12DDI_RESOURCE_STATE_COPY_DEST | D3D12DDI_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
-            D3D12DDI_RESOURCE_STATE_INDEX_BUFFER;
+            D3D12DDI_RESOURCE_STATE_INDEX_BUFFER | D3D12DDI_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+            D3D12DDI_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12DDI_RESOURCE_STATE_UNORDERED_ACCESS;
         if ((before | after) & ~supported)
             return DXGI_ERROR_UNSUPPORTED;
         return record_venus_buffer_barrier(list->venus.command, buffer, buffer_access(before), buffer_access(after));

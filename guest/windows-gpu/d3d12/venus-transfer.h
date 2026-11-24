@@ -11,6 +11,7 @@ typedef struct VenusTransferBuffer {
     VkDeviceSize offset;
     VkDeviceAddress address;
     void *mapped;
+    VkBufferUsageFlags usage;
 } VenusTransferBuffer;
 
 typedef enum VenusBufferMemory {

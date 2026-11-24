@@ -724,6 +724,22 @@ red values, zero green and blue channels, and opaque alpha. Build
 `4.52.38.745` verified all 2,993 pixels on the RTX 2070 at 1.482 ms
 submit-to-fence. See `ddi40-runtime-r8-atlas/` under the lab share.
 
+In the next F239 diagnostic run, build `4.57.38.392` translated the
+first wgpu compute shader and created a Vulkan compute pipeline with
+two storage-buffer bindings. Windows later reached a null DDI pointer
+after placing a 24-byte buffer. See
+`ddi40-runtime-wintanyl-compute-layout/` under the lab share.
+
+The `--compute` probe uses a Shader Model 5.1 compute pipeline, a raw
+buffer SRV, a raw buffer UAV, and two sets of 32-bit root constants.
+It tests nonzero register spaces, descriptor table offsets and buffer
+view offsets. Build `5.2.10.771` verified all 64 computed words and a
+256-byte zero guard on the RTX 2070 at 1.219 ms submit-to-fence,
+including upload and readback. Storage dispatch requires Vulkan
+`robustBufferAccess` and checks descriptor alignment and range against
+the Venus device limits. See `ddi40-runtime-compute-dispatch/` under
+the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

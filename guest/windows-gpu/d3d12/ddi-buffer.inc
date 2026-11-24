@@ -290,6 +290,7 @@ static HRESULT create_placed_buffer(const VenusDevice *venus, const D3D12DDIARG_
             .size = resource->Width,
             .offset = storage->offset + base.Offset,
             .address = storage->address + base.Offset,
+            .usage = storage->usage,
         },
     };
     trace_ddi("CreatePlacedBuffer", 0, object->placed_buffer.offset);
@@ -514,6 +515,9 @@ static void APIENTRY get_debug_allocation_info(D3D12DDI_HDEVICE device, D3D12DDI
 }
 
 #include "ddi-color.inc"
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+#include "ddi-compute-command.inc"
+#endif
 
 #ifdef ENTANGLED_D3D12_PROBE_RUNTIME
 static D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY private_opened_transfer_sizes(
@@ -630,7 +634,8 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnCreateElementLayout = create_vertex_layout,
     .pfnDestroyElementLayout = destroy_vertex_layout,
     .pfnCreateConstantBufferView = create_uniform_cbv,
-    .pfnCreateShaderResourceView = create_sampled_srv,
+    .pfnCreateShaderResourceView = create_shader_srv,
+    .pfnCreateUnorderedAccessView = create_storage_uav,
     .pfnCreateSampler = create_pixel_sampler,
 #endif
     .pfnCalcPrivateHeapAndResourceSizes = private_resource_sizes,
@@ -724,6 +729,11 @@ static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
     .pfnSetGraphicsRootSignature = set_transfer_graphics_root,
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     .pfnSetGraphicsRootDescriptorTable = set_graphics_pixel_table,
+    .pfnSetComputeRootSignature = set_compute_root,
+    .pfnSetComputeRootDescriptorTable = set_compute_table,
+    .pfnSetComputeRoot32BitConstant = set_compute_constant,
+    .pfnSetComputeRoot32BitConstants = set_compute_constants,
+    .pfnDispatch = dispatch_compute,
 #endif
     .pfnIASetIndexBuffer = set_transfer_index_buffer,
     .pfnIASetVertexBuffers = set_transfer_vertex_buffers,

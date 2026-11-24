@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <wchar.h>
 #include <dxil_spirv_c.h>
+#include "ddi-compute-layout.inc"
 
 typedef struct DxbcHeader {
     char tag[4];
@@ -27,6 +28,7 @@ typedef struct DxbcSignatureEntry {
 
 typedef struct DdiShader {
     VkShaderModule module;
+    DxbcHeader *compute_code;
     VkShaderStageFlagBits stage;
     UINT pixel_bindings;
 } DdiShader;
@@ -188,7 +190,8 @@ static dxil_spv_bool remap_pixel_sampler(void *context, const dxil_spv_d3d_bindi
     return 1;
 }
 
-static HRESULT compile_shader_module(const VenusDevice *device, const DxbcHeader *blob, DdiShader *output)
+static HRESULT compile_shader_module(const VenusDevice *device, const DxbcHeader *blob,
+                                     DdiComputeRemap *compute, DdiShader *output)
 {
     HMODULE compiler = load_shader_compiler();
     if (!compiler) {
@@ -220,12 +223,17 @@ static HRESULT compile_shader_module(const VenusDevice *device, const DxbcHeader
     void (*set_sampler)(dxil_spv_converter, dxil_spv_sampler_remapper_cb, void *) =
         (void (*)(dxil_spv_converter, dxil_spv_sampler_remapper_cb, void *))(void *)
         GetProcAddress(compiler, "dxil_spv_converter_set_sampler_remapper");
+    void (*set_uav)(dxil_spv_converter, dxil_spv_uav_remapper_cb, void *) =
+        (void (*)(dxil_spv_converter, dxil_spv_uav_remapper_cb, void *))(void *)
+        GetProcAddress(compiler, "dxil_spv_converter_set_uav_remapper");
+    void (*set_constant_words)(dxil_spv_converter, unsigned) = (void (*)(dxil_spv_converter, unsigned))(void *)
+        GetProcAddress(compiler, "dxil_spv_converter_set_root_constant_word_count");
     const PFN_vkCreateShaderModule create_module = (PFN_vkCreateShaderModule)
         device->proc_addr(device->handle, "vkCreateShaderModule");
     const PFN_vkDestroyShaderModule destroy_module = (PFN_vkDestroyShaderModule)
         device->proc_addr(device->handle, "vkDestroyShaderModule");
     if (!parse || !free_blob || !create || !free_converter || !convert || !compiled || !set_cbv || !set_srv || !set_sampler ||
-        !create_module || !destroy_module) {
+        (compute && (!set_uav || !set_constant_words)) || !create_module || !destroy_module) {
         FreeLibrary(compiler);
         return DXGI_ERROR_UNSUPPORTED;
     }
@@ -237,8 +245,15 @@ static HRESULT compile_shader_module(const VenusDevice *device, const DxbcHeader
     if (result == DXIL_SPV_SUCCESS)
         result = create(parsed, &converter);
     if (result == DXIL_SPV_SUCCESS) {
-        set_cbv(converter, remap_pixel_cbv, &output->pixel_bindings);
-        set_srv(converter, remap_pixel_srv, &output->pixel_bindings);
+        if (compute) {
+            set_cbv(converter, remap_compute_constant, compute);
+            set_srv(converter, remap_compute_srv, compute);
+            set_uav(converter, remap_compute_uav, compute);
+            set_constant_words(converter, compute->layout->constant_words);
+        } else {
+            set_cbv(converter, remap_pixel_cbv, &output->pixel_bindings);
+            set_srv(converter, remap_pixel_srv, &output->pixel_bindings);
+        }
         set_sampler(converter, remap_pixel_sampler, &output->pixel_bindings);
         result = convert(converter);
     }
@@ -287,15 +302,20 @@ static HRESULT create_legacy_shader(D3D12DDI_HDEVICE device, const D3D12DDIARG_C
     DxbcHeader *blob = NULL;
     HRESULT status = make_legacy_dxbc(args, stage, &blob);
     if (SUCCEEDED(status)) {
-        status = compile_shader_module(venus_device(device), blob, shader);
-        HeapFree(GetProcessHeap(), 0, blob);
+        if (stage == DXBC_COMPUTE) {
+            /* Resource types come from the shader, register locations from the pipeline's root signature. */
+            shader->compute_code = blob;
+        } else {
+            status = compile_shader_module(venus_device(device), blob, NULL, shader);
+            HeapFree(GetProcessHeap(), 0, blob);
+        }
     }
     if (SUCCEEDED(status))
         shader->stage = stage == DXBC_COMPUTE ? VK_SHADER_STAGE_COMPUTE_BIT :
             stage == DXBC_PIXEL ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
     trace_ddi(stage == DXBC_COMPUTE ? "CreateComputeShader" :
               stage == DXBC_PIXEL ? "CreatePixelShader" : "CreateVertexShader",
-              (UINT)status, shader->module != VK_NULL_HANDLE);
+              (UINT)status, shader->module != VK_NULL_HANDLE || shader->compute_code != NULL);
     return status;
 }
 
@@ -317,14 +337,21 @@ static HRESULT APIENTRY create_compute_shader(D3D12DDI_HDEVICE device, const D3D
     return create_legacy_shader(device, args, handle, DXBC_COMPUTE);
 }
 
+static void destroy_shader_module(const VenusDevice *venus, VkShaderModule module)
+{
+    const PFN_vkDestroyShaderModule destroy = (PFN_vkDestroyShaderModule)
+        venus->proc_addr(venus->handle, "vkDestroyShaderModule");
+    destroy(venus->handle, module, NULL);
+}
+
 static void APIENTRY destroy_shader(D3D12DDI_HDEVICE device, D3D12DDI_HSHADER handle)
 {
     DdiShader *shader = handle.pDrvPrivate;
-    if (shader && shader->module) {
-        const VenusDevice *venus = venus_device(device);
-        const PFN_vkDestroyShaderModule destroy = (PFN_vkDestroyShaderModule)
-            venus->proc_addr(venus->handle, "vkDestroyShaderModule");
-        destroy(venus->handle, shader->module, NULL);
-        shader->module = VK_NULL_HANDLE;
-    }
+    if (!shader)
+        return;
+    if (shader->module)
+        destroy_shader_module(venus_device(device), shader->module);
+    if (shader->compute_code)
+        HeapFree(GetProcessHeap(), 0, shader->compute_code);
+    *shader = (DdiShader){0};
 }

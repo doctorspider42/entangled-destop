@@ -41,6 +41,8 @@ typedef struct DdiPipeline {
     UINT pixel_bindings;
     UINT minimum_vertex_stride;
     VkVertexInputRate vertex_rate;
+    DdiComputeLayout compute;
+    VkDescriptorSetLayout compute_set;
 } DdiPipeline;
 
 static SIZE_T APIENTRY private_pipeline_size(D3D12DDI_HDEVICE device,
@@ -49,13 +51,67 @@ static SIZE_T APIENTRY private_pipeline_size(D3D12DDI_HDEVICE device,
     return device.pDrvPrivate && args ? sizeof(DdiPipeline) : 0;
 }
 
+static void destroy_compute_layout(const VenusDevice *venus, DdiPipeline *state)
+{
+    const PFN_vkDestroyPipelineLayout destroy_layout = (PFN_vkDestroyPipelineLayout)
+        venus->proc_addr(venus->handle, "vkDestroyPipelineLayout");
+    const PFN_vkDestroyDescriptorSetLayout destroy_set = (PFN_vkDestroyDescriptorSetLayout)
+        venus->proc_addr(venus->handle, "vkDestroyDescriptorSetLayout");
+    if (state->layout)
+        destroy_layout(venus->handle, state->layout, NULL);
+    if (state->compute_set)
+        destroy_set(venus->handle, state->compute_set, NULL);
+}
+
+static HRESULT create_compute_layout(const VenusDevice *venus, DdiPipeline *state)
+{
+    const PFN_vkCreatePipelineLayout create_layout = (PFN_vkCreatePipelineLayout)
+        venus->proc_addr(venus->handle, "vkCreatePipelineLayout");
+    const PFN_vkCreateDescriptorSetLayout create_set = (PFN_vkCreateDescriptorSetLayout)
+        venus->proc_addr(venus->handle, "vkCreateDescriptorSetLayout");
+    if (!create_layout || !create_set || !venus->proc_addr(venus->handle, "vkDestroyPipelineLayout") ||
+        !venus->proc_addr(venus->handle, "vkDestroyDescriptorSetLayout"))
+        return E_FAIL;
+
+    const UINT bindings = state->compute.buffer_count;
+    if (bindings) {
+        VkDescriptorSetLayoutBinding buffers[DDI_COMPUTE_BUFFER_BINDINGS];
+        for (UINT i = 0; i < bindings; ++i) {
+            buffers[i] = (VkDescriptorSetLayoutBinding){ .binding = i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT };
+        }
+        const VkDescriptorSetLayoutCreateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = bindings, .pBindings = buffers,
+        };
+        const HRESULT status = venus_hresult(create_set(venus->handle, &info, NULL, &state->compute_set));
+        if (FAILED(status))
+            return status;
+    }
+    const VkPushConstantRange constants = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .size = state->compute.constant_words * sizeof(UINT32),
+    };
+    const VkPipelineLayoutCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = bindings ? 1 : 0,
+        .pSetLayouts = bindings ? &state->compute_set : NULL,
+        .pushConstantRangeCount = constants.size ? 1 : 0,
+        .pPushConstantRanges = constants.size ? &constants : NULL,
+    };
+    return venus_hresult(create_layout(venus->handle, &info, NULL, &state->layout));
+}
+
 static HRESULT create_compute_pipeline(const VenusDevice *venus, const D3D12DDIARG_CREATE_PIPELINE_STATE_0033 *args,
                                         DdiPipeline *state)
 {
     const DdiShader *shader = args->hComputeShader.pDrvPrivate;
     const DdiRootSignature *root = args->hRootSignature.pDrvPrivate;
-    if (!shader->module || shader->stage != VK_SHADER_STAGE_COMPUTE_BIT ||
-        !root || !root->empty_layout || args->NodeMask > 1)
+    if (!shader || !shader->compute_code || shader->stage != VK_SHADER_STAGE_COMPUTE_BIT ||
+        !root || root->desc.NumStaticSamplers || args->NodeMask > 1)
+        return DXGI_ERROR_UNSUPPORTED;
+
+    DdiPipeline pipeline = { .device = venus, .bind_point = VK_PIPELINE_BIND_POINT_COMPUTE };
+    pipeline.compute.constant_words = compute_constant_words(root);
+    if (pipeline.compute.constant_words > DDI_COMPUTE_CONSTANT_WORDS)
         return DXGI_ERROR_UNSUPPORTED;
 
     const PFN_vkCreateComputePipelines create = (PFN_vkCreateComputePipelines)
@@ -65,28 +121,37 @@ static HRESULT create_compute_pipeline(const VenusDevice *venus, const D3D12DDIA
     if (!create || !destroy)
         return E_FAIL;
 
+    DdiShader compiled = {0};
+    DdiComputeRemap remap = { .root = root, .layout = &pipeline.compute };
+    HRESULT status = compile_shader_module(venus, shader->compute_code, &remap, &compiled);
+    if (SUCCEEDED(status) && pipeline.compute.buffer_count &&
+        (!venus->robust_buffer_access || pipeline.compute.buffer_count > venus->limits.maxPerStageDescriptorStorageBuffers))
+        status = DXGI_ERROR_UNSUPPORTED;
+    if (SUCCEEDED(status))
+        status = create_compute_layout(venus, &pipeline);
     const VkComputePipelineCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = shader->module,
+            .module = compiled.module,
             .pName = "main",
         },
-        .layout = root->empty_layout,
+        .layout = pipeline.layout,
         .basePipelineIndex = -1,
     };
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    const VkResult result = create(venus->handle, VK_NULL_HANDLE, 1, &info, NULL, &pipeline);
-    if (result == VK_SUCCESS) {
-        state->device = venus;
-        state->pipeline = pipeline;
-        state->bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
-    } else if (pipeline) {
-        destroy(venus->handle, pipeline, NULL);
+    if (SUCCEEDED(status))
+        status = venus_hresult(create(venus->handle, VK_NULL_HANDLE, 1, &info, NULL, &pipeline.pipeline));
+    if (compiled.module)
+        destroy_shader_module(venus, compiled.module);
+    if (SUCCEEDED(status))
+        *state = pipeline;
+    else {
+        if (pipeline.pipeline)
+            destroy(venus->handle, pipeline.pipeline, NULL);
+        destroy_compute_layout(venus, &pipeline);
     }
-    const HRESULT status = venus_hresult(result);
-    trace_ddi("CreateComputePipelineState", (UINT)status, state->pipeline != VK_NULL_HANDLE);
+    trace_ddi("CreateComputePipelineState", (UINT)status, pipeline.compute.buffer_count);
     return status;
 }
 
@@ -300,6 +365,8 @@ static void APIENTRY destroy_pipeline(D3D12DDI_HDEVICE device, D3D12DDI_HPIPELIN
     const PFN_vkDestroyRenderPass destroy_pass = (PFN_vkDestroyRenderPass)
         venus->proc_addr(venus->handle, "vkDestroyRenderPass");
     destroy(venus->handle, state->pipeline, NULL);
+    if (state->bind_point == VK_PIPELINE_BIND_POINT_COMPUTE)
+        destroy_compute_layout(venus, state);
     if (state->render_pass)
         destroy_pass(venus->handle, state->render_pass, NULL);
     *state = (DdiPipeline){0};

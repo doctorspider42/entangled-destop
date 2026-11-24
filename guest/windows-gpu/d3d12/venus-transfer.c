@@ -61,6 +61,7 @@ HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize siz
     buffer->device = device;
     buffer->handle = handle;
     buffer->size = size;
+    buffer->usage = info.usage;
 
     VkMemoryRequirements req;
     requirements(device->handle, handle, &req);

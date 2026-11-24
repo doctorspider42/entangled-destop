@@ -257,6 +257,15 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
     BOOL has_buffer_device_address = FALSE;
     BOOL has_dynamic_rendering = FALSE;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
+    VkPhysicalDeviceFeatures core_features = {0};
+    const PFN_vkGetPhysicalDeviceProperties2 get_properties = (PFN_vkGetPhysicalDeviceProperties2)
+        adapter->instance_proc_addr(adapter->instance, "vkGetPhysicalDeviceProperties2");
+    VkPhysicalDeviceProperties2 properties = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+    if (!get_properties)
+        return E_FAIL;
+    get_properties(adapter->physical_device, &properties);
+    info.pEnabledFeatures = &core_features;
+
     VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
     };
@@ -285,6 +294,9 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
             .pNext = &address,
         };
         get_features(adapter->physical_device, &features);
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+        core_features.robustBufferAccess = features.features.robustBufferAccess;
+#endif
         has_dynamic_rendering = rendering.dynamicRendering != VK_FALSE;
         if (has_dynamic_rendering) {
             rendering.pNext = (void *)info.pNext;
@@ -326,6 +338,10 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
         .maintenance5 = has_maintenance5,
         .buffer_device_address = has_buffer_device_address,
         .dynamic_rendering = has_dynamic_rendering,
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+        .robust_buffer_access = core_features.robustBufferAccess,
+        .limits = properties.properties.limits,
+#endif
     };
     get_memory(adapter->physical_device, &device->memory);
     return S_OK;
