@@ -1239,7 +1239,7 @@ QPC frequency. Build from an x64 MSVC prompt with the object and executable
 outputs on the scratch drive:
 
 ```cmd
-cl /nologo /std:c++17 /O2 /EHsc /MT /W4 /WX tests\windows\dcomp-cadence.cpp /FoF:\scratch\dcomp-cadence.obj /FeF:\scratch\dcomp-cadence.exe d3d11.lib dcomp.lib dwmapi.lib user32.lib gdi32.lib
+cl /nologo /std:c++17 /O2 /EHsc /MT /W4 /WX /external:I "%WindowsSdkDir%Include\%WindowsSDKVersion%cppwinrt" /external:W0 tests\windows\dcomp-cadence.cpp /FoF:\scratch\dcomp-cadence.obj /FeF:\scratch\dcomp-cadence.exe d3d11.lib dcomp.lib dwmapi.lib user32.lib gdi32.lib windowsapp.lib
 ```
 
 Verify changing pixels in the benchmark window as well as its timings. A
@@ -1388,6 +1388,46 @@ Raw ETLs are in `F:/VMs/Entangled/d3d12-lab/share/animation-etw/`
 (`effects-stages.etl`, `effects-lite.etl`). The joined trace,
 `effects-lite-breakdown.txt`, and the matching `fx-lite` host actions and
 pixel capture are in `F:/VMs/Entangled/d3d12-lab/physical-wheel/`.
+
+#### Reusing one captured window surface
+
+The detailed trace attributed 22 strip updates and 22 realizations of the
+same 1280×820 window source to the 1.32 s draw. Wintanyl builds the lamp
+from per-strip `CompositionVisualSurface` objects over a nested window
+mirror. A separate 24→4 strip control roughly doubled the visible
+minimize updates (1–2 to 4) while leaving first-pixel latency near 0.5 s.
+That control changed the effect geometry and was reverted.
+
+The cadence probe's `--snapshot HWND` mode captures one visible window
+with Windows Graphics Capture. Pass a hexadecimal guest HWND. It copies
+the frame with `CopySubresourceRegion` into a DirectComposition surface
+on the same D3D11 device, without CPU pixel readback or an inter-API
+shared handle. All visuals sample the resulting surface, and the mode
+uses the same 60 Hz commit clock. The probe scales the full texture to
+400×384 and moves clipped strips horizontally. It does not reproduce the
+lamp's projective transforms or Wintanyl's decoration and reversal.
+
+On the hardware Entangled WDDM adapter, two captures of the actual F239
+Explorer measured 79–81 ms from `StartCapture` to the first frame and
+another 69–71 ms through copy submission and `EndDraw`. In both 24-strip
+phases, after skipping the first 600 ms, 264 commits produced 164 and 178
+guest scanouts and the same numbers of changed host frames in 4.38 s.
+Host pixel intervals had a 25 ms median, 29–33 ms p95 and 54–58 ms
+maximum. The paired one-visual controls had 156–180 changed host frames.
+A guest screenshot confirmed that the probe displayed the Explorer file
+list.
+
+Starting capture after the same window was already minimized timed out
+after three seconds (`0x80070102`). For a real lamp implementation, the
+source has to be ready before minimizing, remain available through
+restore, and be invalidated when the window changes. An on-demand cold
+capture alone would consume about 150 ms on this guest before the first
+effect commit. The measured 37–41 visible updates/s also leaves room below
+the 60 Hz guest target. The probe tests source reuse independently of
+window lifecycle and animation geometry. [Capture a window by HWND](https://learn.microsoft.com/en-us/windows/win32/api/windows.graphics.capture.interop/nf-windows-graphics-capture-interop-igraphicscaptureiteminterop-createforwindow) · [Draw to a DirectComposition surface](https://learn.microsoft.com/en-us/windows/win32/api/dcomp/nf-dcomp-idcompositionsurface-begindraw)
+
+The `dcomp-snap` and `dcomp-snap2` host captures and the guest's matching
+results plus `dcomp-minimized` are under the same lab directories as above.
 
 ## Risks, in the order they are likely to bite
 

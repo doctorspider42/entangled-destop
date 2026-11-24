@@ -3,10 +3,17 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <dcomp.h>
 #include <dwmapi.h>
+#include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <wrl/client.h>
 
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +22,8 @@
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
+namespace Capture = winrt::Windows::Graphics::Capture;
+namespace GraphicsDirectX = winrt::Windows::Graphics::DirectX;
 
 namespace {
 constexpr int width = 400;
@@ -62,7 +71,13 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
     return DefWindowProcW(window, message, wparam, lparam);
 }
 
-ComPtr<IDCompositionSurface> make_surface(IDCompositionDevice *composition, ID3D11DeviceContext *context)
+struct Surface {
+    ComPtr<IDCompositionSurface> content;
+    int width;
+    int height;
+};
+
+Surface make_surface(IDCompositionDevice *composition, ID3D11DeviceContext *context)
 {
     ComPtr<IDCompositionSurface> surface;
     check(composition->CreateSurface(width, height, DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -86,7 +101,90 @@ ComPtr<IDCompositionSurface> make_surface(IDCompositionDevice *composition, ID3D
         context->Flush();
     }
     check(surface->EndDraw(), "EndDraw");
-    return surface;
+    return {surface, width, height};
+}
+
+Surface capture_window(HWND source, IDCompositionDevice *composition,
+                       ID3D11Device *device, ID3D11DeviceContext *context, IDXGIDevice *dxgi)
+{
+    struct Apartment {
+        Apartment() { winrt::init_apartment(); }
+        ~Apartment() { winrt::uninit_apartment(); }
+    } apartment;
+    ComPtr<ID3D11Multithread> multithread;
+    check(context->QueryInterface(IID_PPV_ARGS(&multithread)), "Get ID3D11Multithread");
+    multithread->SetMultithreadProtected(TRUE);
+
+    winrt::com_ptr<IInspectable> inspectable;
+    check(CreateDirect3D11DeviceFromDXGIDevice(dxgi, inspectable.put()), "Create WinRT D3D11 device");
+    const auto capture_device = inspectable.as<GraphicsDirectX::Direct3D11::IDirect3DDevice>();
+    const auto factory = winrt::get_activation_factory<Capture::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+    Capture::GraphicsCaptureItem item{nullptr};
+    check(factory->CreateForWindow(source, winrt::guid_of<Capture::IGraphicsCaptureItem>(), winrt::put_abi(item)),
+          "Create capture item for HWND");
+    const auto pool = Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
+        capture_device, GraphicsDirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, item.Size());
+    const auto session = pool.CreateCaptureSession(item);
+    session.IsCursorCaptureEnabled(false);
+    const auto began = counter();
+    session.StartCapture();
+    const auto timeout = GetTickCount64() + 3000;
+    auto frame = pool.TryGetNextFrame();
+    while (!frame && GetTickCount64() < timeout) {
+        Sleep(5);
+        frame = pool.TryGetNextFrame();
+    }
+    if (!frame)
+        check(HRESULT_FROM_WIN32(WAIT_TIMEOUT), "Wait for captured frame");
+
+    const auto captured = counter();
+    const auto size = frame.ContentSize();
+    const auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+    ComPtr<ID3D11Texture2D> input;
+    check(access->GetInterface(IID_PPV_ARGS(&input)), "Get captured D3D11 texture");
+    D3D11_TEXTURE2D_DESC desc{};
+    input->GetDesc(&desc);
+    if (size.Width <= 0 || size.Height <= 0 || static_cast<UINT>(size.Width) > desc.Width ||
+        static_cast<UINT>(size.Height) > desc.Height || desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
+        check(E_INVALIDARG, "Validate captured texture");
+    ComPtr<ID3D11Device> input_device;
+    input->GetDevice(&input_device);
+    if (input_device.Get() != device)
+        check(E_FAIL, "Validate same-device capture");
+
+    ComPtr<IDCompositionSurface> surface;
+    check(composition->CreateSurface(size.Width, size.Height, desc.Format, DXGI_ALPHA_MODE_IGNORE, &surface),
+          "Create snapshot surface");
+    POINT offset{};
+    {
+        ComPtr<IDXGISurface> draw;
+        check(surface->BeginDraw(nullptr, IID_PPV_ARGS(&draw), &offset), "Begin snapshot draw");
+        ComPtr<ID3D11Texture2D> texture;
+        auto status = draw.As(&texture);
+        if (SUCCEEDED(status)) {
+            D3D11_TEXTURE2D_DESC output{};
+            texture->GetDesc(&output);
+            if (offset.x < 0 || offset.y < 0 || offset.x + static_cast<int64_t>(size.Width) > output.Width ||
+                offset.y + static_cast<int64_t>(size.Height) > output.Height)
+                status = E_INVALIDARG;
+        }
+        if (SUCCEEDED(status)) {
+            const D3D11_BOX box{0, 0, 0, static_cast<UINT>(size.Width), static_cast<UINT>(size.Height), 1};
+            context->CopySubresourceRegion(texture.Get(), 0, offset.x, offset.y, 0, input.Get(), 0, &box);
+            context->Flush();
+        }
+        const auto end = surface->EndDraw();
+        check(status, "Validate snapshot draw texture");
+        check(end, "End snapshot draw");
+    }
+    check(device->GetDeviceRemovedReason(), "Check snapshot device");
+    const auto copied = counter();
+    fprintf(stderr, "snapshot hwnd=%p size=%dx%d qpc_start=%lld qpc_frame=%lld qpc_submitted=%lld\n",
+            source, size.Width, size.Height, began, captured, copied);
+    frame.Close();
+    session.Close();
+    pool.Close();
+    return {surface, size.Width, size.Height};
 }
 
 void wait_for_next_tick(HANDLE timer, long long start, long long frame, long long frequency)
@@ -103,7 +201,7 @@ void wait_for_next_tick(HANDLE timer, long long start, long long frame, long lon
         check(E_FAIL, "Wait for queued tick");
 }
 
-bool phase(IDCompositionDevice *composition, IDCompositionTarget *target, IDCompositionSurface *surface,
+bool phase(IDCompositionDevice *composition, IDCompositionTarget *target, const Surface &surface,
            int number, int count, long long frequency, HANDLE queued_timer)
 {
     ComPtr<IDCompositionVisual> root;
@@ -112,11 +210,14 @@ bool phase(IDCompositionDevice *composition, IDCompositionTarget *target, IDComp
     for (int i = 0; i < count; ++i) {
         auto &visual = visuals[i];
         check(composition->CreateVisual(&visual), "Create strip visual");
-        check(visual->SetContent(surface), "SetContent");
-        const float top = static_cast<float>(i * height / count);
-        const float bottom = static_cast<float>((i + 1) * height / count);
-        const D2D_RECT_F clip{0, top, width, bottom};
+        check(visual->SetContent(surface.content.Get()), "SetContent");
+        const float top = static_cast<float>(i * surface.height / count);
+        const float bottom = static_cast<float>((i + 1) * surface.height / count);
+        const D2D_RECT_F clip{0, top, static_cast<float>(surface.width), bottom};
         check(visual->SetClip(clip), "SetClip");
+        const D2D_MATRIX_3X2_F scale{static_cast<float>(width) / static_cast<float>(surface.width), 0, 0,
+                                    static_cast<float>(height) / static_cast<float>(surface.height), 0, 0};
+        check(visual->SetTransform(scale), "Scale source");
         check(visual->SetOffsetY(50.0f), "SetOffsetY");
         check(root->AddVisual(visual.Get(), FALSE, nullptr), "AddVisual");
     }
@@ -154,9 +255,24 @@ bool phase(IDCompositionDevice *composition, IDCompositionTarget *target, IDComp
 
 int main(int argc, char **argv)
 {
-    const bool queued = argc == 2 && std::strcmp(argv[1], "--queued") == 0;
+    HWND source = nullptr;
+    if (argc == 3 && std::strcmp(argv[1], "--snapshot") == 0) {
+        const char *start = argv[2];
+        const char *end = start + std::strlen(start);
+        if (std::strncmp(start, "0x", 2) == 0)
+            start += 2;
+        uintptr_t value = 0;
+        const auto parsed = std::from_chars(start, end, value, 16);
+        if (parsed.ec == std::errc{} && parsed.ptr == end)
+            source = reinterpret_cast<HWND>(value);
+        if (!source || !IsWindow(source)) {
+            fprintf(stderr, "--snapshot requires a live hexadecimal HWND\n");
+            return 2;
+        }
+    }
+    const bool queued = source || (argc == 2 && std::strcmp(argv[1], "--queued") == 0);
     if (argc != 1 && !queued) {
-        fprintf(stderr, "usage: dcomp-cadence.exe [--queued]\n");
+        fprintf(stderr, "usage: dcomp-cadence.exe [--queued | --snapshot HWND]\n");
         return 2;
     }
     try {
@@ -191,7 +307,8 @@ int main(int argc, char **argv)
         check(DCompositionCreateDevice(dxgi.Get(), IID_PPV_ARGS(&composition)), "DCompositionCreateDevice");
         ComPtr<IDCompositionTarget> target;
         check(composition->CreateTargetForHwnd(window, TRUE, &target), "CreateTargetForHwnd");
-        const auto surface = make_surface(composition.Get(), context.Get());
+        const auto surface = source ? capture_window(source, composition.Get(), d3d.Get(), context.Get(), dxgi.Get())
+                                    : make_surface(composition.Get(), context.Get());
         // Show the probe even when the launcher hides its console via STARTUPINFO.
         if (!SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
                           SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW))
@@ -208,7 +325,7 @@ int main(int argc, char **argv)
         }
         puts("phase,visuals,frame,qpc_begin,qpc_commit,qpc_flush,qpc_done,hresult");
         for (int i = 0; i < 3; ++i) {
-            if (!phase(composition.Get(), target.Get(), surface.Get(), i + 1,
+            if (!phase(composition.Get(), target.Get(), surface, i + 1,
                        i == 1 ? strips : 1, frequency.QuadPart, timer.get())) {
                 fprintf(stderr, "window closed during the measurement\n");
                 return 2;
@@ -217,6 +334,10 @@ int main(int argc, char **argv)
         DestroyWindow(window);
     } catch (const Failure &error) {
         fprintf(stderr, "%s failed (0x%08lx)\n", error.call, static_cast<unsigned long>(error.status));
+        return 1;
+    } catch (const winrt::hresult_error &error) {
+        fprintf(stderr, "Windows Graphics Capture failed (0x%08lx): %ls\n",
+                static_cast<unsigned long>(error.code().value), error.message().c_str());
         return 1;
     }
 }
