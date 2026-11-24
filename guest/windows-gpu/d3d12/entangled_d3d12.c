@@ -43,10 +43,15 @@ static VenusDevice *venus_device(D3D12DDI_HDEVICE handle)
 }
 
 #ifdef ENTANGLED_D3D12_PROBE_RUNTIME
-static BOOL runtime_probe_enabled(void)
+static BOOL enabled_environment_flag(const char *name)
 {
     char enabled[2];
-    if (GetEnvironmentVariableA("ENTANGLED_RUNTIME_TABLES", enabled, sizeof(enabled)) != 1 || enabled[0] != '1')
+    return GetEnvironmentVariableA(name, enabled, sizeof(enabled)) == 1 && enabled[0] == '1';
+}
+
+static BOOL runtime_probe_enabled(void)
+{
+    if (!enabled_environment_flag("ENTANGLED_RUNTIME_TABLES"))
         return FALSE;
 
     WCHAR program[MAX_PATH];
@@ -54,7 +59,11 @@ static BOOL runtime_probe_enabled(void)
     if (!length || length >= _countof(program))
         return FALSE;
     const WCHAR *filename = wcsrchr(program, L'\\');
-    return filename && !_wcsicmp(filename + 1, L"d3d12-smoke.exe");
+    if (!filename)
+        return FALSE;
+    ++filename;
+    return !_wcsicmp(filename, L"d3d12-smoke.exe") ||
+           (!_wcsicmp(filename, L"wintanyl-explorer.exe") && enabled_environment_flag("ENTANGLED_WINTANYL_D3D12"));
 }
 #endif
 

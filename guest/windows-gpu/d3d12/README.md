@@ -612,6 +612,25 @@ scanout. See `ddi40-runtime-present-headless-current/scanout-2.png`
 and its `host-pixel-verification.log` under the lab share. The installed
 engine was preserved.
 
+## Wintanyl F239
+
+The lab runtime also admits `wintanyl-explorer.exe` when both
+`ENTANGLED_RUNTIME_TABLES=1` and `ENTANGLED_WINTANYL_D3D12=1` are set.
+Build `3.58.45.44` tested the F239 executable with the SHA-256 from the
+F240/F241 control. The unchanged Explorer enumerated 80 test files. Its
+wgpu adapter probe created and released an Entangled D3D12 device, and
+the process loaded `d3d10warp.dll` and entered the window loop. The
+F239 binary uses wgpu-hal 30.0.2, which rejects Resource Binding Tier 1
+when it enumerates DX12 adapters. The driver reports Tier 1. The next
+rendering test needs shader access to a real bound resource before the
+driver can advance toward Tier 2.
+[wgpu-hal 30.0.2 DX12 adapter admission](https://github.com/gfx-rs/wgpu/blob/v30.0.2/wgpu-hal/src/dx12/adapter.rs#L208-L235).
+
+See `ddi40-runtime-wintanyl-f239/` under the lab share for the debugger
+log, ETW and application trace. The harness ended the process after
+22 seconds and restored `oem58.inf`. F239 has no verified hardware
+frame or scroll measurement in this run.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a
