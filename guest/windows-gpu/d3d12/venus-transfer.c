@@ -363,18 +363,13 @@ static HRESULT ensure_color_attachment(VenusColorImage *image)
     return status;
 }
 
-HRESULT record_venus_color_draw(VkCommandBuffer command, VenusColorImage *image,
-                               const VkViewport *viewport, const VkRect2D *scissor,
-                               UINT vertex_count, UINT instance_count, UINT first_vertex, UINT first_instance)
+static HRESULT begin_venus_color_rendering(VkCommandBuffer command, VenusColorImage *image, BOOL initialized,
+                                            const FLOAT *clear)
 {
     const VenusDevice *device = image->device;
     const PFN_vkCmdPipelineBarrier barrier = DEVICE_FN(device, vkCmdPipelineBarrier);
     const PFN_vkCmdBeginRendering begin = DEVICE_FN(device, vkCmdBeginRendering);
-    const PFN_vkCmdEndRendering end = DEVICE_FN(device, vkCmdEndRendering);
-    const PFN_vkCmdSetViewport set_viewport = DEVICE_FN(device, vkCmdSetViewport);
-    const PFN_vkCmdSetScissor set_scissor = DEVICE_FN(device, vkCmdSetScissor);
-    const PFN_vkCmdDraw draw = DEVICE_FN(device, vkCmdDraw);
-    if (!barrier || !begin || !end || !set_viewport || !set_scissor || !draw)
+    if (!barrier || !begin)
         return E_FAIL;
     HRESULT status = ensure_color_attachment(image);
     if (FAILED(status))
@@ -382,25 +377,64 @@ HRESULT record_venus_color_draw(VkCommandBuffer command, VenusColorImage *image,
 
     const VkImageMemoryBarrier target = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .srcAccessMask = initialized ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .oldLayout = initialized ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
         .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image = image->render_handle,
         .subresourceRange = color_subresource,
     };
-    barrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+    const VkPipelineStageFlags previous = initialized ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                                     : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    barrier(command, previous, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             0, 0, NULL, 0, NULL, 1, &target);
-    const VkRenderingAttachmentInfo attachment = {
+    VkRenderingAttachmentInfo attachment = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = image->render_view,
-        .imageLayout = target.newLayout, .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .imageLayout = target.newLayout,
+        .loadOp = initialized ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
     };
+    if (clear) {
+        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachment.clearValue.color = (VkClearColorValue){ .float32 = {clear[0], clear[1], clear[2], clear[3]} };
+    }
     const VkRenderingInfo rendering = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea.extent = {image->extent.width, image->extent.height},
         .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &attachment,
     };
     begin(command, &rendering);
+    return S_OK;
+}
+
+HRESULT record_venus_clear_attachment(VkCommandBuffer command, VenusColorImage *image, const FLOAT color[4],
+                                      BOOL initialized)
+{
+    const PFN_vkCmdEndRendering end = DEVICE_FN(image->device, vkCmdEndRendering);
+    if (!end)
+        return E_FAIL;
+    const HRESULT status = begin_venus_color_rendering(command, image, initialized, color);
+    if (SUCCEEDED(status))
+        end(command);
+    return status;
+}
+
+HRESULT record_venus_color_draw(VkCommandBuffer command, VenusColorImage *image,
+                               const VkViewport *viewport, const VkRect2D *scissor,
+                               UINT vertex_count, UINT instance_count, UINT first_vertex, UINT first_instance,
+                               BOOL initialized)
+{
+    const VenusDevice *device = image->device;
+    const PFN_vkCmdEndRendering end = DEVICE_FN(device, vkCmdEndRendering);
+    const PFN_vkCmdSetViewport set_viewport = DEVICE_FN(device, vkCmdSetViewport);
+    const PFN_vkCmdSetScissor set_scissor = DEVICE_FN(device, vkCmdSetScissor);
+    const PFN_vkCmdDraw draw = DEVICE_FN(device, vkCmdDraw);
+    if (!end || !set_viewport || !set_scissor || !draw)
+        return E_FAIL;
+    const HRESULT status = begin_venus_color_rendering(command, image, initialized, NULL);
+    if (FAILED(status))
+        return status;
     set_viewport(command, 0, 1, viewport);
     set_scissor(command, 0, 1, scissor);
     draw(command, vertex_count, instance_count, first_vertex, first_instance);

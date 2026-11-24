@@ -791,6 +791,12 @@ indirect change supports signature creation. Nonzero
 `ddi40-runtime-wintanyl-indirect-layout/` under the lab share.
 [wgpu's root-constant command signatures](https://github.com/gfx-rs/wgpu/blob/v30.0.2/wgpu-hal/src/dx12/device.rs#L1299-L1363).
 
+The `--blend` probe clears a blue attachment and draws two red
+premultiplied layers in one command list. Build `20.4.0.794`
+matched RGBA (96, 0, 64, 255) at every pixel on the RTX 2070
+in 1.199 ms submit-to-fence. See
+`ddi40-runtime-premultiplied-blend/` under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

@@ -428,7 +428,7 @@ struct DrawPipeline {
     ComPtr<ID3D12PipelineState> pipeline;
 };
 
-enum class ColorWork { Clear, Draw, TimedDraw, CalibratedDraw, Uniform, Upload, Sample, Atlas, Instance };
+enum class ColorWork { Clear, Draw, TimedDraw, CalibratedDraw, Blend, Uniform, Upload, Sample, Atlas, Instance };
 
 static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT target_format, ColorWork work = ColorWork::Draw)
 {
@@ -447,6 +447,9 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
     constexpr char pixel_source[] = R"(
         float4 main() : SV_Target0 { return float4(0, 1, 0, 1); }
     )";
+    constexpr char blend_source[] = R"(
+        float4 main() : SV_Target0 { return float4(0.25, 0, 0, 0.5); }
+    )";
     constexpr char uniform_source[] = R"(
         cbuffer Tint : register(b0) { float4 tint; };
         float4 main() : SV_Target0 { return tint; }
@@ -461,8 +464,10 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
     const bool uniform = work == ColorWork::Uniform;
     const bool sampled = work == ColorWork::Sample || work == ColorWork::Atlas;
     const bool instanced = work == ColorWork::Instance;
+    const bool blend = work == ColorWork::Blend;
     const auto vertex = compile_shader(instanced ? instance_source : vertex_source, "vs_5_1");
-    const auto pixel = compile_shader(uniform ? uniform_source : sampled ? sampled_source : pixel_source, "ps_5_1");
+    const auto pixel = compile_shader(uniform ? uniform_source : sampled ? sampled_source : blend ? blend_source : pixel_source,
+                                      "ps_5_1");
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned_signature = {};
     versioned_signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
     versioned_signature.Desc_1_1 = {};
@@ -493,11 +498,12 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
     pipeline.VS = {vertex->GetBufferPointer(), vertex->GetBufferSize()};
     pipeline.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
     auto &target = pipeline.BlendState.RenderTarget[0];
+    target.BlendEnable = blend;
     target.SrcBlend = D3D12_BLEND_ONE;
-    target.DestBlend = D3D12_BLEND_ZERO;
+    target.DestBlend = blend ? D3D12_BLEND_INV_SRC_ALPHA : D3D12_BLEND_ZERO;
     target.BlendOp = D3D12_BLEND_OP_ADD;
     target.SrcBlendAlpha = D3D12_BLEND_ONE;
-    target.DestBlendAlpha = D3D12_BLEND_ZERO;
+    target.DestBlendAlpha = target.DestBlend;
     target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     target.LogicOp = D3D12_LOGIC_OP_NOOP;
     target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -735,7 +741,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     const bool use_instances = work == ColorWork::Instance;
     const bool calibrated_draw = work == ColorWork::CalibratedDraw;
     const bool timed_draw = work == ColorWork::TimedDraw || calibrated_draw;
-    const bool programmable = work == ColorWork::Draw || use_uniform || sample_texture || use_instances || timed_draw;
+    const bool blend = work == ColorWork::Blend;
+    const bool programmable = work == ColorWork::Draw || use_uniform || sample_texture || use_instances || timed_draw || blend;
     const D3D12_HEAP_PROPERTIES video_memory = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                                 D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
     D3D12_RESOURCE_DESC desc = {};
@@ -840,6 +847,11 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
             instances = instance_buffer(device, instance_view);
         if (timestamps)
             commands.list->EndQuery(timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        if (blend) {
+            const FLOAT blue[] = {0.0f, 0.0f, 1.0f, 1.0f};
+            commands.list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+            record_draw(commands.list.Get(), draw, rtv, width, height);
+        }
         record_draw(commands.list.Get(), draw, rtv, width, height, bindings.heap ? &bindings : nullptr,
                     use_instances ? &instance_view : nullptr);
         if (timestamps) {
@@ -867,7 +879,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     check(readback->Map(0, &whole, &mapped), "Map rendered image readback");
     const auto pixels = static_cast<const uint8_t *>(mapped) + footprint.Offset;
     constexpr uint8_t red[] = {255, 0, 0, 255}, green[] = {0, 255, 0, 255}, magenta[] = {255, 0, 255, 255};
-    const uint8_t *expected = use_uniform ? magenta : programmable ? green : red;
+    constexpr uint8_t blended[] = {96, 0, 64, 255};
+    const uint8_t *expected = use_uniform ? magenta : blend ? blended : programmable ? green : red;
     for (UINT y = 0; y < height; ++y) {
         const auto row = pixels + static_cast<SIZE_T>(y) * footprint.Footprint.RowPitch;
         for (UINT x = 0; x < width; ++x) {
@@ -900,7 +913,7 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
         tick_readback->Unmap(0, &empty);
     }
     std::wprintf(L"D3D12 %ls PASS: %ux%u verified pixels, submit-to-fence %lld us\n",
-                 timed_draw ? L"TIMESTAMP DRAW" :
+                 timed_draw ? L"TIMESTAMP DRAW" : blend ? L"BLEND" :
                  sample_atlas ? L"R8 ATLAS SAMPLE" : sample_texture ? L"TEXTURE SAMPLE" : upload_texture ? L"TEXTURE UPLOAD" :
                  use_uniform ? L"CBV DRAW" : use_instances ? L"INSTANCE DRAW" : programmable ? L"DRAW" : L"CLEAR",
                  width, height, elapsed);
@@ -1010,7 +1023,7 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, DeviceLocal, Placed, Compute, Clear, Draw, TimedDraw, Clock, Cbv, Upload, Sample, Atlas, Instance, WgpuInit, Present, Composition, Fence, RenderFence };
+    enum class Probe { Copy, DeviceLocal, Placed, Compute, Clear, Draw, TimedDraw, Clock, Blend, Cbv, Upload, Sample, Atlas, Instance, WgpuInit, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -1029,6 +1042,8 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::TimedDraw;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--clock") == 0)
             probe = Probe::Clock;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--blend") == 0)
+            probe = Probe::Blend;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--cbv") == 0)
             probe = Probe::Cbv;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--upload-texture") == 0)
@@ -1050,7 +1065,7 @@ int wmain(int argc, wchar_t **argv)
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence-render-context") == 0)
             probe = Probe::RenderFence;
         else {
-            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --placed-buffer | --compute | --clear | --draw | --timestamps | --clock | --cbv | --upload-texture | "
+            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --placed-buffer | --compute | --clear | --draw | --timestamps | --clock | --blend | --cbv | --upload-texture | "
                        "--sample-texture | --sample-atlas | --instance | --wgpu-init | --present | --composition | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
@@ -1068,6 +1083,8 @@ int wmain(int argc, wchar_t **argv)
             color_and_verify(device.Get(), ColorWork::TimedDraw);
         else if (probe == Probe::Clock)
             color_and_verify(device.Get(), ColorWork::CalibratedDraw);
+        else if (probe == Probe::Blend)
+            color_and_verify(device.Get(), ColorWork::Blend);
         else if (probe == Probe::Cbv)
             color_and_verify(device.Get(), ColorWork::Uniform);
         else if (probe == Probe::Upload)

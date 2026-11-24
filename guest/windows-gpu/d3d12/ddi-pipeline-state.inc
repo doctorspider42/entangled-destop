@@ -39,6 +39,7 @@ typedef struct DdiPipeline {
     VkFormat color_format;
     VkPipelineLayout layout;
     UINT pixel_bindings;
+    BOOL blends;
     UINT minimum_vertex_stride;
     VkVertexInputRate vertex_rate;
     DdiComputeLayout compute;
@@ -175,10 +176,16 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
         args->ViewInstancingDesc.ViewInstanceCount || args->NodeMask > 1 ||
         args->PrimitiveTopologyType != D3D12DDI_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)
         return DXGI_ERROR_UNSUPPORTED;
-    if (!blend || blend->AlphaToCoverageEnable || blend->RenderTarget[0].BlendEnable ||
+    if (!blend || blend->AlphaToCoverageEnable ||
         blend->RenderTarget[0].LogicOpEnable || !raster || raster->FillMode != D3D12DDI_FILL_MODE_SOLID ||
         raster->CullMode != D3D12DDI_CULL_MODE_NONE || !raster->DepthClipEnable || raster->DepthBias ||
         raster->SlopeScaledDepthBias || raster->ForcedSampleCount || (depth && (depth->DepthEnable || depth->StencilEnable)))
+        return DXGI_ERROR_UNSUPPORTED;
+    const D3D12DDI_RENDER_TARGET_BLEND_DESC *target = &blend->RenderTarget[0];
+    if (target->BlendEnable &&
+        (target->SrcBlend != D3D12DDI_BLEND_ONE || target->DestBlend != D3D12DDI_BLEND_INV_SRC_ALPHA ||
+         target->BlendOp != D3D12DDI_BLEND_OP_ADD || target->SrcBlendAlpha != D3D12DDI_BLEND_ONE ||
+         target->DestBlendAlpha != D3D12DDI_BLEND_INV_SRC_ALPHA || target->BlendOpAlpha != D3D12DDI_BLEND_OP_ADD))
         return DXGI_ERROR_UNSUPPORTED;
 
     const PFN_vkCreateGraphicsPipelines create = (PFN_vkCreateGraphicsPipelines)
@@ -220,7 +227,13 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
         .pSampleMask = &sample_mask,
     };
-    const VkPipelineColorBlendAttachmentState attachment = { .colorWriteMask = blend->RenderTarget[0].RenderTargetWriteMask };
+    const VkPipelineColorBlendAttachmentState attachment = {
+        .blendEnable = target->BlendEnable, .colorWriteMask = target->RenderTargetWriteMask,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+    };
     const VkPipelineColorBlendStateCreateInfo blending = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &attachment,
     };
@@ -246,6 +259,7 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
     if (result == VK_SUCCESS) {
         *state = (DdiPipeline){ .device = venus, .pipeline = pipeline, .bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS,
             .color_format = format, .layout = layout, .pixel_bindings = pixel->pixel_bindings,
+            .blends = target->BlendEnable,
             .minimum_vertex_stride = elements ? elements->minimum_stride : 0,
             .vertex_rate = elements ? elements->rate : VK_VERTEX_INPUT_RATE_VERTEX };
     } else if (pipeline) {
