@@ -533,6 +533,13 @@ the matching runtime table. The transfer submission callback waits for
 Vulkan completion before returning. The release build continues to decline
 the provisional DDI.
 
+The `--gpu-buffer` probe creates a committed default buffer in device-local
+memory and checks its GPU virtual address. It copies 65,536 bytes into it,
+transitions it from COPY_DEST to COPY_SOURCE, and copies back into coherent
+readback memory. Build `3.52.32.458` verified every byte after the WDDM
+fence on the RTX 2070 at 1.716 ms submit-to-fence. See
+`ddi40-runtime-device-local-buffer/` under the lab share.
+
 ## Windowed DXGI presentation
 
 For the presentation probe, also set `ENTANGLED_D3D12_WDDM_INCLUDE` to the

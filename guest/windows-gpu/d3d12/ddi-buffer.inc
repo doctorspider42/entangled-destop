@@ -150,12 +150,20 @@ static HRESULT create_transfer_backing(const VenusDevice *device, const D3D12DDI
 {
     const D3D12DDI_RESOURCE_FLAGS_0003 supported_flags = D3D12DDI_RESOURCE_FLAG_0003_SHADER_RESOURCE |
         D3D12DDI_RESOURCE_FLAG_0022_UNORDERED_ACCESS | D3D12DDI_RESOURCE_FLAG_0003_SIMULTANEOUS_ACCESS;
-    if (heap->MemoryPool != D3D12DDI_MEMORY_POOL_L0 || (resource->Flags & ~supported_flags) ||
-        resource->Layout != D3D12DDI_TL_ROW_MAJOR)
+    if ((resource->Flags & ~supported_flags) || resource->Layout != D3D12DDI_TL_ROW_MAJOR)
         return DXGI_ERROR_UNSUPPORTED;
 
-    const BOOL readback = heap->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK;
-    if (!readback && heap->CPUPageProperty != D3D12DDI_CPU_PAGE_PROPERTY_WRITE_COMBINE)
+    VenusBufferMemory placement;
+    if (heap->MemoryPool == D3D12DDI_MEMORY_POOL_L1 &&
+        heap->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE)
+        placement = VENUS_BUFFER_DEVICE_LOCAL;
+    else if (heap->MemoryPool == D3D12DDI_MEMORY_POOL_L0 &&
+             heap->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_WRITE_BACK)
+        placement = VENUS_BUFFER_READBACK;
+    else if (heap->MemoryPool == D3D12DDI_MEMORY_POOL_L0 &&
+             heap->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_WRITE_COMBINE)
+        placement = VENUS_BUFFER_UPLOAD;
+    else
         return DXGI_ERROR_UNSUPPORTED;
 
     if (heap->ByteSize && heap->ByteSize < resource->Width)
@@ -167,7 +175,7 @@ static HRESULT create_transfer_backing(const VenusDevice *device, const D3D12DDI
         uses |= VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     if (resource->Flags & D3D12DDI_RESOURCE_FLAG_0022_UNORDERED_ACCESS)
         uses |= VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    return create_venus_transfer_buffer(device, resource->Width, readback, uses, buffer);
+    return create_venus_transfer_buffer(device, resource->Width, placement, uses, buffer);
 }
 
 static HRESULT APIENTRY create_committed_resource(
@@ -299,7 +307,7 @@ static HRESULT check_backing_resident(const VenusDevice *device, D3D12DDI_HANDLE
     const DdiHeap *heap = pageable_heap(object);
     if (!heap || heap->device != device)
         return E_INVALIDARG;
-    if (heap->kind == DDI_HEAP_TRANSFER_BUFFER && heap->buffer.memory && heap->buffer.mapped)
+    if (heap->kind == DDI_HEAP_TRANSFER_BUFFER && heap->buffer.memory && heap->buffer.handle)
         return S_OK;
     if (heap->kind == DDI_HEAP_COLOR_IMAGE && heap->image.memory && heap->image.handle)
         return S_OK;
@@ -549,7 +557,7 @@ static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
     .pfnResetCommandList = reset_command_list,
     .pfnCopyBufferRegion = copy_buffer_region,
     .pfnClearRenderTargetView = clear_color_rtv,
-    .pfnResourceBarrier = color_resource_barriers,
+    .pfnResourceBarrier = transfer_resource_barriers,
     .pfnCopyTextureRegion = copy_color_texture_region,
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
     .pfnPresent = present_surface,

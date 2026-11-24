@@ -185,7 +185,16 @@ static long long submit_and_wait(ID3D12Device *device, const Recording &commands
     return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
 }
 
-static void copy_and_verify(ID3D12Device *device)
+static void transition(ID3D12GraphicsCommandList *commands, ID3D12Resource *resource,
+                       D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
+    commands->ResourceBarrier(1, &barrier);
+}
+
+static void copy_and_verify(ID3D12Device *device, bool device_local)
 {
     std::array<uint8_t, 64 * 1024> pattern;
     for (size_t i = 0; i < pattern.size(); ++i)
@@ -200,14 +209,23 @@ static void copy_and_verify(ID3D12Device *device)
     source->Unmap(0, &whole);
 
     const auto commands = begin_recording(device);
-    commands.list->CopyBufferRegion(target.Get(), 0, source.Get(), 0, pattern.size());
+    ComPtr<ID3D12Resource> intermediate;
+    if (device_local) {
+        intermediate = buffer(device, pattern.size(), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!intermediate->GetGPUVirtualAddress())
+            check(E_FAIL, "device-local buffer has no GPU virtual address");
+        commands.list->CopyBufferRegion(intermediate.Get(), 0, source.Get(), 0, pattern.size());
+        transition(commands.list.Get(), intermediate.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
+    commands.list->CopyBufferRegion(target.Get(), 0, intermediate ? intermediate.Get() : source.Get(), 0, pattern.size());
     const auto elapsed = submit_and_wait(device, commands);
     check(target->Map(0, &whole, &mapped), "Map readback buffer");
     const bool identical = std::memcmp(mapped, pattern.data(), pattern.size()) == 0;
     target->Unmap(0, &empty);
     if (!identical)
         check(E_FAIL, "readback differs from upload");
-    std::wprintf(L"D3D12 COPY PASS: %zu verified bytes, submit-to-fence %lld us\n", pattern.size(), elapsed);
+    std::wprintf(L"D3D12 %lsCOPY PASS: %zu verified bytes, submit-to-fence %lld us\n",
+                 device_local ? L"DEVICE-LOCAL " : L"", pattern.size(), elapsed);
 }
 
 static ComPtr<ID3DBlob> compile_shader(const char *source, const char *target)
@@ -289,15 +307,6 @@ static void record_draw(ID3D12GraphicsCommandList *commands, const DrawPipeline 
     commands->DrawInstanced(3, 1, 0, 0);
 }
 
-static void transition_color(ID3D12GraphicsCommandList *commands, ID3D12Resource *image,
-                             D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
-{
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition = {image, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
-    commands->ResourceBarrier(1, &barrier);
-}
-
 static ComPtr<ID3D12DescriptorHeap> create_rtv_heap(ID3D12Device *device)
 {
     D3D12_DESCRIPTOR_HEAP_DESC desc = {};
@@ -348,7 +357,7 @@ static void color_and_verify(ID3D12Device *device, bool programmable)
         const FLOAT red[] = {1.0f, 0.0f, 0.0f, 1.0f};
         commands.list->ClearRenderTargetView(rtv, red, 0, nullptr);
     }
-    transition_color(commands.list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(commands.list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
     src.pResource = target.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -441,9 +450,9 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
     const auto rtv = descriptors->GetCPUDescriptorHandleForHeapStart();
     device->CreateRenderTargetView(image.Get(), nullptr, rtv);
     const auto draw = create_draw_pipeline(device, description.Format);
-    transition_color(commands.list.Get(), image.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    transition(commands.list.Get(), image.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     record_draw(commands.list.Get(), draw, rtv, width, height);
-    transition_color(commands.list.Get(), image.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    transition(commands.list.Get(), image.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     const auto render_us = submit_and_wait(device, commands);
 
     const auto present_start = std::chrono::steady_clock::now();
@@ -480,11 +489,13 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, Clear, Draw, Present, Composition, Fence, RenderFence };
+    enum class Probe { Copy, DeviceLocal, Clear, Draw, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
             hardware_control = true;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--gpu-buffer") == 0)
+            probe = Probe::DeviceLocal;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--clear") == 0)
             probe = Probe::Clear;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--draw") == 0)
@@ -498,7 +509,7 @@ int wmain(int argc, wchar_t **argv)
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence-render-context") == 0)
             probe = Probe::RenderFence;
         else {
-            std::fputs("usage: d3d12-smoke.exe [--hardware] [--clear | --draw | --present | --composition | "
+            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --clear | --draw | --present | --composition | "
                        "--fence | --fence-render-context]\n", stderr);
             return 2;
         }
@@ -513,7 +524,7 @@ int wmain(int argc, wchar_t **argv)
         else if (probe == Probe::Present || probe == Probe::Composition)
             draw_and_present(device.Get(), probe == Probe::Composition);
         else
-            copy_and_verify(device.Get());
+            copy_and_verify(device.Get(), probe == Probe::DeviceLocal);
     }
     return 0;
 }

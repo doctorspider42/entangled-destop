@@ -12,13 +12,22 @@ typedef struct VenusTransferBuffer {
     void *mapped;
 } VenusTransferBuffer;
 
-HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize size, BOOL readback, VkBufferUsageFlags uses,
-                                     VenusTransferBuffer *buffer);
+typedef enum VenusBufferMemory {
+    VENUS_BUFFER_UPLOAD,
+    VENUS_BUFFER_READBACK,
+    VENUS_BUFFER_DEVICE_LOCAL,
+} VenusBufferMemory;
+
+HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize size, VenusBufferMemory placement,
+                                     VkBufferUsageFlags uses, VenusTransferBuffer *buffer);
 void destroy_venus_transfer_buffer(VenusTransferBuffer *buffer);
 HRESULT record_venus_buffer_copy(VkCommandBuffer command, const VenusTransferBuffer *dst,
                                  const VenusTransferBuffer *src, VkBufferCopy region);
 
 #ifdef ENTANGLED_D3D12_PROBE_COPY
+HRESULT record_venus_buffer_barrier(VkCommandBuffer command, const VenusTransferBuffer *buffer,
+                                    VkAccessFlags before, VkAccessFlags after);
+
 typedef struct VenusColorImage {
     const VenusDevice *device;
     VkImage handle;

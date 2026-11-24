@@ -103,16 +103,38 @@ static void APIENTRY clear_color_rtv(D3D12DDI_HCOMMANDLIST handle, D3D12DDI_CPU_
     set_command_list_status(list, status);
 }
 
-static HRESULT color_barrier(DdiTransferList *list, const D3D12DDIARG_RESOURCE_BARRIER_0022 *barrier)
+static VkAccessFlags buffer_access(D3D12DDI_RESOURCE_STATES state)
+{
+    if (state == D3D12DDI_RESOURCE_STATE_COMMON)
+        return VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    const VkAccessFlags vertex = state & D3D12DDI_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER
+        ? VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT : 0;
+    const VkAccessFlags index = state & D3D12DDI_RESOURCE_STATE_INDEX_BUFFER ? VK_ACCESS_INDEX_READ_BIT : 0;
+    const VkAccessFlags read = state & D3D12DDI_RESOURCE_STATE_COPY_SOURCE ? VK_ACCESS_TRANSFER_READ_BIT : 0;
+    const VkAccessFlags write = state & D3D12DDI_RESOURCE_STATE_COPY_DEST ? VK_ACCESS_TRANSFER_WRITE_BIT : 0;
+    return vertex | index | read | write;
+}
+
+static HRESULT transition_resource(DdiTransferList *list, const D3D12DDIARG_RESOURCE_BARRIER_0022 *barrier)
 {
     if (barrier->Type != D3D12DDI_RESOURCE_BARRIER_TYPE_TRANSITION || barrier->Flags ||
         (barrier->Transition.Subresource && barrier->Transition.Subresource != D3D12DDI_RESOURCE_BARRIER_ALL_SUBRESOURCES))
         return DXGI_ERROR_UNSUPPORTED;
     DdiHeap *heap = resource_heap(list->venus.device, barrier->Transition.hResource);
-    if (!heap || heap->kind != DDI_HEAP_COLOR_IMAGE)
+    if (!heap)
         return DXGI_ERROR_UNSUPPORTED;
     const D3D12DDI_RESOURCE_STATES before = barrier->Transition.StateBefore;
     const D3D12DDI_RESOURCE_STATES after = barrier->Transition.StateAfter;
+    if (heap->kind == DDI_HEAP_TRANSFER_BUFFER) {
+        const D3D12DDI_RESOURCE_STATES supported = D3D12DDI_RESOURCE_STATE_COPY_SOURCE |
+            D3D12DDI_RESOURCE_STATE_COPY_DEST | D3D12DDI_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
+            D3D12DDI_RESOURCE_STATE_INDEX_BUFFER;
+        if ((before | after) & ~supported)
+            return DXGI_ERROR_UNSUPPORTED;
+        return record_venus_buffer_barrier(list->venus.command, &heap->buffer, buffer_access(before), buffer_access(after));
+    }
+    if (heap->kind != DDI_HEAP_COLOR_IMAGE)
+        return DXGI_ERROR_UNSUPPORTED;
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
     if (heap->present.allocation && before == D3D12DDI_RESOURCE_STATE_COMMON && after == D3D12DDI_RESOURCE_STATE_RENDER_TARGET)
         return S_OK; /* The lab draw and clear discard the previous destination contents. */
@@ -140,8 +162,8 @@ static HRESULT color_barrier(DdiTransferList *list, const D3D12DDIARG_RESOURCE_B
     return status;
 }
 
-static void APIENTRY color_resource_barriers(D3D12DDI_HCOMMANDLIST handle, UINT count,
-                                             const D3D12DDIARG_RESOURCE_BARRIER_0022 *barriers)
+static void APIENTRY transfer_resource_barriers(D3D12DDI_HCOMMANDLIST handle, UINT count,
+                                                const D3D12DDIARG_RESOURCE_BARRIER_0022 *barriers)
 {
     DdiTransferList *list = handle.pDrvPrivate;
     if (!list || FAILED(list->status) || !count)
@@ -154,7 +176,7 @@ static void APIENTRY color_resource_barriers(D3D12DDI_HCOMMANDLIST handle, UINT 
     AcquireSRWLockExclusive(&list->pool->lock);
     HRESULT status = !list->closed && list->generation == list->pool->generation ? S_OK : E_INVALIDARG;
     for (UINT i = 0; i < count && SUCCEEDED(status); ++i)
-        status = color_barrier(list, &barriers[i]);
+        status = transition_resource(list, &barriers[i]);
     ReleaseSRWLockExclusive(&list->pool->lock);
     trace_ddi("ResourceBarrier", (UINT)status, count);
     set_command_list_status(list, status);

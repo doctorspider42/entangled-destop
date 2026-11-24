@@ -7,8 +7,8 @@ static HRESULT allocate_present_surface(const DdiDevice *device, D3D12DDI_HRTRES
         return DXGI_ERROR_UNSUPPORTED;
 
     const UINT64 bytes = (UINT64)image->extent.width * image->extent.height * 4;
-    HRESULT status = create_venus_transfer_buffer(image->device, bytes, TRUE, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                                  &surface->pixels);
+    HRESULT status = create_venus_transfer_buffer(image->device, bytes, VENUS_BUFFER_READBACK,
+                                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT, &surface->pixels);
     if (FAILED(status))
         return status;
     const VIOGPU_CREATE_RESOURCE_EXCHANGE resource_data = {0};

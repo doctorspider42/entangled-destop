@@ -4,17 +4,20 @@
 
 #define DEVICE_FN(device, name) ((PFN_##name)(device)->proc_addr((device)->handle, #name))
 
-static UINT32 transfer_memory_type(const VkPhysicalDeviceMemoryProperties *memory, UINT32 type_bits,
-                                   BOOL readback)
+static UINT32 buffer_memory_type(const VkPhysicalDeviceMemoryProperties *memory, UINT32 type_bits,
+                                  VenusBufferMemory placement)
 {
-    const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkMemoryPropertyFlags required = placement == VENUS_BUFFER_DEVICE_LOCAL
+        ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     UINT32 fallback = UINT32_MAX;
     for (UINT32 i = 0; i < memory->memoryTypeCount; ++i) {
         const VkMemoryPropertyFlags flags = memory->memoryTypes[i].propertyFlags;
         if (!(type_bits & (1u << i)) || (flags & required) != required)
             continue;
-        if (!readback || (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
+        if (placement == VENUS_BUFFER_UPLOAD ||
+            (placement == VENUS_BUFFER_READBACK && (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ||
+            (placement == VENUS_BUFFER_DEVICE_LOCAL && !(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)))
             return i;
         if (fallback == UINT32_MAX)
             fallback = i;
@@ -22,8 +25,8 @@ static UINT32 transfer_memory_type(const VkPhysicalDeviceMemoryProperties *memor
     return fallback;
 }
 
-HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize size, BOOL readback, VkBufferUsageFlags uses,
-                                     VenusTransferBuffer *buffer)
+HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize size, VenusBufferMemory placement,
+                                     VkBufferUsageFlags uses, VenusTransferBuffer *buffer)
 {
     *buffer = (VenusTransferBuffer){0};
     if (!size)
@@ -33,13 +36,14 @@ HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize siz
     const PFN_vkGetBufferMemoryRequirements requirements = DEVICE_FN(device, vkGetBufferMemoryRequirements);
     const PFN_vkAllocateMemory allocate = DEVICE_FN(device, vkAllocateMemory);
     const PFN_vkBindBufferMemory bind = DEVICE_FN(device, vkBindBufferMemory);
-    const PFN_vkMapMemory map = DEVICE_FN(device, vkMapMemory);
+    const BOOL cpu_visible = placement != VENUS_BUFFER_DEVICE_LOCAL;
+    const PFN_vkMapMemory map = cpu_visible ? DEVICE_FN(device, vkMapMemory) : NULL;
     const PFN_vkGetBufferDeviceAddress address = device->buffer_device_address
         ? DEVICE_FN(device, vkGetBufferDeviceAddress) : NULL;
-    if (!create || !requirements || !allocate || !bind || !map ||
+    if (!create || !requirements || !allocate || !bind ||
         (device->buffer_device_address && !address) ||
         !DEVICE_FN(device, vkDestroyBuffer) || !DEVICE_FN(device, vkFreeMemory) ||
-        !DEVICE_FN(device, vkUnmapMemory))
+        (cpu_visible && (!map || !DEVICE_FN(device, vkUnmapMemory))))
         return E_FAIL;
 
     const VkBufferCreateInfo info = {
@@ -59,7 +63,7 @@ HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize siz
 
     VkMemoryRequirements req;
     requirements(device->handle, handle, &req);
-    const UINT32 type = transfer_memory_type(&device->memory, req.memoryTypeBits, readback);
+    const UINT32 type = buffer_memory_type(&device->memory, req.memoryTypeBits, placement);
     if (type == UINT32_MAX) {
         destroy_venus_transfer_buffer(buffer);
         return DXGI_ERROR_UNSUPPORTED;
@@ -92,7 +96,7 @@ HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize siz
             return E_FAIL;
         }
     }
-    if (result == VK_SUCCESS) {
+    if (result == VK_SUCCESS && map) {
         void *mapped;
         result = map(device->handle, memory, 0, VK_WHOLE_SIZE, 0, &mapped);
         if (result == VK_SUCCESS)
@@ -136,6 +140,26 @@ HRESULT record_venus_buffer_copy(VkCommandBuffer command, const VenusTransferBuf
 }
 
 #ifdef ENTANGLED_D3D12_PROBE_COPY
+HRESULT record_venus_buffer_barrier(VkCommandBuffer command, const VenusTransferBuffer *buffer,
+                                    VkAccessFlags before, VkAccessFlags after)
+{
+    const PFN_vkCmdPipelineBarrier barrier = DEVICE_FN(buffer->device, vkCmdPipelineBarrier);
+    if (!barrier)
+        return E_FAIL;
+    const VkBufferMemoryBarrier transition = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = before,
+        .dstAccessMask = after,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = buffer->handle,
+        .size = VK_WHOLE_SIZE,
+    };
+    barrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+            0, NULL, 1, &transition, 0, NULL);
+    return S_OK;
+}
+
 static VkImageCreateInfo color_image_info(VkFormat format, UINT32 width, UINT32 height)
 {
     /* Four bytes per pixel. Pad storage to a multiple of D3D12's 256-byte row alignment. */
