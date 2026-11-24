@@ -8,6 +8,7 @@ typedef struct VenusTransferBuffer {
     VkBuffer handle;
     VkDeviceMemory memory;
     VkDeviceSize size;
+    VkDeviceSize offset;
     VkDeviceAddress address;
     void *mapped;
 } VenusTransferBuffer;

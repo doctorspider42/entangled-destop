@@ -121,8 +121,7 @@ static ComPtr<ID3D12Device> create_device(const Adapter &adapter, bool hardware_
     return device;
 }
 
-static ComPtr<ID3D12Resource> committed_buffer(ID3D12Device *device, UINT64 size, const D3D12_HEAP_PROPERTIES &heap,
-                                               D3D12_RESOURCE_STATES state)
+static D3D12_RESOURCE_DESC buffer_description(UINT64 size)
 {
     D3D12_RESOURCE_DESC resource = {};
     resource.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -132,6 +131,13 @@ static ComPtr<ID3D12Resource> committed_buffer(ID3D12Device *device, UINT64 size
     resource.MipLevels = 1;
     resource.SampleDesc.Count = 1;
     resource.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    return resource;
+}
+
+static ComPtr<ID3D12Resource> committed_buffer(ID3D12Device *device, UINT64 size, const D3D12_HEAP_PROPERTIES &heap,
+                                               D3D12_RESOURCE_STATES state)
+{
+    const auto resource = buffer_description(size);
     ComPtr<ID3D12Resource> result;
     check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &resource, state, nullptr,
                                           IID_PPV_ARGS(&result)), "CreateCommittedResource (buffer)");
@@ -231,6 +237,58 @@ static void copy_and_verify(ID3D12Device *device, bool device_local)
         check(E_FAIL, "readback differs from upload");
     std::wprintf(L"D3D12 %lsCOPY PASS: %zu verified bytes, submit-to-fence %lld us\n",
                  device_local ? L"DEVICE-LOCAL " : L"", pattern.size(), elapsed);
+}
+
+static void verify_placed_buffers(ID3D12Device *device)
+{
+    constexpr UINT64 slot = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    constexpr size_t bytes = 4096;
+    const auto resource = buffer_description(bytes);
+    const auto allocation = device->GetResourceAllocationInfo(0, 1, &resource);
+    std::printf("D3D12 placed buffer allocation: alignment=%llu bytes=%llu\n",
+                allocation.Alignment, allocation.SizeInBytes);
+    const D3D12_HEAP_DESC heap_desc = {
+        2 * slot, {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1},
+        slot, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+    };
+    ComPtr<ID3D12Heap> heap;
+    check(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap)), "CreateHeap (placed buffers)");
+    std::array<ComPtr<ID3D12Resource>, 2> placed;
+    for (size_t i = 0; i < placed.size(); ++i)
+        check(device->CreatePlacedResource(heap.Get(), i * slot, &resource, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                           IID_PPV_ARGS(&placed[i])), "CreatePlacedResource (buffer)");
+    const auto first_address = placed[0]->GetGPUVirtualAddress();
+    if (!first_address || placed[1]->GetGPUVirtualAddress() != first_address + slot)
+        check(E_FAIL, "placed buffers have incorrect GPU virtual addresses");
+
+    const auto source = buffer(device, 2 * bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    const auto target = buffer(device, 2 * bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    std::array<uint8_t, 2 * bytes> pattern;
+    for (size_t i = 0; i < pattern.size(); ++i)
+        pattern[i] = static_cast<uint8_t>(i * 37 + i / 251 + 1);
+    const D3D12_RANGE empty = {}, whole = {0, pattern.size()};
+    void *mapped = nullptr;
+    check(source->Map(0, &empty, &mapped), "Map placed buffer upload");
+    std::memcpy(mapped, pattern.data(), pattern.size());
+    source->Unmap(0, &whole);
+
+    const auto commands = begin_recording(device);
+    for (size_t i = 0; i < placed.size(); ++i)
+        commands.list->CopyBufferRegion(placed[i].Get(), 0, source.Get(), i * bytes, bytes);
+    for (size_t i = 0; i < placed.size(); ++i) {
+        transition(commands.list.Get(), placed[i].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        commands.list->CopyBufferRegion(target.Get(), i * bytes, placed[i].Get(), 0, bytes);
+    }
+    const auto elapsed = submit_and_wait(device, commands);
+    check(target->Map(0, &whole, &mapped), "Map placed buffer readback");
+    const bool identical = std::memcmp(mapped, pattern.data(), pattern.size()) == 0;
+    target->Unmap(0, &empty);
+    if (!identical)
+        check(E_FAIL, "placed buffers alias or do not match the upload");
+    if (!allocation.Alignment || slot % allocation.Alignment ||
+        allocation.SizeInBytes < bytes || allocation.SizeInBytes > slot)
+        check(E_FAIL, "unexpected placed buffer alignment or size");
+    std::printf("D3D12 PLACED BUFFER PASS: %zu verified bytes, submit-to-fence %lld us\n", pattern.size(), elapsed);
 }
 
 static ComPtr<ID3DBlob> compile_shader(const char *source, const char *target)
@@ -751,13 +809,15 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, DeviceLocal, Clear, Draw, Cbv, Upload, Sample, Instance, WgpuInit, Present, Composition, Fence, RenderFence };
+    enum class Probe { Copy, DeviceLocal, Placed, Clear, Draw, Cbv, Upload, Sample, Instance, WgpuInit, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
             hardware_control = true;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--gpu-buffer") == 0)
             probe = Probe::DeviceLocal;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--placed-buffer") == 0)
+            probe = Probe::Placed;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--clear") == 0)
             probe = Probe::Clear;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--draw") == 0)
@@ -781,7 +841,7 @@ int wmain(int argc, wchar_t **argv)
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence-render-context") == 0)
             probe = Probe::RenderFence;
         else {
-            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --clear | --draw | --cbv | --upload-texture | "
+            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --placed-buffer | --clear | --draw | --cbv | --upload-texture | "
                        "--sample-texture | --instance | --wgpu-init | --present | --composition | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
@@ -805,6 +865,8 @@ int wmain(int argc, wchar_t **argv)
             color_and_verify(device.Get(), ColorWork::Instance);
         else if (probe == Probe::WgpuInit)
             verify_wgpu_initialization(device.Get());
+        else if (probe == Probe::Placed)
+            verify_placed_buffers(device.Get());
         else if (probe == Probe::Present || probe == Probe::Composition)
             draw_and_present(device.Get(), probe == Probe::Composition);
         else

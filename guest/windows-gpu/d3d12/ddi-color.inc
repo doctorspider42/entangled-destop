@@ -301,13 +301,14 @@ static HRESULT transition_resource(DdiTransferList *list, const D3D12DDIARG_RESO
         return DXGI_ERROR_UNSUPPORTED;
     const D3D12DDI_RESOURCE_STATES before = barrier->Transition.StateBefore;
     const D3D12DDI_RESOURCE_STATES after = barrier->Transition.StateAfter;
-    if (heap->kind == DDI_HEAP_TRANSFER_BUFFER) {
+    const VenusTransferBuffer *buffer = resource_buffer(list->venus.device, barrier->Transition.hResource);
+    if (buffer) {
         const D3D12DDI_RESOURCE_STATES supported = D3D12DDI_RESOURCE_STATE_COPY_SOURCE |
             D3D12DDI_RESOURCE_STATE_COPY_DEST | D3D12DDI_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER |
             D3D12DDI_RESOURCE_STATE_INDEX_BUFFER;
         if ((before | after) & ~supported)
             return DXGI_ERROR_UNSUPPORTED;
-        return record_venus_buffer_barrier(list->venus.command, &heap->buffer, buffer_access(before), buffer_access(after));
+        return record_venus_buffer_barrier(list->venus.command, buffer, buffer_access(before), buffer_access(after));
     }
     if (heap->kind != DDI_HEAP_COLOR_IMAGE)
         return DXGI_ERROR_UNSUPPORTED;

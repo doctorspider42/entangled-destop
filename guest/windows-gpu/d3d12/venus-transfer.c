@@ -129,6 +129,8 @@ HRESULT record_venus_buffer_copy(VkCommandBuffer command, const VenusTransferBuf
         region.dstOffset >= dst->size || region.size > dst->size - region.dstOffset)
         return E_INVALIDARG;
 
+    region.srcOffset += src->offset;
+    region.dstOffset += dst->offset;
     if (src->handle == dst->handle && region.srcOffset < region.dstOffset + region.size &&
         region.dstOffset < region.srcOffset + region.size)
         return E_INVALIDARG;
@@ -153,7 +155,8 @@ HRESULT record_venus_buffer_barrier(VkCommandBuffer command, const VenusTransfer
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .buffer = buffer->handle,
-        .size = VK_WHOLE_SIZE,
+        .offset = buffer->offset,
+        .size = buffer->size,
     };
     barrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
             0, NULL, 1, &transition, 0, NULL);
@@ -467,7 +470,7 @@ static BOOL color_image_buffer_region(const VenusColorImage *image, const VenusT
     if (span > buffer->size - offset)
         return FALSE;
     *region = (VkBufferImageCopy){
-        .bufferOffset = offset,
+        .bufferOffset = buffer->offset + offset,
         .bufferRowLength = row_pitch / 4,
         .imageSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1 },
         .imageExtent = image->extent,

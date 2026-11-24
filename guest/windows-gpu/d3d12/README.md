@@ -695,6 +695,17 @@ input layout supports one vertex slot with floating-point attributes
 and per-vertex or per-instance stepping. See
 `ddi40-runtime-instance-draw/` under the lab share.
 
+The `--placed-buffer` probe creates one 128 KiB buffer heap and places
+two 4 KiB resources 64 KiB apart. Windows passes the heap's backing
+resource and the placement byte offset to the UMD. Both resources
+share the backing Vulkan buffer, with separate bounds for copies and
+barriers. The probe checks public allocation metadata and GPU address
+spacing, writes distinct data into both ranges, then verifies both
+ranges after the fence. Build `4.47.42.418` verified all 8,192 bytes on
+the RTX 2070 at 1.362 ms submit-to-fence. See
+`ddi40-runtime-placed-buffers/` under the lab share.
+[wgpu DX12 placed buffers](https://github.com/gfx-rs/wgpu/blob/v30.0.2/wgpu-hal/src/dx12/suballocation.rs#L259-L292).
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

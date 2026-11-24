@@ -23,6 +23,7 @@ typedef struct DdiHeap {
 
 typedef struct DdiResource {
     DdiHeap *heap;
+    VenusTransferBuffer placed_buffer;
 } DdiResource;
 
 static DdiHeap *resource_heap(const VenusDevice *device, D3D12DDI_HRESOURCE resource)
@@ -39,7 +40,10 @@ static DdiHeap *resource_heap(const VenusDevice *device, D3D12DDI_HRESOURCE reso
 static const VenusTransferBuffer *resource_buffer(const VenusDevice *device, D3D12DDI_HRESOURCE resource)
 {
     const DdiHeap *heap = resource_heap(device, resource);
-    return heap && heap->kind == DDI_HEAP_TRANSFER_BUFFER ? &heap->buffer : NULL;
+    if (!heap || heap->kind != DDI_HEAP_TRANSFER_BUFFER)
+        return NULL;
+    const DdiResource *object = resource.pDrvPrivate;
+    return object->placed_buffer.handle ? &object->placed_buffer : &heap->buffer;
 }
 
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
@@ -132,6 +136,8 @@ static D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 row_major_allocation(UINT64 size, 
     return (D3D12DDI_RESOURCE_ALLOCATION_INFO_0022){
         .ResourceDataSize = (size + alignment - 1) & ~((UINT64)alignment - 1),
         .ResourceDataAlignment = (UINT32)alignment,
+        .AdditionalDataHeaderAlignment = 1,
+        .AdditionalDataAlignment = 1,
         .Layout = D3D12DDI_TL_ROW_MAJOR,
     };
 }
@@ -163,6 +169,8 @@ static void APIENTRY check_resource_allocation(D3D12DDI_HDEVICE device,
     }
     if (!alignment_restriction || alignment_restriction >= allocation.ResourceDataAlignment)
         *info = allocation;
+    if (resource->ResourceType == D3D12DDI_RT_BUFFER)
+        trace_ddi("Buffer allocation alignment", alignment_restriction, info->ResourceDataAlignment);
 }
 
 static void APIENTRY check_existing_resource_allocation(D3D12DDI_HDEVICE device, D3D12DDI_HRESOURCE resource,
@@ -171,8 +179,10 @@ static void APIENTRY check_existing_resource_allocation(D3D12DDI_HDEVICE device,
     const DdiHeap *heap = resource_heap(venus_device(device), resource);
     if (heap && heap->kind == DDI_HEAP_COLOR_IMAGE)
         *info = row_major_allocation(heap->image.requirements.size, heap->image.requirements.alignment);
-    else
-        *info = row_major_allocation(heap && heap->kind == DDI_HEAP_TRANSFER_BUFFER ? heap->buffer.size : 0, 0);
+    else {
+        const VenusTransferBuffer *buffer = resource_buffer(venus_device(device), resource);
+        *info = row_major_allocation(buffer ? buffer->size : 0, 0);
+    }
     trace_ddi("CheckExistingResourceAllocationInfo", 0, info->ResourceDataSize);
 }
 
@@ -190,8 +200,9 @@ static void APIENTRY check_resource_subresource(D3D12DDI_HDEVICE device, D3D12DD
     *info = (D3D12DDI_SUBRESOURCE_INFO){0};
     const DdiHeap *heap = resource_heap(venus_device(device), resource);
     if (heap && !subresource) {
-        if (heap->kind == DDI_HEAP_TRANSFER_BUFFER)
-            *info = (D3D12DDI_SUBRESOURCE_INFO){ .RowStride = heap->buffer.size, .DepthStride = heap->buffer.size };
+        const VenusTransferBuffer *buffer = resource_buffer(venus_device(device), resource);
+        if (buffer)
+            *info = (D3D12DDI_SUBRESOURCE_INFO){ .RowStride = buffer->size, .DepthStride = buffer->size };
         else if (heap->kind == DDI_HEAP_COLOR_IMAGE)
             *info = (D3D12DDI_SUBRESOURCE_INFO){ .Offset = heap->image.layout.offset,
                 .RowStride = heap->image.layout.rowPitch, .DepthStride = heap->image.layout.rowPitch * heap->image.extent.height };
@@ -211,12 +222,18 @@ static D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY private_resource_sizes(
     };
 }
 
-static HRESULT create_transfer_backing(DdiDevice *owner, const D3D12DDIARG_CREATEHEAP_0001 *heap,
-                                       const D3D12DDIARG_CREATERESOURCE_0003 *resource, VenusTransferBuffer *buffer)
+static BOOL supported_transfer_buffer(const D3D12DDIARG_CREATERESOURCE_0003 *resource)
 {
     const D3D12DDI_RESOURCE_FLAGS_0003 supported_flags = D3D12DDI_RESOURCE_FLAG_0003_SHADER_RESOURCE |
         D3D12DDI_RESOURCE_FLAG_0022_UNORDERED_ACCESS | D3D12DDI_RESOURCE_FLAG_0003_SIMULTANEOUS_ACCESS;
-    if ((resource->Flags & ~supported_flags) || resource->Layout != D3D12DDI_TL_ROW_MAJOR)
+    return resource->ResourceType == D3D12DDI_RT_BUFFER && resource->Width &&
+           !(resource->Flags & ~supported_flags) && resource->Layout == D3D12DDI_TL_ROW_MAJOR;
+}
+
+static HRESULT create_transfer_backing(DdiDevice *owner, const D3D12DDIARG_CREATEHEAP_0001 *heap,
+                                       const D3D12DDIARG_CREATERESOURCE_0003 *resource, VenusTransferBuffer *buffer)
+{
+    if (!supported_transfer_buffer(resource))
         return DXGI_ERROR_UNSUPPORTED;
 
     VenusBufferMemory placement;
@@ -254,7 +271,31 @@ static HRESULT create_transfer_backing(DdiDevice *owner, const D3D12DDIARG_CREAT
     return status;
 }
 
-static HRESULT APIENTRY create_committed_resource(
+static HRESULT create_placed_buffer(const VenusDevice *venus, const D3D12DDIARG_CREATERESOURCE_0003 *resource,
+                                    DdiResource *object)
+{
+    if (!object || !supported_transfer_buffer(resource))
+        return DXGI_ERROR_UNSUPPORTED;
+    const D3D12DDIARG_HRESOURCE_PLACEMENT base = resource->ReuseBufferGPUVA.BaseAddress.UMD;
+    DdiHeap *heap = resource_heap(venus, base.hResource);
+    const VenusTransferBuffer *storage = resource_buffer(venus, base.hResource);
+    if (!storage || !storage->address || base.Offset > storage->size || resource->Width > storage->size - base.Offset)
+        return E_INVALIDARG;
+    *object = (DdiResource){
+        .heap = heap,
+        .placed_buffer = {
+            .device = venus,
+            .handle = storage->handle,
+            .size = resource->Width,
+            .offset = storage->offset + base.Offset,
+            .address = storage->address + base.Offset,
+        },
+    };
+    trace_ddi("CreatePlacedBuffer", 0, object->placed_buffer.offset);
+    return S_OK;
+}
+
+static HRESULT APIENTRY create_heap_and_resource(
     D3D12DDI_HDEVICE device, const D3D12DDIARG_CREATEHEAP_0001 *heap, D3D12DDI_HHEAP driver_heap,
     D3D12DDI_HRTRESOURCE runtime_resource, const D3D12DDIARG_CREATERESOURCE_0003 *resource,
     const D3D12DDI_CLEAR_VALUES *clear, D3D12DDI_HPROTECTEDRESOURCESESSION_0030 protection,
@@ -263,6 +304,9 @@ static HRESULT APIENTRY create_committed_resource(
     const VenusDevice *venus = venus_device(device);
     DdiHeap *backing = driver_heap.pDrvPrivate;
     DdiResource *object = driver_resource.pDrvPrivate;
+    if (!heap && !backing && resource && venus && !protection.pDrvPrivate && !clear &&
+        resource->ReuseBufferGPUVA.BaseAddress.UMD.hResource.pDrvPrivate)
+        return create_placed_buffer(venus, resource, object);
     if (heap && resource) {
         trace_ddi("CreateHeapAndResource flags", resource->Flags, heap->Flags);
         trace_ddi("CreateHeapAndResource memory", heap->MemoryPool, heap->CPUPageProperty);
@@ -326,12 +370,16 @@ static HRESULT APIENTRY create_committed_resource(
     return status;
 }
 
-static void APIENTRY destroy_committed_resource(D3D12DDI_HDEVICE device, D3D12DDI_HHEAP handle,
-                                                D3D12DDI_HRESOURCE resource)
+static void APIENTRY destroy_heap_and_resource(D3D12DDI_HDEVICE device, D3D12DDI_HHEAP handle,
+                                               D3D12DDI_HRESOURCE resource)
 {
     DdiResource *object = resource.pDrvPrivate;
-    if (object)
-        object->heap = NULL;
+    if (object) {
+        const BOOL placed = object->placed_buffer.handle != NULL;
+        *object = (DdiResource){0};
+        if (placed)
+            return;
+    }
     DdiHeap *heap = handle.pDrvPrivate;
     if (!heap || !heap->device || heap->device != venus_device(device))
         return;
@@ -585,8 +633,8 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnCreateSampler = create_pixel_sampler,
 #endif
     .pfnCalcPrivateHeapAndResourceSizes = private_resource_sizes,
-    .pfnCreateHeapAndResource = create_committed_resource,
-    .pfnDestroyHeapAndResource = destroy_committed_resource,
+    .pfnCreateHeapAndResource = create_heap_and_resource,
+    .pfnDestroyHeapAndResource = destroy_heap_and_resource,
     .pfnMapHeap = map_buffer_heap,
     .pfnUnmapHeap = unmap_buffer_heap,
     .pfnCheckResourceAllocationInfo = check_resource_allocation,
