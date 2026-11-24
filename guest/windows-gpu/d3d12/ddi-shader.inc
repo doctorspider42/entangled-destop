@@ -235,7 +235,7 @@ static HRESULT create_legacy_shader(D3D12DDI_HDEVICE device, const D3D12DDIARG_C
     DxbcHeader *blob = NULL;
     HRESULT status = make_legacy_dxbc(args, stage, &blob);
     if (SUCCEEDED(status)) {
-        status = compile_shader_module(device.pDrvPrivate, blob, &shader->module);
+        status = compile_shader_module(venus_device(device), blob, &shader->module);
         HeapFree(GetProcessHeap(), 0, blob);
     }
     if (SUCCEEDED(status))
@@ -261,7 +261,7 @@ static void APIENTRY destroy_shader(D3D12DDI_HDEVICE device, D3D12DDI_HSHADER ha
 {
     DdiShader *shader = handle.pDrvPrivate;
     if (shader && shader->module) {
-        const VenusDevice *venus = device.pDrvPrivate;
+        const VenusDevice *venus = venus_device(device);
         const PFN_vkDestroyShaderModule destroy = (PFN_vkDestroyShaderModule)
             venus->proc_addr(venus->handle, "vkDestroyShaderModule");
         destroy(venus->handle, shader->module, NULL);

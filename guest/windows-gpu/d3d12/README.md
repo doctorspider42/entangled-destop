@@ -418,6 +418,15 @@ and handles are defined for all four heap types. Descriptor writes and shader
 binding are still open. See
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-descriptors/`.
 
+Build `1.57.41.86` created the runtime's command pool as a Vulkan object and
+returned an `ID3D12Device` to the application through `D3D12CreateDevice` at
+feature level 11.0. The Direct3D12 trace records the device start event for
+the Entangled KMT adapter. The first public `CreateCommittedResource`
+returned `DXGI_ERROR_DEVICE_REMOVED` before calling the allocation DDI.
+The same trace records a rejected GPUVA capability query (`0x887A0004`)
+and device removal for a bad UMD error. See
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-pool/`.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

@@ -92,7 +92,7 @@ static HRESULT APIENTRY create_pipeline(D3D12DDI_HDEVICE device,
     if (!state || !private_pipeline_size(device, args))
         return E_INVALIDARG;
     *state = (DdiPipeline){0};
-    const VenusDevice *venus = device.pDrvPrivate;
+    const VenusDevice *venus = venus_device(device);
     if (args->hComputeShader.pDrvPrivate)
         return create_compute_pipeline(venus, args, state);
     const DdiShader *vertex = args->hVertexShader.pDrvPrivate;
@@ -189,7 +189,7 @@ static HRESULT APIENTRY make_pipeline_resident(D3D12DDI_HDEVICE device, D3D12DDI
         if (object->Type != D3D12DDI_HT_PIPELINE_STATE)
             return DXGI_ERROR_UNSUPPORTED;
         const DdiPipeline *state = object->Handle;
-        if (!state || !state->pipeline || state->device != device.pDrvPrivate)
+        if (!state || !state->pipeline || state->device != venus_device(device))
             return E_INVALIDARG;
     }
 
@@ -206,7 +206,7 @@ static void APIENTRY destroy_pipeline(D3D12DDI_HDEVICE device, D3D12DDI_HPIPELIN
     DdiPipeline *state = handle.pDrvPrivate;
     if (!state || !state->pipeline)
         return;
-    const VenusDevice *venus = device.pDrvPrivate;
+    const VenusDevice *venus = venus_device(device);
     const PFN_vkDestroyPipeline destroy = (PFN_vkDestroyPipeline)
         venus->proc_addr(venus->handle, "vkDestroyPipeline");
     const PFN_vkDestroyRenderPass destroy_pass = (PFN_vkDestroyRenderPass)

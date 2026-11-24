@@ -6,6 +6,18 @@
 #include <string.h>
 #include "venus-transfer.h"
 
+typedef struct DdiDevice {
+    VenusDevice venus;
+    D3D12DDI_HRTDEVICE runtime;
+    const D3D12DDI_CORELAYER_DEVICECALLBACKS_0022 *callbacks;
+} DdiDevice;
+
+static VenusDevice *venus_device(D3D12DDI_HDEVICE handle)
+{
+    DdiDevice *device = handle.pDrvPrivate;
+    return device ? &device->venus : NULL;
+}
+
 #ifdef ENTANGLED_D3D12_PROBE_DDI
 static void trace_ddi(const char *operation, UINT code, SIZE_T value)
 {
@@ -107,6 +119,7 @@ static void APIENTRY query_node_map(D3D12DDI_HDEVICE device, UINT physical_adapt
 #endif
 #include "ddi-pipeline-state.inc"
 #include "ddi-descriptor-heap.inc"
+#include "ddi-command.inc"
 #include "ddi-buffer.inc"
 #endif
 
@@ -118,7 +131,7 @@ static SIZE_T APIENTRY private_device_size(D3D12DDI_HADAPTER adapter,
 #ifdef ENTANGLED_D3D12_PROBE_DDI
     trace_ddi("CalcPrivateDeviceSize", args->Interface, args->Version);
 #endif
-    return args->Interface == D3D12DDI_INTERFACE_VERSION_R4 ? sizeof(VenusDevice) : 0;
+    return args->Interface == D3D12DDI_INTERFACE_VERSION_R4 ? sizeof(DdiDevice) : 0;
 }
 
 static HRESULT APIENTRY create_device(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_CREATEDEVICE_0003 *args)
@@ -131,18 +144,18 @@ static HRESULT APIENTRY create_device(D3D12DDI_HADAPTER adapter, const D3D12DDIA
 #endif
     if (args->Interface != D3D12DDI_INTERFACE_VERSION_R4)
         return DXGI_ERROR_UNSUPPORTED;
-    VenusDevice *device = args->hDrvDevice.pDrvPrivate;
+    DdiDevice *device = args->hDrvDevice.pDrvPrivate;
     if (!device)
         return E_INVALIDARG;
-    *device = (VenusDevice){0};
-    HRESULT result = create_venus_device(venus, device);
+    *device = (DdiDevice){ .runtime = args->hRTDevice, .callbacks = args->p12UMCallbacks_0022 };
+    HRESULT result = create_venus_device(venus, &device->venus);
 #ifdef ENTANGLED_D3D12_PROBE_COPY
     if (SUCCEEDED(result)) {
         trace_ddi("Venus copy begin", 0, 64 * 1024);
         result = probe_d3d12_buffer_ddi(args->hDrvDevice);
         trace_ddi("Venus copy result", (UINT)result, 64 * 1024);
         if (FAILED(result))
-            destroy_venus_device(device);
+            destroy_venus_device(&device->venus);
     }
 #endif
 #ifdef ENTANGLED_D3D12_PROBE_DDI
@@ -305,7 +318,7 @@ static HRESULT APIENTRY fill_table(D3D12DDI_HADAPTER adapter, D3D12DDI_TABLE_TYP
 static void APIENTRY destroy_device(D3D12DDI_HDEVICE device)
 {
     if (device.pDrvPrivate)
-        destroy_venus_device(device.pDrvPrivate);
+        destroy_venus_device(venus_device(device));
 #ifdef ENTANGLED_D3D12_PROBE_DDI
     trace_ddi("DestroyDevice", 0, 0);
 #endif

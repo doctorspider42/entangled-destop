@@ -116,24 +116,41 @@ HRESULT record_venus_buffer_copy(VkCommandBuffer command, const VenusTransferBuf
 }
 
 #ifdef ENTANGLED_D3D12_PROBE_COPY
+HRESULT create_venus_command_pool(const VenusDevice *device, VkCommandPoolCreateFlags flags, VkCommandPool *pool)
+{
+    const PFN_vkCreateCommandPool create = DEVICE_FN(device, vkCreateCommandPool);
+    if (!create || !DEVICE_FN(device, vkDestroyCommandPool) || !DEVICE_FN(device, vkResetCommandPool))
+        return E_FAIL;
+    const VkCommandPoolCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = flags,
+        .queueFamilyIndex = device->graphics_queue_family,
+    };
+    return venus_hresult(create(device->handle, &info, NULL, pool));
+}
+
+HRESULT reset_venus_command_pool(const VenusDevice *device, VkCommandPool pool)
+{
+    return venus_hresult(DEVICE_FN(device, vkResetCommandPool)(device->handle, pool, 0));
+}
+
+void destroy_venus_command_pool(const VenusDevice *device, VkCommandPool pool)
+{
+    DEVICE_FN(device, vkDestroyCommandPool)(device->handle, pool, NULL);
+}
+
 HRESULT begin_venus_transfer_list(const VenusDevice *device, VenusTransferList *list)
 {
     *list = (VenusTransferList){0};
-    const PFN_vkCreateCommandPool create_pool = DEVICE_FN(device, vkCreateCommandPool);
     const PFN_vkAllocateCommandBuffers allocate = DEVICE_FN(device, vkAllocateCommandBuffers);
     const PFN_vkBeginCommandBuffer begin = DEVICE_FN(device, vkBeginCommandBuffer);
-    if (!create_pool || !DEVICE_FN(device, vkDestroyCommandPool) || !allocate || !begin)
+    if (!allocate || !begin)
         return E_FAIL;
 
-    const VkCommandPoolCreateInfo pool_info = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-        .queueFamilyIndex = device->graphics_queue_family,
-    };
     VkCommandPool pool;
-    VkResult result = create_pool(device->handle, &pool_info, NULL, &pool);
-    if (result != VK_SUCCESS)
-        return venus_hresult(result);
+    const HRESULT status = create_venus_command_pool(device, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, &pool);
+    if (FAILED(status))
+        return status;
     list->device = device;
     list->pool = pool;
 
@@ -148,7 +165,7 @@ HRESULT begin_venus_transfer_list(const VenusDevice *device, VenusTransferList *
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     VkCommandBuffer command;
-    result = allocate(device->handle, &command_info, &command);
+    VkResult result = allocate(device->handle, &command_info, &command);
     if (result == VK_SUCCESS)
         result = begin(command, &begin_info);
     if (result == VK_SUCCESS)
@@ -215,7 +232,7 @@ void destroy_venus_transfer_list(VenusTransferList *list)
 {
     const VenusDevice *device = list->device;
     if (device)
-        DEVICE_FN(device, vkDestroyCommandPool)(device->handle, list->pool, NULL);
+        destroy_venus_command_pool(device, list->pool);
     *list = (VenusTransferList){0};
 }
 #endif

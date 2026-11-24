@@ -72,7 +72,7 @@ static HRESULT APIENTRY create_root_signature(D3D12DDI_HDEVICE device,
         }
     }
     if (!desc->NumParameters && !desc->NumStaticSamplers) {
-        const VenusDevice *venus = device.pDrvPrivate;
+        const VenusDevice *venus = venus_device(device);
         const PFN_vkCreatePipelineLayout create_layout = (PFN_vkCreatePipelineLayout)
             venus->proc_addr(venus->handle, "vkCreatePipelineLayout");
         const PFN_vkDestroyPipelineLayout destroy_layout = (PFN_vkDestroyPipelineLayout)
@@ -96,7 +96,7 @@ static void APIENTRY destroy_root_signature(D3D12DDI_HDEVICE device, D3D12DDI_HR
     if (!root)
         return;
     if (root->empty_layout) {
-        const VenusDevice *venus = device.pDrvPrivate;
+        const VenusDevice *venus = venus_device(device);
         const PFN_vkDestroyPipelineLayout destroy_layout = (PFN_vkDestroyPipelineLayout)
             venus->proc_addr(venus->handle, "vkDestroyPipelineLayout");
         destroy_layout(venus->handle, root->empty_layout, NULL);

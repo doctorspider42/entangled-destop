@@ -65,7 +65,7 @@ static HRESULT APIENTRY create_committed_buffer(
         return E_INVALIDARG;
 
     *object = (DdiBufferResource){0};
-    HRESULT status = create_venus_transfer_buffer(device.pDrvPrivate, resource->Width, readback, buffer);
+    HRESULT status = create_venus_transfer_buffer(venus_device(device), resource->Width, readback, buffer);
     if (SUCCEEDED(status))
         object->backing = buffer;
     return status;
@@ -85,7 +85,7 @@ static void APIENTRY destroy_committed_buffer(D3D12DDI_HDEVICE device, D3D12DDI_
 static HRESULT APIENTRY map_buffer_heap(D3D12DDI_HDEVICE device, D3D12DDI_HHEAP heap, void **data)
 {
     const VenusTransferBuffer *buffer = heap.pDrvPrivate;
-    if (!buffer || buffer->device != device.pDrvPrivate || !buffer->mapped || !data)
+    if (!buffer || buffer->device != venus_device(device) || !buffer->mapped || !data)
         return E_INVALIDARG;
     *data = buffer->mapped;
     return S_OK;
@@ -113,6 +113,17 @@ static void APIENTRY get_debug_allocation_info(D3D12DDI_HDEVICE device, D3D12DDI
 }
 
 static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
+    .pfnCalcPrivateCommandQueueSize = private_command_queue_size,
+    .pfnCreateCommandQueue = create_command_queue,
+    .pfnDestroyCommandQueue = destroy_command_queue,
+    .pfnCalcPrivateCommandPoolSize = private_command_pool_size,
+    .pfnCreateCommandPool = create_command_pool,
+    .pfnDestroyCommandPool = destroy_command_pool,
+    .pfnResetCommandPool = reset_command_pool,
+    .pfnCalcPrivateCommandRecorderSize = private_command_recorder_size,
+    .pfnCreateCommandRecorder = create_command_recorder,
+    .pfnDestroyCommandRecorder = destroy_command_recorder,
+    .pfnCommandRecorderSetCommandPoolAsTarget = set_command_pool_as_target,
     .pfnCalcPrivateBlendStateSize = private_blend_state_size,
     .pfnCreateBlendState = create_blend_state,
     .pfnDestroyBlendState = destroy_blend_state,
@@ -196,7 +207,7 @@ static HRESULT probe_ddi_transfer_list(D3D12DDI_HDEVICE device, D3D12DDI_HRESOUR
                                        VkBufferCopy region)
 {
     DdiTransferList transfer = {0};
-    HRESULT status = begin_venus_transfer_list(device.pDrvPrivate, &transfer.venus);
+    HRESULT status = begin_venus_transfer_list(venus_device(device), &transfer.venus);
     if (FAILED(status))
         return status;
 
