@@ -11,6 +11,7 @@ typedef struct VenusAdapter {
     PFN_vkDestroyInstance destroy_instance;
     VkInstance instance;
     VkPhysicalDevice physical_device;
+    UINT32 api_version;
     UINT32 graphics_queue_family;
     UINT32 subgroup_size;
 } VenusAdapter;
@@ -22,6 +23,7 @@ typedef struct VenusDevice {
     PFN_vkDestroyDevice destroy;
     UINT32 graphics_queue_family;
     VkPhysicalDeviceMemoryProperties memory;
+    BOOL maintenance5;
 } VenusDevice;
 
 HRESULT open_venus_adapter(VenusAdapter *adapter);

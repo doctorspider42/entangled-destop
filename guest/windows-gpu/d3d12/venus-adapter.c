@@ -2,6 +2,7 @@
 #include "venus-adapter.h"
 #include <dxgi.h>
 #include <stdio.h>
+#include <string.h>
 
 static HRESULT find_graphics_queue(VkPhysicalDevice device,
                                    PFN_vkGetPhysicalDeviceQueueFamilyProperties get_queue_families,
@@ -74,6 +75,8 @@ static HRESULT select_physical_device(VenusAdapter *adapter)
                 continue;
             if (SUCCEEDED(result)) {
                 adapter->physical_device = devices[i];
+                if (properties.properties.apiVersion < adapter->api_version)
+                    adapter->api_version = properties.properties.apiVersion;
                 adapter->subgroup_size = subgroup.subgroupSize;
                 char message[384];
                 snprintf(message, sizeof(message), "Entangled D3D12: Venus device %04x:%04x %s, graphics queue %u\n",
@@ -106,8 +109,17 @@ HRESULT open_venus_adapter(VenusAdapter *adapter)
     if (!create)
         return DXGI_ERROR_UNSUPPORTED;
 
+    adapter->api_version = VK_API_VERSION_1_2;
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    const PFN_vkEnumerateInstanceVersion enumerate_version = (PFN_vkEnumerateInstanceVersion)
+        adapter->instance_proc_addr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion");
+    UINT32 loader_version = 0;
+    if (enumerate_version && enumerate_version(&loader_version) == VK_SUCCESS &&
+        loader_version >= VK_API_VERSION_1_3)
+        adapter->api_version = VK_API_VERSION_1_3;
+#endif
     const VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-                                    .pEngineName = "Entangled D3D12", .apiVersion = VK_API_VERSION_1_2 };
+                                    .pEngineName = "Entangled D3D12", .apiVersion = adapter->api_version };
     const VkInstanceCreateInfo info = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
     VkInstance instance = VK_NULL_HANDLE;
     const VkResult result = create(&info, NULL, &instance);
@@ -140,6 +152,43 @@ HRESULT venus_hresult(VkResult result)
     }
 }
 
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+static BOOL supports_maintenance5(const VenusAdapter *adapter, VkPhysicalDeviceMaintenance5FeaturesKHR *feature)
+{
+    if (adapter->api_version < VK_API_VERSION_1_3)
+        return FALSE;
+    const PFN_vkEnumerateDeviceExtensionProperties enumerate = (PFN_vkEnumerateDeviceExtensionProperties)
+        adapter->instance_proc_addr(adapter->instance, "vkEnumerateDeviceExtensionProperties");
+    const PFN_vkGetPhysicalDeviceFeatures2 features = (PFN_vkGetPhysicalDeviceFeatures2)
+        adapter->instance_proc_addr(adapter->instance, "vkGetPhysicalDeviceFeatures2");
+    UINT32 count = 0;
+    if (!enumerate || !features || enumerate(adapter->physical_device, NULL, &count, NULL) != VK_SUCCESS || !count)
+        return FALSE;
+    VkExtensionProperties *ext = HeapAlloc(GetProcessHeap(), 0, count * sizeof(*ext));
+    if (!ext)
+        return FALSE;
+    BOOL found = FALSE;
+    if (enumerate(adapter->physical_device, NULL, &count, ext) == VK_SUCCESS) {
+        for (UINT32 i = 0; i < count; ++i) {
+            if (strcmp(ext[i].extensionName, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0) {
+                found = TRUE;
+                break;
+            }
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, ext);
+    if (!found)
+        return FALSE;
+
+    VkPhysicalDeviceFeatures2 requested = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = feature,
+    };
+    features(adapter->physical_device, &requested);
+    return feature->maintenance5 != VK_FALSE;
+}
+#endif
+
 HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
 {
     const PFN_vkCreateDevice create = (PFN_vkCreateDevice)
@@ -160,11 +209,24 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
         .queueCount = 1,
         .pQueuePriorities = &priority,
     };
-    const VkDeviceCreateInfo info = {
+    VkDeviceCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queue_info,
     };
+    BOOL has_maintenance5 = FALSE;
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
+    };
+    const char *extension = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
+    has_maintenance5 = supports_maintenance5(adapter, &maintenance5);
+    if (has_maintenance5) {
+        info.pNext = &maintenance5;
+        info.enabledExtensionCount = 1;
+        info.ppEnabledExtensionNames = &extension;
+    }
+#endif
     VkDevice handle;
     const VkResult result = create(adapter->physical_device, &info, NULL, &handle);
     if (result != VK_SUCCESS)
@@ -189,6 +251,7 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
         .proc_addr = proc_addr,
         .destroy = destroy,
         .graphics_queue_family = adapter->graphics_queue_family,
+        .maintenance5 = has_maintenance5,
     };
     get_memory(adapter->physical_device, &device->memory);
     return S_OK;

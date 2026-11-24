@@ -98,7 +98,40 @@ static void APIENTRY unmap_buffer_heap(D3D12DDI_HDEVICE device, D3D12DDI_HHEAP h
     (void)heap;
 }
 
+static void APIENTRY get_debug_allocation_info(D3D12DDI_HDEVICE device, D3D12DDI_HANDLE_AND_TYPE object,
+                                              UINT *num_addresses,
+                                              D3D12DDI_DEBUG_VIRTUAL_ADDRESS_ALLOCATION_INFO_0012 *addresses,
+                                              UINT *num_allocations, D3D12DDI_DEBUG_KMT_ALLOCATION_INFO_0014 *allocations)
+{
+    (void)device;
+    (void)addresses;
+    (void)allocations;
+    /* The lab's Venus objects do not have KMT allocation handles or WDDM GPUVAs. */
+    *num_addresses = 0;
+    *num_allocations = 0;
+    trace_ddi("GetDebugAllocationInfo", object.Type, 0);
+}
+
 static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
+    .pfnCalcPrivateBlendStateSize = private_blend_state_size,
+    .pfnCreateBlendState = create_blend_state,
+    .pfnDestroyBlendState = destroy_blend_state,
+    .pfnCalcPrivateDepthStencilStateSize = private_depth_stencil_state_size,
+    .pfnCreateDepthStencilState = create_depth_stencil_state,
+    .pfnDestroyDepthStencilState = destroy_depth_stencil_state,
+    .pfnCalcPrivateRasterizerStateSize = private_rasterizer_state_size,
+    .pfnCreateRasterizerState = create_rasterizer_state,
+    .pfnDestroyRasterizerState = destroy_rasterizer_state,
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    .pfnCalcPrivateShaderSize = private_shader_size,
+    .pfnCreateVertexShader = create_vertex_shader,
+    .pfnCreateComputeShader = create_compute_shader,
+    .pfnDestroyShader = destroy_shader,
+    .pfnCalcPrivatePipelineStateSize = private_pipeline_size,
+    .pfnCreatePipelineState = create_pipeline,
+    .pfnDestroyPipelineState = destroy_pipeline,
+    .pfnMakeResident = make_pipeline_resident,
+#endif
     .pfnCalcPrivateRootSignatureSize = private_root_signature_size,
     .pfnCreateRootSignature = create_root_signature,
     .pfnDestroyRootSignature = destroy_root_signature,
@@ -108,6 +141,7 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnMapHeap = map_buffer_heap,
     .pfnUnmapHeap = unmap_buffer_heap,
     .pfnCheckResourceAllocationInfo = check_buffer_allocation,
+    .pfnGetDebugAllocationInfo = get_debug_allocation_info,
     .pfnGetImplicitPhysicalAdapterMask = implicit_physical_adapter_mask,
     .pfnQueryNodeMap = query_node_map,
 };

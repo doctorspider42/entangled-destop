@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory)][string]$WddmPackage,
     [Parameter(Mandatory)][string]$Umd,
-    [Parameter(Mandatory)][string]$Out
+    [Parameter(Mandatory)][string]$Out,
+    [string]$ShaderCompiler
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,6 +26,13 @@ if (-not (Test-Path -LiteralPath $Umd -PathType Leaf)) {
 
 $text = Get-Content -LiteralPath $inf -Raw
 $sections = @{SourceDisksFiles = 'entangled_d3d12.dll = 1'; 'EntangledWddm.UserMode' = 'entangled_d3d12.dll'}
+if ($ShaderCompiler) {
+    if (-not (Test-Path -LiteralPath $ShaderCompiler -PathType Leaf)) {
+        throw "Missing x64 shader compiler: $ShaderCompiler"
+    }
+    $sections.SourceDisksFiles += "`r`ndxil-spirv-c-shared.dll = 1"
+    $sections['EntangledWddm.UserMode'] += "`r`ndxil-spirv-c-shared.dll"
+}
 foreach ($section in $sections.Keys) {
     $header = '[' + $section + ']'
     $pattern = '(?m)^' + [regex]::Escape($header) + '\r?\n'
@@ -59,6 +67,9 @@ foreach ($file in $files) {
     Copy-Item -LiteralPath (Join-Path $WddmPackage $file) -Destination $Out
 }
 Copy-Item -LiteralPath $Umd -Destination (Join-Path $Out 'entangled_d3d12.dll')
+if ($ShaderCompiler) {
+    Copy-Item -LiteralPath $ShaderCompiler -Destination (Join-Path $Out 'dxil-spirv-c-shared.dll')
+}
 [IO.File]::WriteAllText((Join-Path (Resolve-Path -LiteralPath $Out).Path 'entangled-wddm.inf'),
                        ($text -replace '\r?\n', "`r`n"), [Text.Encoding]::ASCII)
 Write-Output "Staged unsigned D3D12 lab WDDM package in $Out"

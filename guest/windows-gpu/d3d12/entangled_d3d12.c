@@ -102,6 +102,10 @@ static void APIENTRY query_node_map(D3D12DDI_HDEVICE device, UINT physical_adapt
 
 /* The WDK DDI headers define external C constants. Keep the callbacks in this translation unit. */
 #include "ddi-root-signature.inc"
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+#include "ddi-shader.inc"
+#endif
+#include "ddi-pipeline-state.inc"
 #include "ddi-buffer.inc"
 #endif
 

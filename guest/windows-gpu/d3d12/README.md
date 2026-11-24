@@ -366,11 +366,50 @@ The smaller shader-only candidate is `dxil-spirv` with its
 A local probe translated a vertex shader compiled with FXC `vs_5_1`
 and with DXC `vs_6_0` through the public C API. It verified the vertex
 stage and SPIR-V magic for both outputs. The converter and evidence are
-in `F:/entangled-targets/d3d12/upstream/dxil-spirv-msvc/`. Driver
-packaging, raw DDI shader decoding and Vulkan pipeline execution remain
-separate steps.
+in `F:/entangled-targets/d3d12/upstream/dxil-spirv-msvc/`. This compiler
+test ran as a Windows host process.
 [dxil-spirv license](https://github.com/HansKristian-Work/dxil-spirv/blob/53aac41815f8203dff4e081969438ed5063dbff3/LICENSE.MIT),
 [dxbc-spirv license](https://github.com/doitsujin/dxbc-spirv/blob/d82d9eaa6cab5c7277a6839f328e1b4d2f146894/LICENSE).
+
+The runtime supplies raw tokens and separate input/output signature entries.
+The first vertex shader has no inputs and one `SV_Position` output. The
+diagnostic reconstructs the three DXBC chunks from these inputs. In the
+local FXC fixture, retaining both signatures produced byte-identical SPIR-V
+to the original container. The runtime shader also translated locally.
+See `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-shader-io/` and
+`F:/entangled-targets/d3d12/upstream/dxil-spirv-msvc/ddi-vertex.log`.
+
+For the shader probe, point `ENTANGLED_D3D12_SHADER_INCLUDE` at the pinned
+`dxil-spirv` include directory and enable both existing DDI and copy flags.
+Pass the Windows x64 `dxil-spirv-c-shared.dll` to `stage-lab.ps1` with
+`-ShaderCompiler`. Use the converter built with a static CRT
+(`CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`). The UMD loads it from its own
+Driver Store package. Build `1.26.39.682` with the dynamic CRT reached the
+loader and reported `0x887A0004`. Build `1.32.22.507` with the static CRT
+created a Venus `VkShaderModule` for the runtime vertex shader, then
+initialized the blend, depth-stencil and rasterizer descriptions.
+
+Build `1.38.16.411` negotiated `VK_KHR_maintenance5` and created the
+runtime's vertex-only point pipeline without attachments. Maintenance5
+provides a Vulkan point size of 1 when the shader omits it. Windows then
+called `pfnMakeResident` for its pipeline initialization. The GPU copy,
+shader-module and graphics-pipeline creation results are recorded in
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-vk-pso/`.
+[Vulkan maintenance5](https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_maintenance5.html).
+
+Windows passed an empty make-resident batch for the graphics pipeline and
+asked for debug allocation records. The experimental UMD has no KMT
+allocations or WDDM GPU virtual addresses to report for these host-backed
+objects. With both callbacks in place, the runtime requested its second
+shader, an eight-DWORD Shader Model 5.0 compute program. The trace is in
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-debug-alloc/`.
+
+Build `1.47.32.724` translated the compute program and created its Vulkan
+shader module and compute pipeline with the empty root layout. The
+runtime finished both pipeline initialization paths and reached
+`pfnGetDescriptorSizeInBytes`. The guest still observed the scratch
+driver's stop callback at that slot. See
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-compute-pso/`.
 
 ## End-to-end test criteria
 
