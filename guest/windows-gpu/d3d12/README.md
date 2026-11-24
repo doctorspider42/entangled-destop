@@ -497,6 +497,17 @@ in the test process's environment. The only admitted executable name is
 heap opens and tiled copies explicitly declined. See
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-in-tree-tables/`.
 
+Build `2.54.20.259` passed `d3d12-smoke.exe --clear` through the system
+runtime. The application cleared an RGBA8 render target, transitioned it
+to copy source, copied it into a readback buffer with a 512-byte row pitch,
+and verified all 73 × 41 pixels after its WDDM fence. Vulkan used a
+single-sample linear image in device-local memory and executed the clear
+and copy on the RTX 2070. Host Venus context `1082369` allocated the
+page-rounded 24,576-byte readback. The debugger run reported 102.057 ms
+from submit to fence for clear and readback, and 2.243 ms for the separate
+65,536-byte copy regression. See
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-color-clear/`.
+
 The experimental `_0040` queue and list callbacks now hold a WDDM context
 and Vulkan command pool, serialize recording on the shared pool and select
 the matching runtime table. The transfer submission callback waits for

@@ -28,6 +28,8 @@ typedef struct DdiTransferList {
     DdiCommandPool *pool;
     UINT64 generation;
     BOOL closed;
+    const VenusColorImage *cleared_color;
+    BOOL color_copy_source;
 } DdiTransferList;
 
 static void set_command_list_status(DdiTransferList *list, HRESULT status)
@@ -354,6 +356,8 @@ static void APIENTRY reset_command_list(D3D12DDI_HCOMMANDLIST driver_list, const
     list->pool = NULL;
     list->closed = FALSE;
     list->venus = (VenusTransferList){0};
+    list->cleared_color = NULL;
+    list->color_copy_source = FALSE;
     if (!pool || pool->device != list->device || recorder->device != list->device ||
         args->CommandListFlags != D3D12DDI_COMMAND_LIST_FLAG_NONE) {
         set_command_list_status(list, E_INVALIDARG);

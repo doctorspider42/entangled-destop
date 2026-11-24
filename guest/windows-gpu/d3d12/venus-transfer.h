@@ -19,6 +19,26 @@ HRESULT record_venus_buffer_copy(VkCommandBuffer command, const VenusTransferBuf
                                  const VenusTransferBuffer *src, VkBufferCopy region);
 
 #ifdef ENTANGLED_D3D12_PROBE_COPY
+typedef struct VenusColorImage {
+    const VenusDevice *device;
+    VkImage handle;
+    VkDeviceMemory memory;
+    VkMemoryRequirements requirements;
+    VkSubresourceLayout layout;
+    VkExtent3D extent;
+    VkFormat format;
+} VenusColorImage;
+
+HRESULT venus_color_image_requirements(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
+                                      VkMemoryRequirements *requirements);
+HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
+                                 VenusColorImage *image);
+void destroy_venus_color_image(VenusColorImage *image);
+HRESULT record_venus_clear_color(VkCommandBuffer command, const VenusColorImage *image, const FLOAT color[4]);
+HRESULT prepare_venus_color_copy(VkCommandBuffer command, const VenusColorImage *image);
+HRESULT copy_venus_color_to_buffer(VkCommandBuffer command, const VenusColorImage *source,
+                                  const VenusTransferBuffer *destination, VkDeviceSize offset, UINT32 row_pitch);
+
 HRESULT create_venus_command_pool(const VenusDevice *device, VkCommandPoolCreateFlags flags, VkCommandPool *pool);
 HRESULT reset_venus_command_pool(const VenusDevice *device, VkCommandPool pool);
 void destroy_venus_command_pool(const VenusDevice *device, VkCommandPool pool);

@@ -299,7 +299,11 @@ static HRESULT APIENTRY get_caps(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_GE
         return write_probe_caps(args, &priority, sizeof(priority));
     }
     if (args->Type == D3D12DDICAPS_TYPE_0022_TEXTURE_LAYOUT && !args->pInfo) {
-        const D3D12DDI_TEXTURE_LAYOUT_CAPS_0026 layout = {0};
+        const D3D12DDI_TEXTURE_LAYOUT_CAPS_0026 layout = {
+#ifdef ENTANGLED_D3D12_PROBE_COPY
+            .SupportsRowMajorTexture = TRUE,
+#endif
+        };
         return write_probe_caps(args, &layout, sizeof(layout));
     }
     if (args->Type == D3D12DDICAPS_TYPE_TEXTURE_LAYOUT_SETS) {
