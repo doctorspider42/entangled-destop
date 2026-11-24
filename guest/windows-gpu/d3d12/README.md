@@ -585,6 +585,16 @@ signing helper had restored the old Mesa UMD from cache. The traces above
 therefore do not qualify the newer companion UMD. See
 `ddi40-runtime-present-composition/`.
 
+Build `3.47.25.747` staged all driver DLLs and verified the newer Mesa
+companion's SHA-256 in the guest. The DirectComposition probe passed in
+1.242 ms submit-to-fence, 5.120 ms in Present and 21.092 ms in DwmFlush.
+A guest desktop capture verified all 76,800 pixels in the app's frame.
+Host captures with `ENTANGLED_SCANOUT_PATH=copy` stayed black. The
+installed engine tag `v0.2.152` predates `6db240a`, which added the
+headless GPU presenter for the DWM overlay. See
+`ddi40-runtime-present-copy-scanout/guest-desktop.png` and its
+`guest-pixel-verification.log` under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a
