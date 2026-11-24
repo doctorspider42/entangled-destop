@@ -631,6 +631,17 @@ log, ETW and application trace. The harness ended the process after
 22 seconds and restored `oem58.inf`. F239 has no verified hardware
 frame or scroll measurement in this run.
 
+Build `4.4.34.384` queried descriptor indexing through the same Windows
+Venus ICD and physical RTX 2070. It reported runtime arrays, partially bound
+descriptors, variable descriptor counts, sampled-image update-after-bind,
+and nonuniform indexing of sampled images, uniform buffers and storage
+buffers. The update-after-bind properties exposed 1,048,576 samplers per
+stage, and 1,048,576 samplers, sampled images and storage buffers per set.
+These are Vulkan capabilities. D3D12 Tier 2 still needs descriptor binding,
+shader register remapping, resource lifetime and execution tests.
+`--gpu-buffer` also passed in this run. See
+`ddi40-runtime-descriptor-capabilities/` under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

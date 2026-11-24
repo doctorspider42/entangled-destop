@@ -30,6 +30,42 @@ static HRESULT find_graphics_queue(VkPhysicalDevice device,
     return result;
 }
 
+#ifdef ENTANGLED_D3D12_PROBE_RUNTIME
+static void trace_descriptor_indexing(const VenusAdapter *adapter, PFN_vkGetPhysicalDeviceProperties2 get_properties)
+{
+    const PFN_vkGetPhysicalDeviceFeatures2 get_features = (PFN_vkGetPhysicalDeviceFeatures2)
+        adapter->instance_proc_addr(adapter->instance, "vkGetPhysicalDeviceFeatures2");
+    if (!get_features)
+        return;
+    VkPhysicalDeviceDescriptorIndexingFeatures indexing = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+    };
+    VkPhysicalDeviceFeatures2 features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &indexing,
+    };
+    get_features(adapter->physical_device, &features);
+    VkPhysicalDeviceDescriptorIndexingProperties capacity = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES,
+    };
+    VkPhysicalDeviceProperties2 properties = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &capacity,
+    };
+    get_properties(adapter->physical_device, &properties);
+    char message[576];
+    snprintf(message, sizeof(message),
+             "Entangled D3D12: Venus descriptors runtime-arrays=%u partially-bound=%u variable-count=%u "
+             "sampled-nonuniform=%u uniform-nonuniform=%u storage-nonuniform=%u "
+             "sampled-update-after-bind=%u set-samplers=%u stage-samplers=%u set-sampled=%u set-storage=%u pool=%u\n",
+             indexing.runtimeDescriptorArray, indexing.descriptorBindingPartiallyBound,
+             indexing.descriptorBindingVariableDescriptorCount, indexing.shaderSampledImageArrayNonUniformIndexing,
+             indexing.shaderUniformBufferArrayNonUniformIndexing, indexing.shaderStorageBufferArrayNonUniformIndexing,
+             indexing.descriptorBindingSampledImageUpdateAfterBind, capacity.maxDescriptorSetUpdateAfterBindSamplers,
+             capacity.maxPerStageDescriptorUpdateAfterBindSamplers, capacity.maxDescriptorSetUpdateAfterBindSampledImages,
+             capacity.maxDescriptorSetUpdateAfterBindStorageBuffers, capacity.maxUpdateAfterBindDescriptorsInAllPools);
+    OutputDebugStringA(message);
+}
+#endif
+
 static HRESULT select_physical_device(VenusAdapter *adapter)
 {
     const PFN_vkEnumeratePhysicalDevices enumerate = (PFN_vkEnumeratePhysicalDevices)
@@ -83,6 +119,9 @@ static HRESULT select_physical_device(VenusAdapter *adapter)
                          properties.properties.vendorID, properties.properties.deviceID,
                          properties.properties.deviceName, adapter->graphics_queue_family);
                 OutputDebugStringA(message);
+#ifdef ENTANGLED_D3D12_PROBE_RUNTIME
+                trace_descriptor_indexing(adapter, get_properties);
+#endif
             }
             break;
         }
