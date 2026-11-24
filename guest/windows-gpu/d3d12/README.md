@@ -848,6 +848,51 @@ and a working frame-latency waitable object. It measured 1.693 ms
 draw-to-fence, 7.795 ms in `Present` and 68.152 ms in `DwmFlush`.
 See `ddi40-runtime-wintanyl-persistent-textures/` under the lab share.
 
+### F239 scroll latency in the lab
+
+Build `20.44.20.660` used the in-tree Wintanyl probe configuration.
+The 60 Hz guest ran an unchanged F239 executable on a local directory
+of 80 files. The input probe sampled QPC immediately before one
+`SendInput` wheel notch, then checked the list region of the guest
+desktop until the pixels changed. It alternated direction and waited
+905 ms after each observation. All nine samples in each run showed
+the expected change.
+
+| Phase at 60 Hz | Median | Range |
+| --- | ---: | ---: |
+| Input to start of render submission, timing trace enabled | 4.04 ms | 3.21–7.88 ms |
+| Render submission to Venus retirement, seven lists | 8.76 ms | 5.03–20.51 ms |
+| Present copy submission to Venus retirement, one list | 1.82 ms | 1.11–2.64 ms |
+| UMD handoff to WDDM | 0.52 ms | 0.42–0.71 ms |
+| End of WDDM handoff to detection in the guest desktop | 61.64 ms | 25.32–102.52 ms |
+| Input to guest desktop pixels, timing trace enabled | 94.86 ms | 40.95–133.63 ms |
+| Input to guest desktop pixels, without the debugger | 54.77 ms | 40.89–83.35 ms |
+
+The timing-enabled run uses guest QPC for both the UMD and pixel probe.
+The render interval includes Venus submission and waiting for GPU
+retirement. The final pixel interval includes DWM and GDI sampling
+costs. F241 measured median latencies of 5.16 ms on RTX and 312.73 ms
+on WARP using DXGI Desktop Duplication at 239 Hz on the physical
+monitor. See `ddi40-runtime-wintanyl-scroll/` under the lab share for
+the input probe source, raw samples, stage timings and the scanout.
+
+The lab then used the same driver, application, directory, 1,280 × 720
+display and pixel probe at a guest-reported 239 Hz. Both runs completed
+without a debugger. The WARP run set `WT_UI_WARP=1` for F239. All
+18 wheel inputs produced the expected list movement.
+The hardware run's F239 process (PID 9,100) owned Venus context
+2,329,601. The host trace records `CmdDraw`, `QueueSubmit` and
+fence retirements on the RTX 2070 during the input series.
+
+| F239 backend in the same 239 Hz guest | Samples | Median | Range |
+| --- | ---: | ---: | ---: |
+| Entangled D3D12 via Venus and RTX 2070 | 9 | 63.70 ms | 48.39–109.68 ms |
+| WARP | 9 | 374.93 ms | 335.39–409.43 ms |
+
+The WARP median was 5.9 times the hardware median. The 60 Hz hardware
+run measured a lower median of 54.77 ms. Both capture series include time
+after the UMD handoff. See `ddi40-runtime-wintanyl-refresh239/` under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a
