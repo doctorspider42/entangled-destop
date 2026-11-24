@@ -106,12 +106,33 @@ static void APIENTRY clear_color_rtv(D3D12DDI_HCOMMANDLIST handle, D3D12DDI_CPU_
 static HRESULT color_barrier(DdiTransferList *list, const D3D12DDIARG_RESOURCE_BARRIER_0022 *barrier)
 {
     if (barrier->Type != D3D12DDI_RESOURCE_BARRIER_TYPE_TRANSITION || barrier->Flags ||
-        barrier->Transition.StateBefore != D3D12DDI_RESOURCE_STATE_RENDER_TARGET ||
-        barrier->Transition.StateAfter != D3D12DDI_RESOURCE_STATE_COPY_SOURCE ||
         (barrier->Transition.Subresource && barrier->Transition.Subresource != D3D12DDI_RESOURCE_BARRIER_ALL_SUBRESOURCES))
         return DXGI_ERROR_UNSUPPORTED;
-    const VenusColorImage *image = resource_color(list->venus.device, barrier->Transition.hResource);
-    if (!image || image != list->written_color || list->color_copy_source)
+    DdiHeap *heap = resource_heap(list->venus.device, barrier->Transition.hResource);
+    if (!heap || heap->kind != DDI_HEAP_COLOR_IMAGE)
+        return DXGI_ERROR_UNSUPPORTED;
+    const D3D12DDI_RESOURCE_STATES before = barrier->Transition.StateBefore;
+    const D3D12DDI_RESOURCE_STATES after = barrier->Transition.StateAfter;
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    if (heap->present.allocation && before == D3D12DDI_RESOURCE_STATE_COMMON && after == D3D12DDI_RESOURCE_STATE_RENDER_TARGET)
+        return S_OK; /* The lab draw and clear discard the previous destination contents. */
+#endif
+    const VenusColorImage *image = &heap->image;
+    if (before != D3D12DDI_RESOURCE_STATE_RENDER_TARGET || image != list->written_color || list->color_copy_source)
+        return DXGI_ERROR_UNSUPPORTED;
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    if (heap->present.allocation && after == D3D12DDI_RESOURCE_STATE_COMMON && !list->present) {
+        const HRESULT status = prepare_venus_color_copy(list->venus.command, image, list->color_rendered);
+        if (FAILED(status))
+            return status;
+        const HRESULT copied = copy_venus_color_to_buffer(list->venus.command, image, list->color_rendered,
+                                                         &heap->present.pixels, 0, image->extent.width * 4);
+        if (SUCCEEDED(copied))
+            list->present = &heap->present;
+        return copied;
+    }
+#endif
+    if (after != D3D12DDI_RESOURCE_STATE_COPY_SOURCE)
         return DXGI_ERROR_UNSUPPORTED;
     const HRESULT status = prepare_venus_color_copy(list->venus.command, image, list->color_rendered);
     if (SUCCEEDED(status))

@@ -44,6 +44,9 @@ typedef struct DdiTransferList {
     const VenusColorImage *written_color;
     BOOL color_copy_source;
     BOOL color_rendered;
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    DdiPresentSurface *present;
+#endif
     DdiDrawState draw;
 } DdiTransferList;
 
@@ -414,6 +417,9 @@ static void APIENTRY reset_command_list(D3D12DDI_HCOMMANDLIST driver_list, const
     list->closed = FALSE;
     list->venus = (VenusTransferList){0};
     list->written_color = NULL;
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    list->present = NULL;
+#endif
     list->color_copy_source = FALSE;
     list->color_rendered = FALSE;
     list->draw = (DdiDrawState){0};
@@ -539,6 +545,15 @@ static void APIENTRY execute_transfer_lists(D3D12DDI_HCOMMANDQUEUE driver_queue,
         /* The lab completes Venus work before the runtime can signal its WDDM fence. */
         AcquireSRWLockExclusive(&device->queue_lock);
         status = submit_venus_transfer_commands(&device->venus, count, commands);
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+        if (SUCCEEDED(status)) {
+            for (UINT i = 0; i < count; ++i) {
+                const DdiTransferList *list = lists[i].pDrvPrivate;
+                if (list->present)
+                    list->present->ready = TRUE;
+            }
+        }
+#endif
         ReleaseSRWLockExclusive(&device->queue_lock);
     }
     if (commands != local)

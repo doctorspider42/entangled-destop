@@ -14,16 +14,18 @@ if not exist "%OUT%" exit /b 1
 rem Advertise the provisional revision only in disposable runtime contract probes.
 set "DDI_PROBE="
 set "SHADER_PROBE="
+set "PRESENT_PROBE="
 if "%ENTANGLED_D3D12_PROBE_DDI%"=="1" set "DDI_PROBE=/DENTANGLED_D3D12_PROBE_DDI=1"
 if "%ENTANGLED_D3D12_PROBE_DDI%%ENTANGLED_D3D12_PROBE_COPY%"=="11" set "DDI_PROBE=%DDI_PROBE% /DENTANGLED_D3D12_PROBE_COPY=1"
 if "%ENTANGLED_D3D12_PROBE_DDI%%ENTANGLED_D3D12_PROBE_COPY%"=="11" if defined ENTANGLED_D3D12_SHADER_INCLUDE set SHADER_PROBE=/DENTANGLED_D3D12_PROBE_SHADER=1 /I"%ENTANGLED_D3D12_SHADER_INCLUDE%"
 if "%ENTANGLED_D3D12_PROBE_RUNTIME%"=="1" if defined SHADER_PROBE set "DDI_PROBE=%DDI_PROBE% /DENTANGLED_D3D12_PROBE_RUNTIME=1"
-cl /nologo /std:c11 /W4 /WX /O2 /MT /LD %DDI_PROBE% %SHADER_PROBE% /I"%SRC%..\..\..\tools\venus-protocol\include" ^
+if "%ENTANGLED_D3D12_PROBE_RUNTIME%"=="1" if defined SHADER_PROBE if defined ENTANGLED_D3D12_WDDM_INCLUDE set PRESENT_PROBE=/DENTANGLED_D3D12_PROBE_PRESENT=1 /I"%ENTANGLED_D3D12_WDDM_INCLUDE%"
+cl /nologo /std:c11 /W4 /WX /O2 /MT /LD %DDI_PROBE% %SHADER_PROBE% %PRESENT_PROBE% /I"%SRC%..\..\..\tools\venus-protocol\include" ^
     "%SRC%entangled_d3d12.c" "%SRC%venus-adapter.c" "%SRC%venus-transfer.c" ^
     /Fo"%OUT%\\" /Fe"%OUT%\entangled_d3d12.dll" /link /IMPLIB:"%OUT%\entangled_d3d12.lib"
 if errorlevel 1 exit /b 1
 cl /nologo /std:c11 /W4 /WX /O2 /MT %DDI_PROBE% "%SRC%ddi-test.c" /Fo"%OUT%\ddi-test.obj" /Fe"%OUT%\ddi-test.exe"
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc "%SRC%d3d12-smoke.cpp" "%SRC%wddm-fence.cpp" ^
-    /Fo"%OUT%\\" /Fe"%OUT%\d3d12-smoke.exe" /link /DEPENDENTLOADFLAG:0x800 d3d12.lib d3dcompiler.lib dxgi.lib gdi32.lib
+    /Fo"%OUT%\\" /Fe"%OUT%\d3d12-smoke.exe" /link /DEPENDENTLOADFLAG:0x800 d3d12.lib d3dcompiler.lib dxgi.lib gdi32.lib user32.lib dwmapi.lib
 exit /b %errorlevel%

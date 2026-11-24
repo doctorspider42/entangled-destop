@@ -520,11 +520,39 @@ times were 1.273 ms for draw and readback, 148.274 ms for clear and readback,
 and 1.329 ms for buffer copy. These are individual trace runs. See
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-color-draw/`.
 
+The live driver rollback stalled after the three draw-suite processes
+exited. The lab stopped accepting ACPI shutdown. After pausing only that VM
+and confirming the disk had stopped writing, its framebuffer recovery boot
+removed the exact `3.6.27.946` package and test certificate and verified the
+baseline `oem58.inf` in the guest store. The recovery log is alongside the
+draw results. Subsequent installs run one probe process per boot.
+
 The experimental `_0040` queue and list callbacks now hold a WDDM context
 and Vulkan command pool, serialize recording on the shared pool and select
 the matching runtime table. The transfer submission callback waits for
 Vulkan completion before returning. The release build continues to decline
 the provisional DDI.
+
+## Windowed DXGI presentation
+
+For the presentation probe, also set `ENTANGLED_D3D12_WDDM_INCLUDE` to the
+pinned miniport's `viogpu/shared` directory. The UMD uses that header to
+allocate a WDDM surface for each BGRA8 backbuffer. The `--present` probe
+creates a 320 × 240 flip-discard swap chain. Rendering and the copy into a
+coherent staging buffer run through Venus. After GPU retirement, the
+presentation DDI copies the tightly packed pixels into the WDDM allocation
+via Lock2 and returns the allocation and the queue's WDDM context to DXGI.
+This first path has a synchronous staging copy.
+
+Build `3.21.55.661` created the swap chain and returned two KMT allocation
+handles. The draw initially stopped at the PRESENT-to-RENDER_TARGET barrier.
+Build `3.25.26.722` executed the draw and copy on the RTX 2070 and reported
+successful WDDM Lock2 and DXGI Present. This trace measured 2.020 ms from
+submit to fence, 10.806 ms in Present, and 516.285 ms in DwmFlush, which
+returned `DWM_E_COMPOSITIONDISABLED` (`0x80263001`). All ten host scanout
+captures taken while the probe ran were black. The lab restored
+`oem58.inf` and shut down cleanly. See
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-present-copy/`.
 
 ## End-to-end test criteria
 

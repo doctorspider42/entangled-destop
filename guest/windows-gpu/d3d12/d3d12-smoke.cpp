@@ -3,7 +3,8 @@
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <d3dkmthk.h>
-#include <dxgi1_2.h>
+#include <dwmapi.h>
+#include <dxgi1_4.h>
 #include <wrl/client.h>
 
 #include <array>
@@ -273,6 +274,39 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
     return draw;
 }
 
+static void record_draw(ID3D12GraphicsCommandList *commands, const DrawPipeline &draw,
+                         D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT width, UINT height)
+{
+    const D3D12_VIEWPORT viewport = {0, 0, static_cast<FLOAT>(width), static_cast<FLOAT>(height), 0, 1};
+    const D3D12_RECT scissor = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+    commands->SetGraphicsRootSignature(draw.root.Get());
+    commands->SetPipelineState(draw.pipeline.Get());
+    commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commands->RSSetViewports(1, &viewport);
+    commands->RSSetScissorRects(1, &scissor);
+    commands->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    commands->DrawInstanced(3, 1, 0, 0);
+}
+
+static void transition_color(ID3D12GraphicsCommandList *commands, ID3D12Resource *image,
+                             D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {image, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
+    commands->ResourceBarrier(1, &barrier);
+}
+
+static ComPtr<ID3D12DescriptorHeap> create_rtv_heap(ID3D12Device *device)
+{
+    D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    desc.NumDescriptors = 1;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap)), "CreateDescriptorHeap (RTV)");
+    return heap;
+}
+
 static void color_and_verify(ID3D12Device *device, bool programmable)
 {
     constexpr UINT width = 73, height = 41;
@@ -292,11 +326,7 @@ static void color_and_verify(ID3D12Device *device, bool programmable)
     check(device->CreateCommittedResource(&video_memory, D3D12_HEAP_FLAG_NONE, &desc,
                                           D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&target)),
           "CreateCommittedResource (render target)");
-    D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
-    rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    rtv_desc.NumDescriptors = 1;
-    ComPtr<ID3D12DescriptorHeap> rtv_heap;
-    check(device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv_heap)), "CreateDescriptorHeap (RTV)");
+    const auto rtv_heap = create_rtv_heap(device);
     const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
     device->CreateRenderTargetView(target.Get(), nullptr, rtv);
 
@@ -312,24 +342,12 @@ static void color_and_verify(ID3D12Device *device, bool programmable)
     DrawPipeline draw;
     if (programmable) {
         draw = create_draw_pipeline(device, desc.Format);
-        const D3D12_VIEWPORT viewport = {0, 0, static_cast<FLOAT>(width), static_cast<FLOAT>(height), 0, 1};
-        const D3D12_RECT scissor = {0, 0, width, height};
-        commands.list->SetGraphicsRootSignature(draw.root.Get());
-        commands.list->SetPipelineState(draw.pipeline.Get());
-        commands.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        commands.list->RSSetViewports(1, &viewport);
-        commands.list->RSSetScissorRects(1, &scissor);
-        commands.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        commands.list->DrawInstanced(3, 1, 0, 0);
+        record_draw(commands.list.Get(), draw, rtv, width, height);
     } else {
         const FLOAT red[] = {1.0f, 0.0f, 0.0f, 1.0f};
         commands.list->ClearRenderTargetView(rtv, red, 0, nullptr);
     }
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition = {target.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                          D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
-    commands.list->ResourceBarrier(1, &barrier);
+    transition_color(commands.list.Get(), target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
     src.pResource = target.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -357,10 +375,94 @@ static void color_and_verify(ID3D12Device *device, bool programmable)
                  programmable ? L"DRAW" : L"CLEAR", width, height, elapsed);
 }
 
+static void draw_and_present(ID3D12Device *device)
+{
+    constexpr UINT width = 320, height = 240;
+    constexpr wchar_t window_class[] = L"EntangledD3D12Smoke";
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    WNDCLASSW window_description = {};
+    window_description.lpfnWndProc = DefWindowProcW;
+    window_description.hInstance = instance;
+    window_description.lpszClassName = window_class;
+    if (!RegisterClassW(&window_description))
+        check(HRESULT_FROM_WIN32(GetLastError()), "RegisterClassW");
+    RECT bounds = {0, 0, width, height};
+    if (!AdjustWindowRect(&bounds, WS_OVERLAPPEDWINDOW, FALSE))
+        check(HRESULT_FROM_WIN32(GetLastError()), "AdjustWindowRect");
+    HWND window = CreateWindowExW(0, window_class, L"Entangled D3D12 presentation probe", WS_OVERLAPPEDWINDOW,
+                                  240, 180, bounds.right - bounds.left, bounds.bottom - bounds.top,
+                                  nullptr, nullptr, instance, nullptr);
+    if (!window)
+        check(HRESULT_FROM_WIN32(GetLastError()), "CreateWindowExW");
+    ShowWindow(window, SW_SHOWNORMAL);
+
+    const auto commands = begin_recording(device);
+    ComPtr<IDXGIFactory2> factory;
+    check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
+    check(factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER), "MakeWindowAssociation");
+    DXGI_SWAP_CHAIN_DESC1 description = {};
+    description.Width = width;
+    description.Height = height;
+    description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    description.SampleDesc.Count = 1;
+    description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    description.BufferCount = 2;
+    description.Scaling = DXGI_SCALING_STRETCH;
+    description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    ComPtr<IDXGISwapChain1> created;
+    check(factory->CreateSwapChainForHwnd(commands.queue.Get(), window, &description, nullptr, nullptr, &created),
+          "CreateSwapChainForHwnd");
+    ComPtr<IDXGISwapChain3> swapchain;
+    check(created.As(&swapchain), "Query IDXGISwapChain3");
+    std::wprintf(L"D3D12 PRESENT: created %ux%u flip-discard swap chain\n", width, height);
+    std::fflush(stdout);
+
+    ComPtr<ID3D12Resource> image;
+    check(swapchain->GetBuffer(swapchain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&image)), "GetBuffer (swap chain)");
+    const auto descriptors = create_rtv_heap(device);
+    const auto rtv = descriptors->GetCPUDescriptorHandleForHeapStart();
+    device->CreateRenderTargetView(image.Get(), nullptr, rtv);
+    const auto draw = create_draw_pipeline(device, description.Format);
+    transition_color(commands.list.Get(), image.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    record_draw(commands.list.Get(), draw, rtv, width, height);
+    transition_color(commands.list.Get(), image.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    const auto render_us = submit_and_wait(device, commands);
+
+    const auto present_start = std::chrono::steady_clock::now();
+    const HRESULT presented = swapchain->Present(1, 0);
+    check(presented, "Present (swap chain)");
+    const auto present_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - present_start).count();
+    const auto composition_start = std::chrono::steady_clock::now();
+    const HRESULT composition = DwmFlush();
+    const auto composition_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - composition_start).count();
+    std::wprintf(L"D3D12 PRESENT: draw-to-fence %lld us, Present %lld us, DwmFlush %lld us (0x%08lX)\n",
+                 render_us, static_cast<long long>(present_us), static_cast<long long>(composition_us),
+                 static_cast<unsigned long>(composition));
+    std::fflush(stdout);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (std::chrono::steady_clock::now() < deadline) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        MsgWaitForMultipleObjectsEx(0, nullptr, 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    }
+    DestroyWindow(window);
+    UnregisterClassW(window_class, instance);
+    if (presented != S_OK)
+        check(DXGI_ERROR_INVALID_CALL, "Present did not submit a frame");
+    check(composition, "DwmFlush");
+    std::puts("D3D12 PRESENT: DXGI and DWM calls passed");
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, Clear, Draw, Fence, RenderFence };
+    enum class Probe { Copy, Clear, Draw, Present, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -369,12 +471,14 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Clear;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--draw") == 0)
             probe = Probe::Draw;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--present") == 0)
+            probe = Probe::Present;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence") == 0)
             probe = Probe::Fence;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence-render-context") == 0)
             probe = Probe::RenderFence;
         else {
-            std::fputs("usage: d3d12-smoke.exe [--hardware] [--clear | --draw | --fence | --fence-render-context]\n", stderr);
+            std::fputs("usage: d3d12-smoke.exe [--hardware] [--clear | --draw | --present | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
     }
@@ -385,6 +489,8 @@ int wmain(int argc, wchar_t **argv)
         const auto device = create_device(adapter, hardware_control);
         if (probe == Probe::Clear || probe == Probe::Draw)
             color_and_verify(device.Get(), probe == Probe::Draw);
+        else if (probe == Probe::Present)
+            draw_and_present(device.Get());
         else
             copy_and_verify(device.Get());
     }

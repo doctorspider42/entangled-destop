@@ -12,6 +12,9 @@ typedef struct DdiHeap {
         VenusTransferBuffer buffer;
         VenusColorImage image;
     };
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    DdiPresentSurface present;
+#endif
 } DdiHeap;
 
 typedef struct DdiResource {
@@ -24,6 +27,10 @@ static DdiHeap *resource_heap(const VenusDevice *device, D3D12DDI_HRESOURCE reso
     DdiHeap *heap = object ? object->heap : NULL;
     return device && heap && heap->device == device ? heap : NULL;
 }
+
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+#include "ddi-present.inc"
+#endif
 
 static const VenusTransferBuffer *resource_buffer(const VenusDevice *device, D3D12DDI_HRESOURCE resource)
 {
@@ -169,23 +176,31 @@ static HRESULT APIENTRY create_committed_resource(
     const D3D12DDI_CLEAR_VALUES *clear, D3D12DDI_HPROTECTEDRESOURCESESSION_0030 protection,
     D3D12DDI_HRESOURCE driver_resource)
 {
-    (void)runtime_resource;
     const VenusDevice *venus = venus_device(device);
     DdiHeap *backing = driver_heap.pDrvPrivate;
     DdiResource *object = driver_resource.pDrvPrivate;
-    if (!heap || !resource || protection.pDrvPrivate || clear || (heap->Flags & D3D12DDI_HEAP_FLAG_PRIMARY) ||
+    if (heap && resource) {
+        trace_ddi("CreateHeapAndResource flags", resource->Flags, heap->Flags);
+        trace_ddi("CreateHeapAndResource memory", heap->MemoryPool, heap->CPUPageProperty);
+        trace_ddi("CreateHeapAndResource layout", resource->Layout, resource->pRowMajorLayout != NULL);
+    }
+    if (!heap || !resource || protection.pDrvPrivate || clear ||
         heap->CreationNodeMask > 1 || heap->VisibleNodeMask > 1 ||
         resource->ReuseBufferGPUVA.BaseAddress.UMD.hResource.pDrvPrivate)
         return DXGI_ERROR_UNSUPPORTED;
     if (!venus || !backing || !object || !resource->Width)
         return E_INVALIDARG;
 
-    trace_ddi("CreateHeapAndResource flags", resource->Flags, heap->Flags);
-    trace_ddi("CreateHeapAndResource memory", heap->MemoryPool, heap->CPUPageProperty);
+    const BOOL primary = (heap->Flags & D3D12DDI_HEAP_FLAG_PRIMARY) != 0;
+#ifndef ENTANGLED_D3D12_PROBE_PRESENT
+    (void)runtime_resource;
+    if (primary)
+        return DXGI_ERROR_UNSUPPORTED;
+#endif
     *backing = (DdiHeap){0};
     *object = (DdiResource){0};
     HRESULT status = DXGI_ERROR_UNSUPPORTED;
-    if (resource->ResourceType == D3D12DDI_RT_BUFFER) {
+    if (resource->ResourceType == D3D12DDI_RT_BUFFER && !primary) {
         status = create_transfer_backing(venus, heap, resource, &backing->buffer);
         if (SUCCEEDED(status))
             backing->kind = DDI_HEAP_TRANSFER_BUFFER;
@@ -204,6 +219,16 @@ static HRESULT APIENTRY create_committed_resource(
         }
     }
     if (SUCCEEDED(status)) {
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+        if (primary) {
+            status = allocate_present_surface(device.pDrvPrivate, runtime_resource, &backing->image, &backing->present);
+            if (FAILED(status)) {
+                destroy_venus_color_image(&backing->image);
+                *backing = (DdiHeap){0};
+                return status;
+            }
+        }
+#endif
         backing->device = venus;
         object->heap = backing;
     }
@@ -220,6 +245,10 @@ static void APIENTRY destroy_committed_resource(D3D12DDI_HDEVICE device, D3D12DD
     DdiHeap *heap = handle.pDrvPrivate;
     if (!heap || !heap->device || heap->device != venus_device(device))
         return;
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    if (heap->present.allocation)
+        deallocate_present_surface(device.pDrvPrivate, &heap->present);
+#endif
     if (heap->kind == DDI_HEAP_TRANSFER_BUFFER)
         destroy_venus_transfer_buffer(&heap->buffer);
     else if (heap->kind == DDI_HEAP_COLOR_IMAGE)
@@ -246,6 +275,15 @@ static void APIENTRY unmap_buffer_heap(D3D12DDI_HDEVICE device, D3D12DDI_HHEAP h
     (void)heap;
 }
 
+static const DdiHeap *pageable_heap(D3D12DDI_HANDLE_AND_TYPE object)
+{
+    if (object.Type == D3D12DDI_HT_HEAP)
+        return object.Handle;
+    if (object.Type == D3D12DDI_HT_0012_RESOURCE && object.Handle)
+        return ((const DdiResource *)object.Handle)->heap;
+    return NULL;
+}
+
 static HRESULT check_backing_resident(const VenusDevice *device, D3D12DDI_HANDLE_AND_TYPE object)
 {
     if (!object.Handle)
@@ -256,17 +294,9 @@ static HRESULT check_backing_resident(const VenusDevice *device, D3D12DDI_HANDLE
         return state->pipeline && state->device == device ? S_OK : E_INVALIDARG;
     }
 #endif
-    const DdiHeap *heap;
-    switch (object.Type) {
-    case D3D12DDI_HT_HEAP:
-        heap = object.Handle;
-        break;
-    case D3D12DDI_HT_0012_RESOURCE:
-        heap = ((const DdiResource *)object.Handle)->heap;
-        break;
-    default:
+    if (object.Type != D3D12DDI_HT_HEAP && object.Type != D3D12DDI_HT_0012_RESOURCE)
         return DXGI_ERROR_UNSUPPORTED;
-    }
+    const DdiHeap *heap = pageable_heap(object);
     if (!heap || heap->device != device)
         return E_INVALIDARG;
     if (heap->kind == DDI_HEAP_TRANSFER_BUFFER && heap->buffer.memory && heap->buffer.mapped)
@@ -296,6 +326,20 @@ static HRESULT APIENTRY make_venus_objects_resident(D3D12DDI_HDEVICE handle, D3D
     if (args->NumAdapters && args->pPagingFenceValue)
         args->pPagingFenceValue[0] = 0;
     trace_ddi("MakeResident", args->NumObjects, args->NumAdapters);
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    D3DKMT_HANDLE allocations[8];
+    UINT count = 0;
+    for (UINT i = 0; i < args->NumObjects; ++i) {
+        const DdiHeap *heap = pageable_heap(args->pObjects[i]);
+        if (heap && heap->present.allocation) {
+            if (count == _countof(allocations))
+                return DXGI_ERROR_UNSUPPORTED;
+            allocations[count++] = heap->present.allocation;
+        }
+    }
+    if (count)
+        return make_present_surfaces_resident(handle.pDrvPrivate, args, allocations, count);
+#endif
     return S_OK;
 }
 
@@ -306,10 +350,23 @@ static void APIENTRY get_debug_allocation_info(D3D12DDI_HDEVICE device, D3D12DDI
 {
     (void)device;
     (void)addresses;
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    const UINT capacity = allocations ? *num_allocations : 0;
+#else
     (void)allocations;
-    /* The lab's Venus objects do not have KMT allocation handles or WDDM GPUVAs. */
+#endif
     *num_addresses = 0;
     *num_allocations = 0;
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    const DdiHeap *heap = pageable_heap(object);
+    if (heap && heap->present.allocation && heap->device == venus_device(device)) {
+        if (capacity) {
+            *allocations = (D3D12DDI_DEBUG_KMT_ALLOCATION_INFO_0014){ .hAllocation = heap->present.allocation,
+                .Size = (UINT64)heap->image.extent.width * heap->image.extent.height * 4 };
+        }
+        *num_allocations = 1;
+    }
+#endif
     trace_ddi("GetDebugAllocationInfo", object.Type, 0);
 }
 
@@ -429,6 +486,10 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnCheckSubresourceInfo = check_resource_subresource,
     .pfnCheckExistingResourceAllocationInfo = check_existing_resource_allocation,
     .pfnCheckResourceVirtualAddress = check_buffer_address,
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    .pfnGetPresentPrivateDriverDataSize = present_private_data_size,
+    .pfnCheckResourceAllocationHandle = check_present_allocation,
+#endif
     .pfnGetDebugAllocationInfo = get_debug_allocation_info,
     .pfnGetImplicitPhysicalAdapterMask = implicit_physical_adapter_mask,
     .pfnQueryNodeMap = query_node_map,
@@ -490,6 +551,9 @@ static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
     .pfnClearRenderTargetView = clear_color_rtv,
     .pfnResourceBarrier = color_resource_barriers,
     .pfnCopyTextureRegion = copy_color_texture_region,
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    .pfnPresent = present_surface,
+#endif
 #ifdef ENTANGLED_D3D12_PROBE_RUNTIME
     .pfnCopyTiles = copy_transfer_tiles,
 #endif

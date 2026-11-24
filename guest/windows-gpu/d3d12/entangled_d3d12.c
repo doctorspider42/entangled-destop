@@ -6,6 +6,16 @@
 #include <string.h>
 #include <wchar.h>
 #include "venus-transfer.h"
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+#include <viogpum.h>
+
+typedef struct DdiPresentSurface {
+    HANDLE runtime_resource;
+    D3DKMT_HANDLE allocation;
+    VenusTransferBuffer pixels;
+    BOOL ready;
+} DdiPresentSurface;
+#endif
 
 typedef struct DdiAdapter {
     VenusAdapter venus;
@@ -17,6 +27,9 @@ typedef struct DdiDevice {
     const DdiAdapter *adapter;
     D3D12DDI_HRTDEVICE runtime;
     const D3D12DDI_CORELAYER_DEVICECALLBACKS_0022 *callbacks;
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    const D3DDDI_DEVICECALLBACKS *kernel;
+#endif
     SRWLOCK queue_lock;
 } DdiDevice;
 
@@ -173,6 +186,9 @@ static HRESULT APIENTRY create_device(D3D12DDI_HADAPTER adapter, const D3D12DDIA
     if (!device)
         return E_INVALIDARG;
     *device = (DdiDevice){ .adapter = driver, .runtime = args->hRTDevice, .callbacks = args->p12UMCallbacks_0022 };
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    device->kernel = args->pKTCallbacks;
+#endif
     HRESULT result = create_venus_device(&driver->venus, &device->venus);
 #ifdef ENTANGLED_D3D12_PROBE_COPY
     if (SUCCEEDED(result)) {
