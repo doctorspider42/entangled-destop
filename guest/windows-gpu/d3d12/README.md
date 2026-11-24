@@ -538,11 +538,12 @@ the provisional DDI.
 For the presentation probe, also set `ENTANGLED_D3D12_WDDM_INCLUDE` to the
 pinned miniport's `viogpu/shared` directory. The UMD uses that header to
 allocate a WDDM surface for each BGRA8 backbuffer. The `--present` probe
-creates a 320 × 240 flip-discard swap chain. Rendering and the copy into a
-coherent staging buffer run through Venus. After GPU retirement, the
-presentation DDI copies the tightly packed pixels into the WDDM allocation
-via Lock2 and returns the allocation and the queue's WDDM context to DXGI.
-This first path has a synchronous staging copy.
+creates a 320 × 240 flip-discard HWND swap chain. The `--composition` mode
+uses a flip-sequential, premultiplied swap chain attached to a DirectComposition
+visual. Rendering and the copy into a coherent staging buffer run through
+Venus. After GPU retirement, the UMD passes the packed pixels to the existing
+WDDM shared-surface handoff and returns the allocation and queue context to
+DXGI. This lab path has a synchronous staging copy.
 
 Build `3.21.55.661` created the swap chain and returned two KMT allocation
 handles. The draw initially stopped at the PRESENT-to-RENDER_TARGET barrier.
@@ -564,6 +565,25 @@ identified a crash in the older `entangled_d3d10.dll` in the lab package.
 The D3D12 draw and WDDM Present still succeeded, and DWM and scanout failed.
 See `ddi40-runtime-present-dwm/` and `ddi40-runtime-present-dwm-acquire/`
 under the lab share.
+
+DWM later composed successfully and reached the 320 × 240 app surface.
+Its read returned `STATUS_DEVICE_NOT_READY` because the first probe copied
+only into the Lock2 mapping. Using the existing present-source write
+escape let DWM read the staged pixels from its opened allocation. The
+HWND run on `3.40.57.447` passed the DXGI and DWM calls with 2.102 ms
+submit-to-fence, 8.998 ms in Present and 24.372 ms in DwmFlush. The
+installed engine did not recognize the full-size capture command used
+in that run, so it did not produce a host image for visual verification.
+See `ddi40-runtime-present-current-mesa/` and
+`ddi40-runtime-present-dwm-pixels/` under the lab share.
+
+Build `3.43.42.592` also passed the flip-sequential DirectComposition
+probe. It took 2.459 ms submit-to-fence, 7.504 ms in Present and 10.694 ms
+in DwmFlush. The host logged Venus scanout flips, but its headless captures
+showed the firmware framebuffer. A package audit also found that the local
+signing helper had restored the old Mesa UMD from cache. The traces above
+therefore do not qualify the newer companion UMD. See
+`ddi40-runtime-present-composition/`.
 
 ## End-to-end test criteria
 

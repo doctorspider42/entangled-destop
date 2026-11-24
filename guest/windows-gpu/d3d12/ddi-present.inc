@@ -87,19 +87,31 @@ static HRESULT write_present_allocation(const DdiDevice *device, const DdiPresen
 {
     if (!surface->ready)
         return DXGI_ERROR_INVALID_CALL;
-    if (!device->kernel || !device->kernel->pfnLock2Cb || !device->kernel->pfnUnlock2Cb)
+    if (!device->kernel || !device->kernel->pfnEscapeCb || !device->adapter->runtime.handle)
         return DXGI_ERROR_UNSUPPORTED;
 
-    D3DDDICB_LOCK2 mapped = { .hAllocation = surface->allocation };
-    HRESULT status = device->kernel->pfnLock2Cb(device->runtime.handle, &mapped);
-    trace_ddi("Present Lock2", (UINT)status, mapped.pData != NULL);
-    if (FAILED(status))
-        return status;
-    if (mapped.pData)
-        memcpy(mapped.pData, surface->pixels.mapped, (SIZE_T)surface->pixels.size);
-    const D3DDDICB_UNLOCK2 unlock = { .hAllocation = surface->allocation };
-    status = device->kernel->pfnUnlock2Cb(device->runtime.handle, &unlock);
-    return mapped.pData ? status : E_FAIL;
+    /* Same WDDM pixel handoff as the Mesa UMD. An opened allocation's
+       compositor can read these pixels even when VidMm never maps its pages. */
+    struct {
+        USHORT type;
+        USHORT length;
+        D3DKMT_HANDLE allocation;
+        UINT64 address;
+        UINT64 size;
+    } pixels = {
+        .type = 0x904, /* CopyIn and mark the allocation as a present source. */
+        .length = sizeof(pixels) - 2 * sizeof(USHORT),
+        .allocation = surface->allocation,
+        .address = (UINT64)(UINT_PTR)surface->pixels.mapped,
+        .size = surface->pixels.size,
+    };
+    _Static_assert(sizeof(pixels) == 24, "WDDM pixel escape layout");
+    const D3DDDICB_ESCAPE escape = {
+        .hDevice = device->runtime.handle,
+        .pPrivateDriverData = &pixels,
+        .PrivateDriverDataSize = sizeof(pixels),
+    };
+    return device->kernel->pfnEscapeCb(device->adapter->runtime.handle, &escape);
 }
 
 static UINT APIENTRY present_private_data_size(D3D12DDI_HDEVICE device, const D3D12DDIARG_PRESENT_0001 *args)

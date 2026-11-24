@@ -27,5 +27,5 @@ if errorlevel 1 exit /b 1
 cl /nologo /std:c11 /W4 /WX /O2 /MT %DDI_PROBE% "%SRC%ddi-test.c" /Fo"%OUT%\ddi-test.obj" /Fe"%OUT%\ddi-test.exe"
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc "%SRC%d3d12-smoke.cpp" "%SRC%wddm-fence.cpp" ^
-    /Fo"%OUT%\\" /Fe"%OUT%\d3d12-smoke.exe" /link /DEPENDENTLOADFLAG:0x800 d3d12.lib d3dcompiler.lib dxgi.lib gdi32.lib user32.lib dwmapi.lib
+    /Fo"%OUT%\\" /Fe"%OUT%\d3d12-smoke.exe" /link /DEPENDENTLOADFLAG:0x800 d3d12.lib d3dcompiler.lib dxgi.lib gdi32.lib user32.lib dwmapi.lib dcomp.lib
 exit /b %errorlevel%

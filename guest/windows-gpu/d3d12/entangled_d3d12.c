@@ -20,6 +20,9 @@ typedef struct DdiPresentSurface {
 typedef struct DdiAdapter {
     VenusAdapter venus;
     D3D12DDI_HRTTABLE command_list_table;
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    D3D12DDI_HRTADAPTER runtime;
+#endif
 } DdiAdapter;
 
 typedef struct DdiDevice {
@@ -448,5 +451,8 @@ __declspec(dllexport) HRESULT APIENTRY OpenAdapter12(D3D12DDIARG_OPENADAPTER *ar
 
     args->hAdapter.pDrvPrivate = driver;
     *args->pAdapterFuncs = adapter_functions;
+#ifdef ENTANGLED_D3D12_PROBE_PRESENT
+    driver->runtime = args->hRTAdapter;
+#endif
     return S_OK;
 }

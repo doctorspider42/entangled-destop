@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <windows.h>
+#include <dcomp.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <d3dkmthk.h>
@@ -375,7 +376,7 @@ static void color_and_verify(ID3D12Device *device, bool programmable)
                  programmable ? L"DRAW" : L"CLEAR", width, height, elapsed);
 }
 
-static void draw_and_present(ID3D12Device *device)
+static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 {
     constexpr UINT width = 320, height = 240;
     constexpr wchar_t window_class[] = L"EntangledD3D12Smoke";
@@ -410,11 +411,28 @@ static void draw_and_present(ID3D12Device *device)
     description.Scaling = DXGI_SCALING_STRETCH;
     description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     ComPtr<IDXGISwapChain1> created;
-    check(factory->CreateSwapChainForHwnd(commands.queue.Get(), window, &description, nullptr, nullptr, &created),
-          "CreateSwapChainForHwnd");
+    ComPtr<IDCompositionDevice> compositor;
+    ComPtr<IDCompositionTarget> target;
+    ComPtr<IDCompositionVisual> visual;
+    if (composition_swapchain) {
+        description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        description.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+        check(factory->CreateSwapChainForComposition(commands.queue.Get(), &description, nullptr, &created),
+              "CreateSwapChainForComposition");
+        check(DCompositionCreateDevice(nullptr, IID_PPV_ARGS(&compositor)), "DCompositionCreateDevice");
+        check(compositor->CreateTargetForHwnd(window, TRUE, &target), "CreateTargetForHwnd");
+        check(compositor->CreateVisual(&visual), "CreateVisual");
+        check(visual->SetContent(created.Get()), "SetContent");
+        check(target->SetRoot(visual.Get()), "SetRoot");
+        check(compositor->Commit(), "Commit (composition)");
+    } else {
+        check(factory->CreateSwapChainForHwnd(commands.queue.Get(), window, &description, nullptr, nullptr, &created),
+              "CreateSwapChainForHwnd");
+    }
     ComPtr<IDXGISwapChain3> swapchain;
     check(created.As(&swapchain), "Query IDXGISwapChain3");
-    std::wprintf(L"D3D12 PRESENT: created %ux%u flip-discard swap chain\n", width, height);
+    std::wprintf(L"D3D12 PRESENT: created %ux%u %ls swap chain\n", width, height,
+                 composition_swapchain ? L"flip-sequential composition" : L"flip-discard HWND");
     std::fflush(stdout);
 
     ComPtr<ID3D12Resource> image;
@@ -462,7 +480,7 @@ static void draw_and_present(ID3D12Device *device)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, Clear, Draw, Present, Fence, RenderFence };
+    enum class Probe { Copy, Clear, Draw, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -473,12 +491,15 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Draw;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--present") == 0)
             probe = Probe::Present;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--composition") == 0)
+            probe = Probe::Composition;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence") == 0)
             probe = Probe::Fence;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence-render-context") == 0)
             probe = Probe::RenderFence;
         else {
-            std::fputs("usage: d3d12-smoke.exe [--hardware] [--clear | --draw | --present | --fence | --fence-render-context]\n", stderr);
+            std::fputs("usage: d3d12-smoke.exe [--hardware] [--clear | --draw | --present | --composition | "
+                       "--fence | --fence-render-context]\n", stderr);
             return 2;
         }
     }
@@ -489,8 +510,8 @@ int wmain(int argc, wchar_t **argv)
         const auto device = create_device(adapter, hardware_control);
         if (probe == Probe::Clear || probe == Probe::Draw)
             color_and_verify(device.Get(), probe == Probe::Draw);
-        else if (probe == Probe::Present)
-            draw_and_present(device.Get());
+        else if (probe == Probe::Present || probe == Probe::Composition)
+            draw_and_present(device.Get(), probe == Probe::Composition);
         else
             copy_and_verify(device.Get());
     }
