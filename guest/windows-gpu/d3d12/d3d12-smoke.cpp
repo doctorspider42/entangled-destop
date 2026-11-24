@@ -428,7 +428,7 @@ struct DrawPipeline {
     ComPtr<ID3D12PipelineState> pipeline;
 };
 
-enum class ColorWork { Clear, Draw, TimedDraw, CalibratedDraw, Blend, Uniform, Upload, Sample, Atlas, Instance };
+enum class ColorWork { Clear, Draw, TimedDraw, CalibratedDraw, Blend, Uniform, Upload, Sample, Atlas, Instance, Bindings };
 
 static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT target_format, ColorWork work = ColorWork::Draw)
 {
@@ -440,6 +440,13 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
     )";
     constexpr char instance_source[] = R"(
         float4 main(uint vertex : SV_VertexID, float4 transform : TEXCOORD0) : SV_Position {
+            float2 p = float2(vertex == 1 ? 3 : -1, vertex == 2 ? 3 : -1);
+            return float4(p * transform.xy + transform.zw, 0, 1);
+        }
+    )";
+    constexpr char bound_vertex_source[] = R"(
+        cbuffer Globals : register(b3, space1) { float4 transform; };
+        float4 main(uint vertex : SV_VertexID) : SV_Position {
             float2 p = float2(vertex == 1 ? 3 : -1, vertex == 2 ? 3 : -1);
             return float4(p * transform.xy + transform.zw, 0, 1);
         }
@@ -461,28 +468,49 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
             return image.SampleLevel(point_sampler, position.xy / float2(73, 41), 0);
         }
     )";
+    constexpr char bound_pixel_source[] = R"(
+        Texture2D<float4> image : register(t2, space2);
+        Texture2D<float4> other_view : register(t3, space2);
+        StructuredBuffer<uint> sampler_indices : register(t4, space2);
+        SamplerState samplers[2] : register(s1, space3);
+        float4 main(float4 position : SV_Position) : SV_Target0 {
+            uint column = (uint) position.x;
+            uint sampler_index = NonUniformResourceIndex(sampler_indices[column & 1]);
+            float2 uv = (position.xy + float2(0.25, 0)) / float2(73, 41);
+            float4 color = image.SampleLevel(samplers[sampler_index], uv, 0);
+            color.g = other_view.Load(int3(int2(position.xy), 0)).g;
+            return color;
+        }
+    )";
     const bool uniform = work == ColorWork::Uniform;
-    const bool sampled = work == ColorWork::Sample || work == ColorWork::Atlas;
+    const bool bindings = work == ColorWork::Bindings;
+    const bool sampled = work == ColorWork::Sample || work == ColorWork::Atlas || bindings;
     const bool instanced = work == ColorWork::Instance;
     const bool blend = work == ColorWork::Blend;
-    const auto vertex = compile_shader(instanced ? instance_source : vertex_source, "vs_5_1");
-    const auto pixel = compile_shader(uniform ? uniform_source : sampled ? sampled_source : blend ? blend_source : pixel_source,
+    const auto vertex = compile_shader(instanced ? instance_source : bindings ? bound_vertex_source : vertex_source, "vs_5_1");
+    const auto pixel = compile_shader(uniform ? uniform_source : bindings ? bound_pixel_source
+                                                             : sampled ? sampled_source : blend ? blend_source : pixel_source,
                                       "ps_5_1");
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned_signature = {};
     versioned_signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
     versioned_signature.Desc_1_1 = {};
     const D3D12_DESCRIPTOR_RANGE1 ranges[] = {
-        {uniform ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,
+        {uniform ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+         bindings ? 3u : 1u, bindings ? 2u : 0u, bindings ? 2u : 0u,
          D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC, 0},
-        {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, bindings ? 2u : 1u, bindings ? 1u : 0u, bindings ? 3u : 0u,
+         D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0},
     };
-    D3D12_ROOT_PARAMETER1 parameters[2] = {};
-    for (UINT i = 0; i < ARRAYSIZE(parameters); ++i) {
+    D3D12_ROOT_PARAMETER1 parameters[3] = {};
+    for (UINT i = 0; i < ARRAYSIZE(ranges); ++i) {
         parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         parameters[i].DescriptorTable = {1, &ranges[i]};
         parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
-    versioned_signature.Desc_1_1.NumParameters = uniform ? 1 : sampled ? 2 : 0;
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    parameters[2].Descriptor = {3, 1, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC};
+    versioned_signature.Desc_1_1.NumParameters = bindings ? 3 : uniform ? 1 : sampled ? 2 : 0;
     versioned_signature.Desc_1_1.pParameters = versioned_signature.Desc_1_1.NumParameters ? parameters : nullptr;
     if (instanced)
         versioned_signature.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -557,10 +585,12 @@ static DrawBindings tint_bindings(ID3D12Device *device)
     return uniform;
 }
 
-static DrawBindings texture_bindings(ID3D12Device *device, ID3D12Resource *texture)
+static DrawBindings texture_bindings(ID3D12Device *device, ID3D12Resource *texture,
+                                     ID3D12Resource *sampler_indices = nullptr)
 {
+    const bool indexed_samplers = sampler_indices != nullptr;
     DrawBindings bindings = {};
-    D3D12_DESCRIPTOR_HEAP_DESC heap = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+    D3D12_DESCRIPTOR_HEAP_DESC heap = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, indexed_samplers ? 3u : 2u,
         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     check(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&bindings.heap)), "CreateDescriptorHeap (sampled texture)");
     D3D12_DESCRIPTOR_HEAP_DESC staging_desc = {heap.Type, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
@@ -579,14 +609,23 @@ static DrawBindings texture_bindings(ID3D12Device *device, ID3D12Resource *textu
     for (const auto &source : source_ranges)
         device->CreateShaderResourceView(texture, &srv, source);
     device->CopyDescriptors(1, &destination, &destination_count, ARRAYSIZE(source_ranges), source_ranges, nullptr, heap.Type);
+    if (indexed_samplers) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC indices = {};
+        indices.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        indices.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        indices.Buffer.NumElements = 2;
+        indices.Buffer.StructureByteStride = sizeof(UINT32);
+        device->CreateShaderResourceView(sampler_indices, &indices, {destination.ptr + 2 * stride});
+    }
     bindings.table = bindings.heap->GetGPUDescriptorHandleForHeapStart();
-    bindings.table.ptr += stride;
+    if (!indexed_samplers)
+        bindings.table.ptr += stride;
 
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-    heap.NumDescriptors = 1;
+    heap.NumDescriptors = indexed_samplers ? 2 : 1;
     check(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&bindings.sampler_heap)), "CreateDescriptorHeap (sampler)");
     staging_desc.Type = heap.Type;
-    staging_desc.NumDescriptors = 1;
+    staging_desc.NumDescriptors = heap.NumDescriptors;
     ComPtr<ID3D12DescriptorHeap> sampler_staging;
     check(device->CreateDescriptorHeap(&staging_desc, IID_PPV_ARGS(&sampler_staging)), "CreateDescriptorHeap (sampler staging)");
     D3D12_SAMPLER_DESC sampler = {};
@@ -597,14 +636,20 @@ static DrawBindings texture_bindings(ID3D12Device *device, ID3D12Resource *textu
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
     const auto sampler_source = sampler_staging->GetCPUDescriptorHandleForHeapStart();
     device->CreateSampler(&sampler, sampler_source);
-    device->CopyDescriptorsSimple(1, bindings.sampler_heap->GetCPUDescriptorHandleForHeapStart(), sampler_source, heap.Type);
+    if (indexed_samplers) {
+        const UINT increment = device->GetDescriptorHandleIncrementSize(heap.Type);
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        device->CreateSampler(&sampler, {sampler_source.ptr + increment});
+    }
+    device->CopyDescriptorsSimple(heap.NumDescriptors, bindings.sampler_heap->GetCPUDescriptorHandleForHeapStart(),
+                                  sampler_source, heap.Type);
     bindings.sampler_table = bindings.sampler_heap->GetGPUDescriptorHandleForHeapStart();
     return bindings;
 }
 
 static void record_draw(ID3D12GraphicsCommandList *commands, const DrawPipeline &draw,
                          D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT width, UINT height, const DrawBindings *bindings = nullptr,
-                         const D3D12_VERTEX_BUFFER_VIEW *instances = nullptr)
+                         const D3D12_VERTEX_BUFFER_VIEW *instances = nullptr, D3D12_GPU_VIRTUAL_ADDRESS vertex_cbv = 0)
 {
     const D3D12_VIEWPORT viewport = {0, 0, static_cast<FLOAT>(width), static_cast<FLOAT>(height), 0, 1};
     const D3D12_RECT scissor = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
@@ -619,6 +664,8 @@ static void record_draw(ID3D12GraphicsCommandList *commands, const DrawPipeline 
     }
     if (instances)
         commands->IASetVertexBuffers(0, 1, instances);
+    if (vertex_cbv)
+        commands->SetGraphicsRootConstantBufferView(2, vertex_cbv);
     commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commands->RSSetViewports(1, &viewport);
     commands->RSSetScissorRects(1, &scissor);
@@ -736,7 +783,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     constexpr UINT width = 73, height = 41;
     const bool upload_texture = work == ColorWork::Upload;
     const bool sample_atlas = work == ColorWork::Atlas;
-    const bool sample_texture = work == ColorWork::Sample || sample_atlas;
+    const bool general_bindings = work == ColorWork::Bindings;
+    const bool sample_texture = work == ColorWork::Sample || sample_atlas || general_bindings;
     const bool use_uniform = work == ColorWork::Uniform;
     const bool use_instances = work == ColorWork::Instance;
     const bool calibrated_draw = work == ColorWork::CalibratedDraw;
@@ -791,6 +839,9 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     ComPtr<ID3D12Resource> upload;
     ComPtr<ID3D12Resource> sampled;
     ComPtr<ID3D12Resource> instances;
+    ComPtr<ID3D12Resource> transforms;
+    ComPtr<ID3D12Resource> indices, index_upload;
+    D3D12_GPU_VIRTUAL_ADDRESS vertex_cbv = 0;
     D3D12_VERTEX_BUFFER_VIEW instance_view = {};
     D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
     src.pResource = target.Get();
@@ -841,8 +892,29 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
         if (sample_texture) {
             transition(commands.list.Get(), sampled.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            bindings = texture_bindings(device, sampled.Get());
         }
+        if (general_bindings) {
+            constexpr UINT offset = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+            const FLOAT transform[] = {1.f, 1.f, 0.f, 0.f};
+            transforms = buffer(device, 2 * offset, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            check(transforms->Map(0, &empty, &mapped), "Map vertex root CBV");
+            std::memcpy(static_cast<uint8_t *>(mapped) + offset, transform, sizeof(transform));
+            const D3D12_RANGE written = {offset, offset + sizeof(transform)};
+            transforms->Unmap(0, &written);
+            vertex_cbv = transforms->GetGPUVirtualAddress() + offset;
+
+            constexpr UINT32 sampler_indices[] = {0, 1};
+            indices = buffer(device, sizeof(sampler_indices), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+            index_upload = buffer(device, sizeof(sampler_indices), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+            check(index_upload->Map(0, &empty, &mapped), "Map sampler index upload");
+            std::memcpy(mapped, sampler_indices, sizeof(sampler_indices));
+            const D3D12_RANGE index_range = {0, sizeof(sampler_indices)};
+            index_upload->Unmap(0, &index_range);
+            commands.list->CopyBufferRegion(indices.Get(), 0, index_upload.Get(), 0, sizeof(sampler_indices));
+            transition(commands.list.Get(), indices.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        if (sample_texture)
+            bindings = texture_bindings(device, sampled.Get(), indices.Get());
         if (use_instances)
             instances = instance_buffer(device, instance_view);
         if (timestamps)
@@ -853,7 +925,7 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
             record_draw(commands.list.Get(), draw, rtv, width, height);
         }
         record_draw(commands.list.Get(), draw, rtv, width, height, bindings.heap ? &bindings : nullptr,
-                    use_instances ? &instance_view : nullptr);
+                    use_instances ? &instance_view : nullptr, vertex_cbv);
         if (timestamps) {
             commands.list->EndQuery(timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
             commands.list->ResolveQueryData(timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1, 2,
@@ -887,6 +959,15 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
             auto original = uploaded_pixel(x, y);
             if (sample_atlas)
                 original[1] = original[2] = 0;
+            if (general_bindings && (x & 1)) {
+                const auto next = uploaded_pixel(x + 1, y);
+                const auto *actual = row + 4 * x;
+                if (std::abs(4 * actual[0] - (3 * original[0] + next[0])) > 4 ||
+                    std::abs(4 * actual[2] - (3 * original[2] + next[2])) > 4 ||
+                    actual[1] != original[1] || actual[3] != 255)
+                    check(E_FAIL, "indexed linear sampler output differs from the reference");
+                continue;
+            }
             if (std::memcmp(row + 4 * x, (upload_texture || sample_texture) ? original.data() : expected, sizeof(red)) != 0)
                 check(E_FAIL, "texture readback differs from expected RGBA pixels");
         }
@@ -913,7 +994,7 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
         tick_readback->Unmap(0, &empty);
     }
     std::wprintf(L"D3D12 %ls PASS: %ux%u verified pixels, submit-to-fence %lld us\n",
-                 timed_draw ? L"TIMESTAMP DRAW" : blend ? L"BLEND" :
+                 timed_draw ? L"TIMESTAMP DRAW" : blend ? L"BLEND" : general_bindings ? L"GRAPHICS BINDINGS" :
                  sample_atlas ? L"R8 ATLAS SAMPLE" : sample_texture ? L"TEXTURE SAMPLE" : upload_texture ? L"TEXTURE UPLOAD" :
                  use_uniform ? L"CBV DRAW" : use_instances ? L"INSTANCE DRAW" : programmable ? L"DRAW" : L"CLEAR",
                  width, height, elapsed);
@@ -1023,7 +1104,7 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, DeviceLocal, Placed, Compute, Clear, Draw, TimedDraw, Clock, Blend, Cbv, Upload, Sample, Atlas, Instance, WgpuInit, Present, Composition, Fence, RenderFence };
+    enum class Probe { Copy, DeviceLocal, Placed, Compute, Clear, Draw, TimedDraw, Clock, Blend, Cbv, Upload, Sample, Atlas, Instance, Bindings, WgpuInit, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -1052,6 +1133,8 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Sample;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--sample-atlas") == 0)
             probe = Probe::Atlas;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--graphics-bindings") == 0)
+            probe = Probe::Bindings;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--instance") == 0)
             probe = Probe::Instance;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--wgpu-init") == 0)
@@ -1066,7 +1149,8 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::RenderFence;
         else {
             std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --placed-buffer | --compute | --clear | --draw | --timestamps | --clock | --blend | --cbv | --upload-texture | "
-                       "--sample-texture | --sample-atlas | --instance | --wgpu-init | --present | --composition | --fence | --fence-render-context]\n", stderr);
+                       "--sample-texture | --sample-atlas | --instance | --graphics-bindings | --wgpu-init | "
+                       "--present | --composition | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
     }
@@ -1093,6 +1177,8 @@ int wmain(int argc, wchar_t **argv)
             color_and_verify(device.Get(), ColorWork::Sample);
         else if (probe == Probe::Atlas)
             color_and_verify(device.Get(), ColorWork::Atlas);
+        else if (probe == Probe::Bindings)
+            color_and_verify(device.Get(), ColorWork::Bindings);
         else if (probe == Probe::Instance)
             color_and_verify(device.Get(), ColorWork::Instance);
         else if (probe == Probe::WgpuInit)

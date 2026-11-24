@@ -260,6 +260,10 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
     BOOL has_dynamic_rendering = FALSE;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     VkPhysicalDeviceFeatures core_features = {0};
+    VkPhysicalDeviceDescriptorIndexingFeatures indexing = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+    };
+    BOOL indexed_samplers = FALSE;
     const PFN_vkGetPhysicalDeviceProperties2 get_properties = (PFN_vkGetPhysicalDeviceProperties2)
         adapter->instance_proc_addr(adapter->instance, "vkGetPhysicalDeviceProperties2");
     VkPhysicalDeviceProperties2 properties = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
@@ -295,9 +299,26 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
             .pNext = &address,
         };
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+        indexing.pNext = &address;
+        features.pNext = &indexing;
+#endif
         get_features(adapter->physical_device, &features);
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
         core_features.robustBufferAccess = features.features.robustBufferAccess;
+        core_features.shaderSampledImageArrayDynamicIndexing = features.features.shaderSampledImageArrayDynamicIndexing;
+        indexed_samplers = indexing.descriptorBindingPartiallyBound && indexing.runtimeDescriptorArray &&
+                           indexing.shaderSampledImageArrayNonUniformIndexing;
+        if (indexed_samplers) {
+            indexing = (VkPhysicalDeviceDescriptorIndexingFeatures){
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+                .pNext = (void *)info.pNext,
+                .shaderSampledImageArrayNonUniformIndexing = VK_TRUE,
+                .descriptorBindingPartiallyBound = VK_TRUE,
+                .runtimeDescriptorArray = VK_TRUE,
+            };
+            info.pNext = &indexing;
+        }
 #endif
         has_dynamic_rendering = rendering.dynamicRendering != VK_FALSE;
         if (has_dynamic_rendering) {
@@ -343,6 +364,7 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
         .dynamic_rendering = has_dynamic_rendering,
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
         .robust_buffer_access = core_features.robustBufferAccess,
+        .indexed_samplers = indexed_samplers,
         .limits = properties.properties.limits,
 #endif
     };

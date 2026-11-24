@@ -81,7 +81,10 @@ static BOOL resolve_buffer_address(DdiDevice *device, D3D12DDI_GPU_VIRTUAL_ADDRE
             continue;
         const UINT64 offset = address - buffer->address;
         if (offset < buffer->size && size <= buffer->size - offset) {
-            *binding = (VkDescriptorBufferInfo){ .buffer = buffer->handle, .offset = offset, .range = size };
+            VkDeviceSize range = size ? size : buffer->size - offset;
+            if (!size && range > device->venus.limits.maxUniformBufferRange)
+                range = device->venus.limits.maxUniformBufferRange;
+            *binding = (VkDescriptorBufferInfo){ .buffer = buffer->handle, .offset = buffer->offset + offset, .range = range };
             found = TRUE;
             break;
         }
@@ -514,9 +517,13 @@ static void APIENTRY get_debug_allocation_info(D3D12DDI_HDEVICE device, D3D12DDI
     trace_ddi("GetDebugAllocationInfo", object.Type, 0);
 }
 
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+static HRESULT bind_graphics_resources(DdiTransferList *list);
+#endif
 #include "ddi-color.inc"
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
 #include "ddi-compute-command.inc"
+#include "ddi-graphics-command.inc"
 #include "ddi-timestamp.inc"
 #endif
 
@@ -732,7 +739,10 @@ static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
     .pfnSetDescriptorHeaps = set_transfer_descriptor_heaps,
     .pfnSetGraphicsRootSignature = set_transfer_graphics_root,
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-    .pfnSetGraphicsRootDescriptorTable = set_graphics_pixel_table,
+    .pfnSetGraphicsRootDescriptorTable = set_graphics_table,
+    .pfnSetGraphicsRootConstantBufferView = set_graphics_cbv,
+    .pfnSetGraphicsRoot32BitConstant = set_graphics_constant,
+    .pfnSetGraphicsRoot32BitConstants = set_graphics_constants,
     .pfnSetComputeRootSignature = set_compute_root,
     .pfnSetComputeRootDescriptorTable = set_compute_table,
     .pfnSetComputeRoot32BitConstant = set_compute_constant,

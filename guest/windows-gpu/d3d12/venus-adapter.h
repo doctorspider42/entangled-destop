@@ -30,6 +30,7 @@ typedef struct VenusDevice {
     BOOL dynamic_rendering;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     BOOL robust_buffer_access;
+    BOOL indexed_samplers;
     VkPhysicalDeviceLimits limits;
 #endif
 } VenusDevice;

@@ -797,6 +797,17 @@ matched RGBA (96, 0, 64, 255) at every pixel on the RTX 2070
 in 1.199 ms submit-to-fence. See
 `ddi40-runtime-premultiplied-blend/` under the lab share.
 
+The `--graphics-bindings` probe resolves a vertex root CBV, two texture
+SRVs, a structured uint SRV and a dynamically indexed sampler array
+from the root signature. Build `20.17.23.920` verified all 2,993
+pixels on the RTX 2070 in 1.607 ms submit-to-fence. The same shader
+mapping created all four graphics pipelines for the unmodified F239
+binary in diagnostic build `20.20.4.488`, including the seven bindings
+of the main UI pipeline. The next failure followed allocation of a
+non-render-target texture heap, before any UI frame reached the queue.
+See `ddi40-runtime-graphics-scalar-bindings/` and
+`ddi40-runtime-wintanyl-scalar-bindings/` under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

@@ -11,6 +11,10 @@ typedef struct DdiCommandPool {
     VkDescriptorPool descriptor_pool;
     UINT sampler_count;
     VkSampler samplers[64];
+    struct {
+        D3D12DDI_FILTER filter;
+        FLOAT max_lod;
+    } sampler_keys[64];
 #endif
 } DdiCommandPool;
 
@@ -101,6 +105,10 @@ static void APIENTRY destroy_command_signature(D3D12DDI_HDEVICE device, D3D12DDI
         *signature = (DdiCommandSignature){0};
 }
 
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+enum { DDI_ROOT_PARAMETERS = 64 };
+#endif
+
 typedef struct DdiDrawState {
     D3D12DDI_PRIMITIVE_TOPOLOGY topology;
     BOOL has_viewport;
@@ -108,23 +116,19 @@ typedef struct DdiDrawState {
     VkViewport viewport;
     VkRect2D scissor;
     VenusColorImage *target;
-    VkPipelineLayout root_layout;
+    const DdiRootSignature *root;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     const DdiPipeline *pipeline;
     D3D12DDI_VERTEX_BUFFER_VIEW vertex_buffer;
-    VkDescriptorSetLayout pixel_set_layout;
-    UINT pixel_bindings;
     const DdiDescriptorHeap *resource_heap;
     const DdiDescriptorHeap *sampler_heap;
-    const DdiDescriptor *uniform;
-    const DdiDescriptor *texture;
-    const DdiDescriptor *sampler;
+    D3D12DDI_GPU_DESCRIPTOR_HANDLE tables[DDI_ROOT_PARAMETERS];
+    D3D12DDI_GPU_VIRTUAL_ADDRESS addresses[DDI_ROOT_PARAMETERS];
+    UINT32 constants[DDI_GRAPHICS_ROOT_WORDS];
 #endif
 } DdiDrawState;
 
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-enum { DDI_ROOT_PARAMETERS = 64 };
-
 typedef struct DdiComputeState {
     const DdiPipeline *pipeline;
     const DdiRootSignature *root;
@@ -236,13 +240,10 @@ static void APIENTRY set_transfer_descriptor_heaps(D3D12DDI_HCOMMANDLIST list, U
             return;
         }
     }
-    if (commands->draw.resource_heap != resource_heap) {
-        commands->draw.uniform = NULL;
-        commands->draw.texture = NULL;
+    if (commands->draw.resource_heap != resource_heap)
         memset(commands->compute.tables, 0, sizeof(commands->compute.tables));
-    }
-    if (commands->draw.sampler_heap != sampler_heap)
-        commands->draw.sampler = NULL;
+    if (commands->draw.resource_heap != resource_heap || commands->draw.sampler_heap != sampler_heap)
+        memset(commands->draw.tables, 0, sizeof(commands->draw.tables));
     commands->draw.resource_heap = resource_heap;
     commands->draw.sampler_heap = sampler_heap;
 #else
@@ -343,47 +344,77 @@ static void APIENTRY set_transfer_graphics_root(D3D12DDI_HCOMMANDLIST handle, D3
         return;
     const DdiRootSignature *root = signature.pDrvPrivate;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-    commands->draw.pixel_set_layout = root ? root->pixel_set_layout : VK_NULL_HANDLE;
-    commands->draw.pixel_bindings = root ? root->pixel_bindings : 0;
-    commands->draw.uniform = NULL;
-    commands->draw.texture = NULL;
-    commands->draw.sampler = NULL;
-    if (commands->draw.pixel_set_layout) {
-        commands->draw.root_layout = root->pixel_pipeline_layout;
-        return;
+    if (commands->draw.root != root) {
+        memset(commands->draw.tables, 0, sizeof(commands->draw.tables));
+        memset(commands->draw.addresses, 0, sizeof(commands->draw.addresses));
+        memset(commands->draw.constants, 0, sizeof(commands->draw.constants));
     }
-#endif
+#else
     if (root && !root->empty_layout) {
         set_command_list_status(commands, DXGI_ERROR_UNSUPPORTED);
         return;
     }
-    commands->draw.root_layout = root ? root->empty_layout : VK_NULL_HANDLE;
+#endif
+    commands->draw.root = root;
 }
 
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-static void APIENTRY set_graphics_pixel_table(D3D12DDI_HCOMMANDLIST list, UINT parameter,
-                                               D3D12DDI_GPU_DESCRIPTOR_HANDLE base)
+static const D3D12DDI_ROOT_PARAMETER_0013 *graphics_root_parameter(const DdiDrawState *draw, UINT index)
+{
+    return draw->root && index < DDI_ROOT_PARAMETERS && index < draw->root->desc.NumParameters
+        ? &draw->root->desc.pRootParameters[index] : NULL;
+}
+
+static void APIENTRY set_graphics_table(D3D12DDI_HCOMMANDLIST list, UINT parameter, D3D12DDI_GPU_DESCRIPTOR_HANDLE base)
 {
     DdiTransferList *commands = recording_command_list(list);
     if (!commands)
         return;
-    DdiDrawState *draw = &commands->draw;
-    const BOOL sampler = parameter == 1 && (draw->pixel_bindings & DDI_PIXEL_SAMPLER);
-    const DdiDescriptorHeap *heap = sampler ? draw->sampler_heap : draw->resource_heap;
-    const UINT64 start = heap ? (UINT64)(UINT_PTR)(heap + 1) : 0;
-    const UINT64 offset = base.ptr - start;
-    if ((parameter && !sampler) || !draw->pixel_set_layout || !heap || base.ptr < start ||
-        offset % sizeof(DdiDescriptor) || offset / sizeof(DdiDescriptor) >= heap->args.NumDescriptors) {
+    const D3D12DDI_ROOT_PARAMETER_0013 *entry = graphics_root_parameter(&commands->draw, parameter);
+    if (!entry || entry->ParameterType != D3D12DDI_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
         set_command_list_status(commands, E_INVALIDARG);
         return;
     }
-    const DdiDescriptor *descriptor = (const DdiDescriptor *)(UINT_PTR)base.ptr;
-    if (sampler)
-        draw->sampler = descriptor;
-    else if (draw->pixel_bindings == DDI_PIXEL_CBV)
-        draw->uniform = descriptor;
-    else
-        draw->texture = descriptor;
+    commands->draw.tables[parameter] = base;
+}
+
+static void APIENTRY set_graphics_cbv(D3D12DDI_HCOMMANDLIST list, UINT parameter, D3D12DDI_GPU_VIRTUAL_ADDRESS address)
+{
+    DdiTransferList *commands = recording_command_list(list);
+    if (!commands)
+        return;
+    const D3D12DDI_ROOT_PARAMETER_0013 *entry = graphics_root_parameter(&commands->draw, parameter);
+    if (!entry || entry->ParameterType != D3D12DDI_ROOT_PARAMETER_TYPE_CBV ||
+        address % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT) {
+        set_command_list_status(commands, E_INVALIDARG);
+        return;
+    }
+    commands->draw.addresses[parameter] = address;
+}
+
+static void APIENTRY set_graphics_constants(D3D12DDI_HCOMMANDLIST list, UINT parameter, UINT count,
+                                            const void *data, UINT offset)
+{
+    DdiTransferList *commands = recording_command_list(list);
+    if (!commands || !count)
+        return;
+    const D3D12DDI_ROOT_PARAMETER_0013 *entry = graphics_root_parameter(&commands->draw, parameter);
+    if (!entry || entry->ParameterType != D3D12DDI_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ||
+        !data || offset > entry->Constants.Num32BitValues || count > entry->Constants.Num32BitValues - offset) {
+        set_command_list_status(commands, E_INVALIDARG);
+        return;
+    }
+    const UINT first = graphics_constant_words(commands->draw.root, parameter) + offset;
+    if (first >= DDI_GRAPHICS_ROOT_WORDS || count > DDI_GRAPHICS_ROOT_WORDS - first) {
+        set_command_list_status(commands, E_INVALIDARG);
+        return;
+    }
+    memcpy(&commands->draw.constants[first], data, count * sizeof(UINT32));
+}
+
+static void APIENTRY set_graphics_constant(D3D12DDI_HCOMMANDLIST list, UINT parameter, UINT data, UINT offset)
+{
+    set_graphics_constants(list, parameter, 1, &data, offset);
 }
 #endif
 
@@ -411,9 +442,9 @@ static void APIENTRY clear_transfer_root_arguments(D3D12DDI_HCOMMANDLIST list)
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     DdiTransferList *commands = recording_command_list(list);
     if (commands) {
-        commands->draw.uniform = NULL;
-        commands->draw.texture = NULL;
-        commands->draw.sampler = NULL;
+        memset(commands->draw.tables, 0, sizeof(commands->draw.tables));
+        memset(commands->draw.addresses, 0, sizeof(commands->draw.addresses));
+        memset(commands->draw.constants, 0, sizeof(commands->draw.constants));
         memset(commands->compute.tables, 0, sizeof(commands->compute.tables));
         memset(commands->compute.constants, 0, sizeof(commands->compute.constants));
     }

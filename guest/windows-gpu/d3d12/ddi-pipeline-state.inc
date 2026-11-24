@@ -38,12 +38,14 @@ typedef struct DdiPipeline {
     VkRenderPass render_pass;
     VkFormat color_format;
     VkPipelineLayout layout;
-    UINT pixel_bindings;
     BOOL blends;
     UINT minimum_vertex_stride;
     VkVertexInputRate vertex_rate;
     DdiComputeLayout compute;
     VkDescriptorSetLayout compute_set;
+    DdiGraphicsLayout graphics;
+    VkDescriptorSetLayout graphics_set;
+    const DdiRootSignature *graphics_root;
 } DdiPipeline;
 
 static SIZE_T APIENTRY private_pipeline_size(D3D12DDI_HDEVICE device,
@@ -106,7 +108,7 @@ static HRESULT create_compute_pipeline(const VenusDevice *venus, const D3D12DDIA
 {
     const DdiShader *shader = args->hComputeShader.pDrvPrivate;
     const DdiRootSignature *root = args->hRootSignature.pDrvPrivate;
-    if (!shader || !shader->compute_code || shader->stage != VK_SHADER_STAGE_COMPUTE_BIT ||
+    if (!shader || !shader->code || shader->stage != VK_SHADER_STAGE_COMPUTE_BIT ||
         !root || root->desc.NumStaticSamplers || args->NodeMask > 1)
         return DXGI_ERROR_UNSUPPORTED;
 
@@ -122,9 +124,9 @@ static HRESULT create_compute_pipeline(const VenusDevice *venus, const D3D12DDIA
     if (!create || !destroy)
         return E_FAIL;
 
-    DdiShader compiled = {0};
+    VkShaderModule compiled = VK_NULL_HANDLE;
     DdiComputeRemap remap = { .root = root, .layout = &pipeline.compute };
-    HRESULT status = compile_shader_module(venus, shader->compute_code, &remap, &compiled);
+    HRESULT status = compile_shader_module(venus, shader->code, &remap, NULL, &compiled);
     if (SUCCEEDED(status) && pipeline.compute.buffer_count &&
         (!venus->robust_buffer_access || pipeline.compute.buffer_count > venus->limits.maxPerStageDescriptorStorageBuffers))
         status = DXGI_ERROR_UNSUPPORTED;
@@ -135,7 +137,7 @@ static HRESULT create_compute_pipeline(const VenusDevice *venus, const D3D12DDIA
         .stage = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = compiled.module,
+            .module = compiled,
             .pName = "main",
         },
         .layout = pipeline.layout,
@@ -143,8 +145,8 @@ static HRESULT create_compute_pipeline(const VenusDevice *venus, const D3D12DDIA
     };
     if (SUCCEEDED(status))
         status = venus_hresult(create(venus->handle, VK_NULL_HANDLE, 1, &info, NULL, &pipeline.pipeline));
-    if (compiled.module)
-        destroy_shader_module(venus, compiled.module);
+    if (compiled)
+        destroy_shader_module(venus, compiled);
     if (SUCCEEDED(status))
         *state = pipeline;
     else {
@@ -157,18 +159,14 @@ static HRESULT create_compute_pipeline(const VenusDevice *venus, const D3D12DDIA
 }
 
 static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG_CREATE_PIPELINE_STATE_0033 *args,
-                                     const DdiShader *vertex, const DdiRootSignature *root, DdiPipeline *state)
+                                     VkShaderModule vertex, VkShaderModule pixel, DdiPipeline *state)
 {
-    const DdiShader *pixel = args->hPixelShader.pDrvPrivate;
     const D3D12DDI_BLEND_DESC_0010 *blend = args->hBlendState.pDrvPrivate;
     const D3D12DDI_RASTERIZER_DESC_0010 *raster = args->hRasterizerState.pDrvPrivate;
     const D3D12DDI_DEPTH_STENCIL_DESC_0025 *depth = args->hDepthStencilState.pDrvPrivate;
     const DdiElementLayout *elements = args->hElementLayout.pDrvPrivate;
     const VkFormat format = color_image_format(args->RTVFormats[0]);
-    const VkPipelineLayout layout = !root || !pixel || pixel->pixel_bindings != root->pixel_bindings ? VK_NULL_HANDLE
-        : pixel->pixel_bindings ? root->pixel_pipeline_layout : root->empty_layout;
-    if (!venus->dynamic_rendering || !vertex || !vertex->module || vertex->stage != VK_SHADER_STAGE_VERTEX_BIT ||
-        !pixel || !pixel->module || pixel->stage != VK_SHADER_STAGE_FRAGMENT_BIT || !layout ||
+    if (!venus->dynamic_rendering || !vertex || !pixel || !state->layout ||
         args->hDomainShader.pDrvPrivate || args->hHullShader.pDrvPrivate || args->hGeometryShader.pDrvPrivate ||
         (elements && (!elements->count || !venus->proc_addr(venus->handle, "vkCmdBindVertexBuffers2"))) ||
         args->NumRenderTargets != 1 || format == VK_FORMAT_UNDEFINED ||
@@ -196,9 +194,9 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
 
     const VkPipelineShaderStageCreateInfo shaders[] = {
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
-          .module = vertex->module, .pName = "main" },
+          .module = vertex, .pName = "main" },
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-          .module = pixel->module, .pName = "main" },
+          .module = pixel, .pName = "main" },
     };
     VkVertexInputBindingDescription vertex_binding = {0};
     VkPipelineVertexInputStateCreateInfo vertices = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
@@ -252,16 +250,18 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
         .stageCount = _countof(shaders), .pStages = shaders, .pVertexInputState = &vertices,
         .pInputAssemblyState = &assembly, .pViewportState = &viewport, .pRasterizationState = &rasterization,
         .pMultisampleState = &samples, .pColorBlendState = &blending, .pDynamicState = &dynamic,
-        .layout = layout, .basePipelineIndex = -1,
+        .layout = state->layout, .basePipelineIndex = -1,
     };
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult result = create(venus->handle, VK_NULL_HANDLE, 1, &info, NULL, &pipeline);
     if (result == VK_SUCCESS) {
-        *state = (DdiPipeline){ .device = venus, .pipeline = pipeline, .bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS,
-            .color_format = format, .layout = layout, .pixel_bindings = pixel->pixel_bindings,
-            .blends = target->BlendEnable,
-            .minimum_vertex_stride = elements ? elements->minimum_stride : 0,
-            .vertex_rate = elements ? elements->rate : VK_VERTEX_INPUT_RATE_VERTEX };
+        state->device = venus;
+        state->pipeline = pipeline;
+        state->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        state->color_format = format;
+        state->blends = target->BlendEnable;
+        state->minimum_vertex_stride = elements ? elements->minimum_stride : 0;
+        state->vertex_rate = elements ? elements->rate : VK_VERTEX_INPUT_RATE_VERTEX;
     } else if (pipeline) {
         destroy(venus->handle, pipeline, NULL);
     }
@@ -270,25 +270,11 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
     return status;
 }
 
-static HRESULT APIENTRY create_pipeline(D3D12DDI_HDEVICE device,
-                                         const D3D12DDIARG_CREATE_PIPELINE_STATE_0033 *args,
-                                         D3D12DDI_HPIPELINESTATE handle, D3D12DDI_HRTPIPELINESTATE runtime)
+static HRESULT create_point_pipeline(const VenusDevice *venus, const D3D12DDIARG_CREATE_PIPELINE_STATE_0033 *args,
+                                     VkShaderModule vertex, const DdiRootSignature *root, DdiPipeline *state)
 {
-    (void)runtime;
-    DdiPipeline *state = handle.pDrvPrivate;
-    if (!state || !private_pipeline_size(device, args))
-        return E_INVALIDARG;
-    *state = (DdiPipeline){0};
-    const VenusDevice *venus = venus_device(device);
-    if (args->hComputeShader.pDrvPrivate)
-        return create_compute_pipeline(venus, args, state);
-    const DdiShader *vertex = args->hVertexShader.pDrvPrivate;
-    const DdiRootSignature *root = args->hRootSignature.pDrvPrivate;
-    if (args->NumRenderTargets)
-        return create_color_pipeline(venus, args, vertex, root, state);
     /* Windows builds a point pipeline with no attachment or sample state. */
-    if (!vertex || !vertex->module || vertex->stage != VK_SHADER_STAGE_VERTEX_BIT ||
-        !root || !root->empty_layout || args->hPixelShader.pDrvPrivate ||
+    if (!vertex || !root->empty_layout || args->hPixelShader.pDrvPrivate ||
         args->hDomainShader.pDrvPrivate || args->hHullShader.pDrvPrivate ||
         args->hGeometryShader.pDrvPrivate || args->hElementLayout.pDrvPrivate ||
         args->NumRenderTargets || args->DSVFormat != DXGI_FORMAT_UNKNOWN || args->SampleDesc.Count ||
@@ -324,7 +310,7 @@ static HRESULT APIENTRY create_pipeline(D3D12DDI_HDEVICE device,
     const VkPipelineShaderStageCreateInfo stage = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         .stage = VK_SHADER_STAGE_VERTEX_BIT,
-        .module = vertex->module,
+        .module = vertex,
         .pName = "main",
     };
     const VkPipelineVertexInputStateCreateInfo vertex_input = {
@@ -368,6 +354,134 @@ static HRESULT APIENTRY create_pipeline(D3D12DDI_HDEVICE device,
     return status;
 }
 
+static void destroy_graphics_layout(const VenusDevice *device, DdiPipeline *state)
+{
+    if (state->layout) {
+        const PFN_vkDestroyPipelineLayout destroy = (PFN_vkDestroyPipelineLayout)
+            device->proc_addr(device->handle, "vkDestroyPipelineLayout");
+        destroy(device->handle, state->layout, NULL);
+    }
+    if (state->graphics_set) {
+        const PFN_vkDestroyDescriptorSetLayout destroy = (PFN_vkDestroyDescriptorSetLayout)
+            device->proc_addr(device->handle, "vkDestroyDescriptorSetLayout");
+        destroy(device->handle, state->graphics_set, NULL);
+    }
+}
+
+static HRESULT create_graphics_layout(const VenusDevice *device, DdiPipeline *state)
+{
+    const PFN_vkCreatePipelineLayout create = (PFN_vkCreatePipelineLayout)
+        device->proc_addr(device->handle, "vkCreatePipelineLayout");
+    const PFN_vkCreateDescriptorSetLayout create_set = (PFN_vkCreateDescriptorSetLayout)
+        device->proc_addr(device->handle, "vkCreateDescriptorSetLayout");
+    if (!create || !create_set || !device->proc_addr(device->handle, "vkDestroyPipelineLayout") ||
+        !device->proc_addr(device->handle, "vkDestroyDescriptorSetLayout"))
+        return E_FAIL;
+
+    const DdiGraphicsLayout *layout = &state->graphics;
+    if (layout->count) {
+        VkDescriptorSetLayoutBinding bindings[DDI_GRAPHICS_BINDINGS];
+        VkDescriptorBindingFlags flags[DDI_GRAPHICS_BINDINGS] = {0};
+        UINT array_samplers = 0;
+        for (UINT i = 0; i < layout->count; ++i) {
+            const DdiGraphicsBinding *binding = &layout->bindings[i];
+            if (binding->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && !device->robust_buffer_access)
+                return DXGI_ERROR_UNSUPPORTED;
+            if (binding->count > 1) {
+                if (!device->indexed_samplers)
+                    return DXGI_ERROR_UNSUPPORTED;
+                flags[i] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+            }
+            if (binding->type == VK_DESCRIPTOR_TYPE_SAMPLER)
+                array_samplers += binding->count;
+            bindings[i] = (VkDescriptorSetLayoutBinding){
+                .binding = i, .descriptorType = binding->type, .descriptorCount = binding->count,
+                .stageFlags = binding->stages,
+            };
+        }
+        if (array_samplers > 2 * D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE ||
+            array_samplers > device->limits.maxPerStageDescriptorSamplers ||
+            array_samplers > device->limits.maxDescriptorSetSamplers)
+            return DXGI_ERROR_UNSUPPORTED;
+        const VkDescriptorSetLayoutBindingFlagsCreateInfo partial = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+            .bindingCount = layout->count, .pBindingFlags = flags,
+        };
+        const VkDescriptorSetLayoutCreateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = device->indexed_samplers ? &partial : NULL,
+            .bindingCount = layout->count, .pBindings = bindings,
+        };
+        const HRESULT status = venus_hresult(create_set(device->handle, &info, NULL, &state->graphics_set));
+        if (FAILED(status))
+            return status;
+    }
+    const VkPushConstantRange constants = {
+        .stageFlags = layout->constant_stages, .size = layout->constant_words * sizeof(UINT32),
+    };
+    const VkPipelineLayoutCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = layout->count ? 1 : 0,
+        .pSetLayouts = layout->count ? &state->graphics_set : NULL,
+        .pushConstantRangeCount = constants.stageFlags ? 1 : 0,
+        .pPushConstantRanges = constants.stageFlags ? &constants : NULL,
+    };
+    return venus_hresult(create(device->handle, &info, NULL, &state->layout));
+}
+
+static HRESULT APIENTRY create_pipeline(D3D12DDI_HDEVICE device,
+                                         const D3D12DDIARG_CREATE_PIPELINE_STATE_0033 *args,
+                                         D3D12DDI_HPIPELINESTATE handle, D3D12DDI_HRTPIPELINESTATE runtime)
+{
+    (void)runtime;
+    DdiPipeline *state = handle.pDrvPrivate;
+    if (!state || !private_pipeline_size(device, args))
+        return E_INVALIDARG;
+    *state = (DdiPipeline){0};
+    const VenusDevice *venus = venus_device(device);
+    if (args->hComputeShader.pDrvPrivate)
+        return create_compute_pipeline(venus, args, state);
+
+    const DdiShader *vertex = args->hVertexShader.pDrvPrivate;
+    const DdiShader *pixel = args->hPixelShader.pDrvPrivate;
+    const DdiRootSignature *root = args->hRootSignature.pDrvPrivate;
+    if (!root || root->desc.NumStaticSamplers || !vertex || vertex->stage != VK_SHADER_STAGE_VERTEX_BIT ||
+        (args->NumRenderTargets && (!pixel || pixel->stage != VK_SHADER_STAGE_FRAGMENT_BIT)))
+        return DXGI_ERROR_UNSUPPORTED;
+    state->graphics.constant_words = graphics_constant_words(root, root->desc.NumParameters);
+    if (state->graphics.constant_words > DDI_GRAPHICS_ROOT_WORDS ||
+        state->graphics.constant_words * sizeof(UINT32) > venus->limits.maxPushConstantsSize)
+        return DXGI_ERROR_UNSUPPORTED;
+
+    DdiGraphicsRemap remap = { .root = root, .layout = &state->graphics };
+    VkShaderModule vs = VK_NULL_HANDLE, ps = VK_NULL_HANDLE;
+    HRESULT status = compile_shader_module(venus, vertex->code, NULL, &remap, &vs);
+    trace_ddi("CompileVertexShader", (UINT)status, state->graphics.count);
+    if (SUCCEEDED(status) && pixel) {
+        status = compile_shader_module(venus, pixel->code, NULL, &remap, &ps);
+        trace_ddi("CompilePixelShader", (UINT)status, state->graphics.count);
+    }
+    if (SUCCEEDED(status) && args->NumRenderTargets) {
+        status = create_graphics_layout(venus, state);
+        trace_ddi("CreateGraphicsLayout", (UINT)status, state->graphics.count);
+        if (SUCCEEDED(status))
+            status = create_color_pipeline(venus, args, vs, ps, state);
+        if (SUCCEEDED(status))
+            state->graphics_root = root;
+        else
+            destroy_graphics_layout(venus, state);
+    } else if (SUCCEEDED(status)) {
+        status = create_point_pipeline(venus, args, vs, root, state);
+    }
+    if (ps)
+        destroy_shader_module(venus, ps);
+    if (vs)
+        destroy_shader_module(venus, vs);
+    if (FAILED(status))
+        *state = (DdiPipeline){0};
+    return status;
+}
+
 static void APIENTRY destroy_pipeline(D3D12DDI_HDEVICE device, D3D12DDI_HPIPELINESTATE handle)
 {
     DdiPipeline *state = handle.pDrvPrivate;
@@ -381,6 +495,8 @@ static void APIENTRY destroy_pipeline(D3D12DDI_HDEVICE device, D3D12DDI_HPIPELIN
     destroy(venus->handle, state->pipeline, NULL);
     if (state->bind_point == VK_PIPELINE_BIND_POINT_COMPUTE)
         destroy_compute_layout(venus, state);
+    else if (state->graphics_root)
+        destroy_graphics_layout(venus, state);
     if (state->render_pass)
         destroy_pass(venus->handle, state->render_pass, NULL);
     *state = (DdiPipeline){0};
