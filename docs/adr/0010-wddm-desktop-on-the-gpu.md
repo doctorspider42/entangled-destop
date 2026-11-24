@@ -1282,6 +1282,69 @@ then `dcompv` and `dcompqr` on the same binary).
 The correlated results, host trace and window capture are under
 `F:/VMs/Entangled/d3d12-lab/physical-wheel/`.
 
+#### Comparing Wintanyl's existing effect configurations
+
+On the same lab, the shipping F239 shell alternated default effects with
+`[cube] flatten = true` and `[lamp] driver = "expression"`. There were four
+samples per action and variant in an ABBA order. The cube rotated between two
+viewports with one open window in each. Both windows were on the same viewport
+for the minimize and restore tests. The shell log confirmed that two window
+visuals were flattened and that the lamp used expressions with all 24 strips.
+
+| Action and variant | Median command-to-first-change | Detected changes per action | Longest internal pixel gap |
+| --- | ---: | ---: | ---: |
+| Cube, default | 386 ms | 13–16 | 242 ms |
+| Cube, flattened | 468 ms | 5–12 | 300 ms |
+| Minimize, default lamp | 623 ms | 1–2 | 109 ms |
+| Minimize, expression lamp | 368 ms | 1–2 | 192 ms |
+| Restore, default lamp | 616 ms | 2–3 | 196 ms |
+| Restore, expression lamp | 728 ms | 3–5 | 234 ms |
+
+The onset includes polling the shell's command file. We counted pixel
+changes in the same region of the Entangled window over a fixed observation
+period (1.39 s for cube, 1.15 s for lamp), including the final transition.
+Gaps between changes exclude the wait for the first change. Where only one
+change was visible, that sample provides no internal gap. Thresholds of 50,
+150 and 500 changed pixels led to the same comparison. The expression lamp
+started minimizing sooner, with the same 1–2 detectable changes. The lab
+profile was restored. The raw capture, commands and stage comparison share the prefix `fx-arch2` in
+`F:/VMs/Entangled/d3d12-lab/physical-wheel/`.
+
+#### Testing independent animation ticks in the same shell
+
+A diagnostic build from Wintanyl `4828531` used the stock effects in both
+arms. One arm used the existing `DwmFlush` clock. The other scheduled ticks
+every 16.667 ms and left `DwmFlush` running as a background observer. The
+diagnostic clock stopped adding work at three outstanding commits. The
+same executable ran on the same WDDM/D3D12 adapter with the same Explorer
+and Notepad window handles in both arms. Each arm ran four samples per
+action. Counts use the same crop and observation windows as the preceding test.
+
+| Action | Median command-to-first-change, stock → clock | Detected changes per action, stock → clock | Longest internal gap, stock → clock |
+| --- | ---: | ---: | ---: |
+| Cube | 407 → 491 ms | 12–17 → 13–21 | 234 → 221 ms |
+| Minimize | 554 → 448 ms | 2 → 1–2 | 142 → 63 ms (one clock sample with two changes) |
+| Restore | 673 → 330 ms | 1–3 → 3–4 | 71 → 488 ms |
+
+The median cube gap was 33.4 ms for both arms at the 150-pixel threshold.
+The independent clock issued 15–24 commits per cube animation period
+versus 15–18 in the stock arm. During the lamp, the clock hit its
+outstanding-commit limit on 13–15 ticks per run, and the background
+observer recorded zero or one return from `DwmFlush` per period of about
+300 ms. An earlier pilot with an extra dialog showed the same low rate of
+returns during the lamp. The timing and visual cadence results support
+retaining the stock clock while tracing the DWM render and overlay handoff.
+
+Normal shell exit hung in the first diagnostic clock run and later with the
+shipping F239 binary on this guest. Both recovered through the guard. The
+clean clock run exited normally, and F239 was restored and verified on the
+hardware adapter. The diagnostic clock remains a lab experiment.
+
+The benchmark patch, host capture, commands and analysis are under
+`F:/VMs/Entangled/d3d12-lab/physical-wheel/` (`wt-pacer-test.patch`,
+`fx-pacer`, `fx-pacer3`). Fixture states are under
+`F:/VMs/Entangled/d3d12-lab/share/animation-architecture/`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
