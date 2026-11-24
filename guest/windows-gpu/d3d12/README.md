@@ -769,6 +769,28 @@ guest QPC bracket for the calibration call. See
 `ddi40-runtime-wddm-gpu-clock/` under the lab share.
 [Vulkan device time domains](https://docs.vulkan.org/refpages/latest/refpages/source/vkGetCalibratedTimestampsKHR.html).
 
+With clock calibration and timestamp queries in one probe, build
+`5.27.9.537` bracketed the two GPU queries between the queue's
+calibrated GPU samples. All 2,993 pixels matched. The draw took
+2.048 µs between GPU markers and 1.691 ms submit-to-fence.
+See `ddi40-runtime-wddm-calibrated-draw/` under the lab share.
+
+F239 diagnostic build `5.25.13.978` passed the queue frequency query
+and recorded the 208-byte external texture parameter upload. ETW
+later recorded an unsupported UMD call just after creating the
+first four-parameter UI root signature. See
+`ddi40-runtime-wintanyl-gpu-clock/` under the lab share.
+
+Build `5.31.27.950` accepted the three-root-constant argument that
+wgpu prefixes to each indirect signature. F239 created all six UI
+signatures and reached the nine-attribute instance input layout of
+`wt-ui main`. Translation then rejected the vertex shader's CBV
+and the pixel shader's SRV at register 1 in space 0. The current
+indirect change supports signature creation. Nonzero
+`ExecuteIndirect` work still returns unsupported. See
+`ddi40-runtime-wintanyl-indirect-layout/` under the lab share.
+[wgpu's root-constant command signatures](https://github.com/gfx-rs/wgpu/blob/v30.0.2/wgpu-hal/src/dx12/device.rs#L1299-L1363).
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

@@ -47,6 +47,23 @@ static UINT indirect_argument_size(D3D12DDI_INDIRECT_ARGUMENT_TYPE type)
     }
 }
 
+static UINT indirect_constant_size(const DdiRootSignature *root, const D3D12DDI_INDIRECT_ARGUMENT_DESC *arg)
+{
+    if (arg->Type != D3D12DDI_INDIRECT_ARGUMENT_TYPE_CONSTANT || !root)
+        return 0;
+    const UINT parameter = arg->Constant.RootParameterIndex;
+    const UINT offset = arg->Constant.DestOffsetIn32BitValues;
+    const UINT count = arg->Constant.Num32BitValuesToSet;
+    if (parameter >= root->desc.NumParameters || !count)
+        return 0;
+    const D3D12DDI_ROOT_PARAMETER_0013 *entry = &root->desc.pRootParameters[parameter];
+    if (entry->ParameterType != D3D12DDI_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS ||
+        offset > entry->Constants.Num32BitValues || count > entry->Constants.Num32BitValues - offset ||
+        count > UINT32_MAX / sizeof(UINT32))
+        return 0;
+    return count * sizeof(UINT32);
+}
+
 static HRESULT APIENTRY create_command_signature(D3D12DDI_HDEVICE device,
                                                  const D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001 *args,
                                                  D3D12DDI_HCOMMANDSIGNATURE handle)
@@ -54,13 +71,23 @@ static HRESULT APIENTRY create_command_signature(D3D12DDI_HDEVICE device,
     DdiCommandSignature *signature = handle.pDrvPrivate;
     if (!device.pDrvPrivate || !signature || !args || !args->pArgumentDescs || !args->NumArgumentDescs)
         return E_INVALIDARG;
-    if (args->NodeMask > 1 || args->NumArgumentDescs != 1 || args->hRootSignature.pDrvPrivate)
+    trace_ddi("CreateCommandSignature arguments", args->NumArgumentDescs, args->ByteStride);
+    if (args->NodeMask > 1 || args->NumArgumentDescs > 2)
         return DXGI_ERROR_UNSUPPORTED;
-    const D3D12DDI_INDIRECT_ARGUMENT_TYPE type = args->pArgumentDescs[0].Type;
+    const DdiRootSignature *root = args->hRootSignature.pDrvPrivate;
+    const D3D12DDI_INDIRECT_ARGUMENT_TYPE type = args->pArgumentDescs[args->NumArgumentDescs - 1].Type;
     const UINT size = indirect_argument_size(type);
     if (!size)
         return DXGI_ERROR_UNSUPPORTED;
-    if (args->ByteStride < size || args->ByteStride % sizeof(UINT32))
+    UINT constants = 0;
+    if (args->NumArgumentDescs == 2) {
+        constants = indirect_constant_size(root, &args->pArgumentDescs[0]);
+        if (!constants)
+            return DXGI_ERROR_UNSUPPORTED;
+    } else if (root) {
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    if (args->ByteStride < size || args->ByteStride - size < constants || args->ByteStride % sizeof(UINT32))
         return E_INVALIDARG;
     *signature = (DdiCommandSignature){ .device = device.pDrvPrivate, .type = type, .stride = args->ByteStride };
     trace_ddi("CreateCommandSignature", type, signature->stride);

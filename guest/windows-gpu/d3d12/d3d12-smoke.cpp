@@ -196,20 +196,16 @@ static long long submit_and_wait(ID3D12Device *device, const Recording &commands
     return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
 }
 
-static void verify_queue_clock(ID3D12Device *device)
+static UINT64 queue_clock_sample(ID3D12CommandQueue *queue)
 {
-    const D3D12_COMMAND_QUEUE_DESC desc = {};
-    ComPtr<ID3D12CommandQueue> queue;
-    check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "CreateCommandQueue (clock)");
-    UINT64 hz = 0, gpu = 0, cpu = 0;
-    check(queue->GetTimestampFrequency(&hz), "GetTimestampFrequency");
+    UINT64 gpu = 0, cpu = 0;
     LARGE_INTEGER begin, end;
     QueryPerformanceCounter(&begin);
     check(queue->GetClockCalibration(&gpu, &cpu), "GetClockCalibration");
     QueryPerformanceCounter(&end);
-    if (!hz || cpu < static_cast<UINT64>(begin.QuadPart) || cpu > static_cast<UINT64>(end.QuadPart))
-        check(E_FAIL, "queue clock frequency or calibrated guest QPC is invalid");
-    std::wprintf(L"D3D12 QUEUE CLOCK PASS: %llu GPU ticks/s, GPU %llu, guest QPC %llu\n", hz, gpu, cpu);
+    if (cpu < static_cast<UINT64>(begin.QuadPart) || cpu > static_cast<UINT64>(end.QuadPart))
+        check(E_FAIL, "calibrated QPC is outside the guest measurement window");
+    return gpu;
 }
 
 static void transition(ID3D12GraphicsCommandList *commands, ID3D12Resource *resource,
@@ -432,7 +428,7 @@ struct DrawPipeline {
     ComPtr<ID3D12PipelineState> pipeline;
 };
 
-enum class ColorWork { Clear, Draw, TimedDraw, Uniform, Upload, Sample, Atlas, Instance };
+enum class ColorWork { Clear, Draw, TimedDraw, CalibratedDraw, Uniform, Upload, Sample, Atlas, Instance };
 
 static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT target_format, ColorWork work = ColorWork::Draw)
 {
@@ -661,12 +657,32 @@ static void verify_wgpu_initialization(ID3D12Device *device)
         {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, sizeof(D3D12_DISPATCH_ARGUMENTS)},
     };
     ComPtr<ID3D12CommandSignature> signatures[ARRAYSIZE(indirect)];
+    ComPtr<ID3D12CommandSignature> constant_signatures[ARRAYSIZE(indirect)];
+    D3D12_ROOT_PARAMETER constants = {};
+    constants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    constants.Constants = {0, 0, 3};
+    const D3D12_ROOT_SIGNATURE_DESC root_desc = {1, &constants, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> root_bytes;
+    check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &root_bytes, nullptr),
+          "serialize indirect command root signature");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, root_bytes->GetBufferPointer(), root_bytes->GetBufferSize(), IID_PPV_ARGS(&root)),
+          "CreateRootSignature (indirect commands)");
     for (UINT i = 0; i < ARRAYSIZE(indirect); ++i) {
         D3D12_INDIRECT_ARGUMENT_DESC argument = {};
         argument.Type = indirect[i].type;
         const D3D12_COMMAND_SIGNATURE_DESC signature = {indirect[i].stride, 1, &argument, 0};
         check(device->CreateCommandSignature(&signature, nullptr, IID_PPV_ARGS(&signatures[i])),
               "CreateCommandSignature");
+        D3D12_INDIRECT_ARGUMENT_DESC arguments[2] = {};
+        arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+        arguments[0].Constant = {0, 0, 3};
+        arguments[1] = argument;
+        const D3D12_COMMAND_SIGNATURE_DESC with_constants = {
+            indirect[i].stride + 3 * sizeof(UINT32), ARRAYSIZE(arguments), arguments, 0,
+        };
+        check(device->CreateCommandSignature(&with_constants, root.Get(), IID_PPV_ARGS(&constant_signatures[i])),
+              "CreateCommandSignature with root constants");
     }
 
     const D3D12_DESCRIPTOR_HEAP_DESC sampler_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
@@ -699,7 +715,7 @@ static void verify_wgpu_initialization(ID3D12Device *device)
         if (bytes[i])
             check(E_FAIL, "default buffer was not initialized to zero");
     destination->Unmap(0, &empty);
-    std::wprintf(L"D3D12 WGPU INIT PASS: three signatures, sampler heap, null RTV and %zu zeroed bytes, "
+    std::wprintf(L"D3D12 WGPU INIT PASS: six signatures, sampler heap, null RTV and %zu zeroed bytes, "
                  L"submit-to-fence %lld us\n", size, elapsed);
 }
 
@@ -717,7 +733,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     const bool sample_texture = work == ColorWork::Sample || sample_atlas;
     const bool use_uniform = work == ColorWork::Uniform;
     const bool use_instances = work == ColorWork::Instance;
-    const bool timed_draw = work == ColorWork::TimedDraw;
+    const bool calibrated_draw = work == ColorWork::CalibratedDraw;
+    const bool timed_draw = work == ColorWork::TimedDraw || calibrated_draw;
     const bool programmable = work == ColorWork::Draw || use_uniform || sample_texture || use_instances || timed_draw;
     const D3D12_HEAP_PROPERTIES video_memory = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                                 D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
@@ -836,7 +853,16 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     }
     transition(commands.list.Get(), target.Get(), write_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     commands.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    UINT64 frequency = 0, before = 0, after = 0;
+    if (calibrated_draw) {
+        check(commands.queue->GetTimestampFrequency(&frequency), "GetTimestampFrequency");
+        if (!frequency)
+            check(E_FAIL, "queue clock frequency is zero");
+        before = queue_clock_sample(commands.queue.Get());
+    }
     const auto elapsed = submit_and_wait(device, commands);
+    if (calibrated_draw)
+        after = queue_clock_sample(commands.queue.Get());
 
     check(readback->Map(0, &whole, &mapped), "Map rendered image readback");
     const auto pixels = static_cast<const uint8_t *>(mapped) + footprint.Offset;
@@ -859,6 +885,17 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
         const auto *ticks = reinterpret_cast<const UINT64 *>(static_cast<const uint8_t *>(mapped) + timestamp_offset);
         if (!ticks[0] || ticks[1] <= ticks[0])
             check(E_FAIL, "timestamps did not advance around the draw");
+        if (calibrated_draw) {
+            // The host clock read extrapolates from a recent calibrated sample.
+            const UINT64 tolerance = frequency / 1000;
+            std::wprintf(L"D3D12 calibrated GPU clock: %llu ticks/s, before %llu, draw %llu to %llu, after %llu\n",
+                         frequency, before, ticks[0], ticks[1], after);
+            if (after <= before || (ticks[0] < before && before - ticks[0] > tolerance) ||
+                (ticks[1] > after && ticks[1] - after > tolerance))
+                check(E_FAIL, "draw queries and queue calibration differ in time domain");
+            std::wprintf(L"D3D12 QUEUE CLOCK PASS: draw %.3f us between GPU markers\n",
+                         static_cast<double>(ticks[1] - ticks[0]) * 1000000.0 / static_cast<double>(frequency));
+        }
         std::wprintf(L"D3D12 draw GPU timestamp delta: %llu ticks\n", ticks[1] - ticks[0]);
         tick_readback->Unmap(0, &empty);
     }
@@ -1030,7 +1067,7 @@ int wmain(int argc, wchar_t **argv)
         else if (probe == Probe::TimedDraw)
             color_and_verify(device.Get(), ColorWork::TimedDraw);
         else if (probe == Probe::Clock)
-            verify_queue_clock(device.Get());
+            color_and_verify(device.Get(), ColorWork::CalibratedDraw);
         else if (probe == Probe::Cbv)
             color_and_verify(device.Get(), ColorWork::Uniform);
         else if (probe == Probe::Upload)
