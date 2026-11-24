@@ -706,6 +706,24 @@ the RTX 2070 at 1.362 ms submit-to-fence. See
 `ddi40-runtime-placed-buffers/` under the lab share.
 [wgpu DX12 placed buffers](https://github.com/gfx-rs/wgpu/blob/v30.0.2/wgpu-hal/src/dx12/suballocation.rs#L259-L292).
 
+Build `4.50.58.415` used a disposable copy of the UMD with a Tier 2
+reply gated to the F239 diagnostic process. Wgpu proceeded through
+device initialization, the one-million-slot CBV/SRV/UAV heap, the
+2,048-slot sampler heap, the null RTV and placed buffers at offsets 0
+and 524,288. Its first compute shader (Shader Model 5.1, 148 DWORDs)
+failed at SRV register 0 in space 0. The trace shows a four-parameter
+root signature preceding the failure, consistent with wgpu's internal
+indirect dispatch validation pipeline. The app did not reach a frame.
+The branch still reports Tier 1. See
+`ddi40-runtime-wintanyl-tier2-diagnostic/` under the lab share.
+[wgpu indirect dispatch validation layout](https://github.com/gfx-rs/wgpu/blob/v30.0.2/wgpu-core/src/indirect_validation/dispatch.rs#L123-L199).
+
+The `--sample-atlas` probe copies a single-channel R8_UNORM atlas using
+a 256-byte row pitch, then samples it into RGBA8. It checks the original
+red values, zero green and blue channels, and opaque alpha. Build
+`4.52.38.745` verified all 2,993 pixels on the RTX 2070 at 1.482 ms
+submit-to-fence. See `ddi40-runtime-r8-atlas/` under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

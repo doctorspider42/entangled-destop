@@ -109,6 +109,7 @@ static void APIENTRY create_uniform_cbv(D3D12DDI_HDEVICE device, const D3D12DDI_
 static VkFormat color_image_format(DXGI_FORMAT format)
 {
     switch (format) {
+    case DXGI_FORMAT_R8_UNORM: return VK_FORMAT_R8_UNORM;
     case DXGI_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
     case DXGI_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_UNORM;
     default: return VK_FORMAT_UNDEFINED;

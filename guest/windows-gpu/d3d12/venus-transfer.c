@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "venus-transfer.h"
+#include <d3d12.h>
 #include <dxgi.h>
 
 #define DEVICE_FN(device, name) ((PFN_##name)(device)->proc_addr((device)->handle, #name))
@@ -163,10 +164,20 @@ HRESULT record_venus_buffer_barrier(VkCommandBuffer command, const VenusTransfer
     return S_OK;
 }
 
+static UINT32 color_texel_size(VkFormat format)
+{
+    return format == VK_FORMAT_R8_UNORM ? 1 : 4;
+}
+
+static UINT32 color_row_pitch(VkFormat format, UINT32 width)
+{
+    const UINT32 mask = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1;
+    return (width * color_texel_size(format) + mask) & ~mask;
+}
+
 static VkImageCreateInfo color_image_info(VkFormat format, UINT32 width, UINT32 height, BOOL shader_resource)
 {
-    /* Four bytes per pixel. Pad storage to a multiple of D3D12's 256-byte row alignment. */
-    const UINT32 padded_width = (width + 63) & ~63u;
+    const UINT32 padded_width = color_row_pitch(format, width) / color_texel_size(format);
     return (VkImageCreateInfo){
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = VK_IMAGE_TYPE_2D,
@@ -286,12 +297,13 @@ HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UIN
             return status;
         }
         /* The D3D12 copy footprint is independent of the opaque Vulkan layout. */
-        image->layout.rowPitch = (width * 4 + 255) & ~255u;
+        image->layout.rowPitch = color_row_pitch(format, width);
         return S_OK;
     }
     const VkImageSubresource subresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT };
     layout(device->handle, image->handle, &subresource, &image->layout);
-    if (image->layout.rowPitch >= (UINT64)width * 4 && image->layout.rowPitch % 256 == 0)
+    if (image->layout.rowPitch >= (UINT64)width * color_texel_size(format) &&
+        image->layout.rowPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT == 0)
         return S_OK;
     destroy_venus_color_image(image);
     return DXGI_ERROR_UNSUPPORTED;
@@ -463,15 +475,17 @@ HRESULT prepare_venus_shader_read(VkCommandBuffer command, const VenusColorImage
 static BOOL color_image_buffer_region(const VenusColorImage *image, const VenusTransferBuffer *buffer,
                                       VkDeviceSize offset, UINT32 row_pitch, VkBufferImageCopy *region)
 {
-    if (image->device != buffer->device || !row_pitch || row_pitch % 4 || offset % 4 ||
-        row_pitch / 4 < image->extent.width || offset >= buffer->size)
+    const UINT32 texel_size = color_texel_size(image->format);
+    if (image->device != buffer->device || !row_pitch || row_pitch % texel_size ||
+        (offset + buffer->offset) % texel_size ||
+        row_pitch / texel_size < image->extent.width || offset >= buffer->size)
         return FALSE;
-    const UINT64 span = (UINT64)(image->extent.height - 1) * row_pitch + (UINT64)image->extent.width * 4;
+    const UINT64 span = (UINT64)(image->extent.height - 1) * row_pitch + (UINT64)image->extent.width * texel_size;
     if (span > buffer->size - offset)
         return FALSE;
     *region = (VkBufferImageCopy){
         .bufferOffset = buffer->offset + offset,
-        .bufferRowLength = row_pitch / 4,
+        .bufferRowLength = row_pitch / texel_size,
         .imageSubresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1 },
         .imageExtent = image->extent,
     };

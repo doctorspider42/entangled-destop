@@ -307,7 +307,7 @@ struct DrawPipeline {
     ComPtr<ID3D12PipelineState> pipeline;
 };
 
-enum class ColorWork { Clear, Draw, Uniform, Upload, Sample, Instance };
+enum class ColorWork { Clear, Draw, Uniform, Upload, Sample, Atlas, Instance };
 
 static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT target_format, ColorWork work = ColorWork::Draw)
 {
@@ -338,7 +338,7 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
         }
     )";
     const bool uniform = work == ColorWork::Uniform;
-    const bool sampled = work == ColorWork::Sample;
+    const bool sampled = work == ColorWork::Sample || work == ColorWork::Atlas;
     const bool instanced = work == ColorWork::Instance;
     const auto vertex = compile_shader(instanced ? instance_source : vertex_source, "vs_5_1");
     const auto pixel = compile_shader(uniform ? uniform_source : sampled ? sampled_source : pixel_source, "ps_5_1");
@@ -445,7 +445,7 @@ static DrawBindings texture_bindings(ID3D12Device *device, ID3D12Resource *textu
     const D3D12_CPU_DESCRIPTOR_HANDLE destination = bindings.heap->GetCPUDescriptorHandleForHeapStart();
     const UINT destination_count = 2;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.Format = texture->GetDesc().Format;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
@@ -588,7 +588,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
 {
     constexpr UINT width = 73, height = 41;
     const bool upload_texture = work == ColorWork::Upload;
-    const bool sample_texture = work == ColorWork::Sample;
+    const bool sample_atlas = work == ColorWork::Atlas;
+    const bool sample_texture = work == ColorWork::Sample || sample_atlas;
     const bool use_uniform = work == ColorWork::Uniform;
     const bool use_instances = work == ColorWork::Instance;
     const bool programmable = work == ColorWork::Draw || use_uniform || sample_texture || use_instances;
@@ -641,24 +642,33 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     const D3D12_RANGE whole = {0, static_cast<SIZE_T>(bytes)}, empty = {};
     void *mapped = nullptr;
     if (upload_texture || sample_texture) {
-        upload = buffer(device, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        D3D12_RESOURCE_DESC upload_desc = desc;
+        upload_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (sample_atlas)
+            upload_desc.Format = DXGI_FORMAT_R8_UNORM;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT upload_footprint = {};
+        UINT64 upload_row = 0, upload_bytes = 0;
+        device->GetCopyableFootprints(&upload_desc, 0, 1, 0, &upload_footprint, &rows, &upload_row, &upload_bytes);
+        const UINT texel_size = sample_atlas ? 1 : 4;
+        if (rows != height || upload_row != width * texel_size || !upload_bytes || upload_bytes > SIZE_MAX)
+            check(E_FAIL, "unexpected sampled texture upload footprint");
+        upload = buffer(device, upload_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
         check(upload->Map(0, &empty, &mapped), "Map texture upload");
-        auto *base = static_cast<uint8_t *>(mapped) + footprint.Offset;
+        auto *base = static_cast<uint8_t *>(mapped) + upload_footprint.Offset;
         for (UINT y = 0; y < height; ++y) {
-            auto *row = base + static_cast<SIZE_T>(y) * footprint.Footprint.RowPitch;
+            auto *row = base + static_cast<SIZE_T>(y) * upload_footprint.Footprint.RowPitch;
             for (UINT x = 0; x < width; ++x) {
                 const auto color = uploaded_pixel(x, y);
-                std::memcpy(row + 4 * x, color.data(), color.size());
+                std::memcpy(row + texel_size * x, color.data(), texel_size);
             }
         }
-        upload->Unmap(0, &whole);
-        D3D12_TEXTURE_COPY_LOCATION upload_location = dst;
-        upload_location.pResource = upload.Get();
+        const D3D12_RANGE upload_range = {0, static_cast<SIZE_T>(upload_bytes)};
+        upload->Unmap(0, &upload_range);
+        const D3D12_TEXTURE_COPY_LOCATION upload_location = {upload.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                                                               {upload_footprint}};
         D3D12_TEXTURE_COPY_LOCATION upload_target = src;
         if (sample_texture) {
-            D3D12_RESOURCE_DESC sampled_desc = desc;
-            sampled_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-            check(device->CreateCommittedResource(&video_memory, D3D12_HEAP_FLAG_NONE, &sampled_desc,
+            check(device->CreateCommittedResource(&video_memory, D3D12_HEAP_FLAG_NONE, &upload_desc,
                                                   D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&sampled)),
                   "CreateCommittedResource (sampled texture)");
             upload_target.pResource = sampled.Get();
@@ -693,14 +703,16 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     for (UINT y = 0; y < height; ++y) {
         const auto row = pixels + static_cast<SIZE_T>(y) * footprint.Footprint.RowPitch;
         for (UINT x = 0; x < width; ++x) {
-            const auto original = uploaded_pixel(x, y);
+            auto original = uploaded_pixel(x, y);
+            if (sample_atlas)
+                original[1] = original[2] = 0;
             if (std::memcmp(row + 4 * x, (upload_texture || sample_texture) ? original.data() : expected, sizeof(red)) != 0)
                 check(E_FAIL, "texture readback differs from expected RGBA pixels");
         }
     }
     readback->Unmap(0, &empty);
     std::wprintf(L"D3D12 %ls PASS: %ux%u verified pixels, submit-to-fence %lld us\n",
-                 sample_texture ? L"TEXTURE SAMPLE" : upload_texture ? L"TEXTURE UPLOAD" :
+                 sample_atlas ? L"R8 ATLAS SAMPLE" : sample_texture ? L"TEXTURE SAMPLE" : upload_texture ? L"TEXTURE UPLOAD" :
                  use_uniform ? L"CBV DRAW" : use_instances ? L"INSTANCE DRAW" : programmable ? L"DRAW" : L"CLEAR",
                  width, height, elapsed);
 }
@@ -809,7 +821,7 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, DeviceLocal, Placed, Clear, Draw, Cbv, Upload, Sample, Instance, WgpuInit, Present, Composition, Fence, RenderFence };
+    enum class Probe { Copy, DeviceLocal, Placed, Clear, Draw, Cbv, Upload, Sample, Atlas, Instance, WgpuInit, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -828,6 +840,8 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Upload;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--sample-texture") == 0)
             probe = Probe::Sample;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--sample-atlas") == 0)
+            probe = Probe::Atlas;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--instance") == 0)
             probe = Probe::Instance;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--wgpu-init") == 0)
@@ -842,7 +856,7 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::RenderFence;
         else {
             std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --placed-buffer | --clear | --draw | --cbv | --upload-texture | "
-                       "--sample-texture | --instance | --wgpu-init | --present | --composition | --fence | --fence-render-context]\n", stderr);
+                       "--sample-texture | --sample-atlas | --instance | --wgpu-init | --present | --composition | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
     }
@@ -861,6 +875,8 @@ int wmain(int argc, wchar_t **argv)
             color_and_verify(device.Get(), ColorWork::Upload);
         else if (probe == Probe::Sample)
             color_and_verify(device.Get(), ColorWork::Sample);
+        else if (probe == Probe::Atlas)
+            color_and_verify(device.Get(), ColorWork::Atlas);
         else if (probe == Probe::Instance)
             color_and_verify(device.Get(), ColorWork::Instance);
         else if (probe == Probe::WgpuInit)
