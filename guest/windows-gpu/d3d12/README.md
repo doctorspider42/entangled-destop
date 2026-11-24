@@ -740,6 +740,23 @@ including upload and readback. Storage dispatch requires Vulkan
 the Venus device limits. See `ddi40-runtime-compute-dispatch/` under
 the lab share.
 
+F239 diagnostic build `5.4.13.611` created the storage UAV, populated
+the descriptor heap and built both of wgpu's internal compute pipelines.
+It then recorded its initialization copies. Wgpu stopped at
+`ID3D12CommandQueue::GetTimestampFrequency` with `E_NOTIMPL`.
+The lab miniport's `DxgkDdiCalibrateGpuClock` still lacks a GPU clock
+source. See `ddi40-runtime-wintanyl-compute-storage/` under the lab share.
+[D3D12 timestamp frequency and calibration](https://microsoft.github.io/DirectX-Specs/d3d/CountersAndQueries.html#timestamp-frequency).
+
+The `--timestamps` probe writes two D3D12 timestamp queries around a
+real draw, resolves them to a buffer at a nonzero offset and reads
+them after the fence. Build `5.11.2.977` measured 2,016 physical GPU
+ticks between markers and 1.544 ms submit-to-fence, with all 2,993
+pixels verified. The pilot resolves timestamp queries written to a
+single heap in the same command list. The separate `--clock` probe
+checks the public queue frequency and GPU/QPC calibration path.
+See `ddi40-runtime-gpu-timestamps/` under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

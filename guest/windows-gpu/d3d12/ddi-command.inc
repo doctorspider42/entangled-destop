@@ -125,6 +125,8 @@ typedef struct DdiTransferList {
     DdiDrawState draw;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     DdiComputeState compute;
+    VkQueryPool timestamp_pool;
+    UINT64 written_timestamps;
 #endif
 } DdiTransferList;
 
@@ -643,6 +645,8 @@ static void APIENTRY reset_command_list(D3D12DDI_HCOMMANDLIST driver_list, const
     list->draw = (DdiDrawState){0};
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     list->compute = (DdiComputeState){0};
+    list->timestamp_pool = VK_NULL_HANDLE;
+    list->written_timestamps = 0;
 #endif
     if (!pool || pool->device != list->device || recorder->device != list->device ||
         args->CommandListFlags != D3D12DDI_COMMAND_LIST_FLAG_NONE) {

@@ -196,6 +196,22 @@ static long long submit_and_wait(ID3D12Device *device, const Recording &commands
     return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
 }
 
+static void verify_queue_clock(ID3D12Device *device)
+{
+    const D3D12_COMMAND_QUEUE_DESC desc = {};
+    ComPtr<ID3D12CommandQueue> queue;
+    check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)), "CreateCommandQueue (clock)");
+    UINT64 hz = 0, gpu = 0, cpu = 0;
+    check(queue->GetTimestampFrequency(&hz), "GetTimestampFrequency");
+    LARGE_INTEGER begin, end;
+    QueryPerformanceCounter(&begin);
+    check(queue->GetClockCalibration(&gpu, &cpu), "GetClockCalibration");
+    QueryPerformanceCounter(&end);
+    if (!hz || cpu < static_cast<UINT64>(begin.QuadPart) || cpu > static_cast<UINT64>(end.QuadPart))
+        check(E_FAIL, "queue clock frequency or calibrated guest QPC is invalid");
+    std::wprintf(L"D3D12 QUEUE CLOCK PASS: %llu GPU ticks/s, GPU %llu, guest QPC %llu\n", hz, gpu, cpu);
+}
+
 static void transition(ID3D12GraphicsCommandList *commands, ID3D12Resource *resource,
                        D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
 {
@@ -416,7 +432,7 @@ struct DrawPipeline {
     ComPtr<ID3D12PipelineState> pipeline;
 };
 
-enum class ColorWork { Clear, Draw, Uniform, Upload, Sample, Atlas, Instance };
+enum class ColorWork { Clear, Draw, TimedDraw, Uniform, Upload, Sample, Atlas, Instance };
 
 static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT target_format, ColorWork work = ColorWork::Draw)
 {
@@ -701,7 +717,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     const bool sample_texture = work == ColorWork::Sample || sample_atlas;
     const bool use_uniform = work == ColorWork::Uniform;
     const bool use_instances = work == ColorWork::Instance;
-    const bool programmable = work == ColorWork::Draw || use_uniform || sample_texture || use_instances;
+    const bool timed_draw = work == ColorWork::TimedDraw;
+    const bool programmable = work == ColorWork::Draw || use_uniform || sample_texture || use_instances || timed_draw;
     const D3D12_HEAP_PROPERTIES video_memory = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                                 D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
     D3D12_RESOURCE_DESC desc = {};
@@ -736,6 +753,15 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     const auto readback = buffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
     const auto commands = begin_recording(device);
+    constexpr UINT64 timestamp_offset = 2 * sizeof(UINT64);
+    constexpr SIZE_T timestamp_end = timestamp_offset + 2 * sizeof(UINT64);
+    ComPtr<ID3D12QueryHeap> timestamps;
+    ComPtr<ID3D12Resource> tick_readback;
+    if (timed_draw) {
+        const D3D12_QUERY_HEAP_DESC heap = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 4, 0};
+        check(device->CreateQueryHeap(&heap, IID_PPV_ARGS(&timestamps)), "CreateQueryHeap (timestamp)");
+        tick_readback = buffer(device, timestamp_end, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
     DrawPipeline draw;
     DrawBindings bindings = {};
     ComPtr<ID3D12Resource> upload;
@@ -795,8 +821,15 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
         }
         if (use_instances)
             instances = instance_buffer(device, instance_view);
+        if (timestamps)
+            commands.list->EndQuery(timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
         record_draw(commands.list.Get(), draw, rtv, width, height, bindings.heap ? &bindings : nullptr,
                     use_instances ? &instance_view : nullptr);
+        if (timestamps) {
+            commands.list->EndQuery(timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+            commands.list->ResolveQueryData(timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1, 2,
+                                            tick_readback.Get(), timestamp_offset);
+        }
     } else if (!upload_texture) {
         const FLOAT red[] = {1.0f, 0.0f, 0.0f, 1.0f};
         commands.list->ClearRenderTargetView(rtv, red, 0, nullptr);
@@ -820,7 +853,17 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
         }
     }
     readback->Unmap(0, &empty);
+    if (timestamps) {
+        const D3D12_RANGE tick_range = {timestamp_offset, timestamp_end};
+        check(tick_readback->Map(0, &tick_range, &mapped), "Map timestamp results");
+        const auto *ticks = reinterpret_cast<const UINT64 *>(static_cast<const uint8_t *>(mapped) + timestamp_offset);
+        if (!ticks[0] || ticks[1] <= ticks[0])
+            check(E_FAIL, "timestamps did not advance around the draw");
+        std::wprintf(L"D3D12 draw GPU timestamp delta: %llu ticks\n", ticks[1] - ticks[0]);
+        tick_readback->Unmap(0, &empty);
+    }
     std::wprintf(L"D3D12 %ls PASS: %ux%u verified pixels, submit-to-fence %lld us\n",
+                 timed_draw ? L"TIMESTAMP DRAW" :
                  sample_atlas ? L"R8 ATLAS SAMPLE" : sample_texture ? L"TEXTURE SAMPLE" : upload_texture ? L"TEXTURE UPLOAD" :
                  use_uniform ? L"CBV DRAW" : use_instances ? L"INSTANCE DRAW" : programmable ? L"DRAW" : L"CLEAR",
                  width, height, elapsed);
@@ -930,7 +973,7 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, DeviceLocal, Placed, Compute, Clear, Draw, Cbv, Upload, Sample, Atlas, Instance, WgpuInit, Present, Composition, Fence, RenderFence };
+    enum class Probe { Copy, DeviceLocal, Placed, Compute, Clear, Draw, TimedDraw, Clock, Cbv, Upload, Sample, Atlas, Instance, WgpuInit, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -945,6 +988,10 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Clear;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--draw") == 0)
             probe = Probe::Draw;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--timestamps") == 0)
+            probe = Probe::TimedDraw;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--clock") == 0)
+            probe = Probe::Clock;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--cbv") == 0)
             probe = Probe::Cbv;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--upload-texture") == 0)
@@ -966,7 +1013,7 @@ int wmain(int argc, wchar_t **argv)
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence-render-context") == 0)
             probe = Probe::RenderFence;
         else {
-            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --placed-buffer | --compute | --clear | --draw | --cbv | --upload-texture | "
+            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --placed-buffer | --compute | --clear | --draw | --timestamps | --clock | --cbv | --upload-texture | "
                        "--sample-texture | --sample-atlas | --instance | --wgpu-init | --present | --composition | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
@@ -980,6 +1027,10 @@ int wmain(int argc, wchar_t **argv)
             color_and_verify(device.Get(), ColorWork::Clear);
         else if (probe == Probe::Draw)
             color_and_verify(device.Get(), ColorWork::Draw);
+        else if (probe == Probe::TimedDraw)
+            color_and_verify(device.Get(), ColorWork::TimedDraw);
+        else if (probe == Probe::Clock)
+            verify_queue_clock(device.Get());
         else if (probe == Probe::Cbv)
             color_and_verify(device.Get(), ColorWork::Uniform);
         else if (probe == Probe::Upload)

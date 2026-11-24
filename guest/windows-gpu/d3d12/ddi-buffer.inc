@@ -517,6 +517,7 @@ static void APIENTRY get_debug_allocation_info(D3D12DDI_HDEVICE device, D3D12DDI
 #include "ddi-color.inc"
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
 #include "ddi-compute-command.inc"
+#include "ddi-timestamp.inc"
 #endif
 
 #ifdef ENTANGLED_D3D12_PROBE_RUNTIME
@@ -636,6 +637,9 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnCreateConstantBufferView = create_uniform_cbv,
     .pfnCreateShaderResourceView = create_shader_srv,
     .pfnCreateUnorderedAccessView = create_storage_uav,
+    .pfnCalcPrivateQueryHeapSize = private_timestamp_heap_size,
+    .pfnCreateQueryHeap = create_timestamp_heap,
+    .pfnDestroyQueryHeap = destroy_timestamp_heap,
     .pfnCreateSampler = create_pixel_sampler,
 #endif
     .pfnCalcPrivateHeapAndResourceSizes = private_resource_sizes,
@@ -734,6 +738,9 @@ static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
     .pfnSetComputeRoot32BitConstant = set_compute_constant,
     .pfnSetComputeRoot32BitConstants = set_compute_constants,
     .pfnDispatch = dispatch_compute,
+    .pfnBeginQuery = begin_unsupported_query,
+    .pfnEndQuery = end_timestamp,
+    .pfnResolveQueryData = resolve_timestamps,
 #endif
     .pfnIASetIndexBuffer = set_transfer_index_buffer,
     .pfnIASetVertexBuffers = set_transfer_vertex_buffers,

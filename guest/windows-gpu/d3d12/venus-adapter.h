@@ -13,6 +13,7 @@ typedef struct VenusAdapter {
     VkPhysicalDevice physical_device;
     UINT32 api_version;
     UINT32 graphics_queue_family;
+    UINT32 timestamp_valid_bits;
     UINT32 subgroup_size;
 } VenusAdapter;
 
@@ -22,6 +23,7 @@ typedef struct VenusDevice {
     PFN_vkGetDeviceProcAddr proc_addr;
     PFN_vkDestroyDevice destroy;
     UINT32 graphics_queue_family;
+    UINT32 timestamp_valid_bits;
     VkPhysicalDeviceMemoryProperties memory;
     BOOL maintenance5;
     BOOL buffer_device_address;

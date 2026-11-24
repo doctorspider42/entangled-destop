@@ -6,7 +6,7 @@
 
 static HRESULT find_graphics_queue(VkPhysicalDevice device,
                                    PFN_vkGetPhysicalDeviceQueueFamilyProperties get_queue_families,
-                                   UINT32 *family)
+                                   UINT32 *family, UINT32 *timestamp_bits)
 {
     UINT32 count = 0;
     get_queue_families(device, &count, NULL);
@@ -22,6 +22,7 @@ static HRESULT find_graphics_queue(VkPhysicalDevice device,
     for (UINT32 i = 0; i < count; ++i) {
         if (queues[i].queueCount && (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
             *family = i;
+            *timestamp_bits = queues[i].timestampValidBits;
             result = S_OK;
             break;
         }
@@ -106,7 +107,8 @@ static HRESULT select_physical_device(VenusAdapter *adapter)
             if (driver.driverID != VK_DRIVER_ID_MESA_VENUS)
                 continue;
 
-            result = find_graphics_queue(devices[i], get_queue_families, &adapter->graphics_queue_family);
+            result = find_graphics_queue(devices[i], get_queue_families, &adapter->graphics_queue_family,
+                                         &adapter->timestamp_valid_bits);
             if (result == DXGI_ERROR_UNSUPPORTED)
                 continue;
             if (SUCCEEDED(result)) {
@@ -335,6 +337,7 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
         .proc_addr = proc_addr,
         .destroy = destroy,
         .graphics_queue_family = adapter->graphics_queue_family,
+        .timestamp_valid_bits = adapter->timestamp_valid_bits,
         .maintenance5 = has_maintenance5,
         .buffer_device_address = has_buffer_device_address,
         .dynamic_rendering = has_dynamic_rendering,
