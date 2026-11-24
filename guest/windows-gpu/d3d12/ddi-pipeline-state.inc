@@ -39,6 +39,8 @@ typedef struct DdiPipeline {
     VkFormat color_format;
     VkPipelineLayout layout;
     UINT pixel_bindings;
+    UINT minimum_vertex_stride;
+    VkVertexInputRate vertex_rate;
 } DdiPipeline;
 
 static SIZE_T APIENTRY private_pipeline_size(D3D12DDI_HDEVICE device,
@@ -95,13 +97,15 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
     const D3D12DDI_BLEND_DESC_0010 *blend = args->hBlendState.pDrvPrivate;
     const D3D12DDI_RASTERIZER_DESC_0010 *raster = args->hRasterizerState.pDrvPrivate;
     const D3D12DDI_DEPTH_STENCIL_DESC_0025 *depth = args->hDepthStencilState.pDrvPrivate;
+    const DdiElementLayout *elements = args->hElementLayout.pDrvPrivate;
     const VkFormat format = color_image_format(args->RTVFormats[0]);
     const VkPipelineLayout layout = !root || !pixel || pixel->pixel_bindings != root->pixel_bindings ? VK_NULL_HANDLE
         : pixel->pixel_bindings ? root->pixel_pipeline_layout : root->empty_layout;
     if (!venus->dynamic_rendering || !vertex || !vertex->module || vertex->stage != VK_SHADER_STAGE_VERTEX_BIT ||
         !pixel || !pixel->module || pixel->stage != VK_SHADER_STAGE_FRAGMENT_BIT || !layout ||
         args->hDomainShader.pDrvPrivate || args->hHullShader.pDrvPrivate || args->hGeometryShader.pDrvPrivate ||
-        args->hElementLayout.pDrvPrivate || args->NumRenderTargets != 1 || format == VK_FORMAT_UNDEFINED ||
+        (elements && (!elements->count || !venus->proc_addr(venus->handle, "vkCmdBindVertexBuffers2"))) ||
+        args->NumRenderTargets != 1 || format == VK_FORMAT_UNDEFINED ||
         args->DSVFormat != DXGI_FORMAT_UNKNOWN || args->SampleDesc.Count != 1 || args->SampleDesc.Quality ||
         args->ViewInstancingDesc.ViewInstanceCount || args->NodeMask > 1 ||
         args->PrimitiveTopologyType != D3D12DDI_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)
@@ -124,7 +128,17 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
           .module = pixel->module, .pName = "main" },
     };
-    const VkPipelineVertexInputStateCreateInfo vertices = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkVertexInputBindingDescription vertex_binding = {0};
+    VkPipelineVertexInputStateCreateInfo vertices = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    if (elements) {
+        vertex_binding = (VkVertexInputBindingDescription){
+            .binding = 0, .stride = elements->minimum_stride, .inputRate = elements->rate,
+        };
+        vertices.vertexBindingDescriptionCount = 1;
+        vertices.pVertexBindingDescriptions = &vertex_binding;
+        vertices.vertexAttributeDescriptionCount = elements->count;
+        vertices.pVertexAttributeDescriptions = elements->attributes;
+    }
     const VkPipelineInputAssemblyStateCreateInfo assembly = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
     };
@@ -145,9 +159,11 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
     const VkPipelineColorBlendStateCreateInfo blending = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &attachment,
     };
-    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    const VkDynamicState dynamic_states[] = {
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
+    };
     const VkPipelineDynamicStateCreateInfo dynamic = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = _countof(dynamic_states),
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = elements ? 3 : 2,
         .pDynamicStates = dynamic_states,
     };
     const VkPipelineRenderingCreateInfo rendering = {
@@ -164,7 +180,9 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
     const VkResult result = create(venus->handle, VK_NULL_HANDLE, 1, &info, NULL, &pipeline);
     if (result == VK_SUCCESS) {
         *state = (DdiPipeline){ .device = venus, .pipeline = pipeline, .bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS,
-            .color_format = format, .layout = layout, .pixel_bindings = pixel->pixel_bindings };
+            .color_format = format, .layout = layout, .pixel_bindings = pixel->pixel_bindings,
+            .minimum_vertex_stride = elements ? elements->minimum_stride : 0,
+            .vertex_rate = elements ? elements->rate : VK_VERTEX_INPUT_RATE_VERTEX };
     } else if (pipeline) {
         destroy(venus->handle, pipeline, NULL);
     }

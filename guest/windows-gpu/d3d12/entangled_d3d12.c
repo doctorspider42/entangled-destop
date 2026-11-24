@@ -182,6 +182,7 @@ static void set_command_device_error(const DdiDevice *device, HRESULT status);
 #include "ddi-root-signature.inc"
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
 #include "ddi-shader.inc"
+#include "ddi-input-layout.inc"
 #endif
 #include "ddi-pipeline-state.inc"
 #include "ddi-descriptor-heap.inc"

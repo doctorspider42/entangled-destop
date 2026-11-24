@@ -249,7 +249,7 @@ struct DrawPipeline {
     ComPtr<ID3D12PipelineState> pipeline;
 };
 
-enum class ColorWork { Clear, Draw, Uniform, Upload, Sample };
+enum class ColorWork { Clear, Draw, Uniform, Upload, Sample, Instance };
 
 static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT target_format, ColorWork work = ColorWork::Draw)
 {
@@ -257,6 +257,12 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
         float4 main(uint vertex : SV_VertexID) : SV_Position {
             float2 p = float2(vertex == 1 ? 3 : -1, vertex == 2 ? 3 : -1);
             return float4(p, 0, 1);
+        }
+    )";
+    constexpr char instance_source[] = R"(
+        float4 main(uint vertex : SV_VertexID, float4 transform : TEXCOORD0) : SV_Position {
+            float2 p = float2(vertex == 1 ? 3 : -1, vertex == 2 ? 3 : -1);
+            return float4(p * transform.xy + transform.zw, 0, 1);
         }
     )";
     constexpr char pixel_source[] = R"(
@@ -275,7 +281,8 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
     )";
     const bool uniform = work == ColorWork::Uniform;
     const bool sampled = work == ColorWork::Sample;
-    const auto vertex = compile_shader(vertex_source, "vs_5_1");
+    const bool instanced = work == ColorWork::Instance;
+    const auto vertex = compile_shader(instanced ? instance_source : vertex_source, "vs_5_1");
     const auto pixel = compile_shader(uniform ? uniform_source : sampled ? sampled_source : pixel_source, "ps_5_1");
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned_signature = {};
     versioned_signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
@@ -293,6 +300,8 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
     }
     versioned_signature.Desc_1_1.NumParameters = uniform ? 1 : sampled ? 2 : 0;
     versioned_signature.Desc_1_1.pParameters = versioned_signature.Desc_1_1.NumParameters ? parameters : nullptr;
+    if (instanced)
+        versioned_signature.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> root_bytes;
     check(D3D12SerializeVersionedRootSignature(&versioned_signature, &root_bytes, nullptr),
           "D3D12SerializeVersionedRootSignature");
@@ -322,6 +331,10 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
     pipeline.NumRenderTargets = 1;
     pipeline.RTVFormats[0] = target_format;
     pipeline.SampleDesc.Count = 1;
+    const D3D12_INPUT_ELEMENT_DESC element = {"TEXCOORD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT,
+        0, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1};
+    if (instanced)
+        pipeline.InputLayout = {&element, 1};
     check(device->CreateGraphicsPipelineState(&pipeline, IID_PPV_ARGS(&draw.pipeline)), "CreateGraphicsPipelineState");
     return draw;
 }
@@ -405,7 +418,8 @@ static DrawBindings texture_bindings(ID3D12Device *device, ID3D12Resource *textu
 }
 
 static void record_draw(ID3D12GraphicsCommandList *commands, const DrawPipeline &draw,
-                         D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT width, UINT height, const DrawBindings *bindings = nullptr)
+                         D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT width, UINT height, const DrawBindings *bindings = nullptr,
+                         const D3D12_VERTEX_BUFFER_VIEW *instances = nullptr)
 {
     const D3D12_VIEWPORT viewport = {0, 0, static_cast<FLOAT>(width), static_cast<FLOAT>(height), 0, 1};
     const D3D12_RECT scissor = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
@@ -418,11 +432,28 @@ static void record_draw(ID3D12GraphicsCommandList *commands, const DrawPipeline 
         if (bindings->sampler_heap)
             commands->SetGraphicsRootDescriptorTable(1, bindings->sampler_table);
     }
+    if (instances)
+        commands->IASetVertexBuffers(0, 1, instances);
     commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commands->RSSetViewports(1, &viewport);
     commands->RSSetScissorRects(1, &scissor);
     commands->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    commands->DrawInstanced(3, 1, 0, 0);
+    commands->DrawInstanced(3, 1, 0, instances ? 1 : 0);
+}
+
+static ComPtr<ID3D12Resource> instance_buffer(ID3D12Device *device, D3D12_VERTEX_BUFFER_VIEW &view)
+{
+    constexpr UINT stride = 32;
+    const auto instance = buffer(device, 3 * stride, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    const D3D12_RANGE empty = {}, whole = {0, 3 * stride};
+    void *mapped = nullptr;
+    check(instance->Map(0, &empty, &mapped), "Map instance buffer");
+    std::memset(mapped, 0, whole.End);
+    const FLOAT transform[] = {1.0f, 1.0f, 0.0f, 0.0f};
+    std::memcpy(static_cast<uint8_t *>(mapped) + 2 * stride, transform, sizeof(transform));
+    instance->Unmap(0, &whole);
+    view = {instance->GetGPUVirtualAddress() + stride, 2 * stride, stride};
+    return instance;
 }
 
 static ComPtr<ID3D12DescriptorHeap> create_rtv_heap(ID3D12Device *device)
@@ -501,7 +532,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     const bool upload_texture = work == ColorWork::Upload;
     const bool sample_texture = work == ColorWork::Sample;
     const bool use_uniform = work == ColorWork::Uniform;
-    const bool programmable = work == ColorWork::Draw || use_uniform || sample_texture;
+    const bool use_instances = work == ColorWork::Instance;
+    const bool programmable = work == ColorWork::Draw || use_uniform || sample_texture || use_instances;
     const D3D12_HEAP_PROPERTIES video_memory = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                                 D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
     D3D12_RESOURCE_DESC desc = {};
@@ -540,6 +572,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     DrawBindings bindings = {};
     ComPtr<ID3D12Resource> upload;
     ComPtr<ID3D12Resource> sampled;
+    ComPtr<ID3D12Resource> instances;
+    D3D12_VERTEX_BUFFER_VIEW instance_view = {};
     D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
     src.pResource = target.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -582,7 +616,10 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             bindings = texture_bindings(device, sampled.Get());
         }
-        record_draw(commands.list.Get(), draw, rtv, width, height, bindings.heap ? &bindings : nullptr);
+        if (use_instances)
+            instances = instance_buffer(device, instance_view);
+        record_draw(commands.list.Get(), draw, rtv, width, height, bindings.heap ? &bindings : nullptr,
+                    use_instances ? &instance_view : nullptr);
     } else if (!upload_texture) {
         const FLOAT red[] = {1.0f, 0.0f, 0.0f, 1.0f};
         commands.list->ClearRenderTargetView(rtv, red, 0, nullptr);
@@ -606,7 +643,7 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     readback->Unmap(0, &empty);
     std::wprintf(L"D3D12 %ls PASS: %ux%u verified pixels, submit-to-fence %lld us\n",
                  sample_texture ? L"TEXTURE SAMPLE" : upload_texture ? L"TEXTURE UPLOAD" :
-                 use_uniform ? L"CBV DRAW" : programmable ? L"DRAW" : L"CLEAR",
+                 use_uniform ? L"CBV DRAW" : use_instances ? L"INSTANCE DRAW" : programmable ? L"DRAW" : L"CLEAR",
                  width, height, elapsed);
 }
 
@@ -714,7 +751,7 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, DeviceLocal, Clear, Draw, Cbv, Upload, Sample, WgpuInit, Present, Composition, Fence, RenderFence };
+    enum class Probe { Copy, DeviceLocal, Clear, Draw, Cbv, Upload, Sample, Instance, WgpuInit, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -731,6 +768,8 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Upload;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--sample-texture") == 0)
             probe = Probe::Sample;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--instance") == 0)
+            probe = Probe::Instance;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--wgpu-init") == 0)
             probe = Probe::WgpuInit;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--present") == 0)
@@ -743,7 +782,7 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::RenderFence;
         else {
             std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --clear | --draw | --cbv | --upload-texture | "
-                       "--sample-texture | --wgpu-init | --present | --composition | --fence | --fence-render-context]\n", stderr);
+                       "--sample-texture | --instance | --wgpu-init | --present | --composition | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
     }
@@ -762,6 +801,8 @@ int wmain(int argc, wchar_t **argv)
             color_and_verify(device.Get(), ColorWork::Upload);
         else if (probe == Probe::Sample)
             color_and_verify(device.Get(), ColorWork::Sample);
+        else if (probe == Probe::Instance)
+            color_and_verify(device.Get(), ColorWork::Instance);
         else if (probe == Probe::WgpuInit)
             verify_wgpu_initialization(device.Get());
         else if (probe == Probe::Present || probe == Probe::Composition)

@@ -84,6 +84,7 @@ typedef struct DdiDrawState {
     VkPipelineLayout root_layout;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     const DdiPipeline *pipeline;
+    D3D12DDI_VERTEX_BUFFER_VIEW vertex_buffer;
     VkDescriptorSetLayout pixel_set_layout;
     UINT pixel_bindings;
     const DdiDescriptorHeap *resource_heap;
@@ -216,11 +217,21 @@ static void APIENTRY set_transfer_vertex_buffers(D3D12DDI_HCOMMANDLIST list, UIN
     }
     for (UINT i = 0; views && i < count; ++i) {
         if (views[i].BufferLocation || views[i].SizeInBytes) {
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+            if (!first && !i && views[i].BufferLocation && views[i].SizeInBytes)
+                continue;
+#endif
             require_transfer_state(list, FALSE);
             return;
         }
     }
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    DdiTransferList *commands = recording_command_list(list);
+    if (commands && !first && count)
+        commands->draw.vertex_buffer = views ? views[0] : (D3D12DDI_VERTEX_BUFFER_VIEW){0};
+#else
     require_transfer_state(list, TRUE);
+#endif
 }
 
 static void APIENTRY set_transfer_index_buffer(D3D12DDI_HCOMMANDLIST list, const D3D12DDI_INDEX_BUFFER_VIEW *view)

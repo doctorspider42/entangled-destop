@@ -577,6 +577,9 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnCopyDescriptors = copy_descriptors,
     .pfnCopyDescriptorsSimple = copy_descriptors_simple,
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
+    .pfnCalcPrivateElementLayoutSize = private_vertex_layout_size,
+    .pfnCreateElementLayout = create_vertex_layout,
+    .pfnDestroyElementLayout = destroy_vertex_layout,
     .pfnCreateConstantBufferView = create_uniform_cbv,
     .pfnCreateShaderResourceView = create_sampled_srv,
     .pfnCreateSampler = create_pixel_sampler,

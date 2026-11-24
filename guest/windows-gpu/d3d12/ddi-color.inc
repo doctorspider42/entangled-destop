@@ -198,6 +198,27 @@ static HRESULT bind_pixel_descriptors(DdiTransferList *list)
     return S_OK;
 }
 
+static HRESULT bind_draw_vertices(const DdiTransferList *list, UINT64 last)
+{
+    const D3D12DDI_VERTEX_BUFFER_VIEW *view = &list->draw.vertex_buffer;
+    const UINT required = list->draw.pipeline->minimum_vertex_stride;
+    VkDescriptorBufferInfo buffer;
+    if (view->StrideInBytes < required || view->StrideInBytes > D3D12_REQ_MULTI_ELEMENT_STRUCTURE_SIZE_IN_BYTES ||
+        view->BufferLocation % 4 || view->StrideInBytes % 4 || view->SizeInBytes < required ||
+        last > (view->SizeInBytes - required) / view->StrideInBytes ||
+        !resolve_buffer_address(list->device, view->BufferLocation, view->SizeInBytes, &buffer))
+        return E_INVALIDARG;
+    const VenusDevice *venus = list->venus.device;
+    const PFN_vkCmdBindVertexBuffers2 bind = (PFN_vkCmdBindVertexBuffers2)
+        venus->proc_addr(venus->handle, "vkCmdBindVertexBuffers2");
+    if (!bind)
+        return E_FAIL;
+    const VkDeviceSize stride = view->StrideInBytes;
+    bind(list->venus.command, 0, 1, &buffer.buffer, &buffer.offset, &buffer.range, &stride);
+    trace_ddi("BindVertexBuffer", 0, view->StrideInBytes);
+    return S_OK;
+}
+
 static void APIENTRY draw_color_target(D3D12DDI_HCOMMANDLIST handle, UINT vertex_count, UINT instance_count,
                                        UINT first_vertex, UINT first_instance)
 {
@@ -215,6 +236,11 @@ static void APIENTRY draw_color_target(D3D12DDI_HCOMMANDLIST handle, UINT vertex
 
     AcquireSRWLockExclusive(&list->pool->lock);
     HRESULT status = list->generation == list->pool->generation ? S_OK : E_INVALIDARG;
+    if (SUCCEEDED(status) && draw->pipeline->minimum_vertex_stride) {
+        const UINT64 last = draw->pipeline->vertex_rate == VK_VERTEX_INPUT_RATE_INSTANCE
+            ? (UINT64)first_instance + instance_count - 1 : (UINT64)first_vertex + vertex_count - 1;
+        status = bind_draw_vertices(list, last);
+    }
     if (SUCCEEDED(status) && draw->pipeline->pixel_bindings)
         status = bind_pixel_descriptors(list);
     if (SUCCEEDED(status))

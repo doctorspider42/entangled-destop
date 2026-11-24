@@ -687,6 +687,14 @@ remains unsupported in this pilot. See `ddi40-runtime-wgpu-init/` under
 the lab share.
 [wgpu DX12 device initialization](https://github.com/gfx-rs/wgpu/blob/v30.0.2/wgpu-hal/src/dx12/device.rs#L58-L191).
 
+The `--instance` probe draws a full-screen triangle using an instance
+attribute read from a vertex buffer. Both the vertex-buffer view and
+first instance have nonzero offsets. Build `4.38.12.692` verified all
+2,993 pixels on the RTX 2070 in 2.265 ms submit-to-fence. The current
+input layout supports one vertex slot with floating-point attributes
+and per-vertex or per-instance stepping. See
+`ddi40-runtime-instance-draw/` under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a
