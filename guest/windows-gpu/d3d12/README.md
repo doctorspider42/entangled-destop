@@ -659,6 +659,16 @@ verified all 73 × 41 pixels through the system runtime at 1.248 ms
 submit-to-fence. The pilot accepts one full, single-subresource upload
 per command list. See `ddi40-runtime-texture-upload/` under the lab share.
 
+The `--sample-texture` probe uploads that pattern to an optimal Vulkan
+image, transitions it for pixel shader access and binds a D3D12 SRV
+and sampler in two shader-visible heaps. The FXC pixel shader looks up
+each texel through the translated Vulkan image and sampler descriptors.
+Build `4.25.6.200` verified all 73 × 41 pixels at 1.780 ms
+submit-to-fence, including upload, rendering and readback. The pilot
+supports one RGBA8 or BGRA8 single-subresource image uploaded in the
+same command list, with point or linear clamp sampling. See
+`ddi40-runtime-texture-sample/` under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

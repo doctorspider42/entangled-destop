@@ -1,31 +1,50 @@
 /* SPDX-License-Identifier: Apache-2.0 */
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+enum DdiPixelBindings {
+    DDI_PIXEL_CBV = 1,
+    DDI_PIXEL_SRV = 2,
+    DDI_PIXEL_SAMPLER = 4,
+};
+#endif
+
 typedef struct DdiRootSignature {
     D3D12DDI_ROOT_SIGNATURE_0013 desc;
     UINT node_mask;
     VkPipelineLayout empty_layout;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-    VkPipelineLayout uniform_pipeline_layout;
-    VkDescriptorSetLayout uniform_set_layout;
+    VkPipelineLayout pixel_pipeline_layout;
+    VkDescriptorSetLayout pixel_set_layout;
+    UINT pixel_bindings;
 #endif
 } DdiRootSignature;
 
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-static BOOL single_pixel_cbv_table(const D3D12DDI_ROOT_SIGNATURE_0013 *desc)
+static BOOL single_pixel_table(const D3D12DDI_ROOT_PARAMETER_0013 *parameter, D3D12DDI_DESCRIPTOR_RANGE_TYPE type)
 {
-    if (desc->NumParameters != 1 || desc->NumStaticSamplers)
-        return FALSE;
-    const D3D12DDI_ROOT_PARAMETER_0013 *parameter = desc->pRootParameters;
     if (parameter->ParameterType != D3D12DDI_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
         parameter->ShaderVisibility != D3D12DDI_SHADER_VISIBILITY_PIXEL ||
         parameter->DescriptorTable.NumDescriptorRanges != 1)
         return FALSE;
     const D3D12DDI_DESCRIPTOR_RANGE_0013 *range = parameter->DescriptorTable.pDescriptorRanges;
-    return range->RangeType == D3D12DDI_DESCRIPTOR_RANGE_TYPE_CBV && range->NumDescriptors == 1 &&
+    return range->RangeType == type && range->NumDescriptors == 1 &&
            !range->BaseShaderRegister && !range->RegisterSpace &&
            (!range->OffsetInDescriptorsFromTableStart || range->OffsetInDescriptorsFromTableStart == UINT32_MAX);
 }
 
-static HRESULT create_uniform_root_layout(const VenusDevice *venus, DdiRootSignature *root)
+static UINT pixel_root_bindings(const D3D12DDI_ROOT_SIGNATURE_0013 *desc)
+{
+    const D3D12DDI_ROOT_PARAMETER_0013 *parameters = desc->pRootParameters;
+    if (desc->NumStaticSamplers)
+        return 0;
+    if (desc->NumParameters == 1 && single_pixel_table(parameters, D3D12DDI_DESCRIPTOR_RANGE_TYPE_CBV))
+        return DDI_PIXEL_CBV;
+    if (desc->NumParameters == 2 && single_pixel_table(&parameters[0], D3D12DDI_DESCRIPTOR_RANGE_TYPE_SRV) &&
+        single_pixel_table(&parameters[1], D3D12DDI_DESCRIPTOR_RANGE_TYPE_SAMPLER))
+        return DDI_PIXEL_SRV | DDI_PIXEL_SAMPLER;
+    return 0;
+}
+
+static HRESULT create_pixel_root_layout(const VenusDevice *venus, DdiRootSignature *root)
 {
     const PFN_vkCreateDescriptorSetLayout create_set = (PFN_vkCreateDescriptorSetLayout)
         venus->proc_addr(venus->handle, "vkCreateDescriptorSetLayout");
@@ -35,12 +54,18 @@ static HRESULT create_uniform_root_layout(const VenusDevice *venus, DdiRootSigna
         venus->proc_addr(venus->handle, "vkCreatePipelineLayout");
     if (!create_set || !destroy_set || !create_layout || !venus->proc_addr(venus->handle, "vkDestroyPipelineLayout"))
         return E_FAIL;
-    const VkDescriptorSetLayoutBinding binding = {
-        .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+    const VkDescriptorSetLayoutBinding bindings[] = {
+        { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+        { .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
     };
+    const BOOL uniform = root->pixel_bindings == DDI_PIXEL_CBV;
     const VkDescriptorSetLayoutCreateInfo set = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &binding,
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = uniform ? 1u : 2u, .pBindings = uniform ? &bindings[0] : &bindings[1],
     };
     VkDescriptorSetLayout set_layout;
     const VkResult result = create_set(venus->handle, &set, NULL, &set_layout);
@@ -55,8 +80,8 @@ static HRESULT create_uniform_root_layout(const VenusDevice *venus, DdiRootSigna
         destroy_set(venus->handle, set_layout, NULL);
         return venus_hresult(pipeline);
     }
-    root->uniform_set_layout = set_layout;
-    root->uniform_pipeline_layout = pipeline_layout;
+    root->pixel_set_layout = set_layout;
+    root->pixel_pipeline_layout = pipeline_layout;
     return S_OK;
 }
 #endif
@@ -143,9 +168,10 @@ static HRESULT APIENTRY create_root_signature(D3D12DDI_HDEVICE device,
         root->empty_layout = layout;
     }
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-    if (single_pixel_cbv_table(desc)) {
-        const HRESULT status = create_uniform_root_layout(venus_device(device), root);
-        trace_ddi("CreateUniformRootLayout", (UINT)status, root->uniform_set_layout != VK_NULL_HANDLE);
+    root->pixel_bindings = pixel_root_bindings(desc);
+    if (root->pixel_bindings) {
+        const HRESULT status = create_pixel_root_layout(venus_device(device), root);
+        trace_ddi("CreatePixelRootLayout", (UINT)status, root->pixel_bindings);
         if (FAILED(status))
             return status;
     }
@@ -166,14 +192,14 @@ static void APIENTRY destroy_root_signature(D3D12DDI_HDEVICE device, D3D12DDI_HR
         destroy_layout(venus->handle, root->empty_layout, NULL);
     }
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-    if (root->uniform_set_layout) {
+    if (root->pixel_set_layout) {
         const VenusDevice *venus = venus_device(device);
         const PFN_vkDestroyPipelineLayout destroy_layout = (PFN_vkDestroyPipelineLayout)
             venus->proc_addr(venus->handle, "vkDestroyPipelineLayout");
         const PFN_vkDestroyDescriptorSetLayout destroy_set = (PFN_vkDestroyDescriptorSetLayout)
             venus->proc_addr(venus->handle, "vkDestroyDescriptorSetLayout");
-        destroy_layout(venus->handle, root->uniform_pipeline_layout, NULL);
-        destroy_set(venus->handle, root->uniform_set_layout, NULL);
+        destroy_layout(venus->handle, root->pixel_pipeline_layout, NULL);
+        destroy_set(venus->handle, root->pixel_set_layout, NULL);
     }
 #endif
     *root = (DdiRootSignature){0};

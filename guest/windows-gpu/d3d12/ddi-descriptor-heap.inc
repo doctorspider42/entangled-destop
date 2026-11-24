@@ -15,7 +15,7 @@ typedef struct DdiDescriptor {
         D3D12DDIARG_CREATE_UNORDERED_ACCESS_VIEW_0002 uav;
         D3D12DDIARG_CREATE_RENDER_TARGET_VIEW_0002 rtv;
         D3D12DDIARG_CREATE_DEPTH_STENCIL_VIEW dsv;
-        D3D12DDIARG_CREATE_SAMPLER sampler;
+        D3D12DDI_SAMPLER_DESC sampler;
     } desc;
 } DdiDescriptor;
 

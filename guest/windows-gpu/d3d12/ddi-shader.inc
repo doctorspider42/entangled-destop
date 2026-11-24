@@ -28,7 +28,7 @@ typedef struct DxbcSignatureEntry {
 typedef struct DdiShader {
     VkShaderModule module;
     VkShaderStageFlagBits stage;
-    BOOL uniform_cbv;
+    UINT pixel_bindings;
 } DdiShader;
 
 typedef enum DxbcStage {
@@ -151,15 +151,40 @@ static HMODULE load_shader_compiler(void)
     return LoadLibraryExW(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
 }
 
+static BOOL single_pixel_register(const dxil_spv_d3d_binding *d3d)
+{
+    return d3d->stage == DXIL_SPV_STAGE_PIXEL && !d3d->register_space && !d3d->register_index && d3d->range_size == 1;
+}
+
 static dxil_spv_bool remap_pixel_cbv(void *context, const dxil_spv_d3d_binding *d3d,
                                      dxil_spv_cbv_vulkan_binding *vulkan)
 {
-    if (d3d->stage != DXIL_SPV_STAGE_PIXEL || d3d->register_space || d3d->register_index || d3d->range_size != 1)
+    if (!single_pixel_register(d3d))
         return 0;
-    *(BOOL *)context = TRUE;
+    *(UINT *)context |= DDI_PIXEL_CBV;
     *vulkan = (dxil_spv_cbv_vulkan_binding){
         .vulkan.uniform_binding = { .set = 0, .binding = 0, .descriptor_type = DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_UBO },
     };
+    return 1;
+}
+
+static dxil_spv_bool remap_pixel_srv(void *context, const dxil_spv_d3d_binding *d3d,
+                                     dxil_spv_srv_vulkan_binding *vulkan)
+{
+    if (!single_pixel_register(d3d) || d3d->kind != DXIL_SPV_RESOURCE_KIND_TEXTURE_2D)
+        return 0;
+    *(UINT *)context |= DDI_PIXEL_SRV;
+    *vulkan = (dxil_spv_srv_vulkan_binding){ .buffer_binding = { .set = 0, .binding = 1 } };
+    return 1;
+}
+
+static dxil_spv_bool remap_pixel_sampler(void *context, const dxil_spv_d3d_binding *d3d,
+                                         dxil_spv_vulkan_binding *vulkan)
+{
+    if (!single_pixel_register(d3d))
+        return 0;
+    *(UINT *)context |= DDI_PIXEL_SAMPLER;
+    *vulkan = (dxil_spv_vulkan_binding){ .set = 0, .binding = 2 };
     return 1;
 }
 
@@ -189,11 +214,17 @@ static HRESULT compile_shader_module(const VenusDevice *device, const DxbcHeader
     void (*set_cbv)(dxil_spv_converter, dxil_spv_cbv_remapper_cb, void *) =
         (void (*)(dxil_spv_converter, dxil_spv_cbv_remapper_cb, void *))(void *)
         GetProcAddress(compiler, "dxil_spv_converter_set_cbv_remapper");
+    void (*set_srv)(dxil_spv_converter, dxil_spv_srv_remapper_cb, void *) =
+        (void (*)(dxil_spv_converter, dxil_spv_srv_remapper_cb, void *))(void *)
+        GetProcAddress(compiler, "dxil_spv_converter_set_srv_remapper");
+    void (*set_sampler)(dxil_spv_converter, dxil_spv_sampler_remapper_cb, void *) =
+        (void (*)(dxil_spv_converter, dxil_spv_sampler_remapper_cb, void *))(void *)
+        GetProcAddress(compiler, "dxil_spv_converter_set_sampler_remapper");
     const PFN_vkCreateShaderModule create_module = (PFN_vkCreateShaderModule)
         device->proc_addr(device->handle, "vkCreateShaderModule");
     const PFN_vkDestroyShaderModule destroy_module = (PFN_vkDestroyShaderModule)
         device->proc_addr(device->handle, "vkDestroyShaderModule");
-    if (!parse || !free_blob || !create || !free_converter || !convert || !compiled || !set_cbv ||
+    if (!parse || !free_blob || !create || !free_converter || !convert || !compiled || !set_cbv || !set_srv || !set_sampler ||
         !create_module || !destroy_module) {
         FreeLibrary(compiler);
         return DXGI_ERROR_UNSUPPORTED;
@@ -206,7 +237,9 @@ static HRESULT compile_shader_module(const VenusDevice *device, const DxbcHeader
     if (result == DXIL_SPV_SUCCESS)
         result = create(parsed, &converter);
     if (result == DXIL_SPV_SUCCESS) {
-        set_cbv(converter, remap_pixel_cbv, &output->uniform_cbv);
+        set_cbv(converter, remap_pixel_cbv, &output->pixel_bindings);
+        set_srv(converter, remap_pixel_srv, &output->pixel_bindings);
+        set_sampler(converter, remap_pixel_sampler, &output->pixel_bindings);
         result = convert(converter);
     }
     if (result == DXIL_SPV_SUCCESS)

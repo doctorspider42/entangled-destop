@@ -160,7 +160,7 @@ HRESULT record_venus_buffer_barrier(VkCommandBuffer command, const VenusTransfer
     return S_OK;
 }
 
-static VkImageCreateInfo color_image_info(VkFormat format, UINT32 width, UINT32 height)
+static VkImageCreateInfo color_image_info(VkFormat format, UINT32 width, UINT32 height, BOOL shader_resource)
 {
     /* Four bytes per pixel. Pad storage to a multiple of D3D12's 256-byte row alignment. */
     const UINT32 padded_width = (width + 63) & ~63u;
@@ -168,24 +168,25 @@ static VkImageCreateInfo color_image_info(VkFormat format, UINT32 width, UINT32 
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = VK_IMAGE_TYPE_2D,
         .format = format,
-        .extent = { padded_width, height, 1 },
+        .extent = { shader_resource ? width : padded_width, height, 1 },
         .mipLevels = 1,
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_LINEAR,
-        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .tiling = shader_resource ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+            (shader_resource ? VK_IMAGE_USAGE_SAMPLED_BIT : 0),
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
 }
 
 HRESULT venus_color_image_requirements(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
-                                      VkMemoryRequirements *requirements)
+                                      BOOL shader_resource, VkMemoryRequirements *requirements)
 {
     const PFN_vkGetDeviceImageMemoryRequirements query = DEVICE_FN(device, vkGetDeviceImageMemoryRequirements);
     if (!query)
         return DXGI_ERROR_UNSUPPORTED;
-    const VkImageCreateInfo image = color_image_info(format, width, height);
+    const VkImageCreateInfo image = color_image_info(format, width, height, shader_resource);
     const VkDeviceImageMemoryRequirements info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS,
         .pCreateInfo = &image,
@@ -248,14 +249,22 @@ static HRESULT create_local_image(const VenusDevice *device, const VkImageCreate
     return venus_hresult(result);
 }
 
+static const VkImageSubresourceRange color_subresource = {
+    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+    .levelCount = 1,
+    .layerCount = 1,
+};
+
 HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
-                                 VenusColorImage *image)
+                                 BOOL shader_resource, VenusColorImage *image)
 {
     *image = (VenusColorImage){0};
     const PFN_vkGetImageSubresourceLayout layout = DEVICE_FN(device, vkGetImageSubresourceLayout);
-    if (!layout)
+    const PFN_vkCreateImageView create_view = DEVICE_FN(device, vkCreateImageView);
+    if ((!shader_resource && !layout) ||
+        (shader_resource && (!create_view || !DEVICE_FN(device, vkDestroyImageView))))
         return DXGI_ERROR_UNSUPPORTED;
-    const VkImageCreateInfo info = color_image_info(format, width, height);
+    const VkImageCreateInfo info = color_image_info(format, width, height, shader_resource);
     HRESULT status = create_local_image(device, &info, &image->handle, &image->memory, &image->requirements);
     if (FAILED(status))
         return status;
@@ -263,6 +272,20 @@ HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UIN
     image->format = format;
     image->extent = (VkExtent3D){width, height, 1};
 
+    if (shader_resource) {
+        const VkImageViewCreateInfo view = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = image->handle,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = format, .subresourceRange = color_subresource,
+        };
+        status = venus_hresult(create_view(device->handle, &view, NULL, &image->sampled_view));
+        if (FAILED(status)) {
+            destroy_venus_color_image(image);
+            return status;
+        }
+        /* The D3D12 copy footprint is independent of the opaque Vulkan layout. */
+        image->layout.rowPitch = (width * 4 + 255) & ~255u;
+        return S_OK;
+    }
     const VkImageSubresource subresource = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT };
     layout(device->handle, image->handle, &subresource, &image->layout);
     if (image->layout.rowPitch >= (UINT64)width * 4 && image->layout.rowPitch % 256 == 0)
@@ -276,6 +299,8 @@ void destroy_venus_color_image(VenusColorImage *image)
     const VenusDevice *device = image->device;
     if (!device)
         return;
+    if (image->sampled_view)
+        DEVICE_FN(device, vkDestroyImageView)(device->handle, image->sampled_view, NULL);
     if (image->render_view) {
         DEVICE_FN(device, vkDestroyImageView)(device->handle, image->render_view, NULL);
         DEVICE_FN(device, vkDestroyImage)(device->handle, image->render_handle, NULL);
@@ -287,12 +312,6 @@ void destroy_venus_color_image(VenusColorImage *image)
     *image = (VenusColorImage){0};
 }
 
-static const VkImageSubresourceRange color_subresource = {
-    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-    .levelCount = 1,
-    .layerCount = 1,
-};
-
 static HRESULT ensure_color_attachment(VenusColorImage *image)
 {
     const VenusDevice *device = image->device;
@@ -303,7 +322,7 @@ static HRESULT ensure_color_attachment(VenusColorImage *image)
     AcquireSRWLockExclusive(&image->render_lock);
     HRESULT status = S_OK;
     if (!image->render_view) {
-        VkImageCreateInfo info = color_image_info(image->format, image->extent.width, image->extent.height);
+        VkImageCreateInfo info = color_image_info(image->format, image->extent.width, image->extent.height, FALSE);
         info.extent = image->extent;
         info.tiling = VK_IMAGE_TILING_OPTIMAL;
         info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -414,6 +433,27 @@ HRESULT prepare_venus_color_copy(VkCommandBuffer command, const VenusColorImage 
     };
     const VkPipelineStageFlags previous = rendered ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
     barrier(command, previous, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &source);
+    return S_OK;
+}
+
+HRESULT prepare_venus_shader_read(VkCommandBuffer command, const VenusColorImage *image)
+{
+    const PFN_vkCmdPipelineBarrier barrier = DEVICE_FN(image->device, vkCmdPipelineBarrier);
+    if (!barrier || !image->sampled_view)
+        return DXGI_ERROR_UNSUPPORTED;
+    const VkImageMemoryBarrier source = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image->handle,
+        .subresourceRange = color_subresource,
+    };
+    barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+            0, NULL, 0, NULL, 1, &source);
     return S_OK;
 }
 

@@ -40,18 +40,20 @@ typedef struct VenusColorImage {
     VkImage render_handle;
     VkDeviceMemory render_memory;
     VkImageView render_view;
+    VkImageView sampled_view;
 } VenusColorImage;
 
 HRESULT venus_color_image_requirements(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
-                                      VkMemoryRequirements *requirements);
+                                      BOOL shader_resource, VkMemoryRequirements *requirements);
 HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
-                                 VenusColorImage *image);
+                                 BOOL shader_resource, VenusColorImage *image);
 void destroy_venus_color_image(VenusColorImage *image);
 HRESULT record_venus_clear_color(VkCommandBuffer command, const VenusColorImage *image, const FLOAT color[4]);
 HRESULT record_venus_color_draw(VkCommandBuffer command, VenusColorImage *image,
                                const VkViewport *viewport, const VkRect2D *scissor,
                                UINT vertex_count, UINT instance_count, UINT first_vertex, UINT first_instance);
 HRESULT prepare_venus_color_copy(VkCommandBuffer command, const VenusColorImage *image, BOOL rendered);
+HRESULT prepare_venus_shader_read(VkCommandBuffer command, const VenusColorImage *image);
 HRESULT upload_venus_color_image(VkCommandBuffer command, const VenusTransferBuffer *source,
                                  VkDeviceSize offset, UINT32 row_pitch, const VenusColorImage *destination);
 HRESULT copy_venus_color_to_buffer(VkCommandBuffer command, const VenusColorImage *source,

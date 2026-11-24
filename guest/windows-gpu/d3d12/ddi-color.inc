@@ -52,16 +52,68 @@ static void APIENTRY set_color_render_targets(D3D12DDI_HCOMMANDLIST handle, UINT
 }
 
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-static HRESULT bind_uniform_cbv(DdiTransferList *list)
+static void APIENTRY create_sampled_srv(D3D12DDI_HDEVICE device, const D3D12DDIARG_CREATE_SHADER_RESOURCE_VIEW_0002 *args,
+                                        D3D12DDI_CPU_DESCRIPTOR_HANDLE destination)
+{
+    const VenusColorImage *image = args ? resource_color(venus_device(device), args->hDrvResource) : NULL;
+    DdiDescriptor *descriptor = (DdiDescriptor *)destination.ptr;
+    if (!descriptor || !image || !image->sampled_view || args->ResourceDimension != D3D12DDI_RD_TEXTURE2D ||
+        (args->Format != DXGI_FORMAT_UNKNOWN && color_image_format(args->Format) != image->format) ||
+        args->Shader4ComponentMapping != D3D12DDI_DEFAULT_SHADER_4_COMPONENT_MAPPING ||
+        args->Tex2D.MostDetailedMip || args->Tex2D.FirstArraySlice || args->Tex2D.MipLevels != 1 ||
+        args->Tex2D.ArraySize != 1 || args->Tex2D.PlaneSlice || args->Tex2D.ResourceMinLODClamp) {
+        set_command_device_error(device.pDrvPrivate, DXGI_ERROR_UNSUPPORTED);
+        return;
+    }
+    *descriptor = (DdiDescriptor){ .kind = DDI_DESCRIPTOR_SRV, .desc.srv = *args };
+    trace_ddi("CreateShaderResourceView", args->Format, image->extent.width);
+}
+
+static void APIENTRY create_pixel_sampler(D3D12DDI_HDEVICE device, const D3D12DDIARG_CREATE_SAMPLER *args,
+                                           D3D12DDI_CPU_DESCRIPTOR_HANDLE destination)
+{
+    const D3D12DDI_SAMPLER_DESC *sampler = args ? args->pSamplerDesc : NULL;
+    DdiDescriptor *descriptor = (DdiDescriptor *)destination.ptr;
+    if (!descriptor || !sampler || (sampler->Filter & ~D3D12DDI_FILTER_MIN_MAG_MIP_LINEAR) ||
+        sampler->AddressU != D3D12DDI_TEXTURE_ADDRESS_MODE_CLAMP ||
+        sampler->AddressV != D3D12DDI_TEXTURE_ADDRESS_MODE_CLAMP ||
+        sampler->AddressW != D3D12DDI_TEXTURE_ADDRESS_MODE_CLAMP ||
+        sampler->MipLODBias || sampler->MinLOD != 0.0f || !(sampler->MaxLOD >= 0.0f)) {
+        set_command_device_error(device.pDrvPrivate, DXGI_ERROR_UNSUPPORTED);
+        return;
+    }
+    *descriptor = (DdiDescriptor){ .kind = DDI_DESCRIPTOR_SAMPLER, .desc.sampler = *sampler };
+    trace_ddi("CreateSampler", 0, sampler->Filter);
+}
+
+static HRESULT create_venus_pixel_sampler(DdiTransferList *list, const D3D12DDI_SAMPLER_DESC *desc, VkSampler *sampler)
+{
+    const VenusDevice *device = list->venus.device;
+    const PFN_vkCreateSampler create = (PFN_vkCreateSampler)device->proc_addr(device->handle, "vkCreateSampler");
+    if (!create || !device->proc_addr(device->handle, "vkDestroySampler"))
+        return E_FAIL;
+    if (list->pool->sampler_count == _countof(list->pool->samplers))
+        return E_OUTOFMEMORY;
+    const VkSamplerCreateInfo info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .minFilter = desc->Filter & D3D12DDI_FILTER_MIN_LINEAR_MAG_MIP_POINT ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        .magFilter = desc->Filter & D3D12DDI_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        .mipmapMode = desc->Filter & D3D12DDI_FILTER_MIN_MAG_POINT_MIP_LINEAR
+            ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .maxLod = desc->MaxLOD < VK_LOD_CLAMP_NONE ? desc->MaxLOD : VK_LOD_CLAMP_NONE,
+    };
+    const HRESULT status = venus_hresult(create(device->handle, &info, NULL, sampler));
+    if (SUCCEEDED(status))
+        list->pool->samplers[list->pool->sampler_count++] = *sampler;
+    return status;
+}
+
+static HRESULT bind_pixel_descriptors(DdiTransferList *list)
 {
     const DdiDrawState *draw = &list->draw;
-    const DdiDescriptor *descriptor = draw->uniform;
-    VkDescriptorBufferInfo buffer;
-    if (!descriptor || descriptor->kind != DDI_DESCRIPTOR_CBV ||
-        !resolve_buffer_address(list->device, descriptor->desc.cbv.BufferLocation, descriptor->desc.cbv.SizeInBytes,
-                                &buffer))
-        return E_INVALIDARG;
-
     const VenusDevice *device = list->venus.device;
     const PFN_vkCreateDescriptorPool create = (PFN_vkCreateDescriptorPool)
         device->proc_addr(device->handle, "vkCreateDescriptorPool");
@@ -73,36 +125,69 @@ static HRESULT bind_uniform_cbv(DdiTransferList *list)
         device->proc_addr(device->handle, "vkCmdBindDescriptorSets");
     if (!create || !allocate || !update || !bind)
         return E_FAIL;
-    if (!list->pool->uniform_pool) {
+    if (!list->pool->pixel_pool) {
         if (!device->proc_addr(device->handle, "vkDestroyDescriptorPool") ||
             !device->proc_addr(device->handle, "vkResetDescriptorPool"))
             return E_FAIL;
-        const VkDescriptorPoolSize capacity = { .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 64 };
+        const UINT max_sets = _countof(list->pool->samplers);
+        const VkDescriptorPoolSize capacity[] = {
+            { .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = max_sets },
+            { .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .descriptorCount = max_sets },
+            { .type = VK_DESCRIPTOR_TYPE_SAMPLER, .descriptorCount = max_sets },
+        };
         const VkDescriptorPoolCreateInfo info = {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = capacity.descriptorCount,
-            .poolSizeCount = 1, .pPoolSizes = &capacity,
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = max_sets,
+            .poolSizeCount = _countof(capacity), .pPoolSizes = capacity,
         };
         VkDescriptorPool pool;
         const VkResult result = create(device->handle, &info, NULL, &pool);
         if (result != VK_SUCCESS)
             return venus_hresult(result);
-        list->pool->uniform_pool = pool;
+        list->pool->pixel_pool = pool;
     }
     const VkDescriptorSetAllocateInfo allocation = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = list->pool->uniform_pool,
-        .descriptorSetCount = 1, .pSetLayouts = &draw->uniform_set_layout,
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = list->pool->pixel_pool,
+        .descriptorSetCount = 1, .pSetLayouts = &draw->pixel_set_layout,
     };
     VkDescriptorSet set;
     const VkResult result = allocate(device->handle, &allocation, &set);
     if (result != VK_SUCCESS)
         return venus_hresult(result);
-    const VkWriteDescriptorSet write = {
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0,
-        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &buffer,
-    };
-    update(device->handle, 1, &write, 0, NULL);
+    if (draw->pipeline->pixel_bindings == DDI_PIXEL_CBV) {
+        const DdiDescriptor *descriptor = draw->uniform;
+        VkDescriptorBufferInfo buffer;
+        if (!descriptor || descriptor->kind != DDI_DESCRIPTOR_CBV ||
+            !resolve_buffer_address(list->device, descriptor->desc.cbv.BufferLocation, descriptor->desc.cbv.SizeInBytes,
+                                    &buffer))
+            return E_INVALIDARG;
+        const VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0,
+            .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &buffer,
+        };
+        update(device->handle, 1, &write, 0, NULL);
+        trace_ddi("BindUniformCbv", 0, buffer.range);
+    } else {
+        const VenusColorImage *image = draw->texture && draw->texture->kind == DDI_DESCRIPTOR_SRV
+            ? resource_color(device, draw->texture->desc.srv.hDrvResource) : NULL;
+        if (!image || image != list->sampled_color || !draw->sampler || draw->sampler->kind != DDI_DESCRIPTOR_SAMPLER)
+            return E_INVALIDARG;
+        VkSampler sampler;
+        const HRESULT status = create_venus_pixel_sampler(list, &draw->sampler->desc.sampler, &sampler);
+        if (FAILED(status))
+            return status;
+        const VkDescriptorImageInfo texture_info = { .imageView = image->sampled_view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        const VkDescriptorImageInfo sampler_info = { .sampler = sampler };
+        const VkWriteDescriptorSet writes[] = {
+            { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1,
+              .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &texture_info },
+            { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 2,
+              .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = &sampler_info },
+        };
+        update(device->handle, _countof(writes), writes, 0, NULL);
+        trace_ddi("BindSampledTexture", 0, image->extent.width);
+    }
     bind(list->venus.command, VK_PIPELINE_BIND_POINT_GRAPHICS, draw->root_layout, 0, 1, &set, 0, NULL);
-    trace_ddi("BindUniformCbv", 0, buffer.range);
     return S_OK;
 }
 
@@ -123,8 +208,8 @@ static void APIENTRY draw_color_target(D3D12DDI_HCOMMANDLIST handle, UINT vertex
 
     AcquireSRWLockExclusive(&list->pool->lock);
     HRESULT status = list->generation == list->pool->generation ? S_OK : E_INVALIDARG;
-    if (SUCCEEDED(status) && draw->pipeline->uniform_cbv)
-        status = bind_uniform_cbv(list);
+    if (SUCCEEDED(status) && draw->pipeline->pixel_bindings)
+        status = bind_pixel_descriptors(list);
     if (SUCCEEDED(status))
         status = record_venus_color_draw(list->venus.command, image, &draw->viewport, &draw->scissor,
                                          vertex_count, instance_count, first_vertex, first_instance);
@@ -200,8 +285,15 @@ static HRESULT transition_resource(DdiTransferList *list, const D3D12DDIARG_RESO
     const VenusColorImage *image = &heap->image;
     const D3D12DDI_RESOURCE_STATES written_state = heap->color_upload
         ? D3D12DDI_RESOURCE_STATE_COPY_DEST : D3D12DDI_RESOURCE_STATE_RENDER_TARGET;
-    if (before != written_state || image != list->written_color || list->color_copy_source)
+    const VenusColorImage *written = heap->color_upload ? list->uploaded_color : list->written_color;
+    if (before != written_state || image != written || image == list->color_copy_source || image == list->sampled_color)
         return DXGI_ERROR_UNSUPPORTED;
+    if (heap->color_upload && after == D3D12DDI_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+        const HRESULT status = prepare_venus_shader_read(list->venus.command, image);
+        if (SUCCEEDED(status))
+            list->sampled_color = image;
+        return status;
+    }
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
     if (heap->present.allocation && after == D3D12DDI_RESOURCE_STATE_COMMON && !list->present) {
         const HRESULT status = prepare_venus_color_copy(list->venus.command, image, list->color_rendered);
@@ -216,9 +308,10 @@ static HRESULT transition_resource(DdiTransferList *list, const D3D12DDIARG_RESO
 #endif
     if (after != D3D12DDI_RESOURCE_STATE_COPY_SOURCE)
         return DXGI_ERROR_UNSUPPORTED;
-    const HRESULT status = prepare_venus_color_copy(list->venus.command, image, list->color_rendered);
+    const HRESULT status = prepare_venus_color_copy(list->venus.command, image,
+                                                    !heap->color_upload && list->color_rendered);
     if (SUCCEEDED(status))
-        list->color_copy_source = TRUE;
+        list->color_copy_source = image;
     return status;
 }
 
@@ -275,7 +368,7 @@ static HRESULT upload_color_texture_region(DdiTransferList *list, const D3D12DDI
         ? resource_heap(list->venus.device, dst->BaseAddress.UMD.hResource) : NULL;
     const VenusColorImage *image = heap && heap->kind == DDI_HEAP_COLOR_IMAGE && heap->color_upload ? &heap->image : NULL;
     const VenusTransferBuffer *buffer = src ? resource_buffer(list->venus.device, src->BaseAddress.UMD.hResource) : NULL;
-    if (!list->pool || list->written_color || !image || !buffer || !whole_color_copy(image, box))
+    if (!list->pool || list->uploaded_color || !image || !buffer || !whole_color_copy(image, box))
         return DXGI_ERROR_UNSUPPORTED;
     const UINT32 row_pitch = color_copy_row_pitch(src_layout, image);
     AcquireSRWLockExclusive(&list->pool->lock);
@@ -283,7 +376,7 @@ static HRESULT upload_color_texture_region(DdiTransferList *list, const D3D12DDI
         ? upload_venus_color_image(list->venus.command, buffer, src->BaseAddress.UMD.Offset, row_pitch, image)
         : E_INVALIDARG;
     if (SUCCEEDED(status))
-        list->written_color = image;
+        list->uploaded_color = image;
     ReleaseSRWLockExclusive(&list->pool->lock);
     trace_ddi("UploadTextureRegion", (UINT)status, row_pitch);
     return status;
@@ -307,7 +400,7 @@ static void APIENTRY copy_color_texture_region(
         !src_placement->BaseAddress.UMD.Offset ? resource_color(list->venus.device, src_placement->BaseAddress.UMD.hResource) : NULL;
     const VenusTransferBuffer *buffer = dst_placement
         ? resource_buffer(list->venus.device, dst_placement->BaseAddress.UMD.hResource) : NULL;
-    if (!list->pool || !image || image != list->written_color || !list->color_copy_source || !buffer ||
+    if (!list->pool || !image || image != list->color_copy_source || !buffer ||
         dst_x || dst_y || dst_z || !whole_color_copy(image, box)) {
         trace_ddi("CopyTextureRegion layouts", src_layout.Layout, dst_layout.Layout);
         set_command_list_status(list, DXGI_ERROR_UNSUPPORTED);
@@ -315,9 +408,10 @@ static void APIENTRY copy_color_texture_region(
     }
 
     const UINT32 row_pitch = color_copy_row_pitch(dst_layout, image);
+    const BOOL rendered = image == list->written_color && list->color_rendered;
     AcquireSRWLockExclusive(&list->pool->lock);
     const HRESULT status = !list->closed && list->generation == list->pool->generation
-        ? copy_venus_color_to_buffer(list->venus.command, image, list->color_rendered, buffer,
+        ? copy_venus_color_to_buffer(list->venus.command, image, rendered, buffer,
                                     dst_placement->BaseAddress.UMD.Offset, row_pitch)
         : E_INVALIDARG;
     ReleaseSRWLockExclusive(&list->pool->lock);

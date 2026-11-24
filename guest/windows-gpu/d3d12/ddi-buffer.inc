@@ -153,8 +153,10 @@ static void APIENTRY check_resource_allocation(D3D12DDI_HDEVICE device,
         allocation = row_major_allocation(resource->Width, 0);
     } else if (supported_color_image(resource)) {
         VkMemoryRequirements backing;
+        const BOOL shader_resource = !(resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET);
         const HRESULT status = venus_color_image_requirements(venus_device(device), color_image_format(resource->Format),
-                                                              (UINT32)resource->Width, resource->Height, &backing);
+                                                              (UINT32)resource->Width, resource->Height,
+                                                              shader_resource, &backing);
         if (SUCCEEDED(status))
             allocation = row_major_allocation(backing.size, backing.alignment);
         trace_ddi("Color image allocation info", (UINT)status, allocation.ResourceDataSize);
@@ -286,7 +288,7 @@ static HRESULT APIENTRY create_committed_resource(
         backing->color_upload = !(resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET);
         if (!backing->color_upload || (!primary && resource->InitialResourceState == D3D12DDI_RESOURCE_STATE_COPY_DEST))
             status = create_venus_color_image(venus, color_image_format(resource->Format), (UINT32)resource->Width,
-                                             resource->Height, &backing->image);
+                                             resource->Height, backing->color_upload, &backing->image);
         if (SUCCEEDED(status)) {
             if (heap->ByteSize && heap->ByteSize < backing->image.requirements.size) {
                 destroy_venus_color_image(&backing->image);
@@ -561,6 +563,8 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnCreateRenderTargetView = create_color_rtv,
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     .pfnCreateConstantBufferView = create_uniform_cbv,
+    .pfnCreateShaderResourceView = create_sampled_srv,
+    .pfnCreateSampler = create_pixel_sampler,
 #endif
     .pfnCalcPrivateHeapAndResourceSizes = private_resource_sizes,
     .pfnCreateHeapAndResource = create_committed_resource,
@@ -651,7 +655,7 @@ static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
     .pfnSetDescriptorHeaps = set_transfer_descriptor_heaps,
     .pfnSetGraphicsRootSignature = set_transfer_graphics_root,
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
-    .pfnSetGraphicsRootDescriptorTable = set_graphics_uniform_table,
+    .pfnSetGraphicsRootDescriptorTable = set_graphics_pixel_table,
 #endif
     .pfnIASetIndexBuffer = set_transfer_index_buffer,
     .pfnIASetVertexBuffers = set_transfer_vertex_buffers,
