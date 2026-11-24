@@ -1354,6 +1354,9 @@ impl<H: HostVulkan> ExecutorFactory<H> {
 }
 
 impl<H: HostVulkan> SinkFactory for ExecutorFactory<H> {
+    fn wddm_gpu_clock(&self) -> Option<crate::protocol::GpuClockReading> {
+        self.host.wddm_gpu_clock()
+    }
     fn checkpoint(
         renderer: &mut crate::venus::renderer::VenusRenderer<Self>,
         request: crate::renderer::checkpoint::CheckpointRequest<'_>,

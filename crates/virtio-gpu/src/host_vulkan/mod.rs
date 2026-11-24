@@ -174,6 +174,8 @@ impl Drop for SharedMemoryHandle {
 /// The host's Vulkan loader. See the module docs.
 pub struct AshVulkan {
     entry: ash::Entry,
+    #[cfg(windows)]
+    wddm_clock: Option<wddm_clock::ClockRegistry>,
 }
 
 impl std::fmt::Debug for AshVulkan {
@@ -195,7 +197,12 @@ impl AshVulkan {
         // returned `Entry` keeps the library loaded for as long as it lives.
         let entry = unsafe { ash::Entry::load() }
             .map_err(|e| format!("the host has no usable Vulkan loader: {e}"))?;
-        Ok(Self { entry })
+        Ok(Self {
+            entry,
+            #[cfg(windows)]
+            wddm_clock: (std::env::var_os("ENTANGLED_WDDM2_GPU_CLOCK").as_deref() == Some("1".as_ref()))
+                .then(wddm_clock::ClockRegistry::default),
+        })
     }
 
     /// The devices a guest would be shown, and why the rest are hidden:
@@ -332,8 +339,18 @@ fn c_string(text: &Option<String>) -> Option<CString> {
 
 mod command_pool_policy;
 mod macos_pool;
+#[cfg(windows)]
+mod wddm_clock;
 
 impl HostVulkan for AshVulkan {
+    fn wddm_gpu_clock(&self) -> Option<crate::protocol::GpuClockReading> {
+        #[cfg(windows)]
+        if let Some(registry) = &self.wddm_clock {
+            return registry.read();
+        }
+        None
+    }
+
     type Instance = ash::Instance;
     type PhysicalDevice = vk::PhysicalDevice;
     type Device = HostDevice;
@@ -738,6 +755,19 @@ impl HostVulkan for AshVulkan {
             .filter_map(|e| CString::new(e.as_str()).ok())
             .collect();
         let name_ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
+        #[cfg(windows)]
+        let (name_ptrs, clock) = {
+            let clock = self.wddm_clock.as_ref().and_then(|registry| {
+                let family = request.queues.first()?.family;
+                let capability = wddm_clock::ClockCapability::query(&self.entry, instance, device, family)?;
+                Some((registry, capability))
+            });
+            let mut name_ptrs = name_ptrs;
+            if let Some((_, capability)) = clock {
+                name_ptrs.push(capability.extension.as_ptr());
+            }
+            (name_ptrs, clock)
+        };
         let features = request.features.as_ref().map(ToAsh::to_ash);
         let mut group = request
             .group
@@ -765,6 +795,10 @@ impl HostVulkan for AshVulkan {
         // points at is a local that outlives the call.
         let created =
             unsafe { instance.create_device(device, &info, None) }.map_err(result_code)?;
+        #[cfg(windows)]
+        if let Some((registry, capability)) = clock {
+            registry.register(instance, created.handle(), capability);
+        }
         // Resolved by hand rather than through `ash::ext::external_memory_host`,
         // whose fallback for a missing entry point panics.
         // SAFETY: `created` is a live device made with the extension enabled
@@ -833,6 +867,10 @@ impl HostVulkan for AshVulkan {
 
     fn destroy_device(&self, device: HostDevice) {
         let _pool = macos_pool::Pool::new();
+        #[cfg(windows)]
+        if let Some(registry) = &self.wddm_clock {
+            registry.unregister(device.device.handle());
+        }
         let probes = std::mem::take(
             &mut *device
                 .probes

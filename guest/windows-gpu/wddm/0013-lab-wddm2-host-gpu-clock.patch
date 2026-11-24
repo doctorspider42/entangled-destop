@@ -1,0 +1,89 @@
+diff --git a/viogpu/viogpu3d/driver.cpp b/viogpu/viogpu3d/driver.cpp
+index ac1f580..4a68dd2 100644
+--- a/viogpu/viogpu3d/driver.cpp
++++ b/viogpu/viogpu3d/driver.cpp
+@@ -698,12 +698,9 @@ static NTSTATUS APIENTRY EntangledFormatHistoryBuffer(HANDLE context, DXGKARG_FO
+ static NTSTATUS APIENTRY EntangledCalibrateGpuClock(HANDLE adapter, UINT32 node, UINT32 engine,
+                                                    DXGKARG_CALIBRATEGPUCLOCK *calibration)
+ {
+-    UNREFERENCED_PARAMETER(adapter);
+-    UNREFERENCED_PARAMETER(node);
+-    UNREFERENCED_PARAMETER(engine);
+-    UNREFERENCED_PARAMETER(calibration);
+-    // The host GPU's timestamp domain is unavailable through the miniport.
+-    return STATUS_NOT_SUPPORTED;
++    if (!adapter || !calibration || node >= ENTANGLED_GPU_NODE_COUNT || engine != 0)
++        return STATUS_INVALID_PARAMETER;
++    return reinterpret_cast<VioGpuAdapter *>(adapter)->CalibrateGpuClock(calibration);
+ }
+
+ static VOID APIENTRY EntangledSetStablePowerState(HANDLE adapter, const DXGKARG_SETSTABLEPOWERSTATE *args)
+diff --git a/viogpu/viogpu3d/viogpu_adapter.h b/viogpu/viogpu3d/viogpu_adapter.h
+index eaded38..eb2556d 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.h
++++ b/viogpu/viogpu3d/viogpu_adapter.h
+@@ -132,6 +132,10 @@ class VioGpuAdapter : IVioGpuPCI
+     {
+         return m_Flags.DriverStarted;
+     }
++#ifdef ENTANGLED_WDDM2_LAB
++    NTSTATUS CalibrateGpuClock(DXGKARG_CALIBRATEGPUCLOCK *calibration);
++#endif
++
+     BOOLEAN IsHardwareInit() const
+     {
+         return m_Flags.HardwareInit;
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index b53fc6b..93553f7 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -973,6 +973,49 @@ VOID VioGpuAdapter::ResetDevice(VOID)
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
+ }
+
++#ifdef ENTANGLED_WDDM2_LAB
++NTSTATUS VioGpuAdapter::CalibrateGpuClock(DXGKARG_CALIBRATEGPUCLOCK *calibration)
++{
++    // See WDDM_CLOCK_CONFIG_OFFSET in the Entangled virtio-gpu protocol.
++    constexpr unsigned versionOffset = 0x100;
++    constexpr unsigned frequencyOffset = 0x108;
++    constexpr unsigned ticksOffset = 0x110;
++    constexpr UINT32 version1 = 0x43470001;
++    if (!IsHardwareInit())
++        return STATUS_DEVICE_NOT_READY;
++
++    auto readConfig = [this](unsigned offset) {
++        UINT32 value = 0;
++        virtio_get_config(&m_VioDev, offset, &value, sizeof(value));
++        return value;
++    };
++    if (readConfig(versionOffset) != version1)
++        return STATUS_NOT_SUPPORTED;
++
++    const UINT64 frequencyLow = readConfig(frequencyOffset);
++    const UINT64 frequency = (static_cast<UINT64>(readConfig(frequencyOffset + 4)) << 32) | frequencyLow;
++    if (!frequency)
++        return STATUS_NOT_SUPPORTED;
++
++    for (unsigned attempt = 0; attempt != 3; ++attempt)
++    {
++        const LONGLONG before = KeQueryPerformanceCounter(nullptr).QuadPart;
++        const UINT32 high = readConfig(ticksOffset + 4);
++        const UINT32 low = readConfig(ticksOffset);
++        const UINT32 highAgain = readConfig(ticksOffset + 4);
++        const LONGLONG after = KeQueryPerformanceCounter(nullptr).QuadPart;
++        if (high == highAgain && after >= before && readConfig(versionOffset) == version1)
++        {
++            calibration->GpuFrequency = frequency;
++            calibration->GpuClockCounter = (static_cast<UINT64>(high) << 32) | low;
++            calibration->CpuClockCounter = before + (after - before) / 2;
++            return STATUS_SUCCESS;
++        }
++    }
++    return STATUS_DEVICE_NOT_READY;
++}
++#endif
++
+ #pragma code_seg(pop) // End Non-Paged Code
+
+ PAGED_CODE_SEG_BEGIN

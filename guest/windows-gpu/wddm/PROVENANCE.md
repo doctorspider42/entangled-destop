@@ -91,6 +91,12 @@ checkout that still has it.
   contexts and keeps paging and GDI on the physical-address node. It reports
   completion interrupts and fence values for the node that submitted the work.
 
+- `0013-lab-wddm2-host-gpu-clock.patch` implements the WDDM 2.0 lab clock
+  callback using the Entangled virtio-gpu clock registers. It samples guest
+  QPC around a bounded read of the physical GPU counter. The host advertises
+  these registers after it obtains a calibrated device timestamp with
+  `ENTANGLED_WDDM2_GPU_CLOCK=1`.
+
 ## The user-mode driver
 
 `entangled_d3d10.dll` is built from Mesa (MIT), not from virtio-win:

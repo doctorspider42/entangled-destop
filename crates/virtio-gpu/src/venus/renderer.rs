@@ -369,6 +369,10 @@ const CAPSETS: [CapsetInfo; 1] = [CapsetInfo {
 /// ([`VenusError::SinkUnavailable`]): a ring with nowhere to put its bytes is
 /// not one to adopt and then quietly drop the bytes of.
 pub trait SinkFactory: Send {
+    /// A physical GPU timestamp for the WDDM lab. Capture and remote sinks have no clock source.
+    fn wddm_gpu_clock(&self) -> Option<crate::protocol::GpuClockReading> {
+        None
+    }
     /// Factory-specific reconstruction dispatched through the renderer's
     /// object-safe interface. Pure capture/legacy factories refuse by default.
     fn checkpoint(
@@ -3885,6 +3889,9 @@ impl<F: SinkFactory> VenusRenderer<F> {
 }
 
 impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
+    fn wddm_gpu_clock(&self) -> Option<crate::protocol::GpuClockReading> {
+        self.sinks.wddm_gpu_clock()
+    }
     fn checkpoint(
         &mut self,
         request: crate::renderer::checkpoint::CheckpointRequest<'_>,

@@ -2858,6 +2858,18 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
+        let clock_offset = crate::protocol::WDDM_CLOCK_CONFIG_OFFSET;
+        if let Some(start) = offset.checked_sub(clock_offset) {
+            data.fill(0);
+            if start < crate::protocol::WDDM_CLOCK_CONFIG_LEN as u64 {
+                let clock = self.three_d.as_ref().and_then(Gpu3d::wddm_gpu_clock);
+                let bytes = crate::protocol::wddm_clock_config(clock);
+                let tail = &bytes[start as usize..];
+                let count = data.len().min(tail.len());
+                data[..count].copy_from_slice(&tail[..count]);
+            }
+            return;
+        }
         let num_capsets = self
             .three_d
             .as_ref()

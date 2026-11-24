@@ -153,6 +153,10 @@ impl Resource3dDesc {
 /// call (host GL errors, renderer-side limits), which the device answers in
 /// band.
 pub trait Renderer3d: Send {
+    /// A sample for the opt-in WDDM clock calibration registers.
+    fn wddm_gpu_clock(&self) -> Option<crate::protocol::GpuClockReading> {
+        None
+    }
     /// Optional streaming checkpoint implementation. Keeping the default a
     /// refusal prevents legacy renderers from silently losing native state.
     fn checkpoint(&mut self, _: checkpoint::CheckpointRequest<'_>) -> Result<(), CommandError> {
@@ -684,6 +688,10 @@ impl Gpu3d {
             resources: HashMap::new(),
             total_elements: 0,
         }
+    }
+
+    pub(crate) fn wddm_gpu_clock(&self) -> Option<crate::protocol::GpuClockReading> {
+        self.renderer.wddm_gpu_clock()
     }
 
     /// Number of capsets, for `struct virtio_gpu_config`.

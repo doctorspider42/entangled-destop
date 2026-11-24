@@ -235,6 +235,10 @@ pub enum CallError {
 /// the command's return value, never turned into a fatal error, because a
 /// driver refusing a well-formed request is an answer, not a protocol fault.
 pub trait HostVulkan: Send + Sync + 'static {
+    /// A reading from the single physical device used by the WDDM lab.
+    fn wddm_gpu_clock(&self) -> Option<crate::protocol::GpuClockReading> {
+        None
+    }
     /// A host `VkInstance` together with whatever calling it needs.
     type Instance: Send + 'static;
     /// A host `VkPhysicalDevice`.

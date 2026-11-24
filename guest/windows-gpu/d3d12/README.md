@@ -757,6 +757,18 @@ single heap in the same command list. The separate `--clock` probe
 checks the public queue frequency and GPU/QPC calibration path.
 See `ddi40-runtime-gpu-timestamps/` under the lab share.
 
+The Windows host engine can publish calibrated GPU clock samples to the
+lab miniport when launched with `ENTANGLED_WDDM2_GPU_CLOCK=1`.
+Venus obtains physical device-domain samples through Vulkan and
+exposes the frequency and counter in a read-only virtio-gpu configuration
+extension. The miniport pairs its counter read with the guest QPC.
+Build `5.21.1.556` passed the system `GetTimestampFrequency` and
+`GetClockCalibration` calls at 1,000,000,000 GPU ticks per second on the
+RTX 2070. It verified that the returned CPU timestamp was within the
+guest QPC bracket for the calibration call. See
+`ddi40-runtime-wddm-gpu-clock/` under the lab share.
+[Vulkan device time domains](https://docs.vulkan.org/refpages/latest/refpages/source/vkGetCalibratedTimestampsKHR.html).
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

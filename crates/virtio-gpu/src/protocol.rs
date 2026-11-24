@@ -118,6 +118,31 @@ pub const MEM_ENTRY_LEN: usize = 16;
 /// Length of `struct virtio_gpu_config`.
 pub const CONFIG_LEN: usize = 16;
 
+/// Opt-in Entangled WDDM lab clock registers, outside the standard virtio-gpu configuration.
+/// The version is zero until the renderer can serve a physical device clock.
+pub(crate) const WDDM_CLOCK_CONFIG_OFFSET: u64 = 0x100;
+pub(crate) const WDDM_CLOCK_CONFIG_LEN: usize = 24;
+const WDDM_CLOCK_VERSION: u32 = 0x4347_0001;
+
+/// A sample in the same device time domain as Vulkan timestamp queries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuClockReading {
+    /// Device timestamp ticks per second.
+    pub frequency_hz: u64,
+    /// Current device timestamp, in hardware ticks.
+    pub ticks: u64,
+}
+
+pub(crate) fn wddm_clock_config(reading: Option<GpuClockReading>) -> [u8; WDDM_CLOCK_CONFIG_LEN] {
+    let mut bytes = [0; WDDM_CLOCK_CONFIG_LEN];
+    if let Some(reading) = reading {
+        bytes[0..4].copy_from_slice(&WDDM_CLOCK_VERSION.to_le_bytes());
+        bytes[8..16].copy_from_slice(&reading.frequency_hz.to_le_bytes());
+        bytes[16..24].copy_from_slice(&reading.ticks.to_le_bytes());
+    }
+    bytes
+}
+
 /// Length of the EDID blob in `struct virtio_gpu_resp_edid` — always 1024 on
 /// the wire, however much of it the actual EDID uses.
 pub const EDID_BLOB_LEN: usize = 1024;
@@ -1407,6 +1432,19 @@ mod tests {
         assert_eq!(le32(&cfg, 4), 0, "events_clear always reads zero");
         assert_eq!(le32(&cfg, 8), 1, "num_scanouts");
         assert_eq!(le32(&cfg, 12), 0, "num_capsets");
+    }
+
+    #[test]
+    fn wddm_clock_config_is_zero_until_available() {
+        assert_eq!(wddm_clock_config(None), [0; 24]);
+        let clock = GpuClockReading {
+            frequency_hz: 1_000_000_000,
+            ticks: 0x1122_3344_5566_7788,
+        };
+        let bytes = wddm_clock_config(Some(clock));
+        assert_eq!(&bytes[..8], &[1, 0, b'G', b'C', 0, 0, 0, 0]);
+        assert_eq!(&bytes[8..16], &clock.frequency_hz.to_le_bytes());
+        assert_eq!(&bytes[16..24], &clock.ticks.to_le_bytes());
     }
 
     /// Sizes of the 3D command set, straight from `virtio_gpu.h`.
