@@ -106,6 +106,7 @@ static void APIENTRY query_node_map(D3D12DDI_HDEVICE device, UINT physical_adapt
 #include "ddi-shader.inc"
 #endif
 #include "ddi-pipeline-state.inc"
+#include "ddi-descriptor-heap.inc"
 #include "ddi-buffer.inc"
 #endif
 

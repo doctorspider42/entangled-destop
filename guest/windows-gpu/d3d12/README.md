@@ -411,6 +411,13 @@ runtime finished both pipeline initialization paths and reached
 driver's stop callback at that slot. See
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-compute-pso/`.
 
+Build `1.53.20.398` returned a 64-byte RTV descriptor stride from the
+driver's private descriptor storage. The runtime then requested its first
+command pool through `pfnCalcPrivateCommandPoolSize`. Descriptor heap storage
+and handles are defined for all four heap types. Descriptor writes and shader
+binding are still open. See
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-descriptors/`.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a
