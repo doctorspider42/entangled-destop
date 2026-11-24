@@ -449,15 +449,34 @@ buffers. The upload buffer returned a nonzero Venus address, and ETW recorded
 its resource creation. That address identifies the Vulkan buffer for this
 device lifetime. It has no WDDM page-table mapping or KMT allocation handle.
 The runtime removed the device before creating the second committed buffer.
-The trace reports a UMD error, with the exact cause still open. See
-`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-bda/`.
+An output-event breakpoint and matching Microsoft public symbols identified
+`CHeap::LUCCompleteLayerConstruction` calling `CDevice::MakeResident_Worker`.
+The prototype accepted pipelines and declined heap objects, which triggered
+the removal. The lab now accepts a heap if its Vulkan backing remains
+allocated and CPU-mapped. See `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-bda/`
+and `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-out-stack/`.
+
+Build `2.25.9.237` completed creation and residency of both application
+buffers with backing on the physical GPU. The upload used write-combine
+properties and the readback used write-back properties. The runtime then
+queried the buffer's subresource layout before mapping it. See
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-resident-buffers/`.
+
+Build `2.27.22.273` mapped the upload buffer, created a virtual WDDM render
+context for the application's DIRECT queue and allocated a Vulkan command
+buffer from its allocator. The runtime selected list table index 0 and
+requested its initial pipeline state after reset. See
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-subresource/`.
+
+Build `2.30.51.496` bound the runtime's initial graphics pipeline to the
+Vulkan command buffer and advanced to input-assembler state initialization.
+See `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-bind-pso/`.
 
 The experimental `_0040` queue and list callbacks now hold a WDDM context
 and Vulkan command pool, serialize recording on the shared pool and select
 the matching runtime table. The transfer submission callback waits for
-Vulkan completion before returning. The bootstrapping trace has yet to
-exercise those paths through the application's queue. The release build
-continues to decline the provisional DDI.
+Vulkan completion before returning. The release build continues to decline
+the provisional DDI.
 
 ## End-to-end test criteria
 

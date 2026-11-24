@@ -268,6 +268,60 @@ static void APIENTRY reset_command_list(D3D12DDI_HCOMMANDLIST driver_list, const
     set_command_list_status(list, status);
 }
 
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+static void APIENTRY set_command_pipeline(D3D12DDI_HCOMMANDLIST driver_list, D3D12DDI_HPIPELINESTATE driver_pipeline)
+{
+    DdiTransferList *list = driver_list.pDrvPrivate;
+    const DdiPipeline *pipeline = driver_pipeline.pDrvPrivate;
+    if (!list || FAILED(list->status))
+        return;
+    if (!list->pool || !pipeline || !pipeline->pipeline || pipeline->device != list->venus.device) {
+        set_command_list_status(list, E_INVALIDARG);
+        return;
+    }
+    const VenusDevice *device = pipeline->device;
+    const PFN_vkCmdBindPipeline bind = (PFN_vkCmdBindPipeline)device->proc_addr(device->handle, "vkCmdBindPipeline");
+    AcquireSRWLockExclusive(&list->pool->lock);
+    HRESULT status = E_INVALIDARG;
+    if (!list->closed && list->generation == list->pool->generation) {
+        status = bind ? S_OK : E_FAIL;
+        if (bind)
+            bind(list->venus.command, pipeline->bind_point, pipeline->pipeline);
+    }
+    ReleaseSRWLockExclusive(&list->pool->lock);
+    trace_ddi("SetPipelineState", (UINT)status, pipeline->bind_point);
+    set_command_list_status(list, status);
+}
+#endif
+
+typedef struct DdiFence {
+    DdiDevice *device;
+    D3D12DDI_FENCE placement;
+} DdiFence;
+
+static SIZE_T APIENTRY private_fence_size(D3D12DDI_HDEVICE device, const D3D12DDIARG_CREATE_FENCE *args)
+{
+    return device.pDrvPrivate && args ? sizeof(DdiFence) : 0;
+}
+
+static HRESULT APIENTRY create_fence(D3D12DDI_HDEVICE device, D3D12DDI_HFENCE handle,
+                                    const D3D12DDIARG_CREATE_FENCE *args)
+{
+    DdiFence *fence = handle.pDrvPrivate;
+    if (!fence || !device.pDrvPrivate || !args || !args->Fences || args->FenceCount != 1)
+        return E_INVALIDARG;
+    *fence = (DdiFence){ .device = device.pDrvPrivate, .placement = args->Fences[0] };
+    trace_ddi("CreateFence", args->FenceCount, fence->placement.Flags);
+    return S_OK;
+}
+
+static void APIENTRY destroy_fence(D3D12DDI_HDEVICE device, D3D12DDI_HFENCE handle)
+{
+    DdiFence *fence = handle.pDrvPrivate;
+    if (fence && fence->device == device.pDrvPrivate)
+        *fence = (DdiFence){0};
+}
+
 static HRESULT gather_transfer_commands(const DdiDevice *device, UINT count, const D3D12DDI_HCOMMANDLIST *lists,
                                         VkCommandBuffer *commands)
 {

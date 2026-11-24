@@ -3,6 +3,13 @@ typedef struct DdiBufferResource {
     VenusTransferBuffer *backing;
 } DdiBufferResource;
 
+static const VenusTransferBuffer *resource_buffer(D3D12DDI_HDEVICE device, D3D12DDI_HRESOURCE resource)
+{
+    const DdiBufferResource *object = resource.pDrvPrivate;
+    const VenusTransferBuffer *buffer = object ? object->backing : NULL;
+    return buffer && buffer->device == venus_device(device) ? buffer : NULL;
+}
+
 static D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 buffer_allocation_info(UINT64 size)
 {
     const UINT32 alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
@@ -36,19 +43,26 @@ static void APIENTRY check_buffer_allocation(D3D12DDI_HDEVICE device,
 static void APIENTRY check_existing_buffer_allocation(D3D12DDI_HDEVICE device, D3D12DDI_HRESOURCE resource,
                                                       D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 *info)
 {
-    const DdiBufferResource *object = resource.pDrvPrivate;
-    const VenusTransferBuffer *buffer = object ? object->backing : NULL;
-    *info = buffer_allocation_info(buffer && buffer->device == venus_device(device) ? buffer->size : 0);
+    const VenusTransferBuffer *buffer = resource_buffer(device, resource);
+    *info = buffer_allocation_info(buffer ? buffer->size : 0);
     trace_ddi("CheckExistingResourceAllocationInfo", 0, info->ResourceDataSize);
 }
 
 static D3D12DDI_GPU_VIRTUAL_ADDRESS APIENTRY check_buffer_address(D3D12DDI_HDEVICE device, D3D12DDI_HRESOURCE resource)
 {
-    const DdiBufferResource *object = resource.pDrvPrivate;
-    const VenusTransferBuffer *buffer = object ? object->backing : NULL;
-    const VkDeviceAddress address = buffer && buffer->device == venus_device(device) ? buffer->address : 0;
+    const VenusTransferBuffer *buffer = resource_buffer(device, resource);
+    const VkDeviceAddress address = buffer ? buffer->address : 0;
     trace_ddi("CheckResourceVirtualAddress", 0, address != 0);
     return address;
+}
+
+static void APIENTRY check_buffer_subresource(D3D12DDI_HDEVICE device, D3D12DDI_HRESOURCE resource, UINT subresource,
+                                             D3D12DDI_SUBRESOURCE_INFO *info)
+{
+    const VenusTransferBuffer *buffer = resource_buffer(device, resource);
+    const UINT64 stride = buffer && !subresource ? buffer->size : 0;
+    *info = (D3D12DDI_SUBRESOURCE_INFO){ .RowStride = stride, .DepthStride = stride };
+    trace_ddi("CheckSubresourceInfo", subresource, stride);
 }
 
 static D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY private_buffer_sizes(
@@ -127,6 +141,7 @@ static HRESULT APIENTRY map_buffer_heap(D3D12DDI_HDEVICE device, D3D12DDI_HHEAP 
     if (!buffer || buffer->device != venus_device(device) || !buffer->mapped || !data)
         return E_INVALIDARG;
     *data = buffer->mapped;
+    trace_ddi("MapHeap", 0, buffer->size);
     return S_OK;
 }
 
@@ -135,6 +150,53 @@ static void APIENTRY unmap_buffer_heap(D3D12DDI_HDEVICE device, D3D12DDI_HHEAP h
     /* The coherent Vulkan mapping lives as long as the backing allocation. */
     (void)device;
     (void)heap;
+}
+
+static HRESULT check_backing_resident(const VenusDevice *device, D3D12DDI_HANDLE_AND_TYPE object)
+{
+    if (!object.Handle)
+        return E_INVALIDARG;
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    if (object.Type == D3D12DDI_HT_PIPELINE_STATE) {
+        const DdiPipeline *state = object.Handle;
+        return state->pipeline && state->device == device ? S_OK : E_INVALIDARG;
+    }
+#endif
+    const VenusTransferBuffer *buffer;
+    switch (object.Type) {
+    case D3D12DDI_HT_HEAP:
+        buffer = object.Handle;
+        break;
+    case D3D12DDI_HT_0012_RESOURCE:
+        buffer = ((const DdiBufferResource *)object.Handle)->backing;
+        break;
+    default:
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    return buffer && buffer->memory && buffer->mapped && buffer->device == device ? S_OK : E_INVALIDARG;
+}
+
+static HRESULT APIENTRY make_venus_objects_resident(D3D12DDI_HDEVICE handle, D3D12DDIARG_MAKERESIDENT_0001 *args)
+{
+    const VenusDevice *device = venus_device(handle);
+    if (!device || !args || (args->NumObjects && !args->pObjects))
+        return E_INVALIDARG;
+    if (args->NumAdapters > 1)
+        return DXGI_ERROR_UNSUPPORTED;
+    for (UINT i = 0; i < args->NumObjects; ++i) {
+        const D3D12DDI_HANDLE_AND_TYPE object = args->pObjects[i];
+        const HRESULT status = check_backing_resident(device, object);
+        trace_ddi("MakeResident object", object.Type, (UINT)status);
+        if (FAILED(status))
+            return status;
+    }
+
+    /* The probe keeps Venus backing allocated throughout each object's lifetime. */
+    args->WaitMask = 0;
+    if (args->NumAdapters && args->pPagingFenceValue)
+        args->pPagingFenceValue[0] = 0;
+    trace_ddi("MakeResident", args->NumObjects, args->NumAdapters);
+    return S_OK;
 }
 
 static void APIENTRY get_debug_allocation_info(D3D12DDI_HDEVICE device, D3D12DDI_HANDLE_AND_TYPE object,
@@ -158,6 +220,9 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnCalcPrivateCommandListSize = private_command_list_size,
     .pfnCreateCommandList = create_command_list,
     .pfnDestroyCommandList = destroy_command_list,
+    .pfnCalcPrivateFenceSize = private_fence_size,
+    .pfnCreateFence = create_fence,
+    .pfnDestroyFence = destroy_fence,
     .pfnCalcPrivateCommandPoolSize = private_command_pool_size,
     .pfnCreateCommandPool = create_command_pool,
     .pfnDestroyCommandPool = destroy_command_pool,
@@ -183,8 +248,8 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnCalcPrivatePipelineStateSize = private_pipeline_size,
     .pfnCreatePipelineState = create_pipeline,
     .pfnDestroyPipelineState = destroy_pipeline,
-    .pfnMakeResident = make_pipeline_resident,
 #endif
+    .pfnMakeResident = make_venus_objects_resident,
     .pfnCalcPrivateRootSignatureSize = private_root_signature_size,
     .pfnCreateRootSignature = create_root_signature,
     .pfnDestroyRootSignature = destroy_root_signature,
@@ -200,6 +265,7 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnMapHeap = map_buffer_heap,
     .pfnUnmapHeap = unmap_buffer_heap,
     .pfnCheckResourceAllocationInfo = check_buffer_allocation,
+    .pfnCheckSubresourceInfo = check_buffer_subresource,
     .pfnCheckExistingResourceAllocationInfo = check_existing_buffer_allocation,
     .pfnCheckResourceVirtualAddress = check_buffer_address,
     .pfnGetDebugAllocationInfo = get_debug_allocation_info,
@@ -262,6 +328,9 @@ static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
     .pfnCloseCommandList = close_transfer_list,
     .pfnResetCommandList = reset_command_list,
     .pfnCopyBufferRegion = copy_buffer_region,
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    .pfnSetPipelineState = set_command_pipeline,
+#endif
 };
 
 static HRESULT probe_ddi_transfer_list(D3D12DDI_HDEVICE device, D3D12DDI_HRESOURCE dst, D3D12DDI_HRESOURCE src,

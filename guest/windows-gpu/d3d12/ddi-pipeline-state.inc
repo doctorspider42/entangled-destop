@@ -34,6 +34,7 @@ GRAPHICS_STATE_DDI(rasterizer_state, D3D12DDI_RASTERIZER_DESC_0010, D3D12DDI_HRA
 typedef struct DdiPipeline {
     const VenusDevice *device;
     VkPipeline pipeline;
+    VkPipelineBindPoint bind_point;
     VkRenderPass render_pass;
 } DdiPipeline;
 
@@ -75,6 +76,7 @@ static HRESULT create_compute_pipeline(const VenusDevice *venus, const D3D12DDIA
     if (result == VK_SUCCESS) {
         state->device = venus;
         state->pipeline = pipeline;
+        state->bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
     } else if (pipeline) {
         destroy(venus->handle, pipeline, NULL);
     }
@@ -167,6 +169,7 @@ static HRESULT APIENTRY create_pipeline(D3D12DDI_HDEVICE device,
     if (result == VK_SUCCESS) {
         state->device = venus;
         state->pipeline = pipeline;
+        state->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
         state->render_pass = render_pass;
     } else {
         if (pipeline)
@@ -176,29 +179,6 @@ static HRESULT APIENTRY create_pipeline(D3D12DDI_HDEVICE device,
     const HRESULT status = venus_hresult(result);
     trace_ddi("CreatePipelineState", (UINT)status, state->pipeline != VK_NULL_HANDLE);
     return status;
-}
-
-static HRESULT APIENTRY make_pipeline_resident(D3D12DDI_HDEVICE device, D3D12DDIARG_MAKERESIDENT_0001 *args)
-{
-    if (!device.pDrvPrivate || !args || (args->NumObjects && !args->pObjects))
-        return E_INVALIDARG;
-    if (args->NumAdapters > 1)
-        return DXGI_ERROR_UNSUPPORTED;
-    for (UINT i = 0; i < args->NumObjects; ++i) {
-        const D3D12DDI_HANDLE_AND_TYPE *object = &args->pObjects[i];
-        if (object->Type != D3D12DDI_HT_PIPELINE_STATE)
-            return DXGI_ERROR_UNSUPPORTED;
-        const DdiPipeline *state = object->Handle;
-        if (!state || !state->pipeline || state->device != venus_device(device))
-            return E_INVALIDARG;
-    }
-
-    /* These Vulkan pipelines were allocated at creation and have no WDDM paging fence. */
-    args->WaitMask = 0;
-    if (args->NumAdapters && args->pPagingFenceValue)
-        args->pPagingFenceValue[0] = 0;
-    trace_ddi("MakeResident", args->NumObjects, args->NumAdapters);
-    return S_OK;
 }
 
 static void APIENTRY destroy_pipeline(D3D12DDI_HDEVICE device, D3D12DDI_HPIPELINESTATE handle)
