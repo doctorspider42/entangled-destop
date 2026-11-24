@@ -1156,6 +1156,54 @@ Evidence: `F:\entangled-targets\dwm3d\evidence-lazy\` (`p1-fixed-with-mapcheck.p
 the oracle's run `M11-*`, shots `X12-*`, `D13*`, `L12-*-long-*`, effects
 `fx-fix12-*`, `fx-def13-*`).
 
+### Amendment, 2026-11-24: the render driver's control-queue wait
+
+In `entangled-gpu.sys`, a command which survived the initial spin would
+check for completion again after `KeDelayExecutionThread(1 ms)`. Windows
+could wake the waiter on the next ordinary system tick. The waiter holds
+the control queue's single command slot, so this wakeup delay can block
+subsequent GPU work from both applications and the desktop compositor.
+
+The slow path now waits on a high-resolution one-shot timer before
+checking the used ring again. The timer belongs to the outstanding
+command and is deleted before returning. The immediate poll path, the
+fence retirement condition and the queue serialization are unchanged.
+If timer allocation fails, the driver uses its ordinary delay.
+
+In the separate Windows 10 lab, build `22.23.12.781` replaced
+`13.32.52.201` on the render-only function. WDDM stayed at
+`21.22.46.312`. The 1920×1080 guest ran at 60 Hz on the RTX 2070.
+Each row has 16 valid guest QPC-to-GDI samples per action. The desktop
+test opened the stock Windows Explorer context menu. The scroll test
+used the unchanged Wintanyl F239 and the 80-file directory.
+
+| Render driver | Desktop menu median / max | F239 scroll median / max |
+| --- | ---: | ---: |
+| Original driver | 131.83 / 764.26 ms | 80.16 / 135.18 ms |
+| High-resolution wait, first run | 112.34 / 310.07 ms | 67.24 / 415.21 ms |
+| High-resolution wait, repeat | 99.79 / 181.39 ms | 82.85 / 110.13 ms |
+| Original driver, restored | 149.41 / 934.71 ms | 106.71 / 418.06 ms |
+
+The menu median improved in both candidate runs and rose after restoring
+the original binary. Scroll medians and tails varied. An additional
+16-sample menu trace per driver separated the popup's Windows show event
+from the menu pixels. Right-click to event changed from 38.85 to 36.73 ms
+at the median. Event to pixels changed from 78.89 to 57.52 ms. The latter
+interval includes composition, Windows event delivery and GDI sampling
+jitter.
+
+The candidate passed the Venus version round trip and a public D3D12
+draw on the Entangled WDDM adapter. The draw verified 2,993 pixels after
+the fence. A second invocation of the Venus probe in the same boot
+received `INVALID_CONTEXT_ID` for its hard-coded context. The successful
+first probe leaves that context allocated. The restored original driver
+reproduced the same first-pass, second-failure sequence.
+
+The lab package active on the render node was checked against the signed
+binary's SHA-256. Probes, installer logs, images and CSVs are under
+`F:/VMs/Entangled/d3d12-lab/present-latency-fix/` and
+`F:/VMs/Entangled/d3d12-lab/share/present-latency-fix/`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

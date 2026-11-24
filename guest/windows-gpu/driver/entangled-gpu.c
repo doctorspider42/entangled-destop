@@ -589,13 +589,15 @@ NTSTATUS EgEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
 }
 
 /* One control command: `request` bytes from the command page out, up to
- * `answer` bytes back into its second half. Polled, up to two seconds. */
+ * `answer` bytes back into its second half. */
 static NTSTATUS Command(DEVICE_CONTEXT *ctx, ULONG request, ULONG answer)
 {
     VIRTQ_DESC *desc = (VIRTQ_DESC *)ctx->Ring;
     volatile UINT16 *avail = (volatile UINT16 *)(ctx->Ring + 1024);
     volatile UINT16 *used = (volatile UINT16 *)(ctx->Ring + 2048);
     LARGE_INTEGER wait;
+    PEX_TIMER pollTimer;
+    NTSTATUS status = STATUS_IO_TIMEOUT;
     ULONG tries;
 
     if (!ctx->Ready || request > REQ_MAX || answer > ANSWER_MAX) {
@@ -618,8 +620,7 @@ static NTSTATUS Command(DEVICE_CONTEXT *ctx, ULONG request, ULONG answer)
     W16(ctx->NotifyBase, ctx->QueueNotifyOff * ctx->NotifyMultiplier, 0);
 
     wait.QuadPart = -10 * 1000; /* 1 ms */
-    /* Most answers come within microseconds: spin up to ~2 ms first, since
-     * a 1 ms sleep really lasts a whole timer tick (~15 ms) on Windows. */
+    /* Keep the fast path for commands that retire before a sleep costs. */
     for (tries = 0; tries < 2000; tries++) {
         KeMemoryBarrier();
         if (used[1] != ctx->LastUsed) {
@@ -628,16 +629,28 @@ static NTSTATUS Command(DEVICE_CONTEXT *ctx, ULONG request, ULONG answer)
         }
         KeStallExecutionProcessor(1);
     }
-    /* Then up to ten seconds: a fenced submit answers once the GPU is done. */
+    /* A fenced submit answers once the GPU is done. Poll at 1 ms while the
+     * shared command slot is held. Allocate the high-resolution timer only
+     * on this slow path and keep its lifetime within this command. */
+    pollTimer = ExAllocateTimer(NULL, NULL, EX_TIMER_HIGH_RESOLUTION);
     for (tries = 0; tries < 10000; tries++) {
         KeMemoryBarrier();
         if (used[1] != ctx->LastUsed) {
             ctx->LastUsed = used[1];
-            return STATUS_SUCCESS;
+            status = STATUS_SUCCESS;
+            break;
         }
-        KeDelayExecutionThread(KernelMode, FALSE, &wait);
+        if (pollTimer != NULL) {
+            ExSetTimer(pollTimer, wait.QuadPart, 0, NULL);
+            KeWaitForSingleObject(pollTimer, Executive, KernelMode, FALSE, NULL);
+        } else {
+            KeDelayExecutionThread(KernelMode, FALSE, &wait);
+        }
     }
-    return STATUS_IO_TIMEOUT;
+    if (pollTimer != NULL) {
+        ExDeleteTimer(pollTimer, TRUE, TRUE, NULL);
+    }
+    return status;
 }
 
 static NTSTATUS HeaderCommand(DEVICE_CONTEXT *ctx, ULONG request, ULONG *type);
