@@ -1466,6 +1466,41 @@ directory. `fx-snapshot2` has the host pixel log. The post-crash samples
 include a shell restart and are unsuitable for comparing animation
 cadence. The archived host trace is `run-before-lamp-reset-20261125-004127.log`.
 
+#### Keeping the composition device alive
+
+The next Wintanyl build kept the same bound `CompositionGraphicsDevice`
+for the lifetime of the effect. It still produced a separate drawing
+surface for each gesture. It completed 16 consecutive minimize/restore
+pairs plus eight more in a same-binary ABBA comparison without a shell
+restart. This ordinary API lifetime change avoided the previously
+reproducible failure in these trials. It does not identify the stale
+reference inside the driver. After the first use, GPU copy submission
+and `EndDraw` took 13–35 ms in the 16-pair run. The first device bind took
+16 ms and the first copy took 80 ms.
+
+The ABBA run used one release binary and the same guest scene and host
+capture rectangle for both modes, with eight gestures per direction
+and mode. The intervals below are between changes of at least 150 pixels
+in the sampled window area. The rectangle did not include the dock, so
+its first change is a region-of-interest onset rather than the first
+visible pixel anywhere along the animation. Command-file polling is
+included in the onset.
+
+| Gesture | Source | First change in region p50 | Pixel gap p50 / max | Max guest scanout gap |
+| --- | --- | ---: | ---: | ---: |
+| Minimize | Live strip surfaces | 507 ms | 100 / 583 ms | 579 ms |
+| Minimize | Shared GPU raster | 420 ms | 33 / 250 ms | 186 ms |
+| Restore | Live strip surfaces | 427 ms | 83 / 450 ms | 448 ms |
+| Restore | Shared GPU raster | 473 ms | 33 / 50 ms | 383 ms |
+
+The raster improved cadence in the sampled area in both directions. The
+restore onset and the remaining scanout gap are still large. The
+Wintanyl implementation is opt-in via `WT_BENCH_LAMP_SNAPSHOT=1` in
+commit `0b6142d`; separate W4 decorations still use the live source.
+The dedicated VM returned to the stock F239 shell after both runs.
+Raw results are `fx-snapshot-reused-device` and `fx-snapshot-abba` in
+the lab's `physical-wheel` directory.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
