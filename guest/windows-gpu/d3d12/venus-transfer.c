@@ -85,6 +85,7 @@ HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize siz
     result = allocate(device->handle, &allocation, NULL, &memory);
     if (result == VK_SUCCESS) {
         buffer->memory = memory;
+        buffer->memory_type = type;
         result = bind(device->handle, handle, memory, 0);
     }
     if (result == VK_SUCCESS && address) {
@@ -181,6 +182,7 @@ static VkImageCreateInfo color_image_info(VkFormat format, UINT32 width, UINT32 
     const UINT32 padded_width = color_row_pitch(format, width) / color_texel_size(format);
     return (VkImageCreateInfo){
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .flags = shader_resource ? VK_IMAGE_CREATE_ALIAS_BIT : 0,
         .imageType = VK_IMAGE_TYPE_2D,
         .format = format,
         .extent = { shader_resource ? width : padded_width, height, 1 },
@@ -264,14 +266,51 @@ static HRESULT create_local_image(const VenusDevice *device, const VkImageCreate
     return venus_hresult(result);
 }
 
+static HRESULT bind_placed_image(const VenusTransferBuffer *storage, VkDeviceSize offset,
+                                  const VkImageCreateInfo *info, VkImage *image, VkMemoryRequirements *requirements)
+{
+    const VenusDevice *device = storage->device;
+    const PFN_vkCreateImage create = DEVICE_FN(device, vkCreateImage);
+    const PFN_vkGetImageMemoryRequirements2 query = DEVICE_FN(device, vkGetImageMemoryRequirements2);
+    const PFN_vkBindImageMemory bind = DEVICE_FN(device, vkBindImageMemory);
+    const PFN_vkDestroyImage destroy = DEVICE_FN(device, vkDestroyImage);
+    if (!create || !query || !bind || !destroy)
+        return DXGI_ERROR_UNSUPPORTED;
+
+    VkImage handle;
+    const VkResult created = create(device->handle, info, NULL, &handle);
+    if (created != VK_SUCCESS)
+        return venus_hresult(created);
+
+    VkMemoryDedicatedRequirements dedicated = { .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS };
+    VkMemoryRequirements2 output = { .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, .pNext = &dedicated };
+    const VkImageMemoryRequirementsInfo2 input = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+        .image = handle };
+    query(device->handle, &input, &output);
+    const VkMemoryRequirements req = output.memoryRequirements;
+    HRESULT status = DXGI_ERROR_UNSUPPORTED;
+    if (!dedicated.requiresDedicatedAllocation && req.alignment && req.size &&
+        (req.memoryTypeBits & (1u << storage->memory_type)) && offset % req.alignment == 0 &&
+        offset < storage->size && req.size <= storage->size - offset)
+        status = venus_hresult(bind(device->handle, handle, storage->memory, offset));
+    if (FAILED(status)) {
+        destroy(device->handle, handle, NULL);
+        return status;
+    }
+    *image = handle;
+    *requirements = req;
+    return S_OK;
+}
+
 static const VkImageSubresourceRange color_subresource = {
     .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
     .levelCount = 1,
     .layerCount = 1,
 };
 
-HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
-                                 BOOL shader_resource, VenusColorImage *image)
+static HRESULT create_color_image(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
+                                  BOOL shader_resource, const VenusTransferBuffer *storage, VkDeviceSize offset,
+                                  VenusColorImage *image)
 {
     *image = (VenusColorImage){0};
     const PFN_vkGetImageSubresourceLayout layout = DEVICE_FN(device, vkGetImageSubresourceLayout);
@@ -280,7 +319,8 @@ HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UIN
         (shader_resource && (!create_view || !DEVICE_FN(device, vkDestroyImageView))))
         return DXGI_ERROR_UNSUPPORTED;
     const VkImageCreateInfo info = color_image_info(format, width, height, shader_resource);
-    HRESULT status = create_local_image(device, &info, &image->handle, &image->memory, &image->requirements);
+    HRESULT status = storage ? bind_placed_image(storage, offset, &info, &image->handle, &image->requirements)
+        : create_local_image(device, &info, &image->handle, &image->memory, &image->requirements);
     if (FAILED(status))
         return status;
     image->device = device;
@@ -308,6 +348,18 @@ HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UIN
         return S_OK;
     destroy_venus_color_image(image);
     return DXGI_ERROR_UNSUPPORTED;
+}
+
+HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
+                                 BOOL shader_resource, VenusColorImage *image)
+{
+    return create_color_image(device, format, width, height, shader_resource, NULL, 0, image);
+}
+
+HRESULT create_venus_placed_sampled_image(const VenusTransferBuffer *storage, VkDeviceSize offset,
+                                          VkFormat format, UINT32 width, UINT32 height, VenusColorImage *image)
+{
+    return create_color_image(storage->device, format, width, height, TRUE, storage, offset, image);
 }
 
 void destroy_venus_color_image(VenusColorImage *image)

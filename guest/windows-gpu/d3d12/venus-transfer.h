@@ -12,6 +12,7 @@ typedef struct VenusTransferBuffer {
     VkDeviceAddress address;
     void *mapped;
     VkBufferUsageFlags usage;
+    UINT32 memory_type;
 } VenusTransferBuffer;
 
 typedef enum VenusBufferMemory {
@@ -50,6 +51,8 @@ HRESULT venus_color_image_requirements(const VenusDevice *device, VkFormat forma
                                       BOOL shader_resource, VkMemoryRequirements *requirements);
 HRESULT create_venus_color_image(const VenusDevice *device, VkFormat format, UINT32 width, UINT32 height,
                                  BOOL shader_resource, VenusColorImage *image);
+HRESULT create_venus_placed_sampled_image(const VenusTransferBuffer *storage, VkDeviceSize offset,
+                                          VkFormat format, UINT32 width, UINT32 height, VenusColorImage *image);
 void destroy_venus_color_image(VenusColorImage *image);
 HRESULT record_venus_clear_color(VkCommandBuffer command, const VenusColorImage *image, const FLOAT color[4]);
 HRESULT record_venus_clear_attachment(VkCommandBuffer command, VenusColorImage *image, const FLOAT color[4], BOOL initialized);

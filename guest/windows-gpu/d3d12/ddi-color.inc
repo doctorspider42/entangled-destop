@@ -1,15 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-static VenusColorImage *resource_color(const VenusDevice *device, D3D12DDI_HRESOURCE resource)
-{
-    DdiHeap *heap = resource_heap(device, resource);
-    return heap && heap->kind == DDI_HEAP_COLOR_IMAGE ? &heap->image : NULL;
-}
-
 static void APIENTRY create_color_rtv(D3D12DDI_HDEVICE device, const D3D12DDIARG_CREATE_RENDER_TARGET_VIEW_0002 *args,
                                       D3D12DDI_CPU_DESCRIPTOR_HANDLE destination)
 {
-    const DdiHeap *heap = args ? resource_heap(venus_device(device), args->hDrvResource) : NULL;
-    const VenusColorImage *image = heap && heap->kind == DDI_HEAP_COLOR_IMAGE && !heap->color_upload ? &heap->image : NULL;
+    const VenusColorImage *image = args ? resource_color(venus_device(device), args->hDrvResource) : NULL;
     DdiDescriptor *descriptor = (DdiDescriptor *)destination.ptr;
     if (descriptor && args && !args->hDrvResource.pDrvPrivate && color_image_format(args->Format) != VK_FORMAT_UNDEFINED &&
         args->ResourceDimension == D3D12DDI_RD_TEXTURE2D && !args->Tex2D.MipSlice &&
@@ -18,7 +11,7 @@ static void APIENTRY create_color_rtv(D3D12DDI_HDEVICE device, const D3D12DDIARG
         trace_ddi("CreateNullRenderTargetView", args->Format, 0);
         return;
     }
-    if (!descriptor || !image || args->ResourceDimension != D3D12DDI_RD_TEXTURE2D ||
+    if (!descriptor || !image || image->sampled_view || args->ResourceDimension != D3D12DDI_RD_TEXTURE2D ||
         (args->Format != DXGI_FORMAT_UNKNOWN && color_image_format(args->Format) != image->format) ||
         args->Tex2D.MipSlice || args->Tex2D.FirstArraySlice || args->Tex2D.PlaneSlice || args->Tex2D.ArraySize != 1) {
         set_command_device_error(device.pDrvPrivate, DXGI_ERROR_UNSUPPORTED);
@@ -294,19 +287,20 @@ static HRESULT transition_resource(DdiTransferList *list, const D3D12DDIARG_RESO
             return DXGI_ERROR_UNSUPPORTED;
         return record_venus_buffer_barrier(list->venus.command, buffer, buffer_access(before), buffer_access(after));
     }
-    if (heap->kind != DDI_HEAP_COLOR_IMAGE)
+    const VenusColorImage *image = resource_color(list->venus.device, barrier->Transition.hResource);
+    if (!image)
         return DXGI_ERROR_UNSUPPORTED;
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
     if (heap->present.allocation && before == D3D12DDI_RESOURCE_STATE_COMMON && after == D3D12DDI_RESOURCE_STATE_RENDER_TARGET)
         return S_OK; /* The lab draw and clear discard the previous destination contents. */
 #endif
-    const VenusColorImage *image = &heap->image;
-    const D3D12DDI_RESOURCE_STATES written_state = heap->color_upload
+    const BOOL color_upload = image->sampled_view != VK_NULL_HANDLE;
+    const D3D12DDI_RESOURCE_STATES written_state = color_upload
         ? D3D12DDI_RESOURCE_STATE_COPY_DEST : D3D12DDI_RESOURCE_STATE_RENDER_TARGET;
-    const VenusColorImage *written = heap->color_upload ? list->uploaded_color : list->written_color;
+    const VenusColorImage *written = color_upload ? list->uploaded_color : list->written_color;
     if (before != written_state || image != written || image == list->color_copy_source || image == list->sampled_color)
         return DXGI_ERROR_UNSUPPORTED;
-    if (heap->color_upload && after == D3D12DDI_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+    if (color_upload && after == D3D12DDI_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
         const HRESULT status = prepare_venus_shader_read(list->venus.command, image);
         if (SUCCEEDED(status))
             list->sampled_color = image;
@@ -329,7 +323,7 @@ static HRESULT transition_resource(DdiTransferList *list, const D3D12DDIARG_RESO
     if (after != D3D12DDI_RESOURCE_STATE_COPY_SOURCE)
         return DXGI_ERROR_UNSUPPORTED;
     const HRESULT status = prepare_venus_color_copy(list->venus.command, image,
-                                                    !heap->color_upload && list->color_rendered);
+                                                    !color_upload && list->color_rendered);
     if (SUCCEEDED(status))
         list->color_copy_source = image;
     return status;
@@ -384,11 +378,10 @@ static HRESULT upload_color_texture_region(DdiTransferList *list, const D3D12DDI
                                              const D3D12DDIARG_BUFFER_PLACEMENT *src,
                                              D3D12DDIARG_PLACED_RESOURCE src_layout, const D3D12DDI_BOX *box)
 {
-    const DdiHeap *heap = dst && !dst->BaseAddress.UMD.Offset
-        ? resource_heap(list->venus.device, dst->BaseAddress.UMD.hResource) : NULL;
-    const VenusColorImage *image = heap && heap->kind == DDI_HEAP_COLOR_IMAGE && heap->color_upload ? &heap->image : NULL;
+    const VenusColorImage *image = dst && !dst->BaseAddress.UMD.Offset
+        ? resource_color(list->venus.device, dst->BaseAddress.UMD.hResource) : NULL;
     const VenusTransferBuffer *buffer = src ? resource_buffer(list->venus.device, src->BaseAddress.UMD.hResource) : NULL;
-    if (!list->pool || list->uploaded_color || !image || !buffer || !whole_color_copy(image, box))
+    if (!list->pool || list->uploaded_color || !image || !image->sampled_view || !buffer || !whole_color_copy(image, box))
         return DXGI_ERROR_UNSUPPORTED;
     const UINT32 row_pitch = color_copy_row_pitch(src_layout, image);
     AcquireSRWLockExclusive(&list->pool->lock);

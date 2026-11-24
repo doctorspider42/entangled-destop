@@ -8,7 +8,7 @@ typedef enum DdiHeapKind {
 typedef struct DdiHeap {
     const VenusDevice *device;
     DdiHeapKind kind;
-    BOOL color_upload;
+    D3D12DDI_HEAP_FLAGS flags;
     union {
         VenusTransferBuffer buffer;
         VenusColorImage image;
@@ -24,6 +24,7 @@ typedef struct DdiHeap {
 typedef struct DdiResource {
     DdiHeap *heap;
     VenusTransferBuffer placed_buffer;
+    VenusColorImage placed_image;
 } DdiResource;
 
 static DdiHeap *resource_heap(const VenusDevice *device, D3D12DDI_HRESOURCE resource)
@@ -31,6 +32,17 @@ static DdiHeap *resource_heap(const VenusDevice *device, D3D12DDI_HRESOURCE reso
     const DdiResource *object = resource.pDrvPrivate;
     DdiHeap *heap = object ? object->heap : NULL;
     return device && heap && heap->device == device ? heap : NULL;
+}
+
+static VenusColorImage *resource_color(const VenusDevice *device, D3D12DDI_HRESOURCE resource)
+{
+    DdiHeap *heap = resource_heap(device, resource);
+    if (!heap)
+        return NULL;
+    DdiResource *object = resource.pDrvPrivate;
+    if (object->placed_image.handle)
+        return &object->placed_image;
+    return heap->kind == DDI_HEAP_COLOR_IMAGE ? &heap->image : NULL;
 }
 
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
@@ -43,6 +55,8 @@ static const VenusTransferBuffer *resource_buffer(const VenusDevice *device, D3D
     if (!heap || heap->kind != DDI_HEAP_TRANSFER_BUFFER)
         return NULL;
     const DdiResource *object = resource.pDrvPrivate;
+    if (object->placed_image.handle)
+        return NULL;
     return object->placed_buffer.handle ? &object->placed_buffer : &heap->buffer;
 }
 
@@ -180,9 +194,9 @@ static void APIENTRY check_resource_allocation(D3D12DDI_HDEVICE device,
 static void APIENTRY check_existing_resource_allocation(D3D12DDI_HDEVICE device, D3D12DDI_HRESOURCE resource,
                                                       D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 *info)
 {
-    const DdiHeap *heap = resource_heap(venus_device(device), resource);
-    if (heap && heap->kind == DDI_HEAP_COLOR_IMAGE)
-        *info = row_major_allocation(heap->image.requirements.size, heap->image.requirements.alignment);
+    const VenusColorImage *image = resource_color(venus_device(device), resource);
+    if (image)
+        *info = row_major_allocation(image->requirements.size, image->requirements.alignment);
     else {
         const VenusTransferBuffer *buffer = resource_buffer(venus_device(device), resource);
         *info = row_major_allocation(buffer ? buffer->size : 0, 0);
@@ -202,14 +216,14 @@ static void APIENTRY check_resource_subresource(D3D12DDI_HDEVICE device, D3D12DD
                                              D3D12DDI_SUBRESOURCE_INFO *info)
 {
     *info = (D3D12DDI_SUBRESOURCE_INFO){0};
-    const DdiHeap *heap = resource_heap(venus_device(device), resource);
-    if (heap && !subresource) {
+    if (!subresource) {
         const VenusTransferBuffer *buffer = resource_buffer(venus_device(device), resource);
+        const VenusColorImage *image = resource_color(venus_device(device), resource);
         if (buffer)
             *info = (D3D12DDI_SUBRESOURCE_INFO){ .RowStride = buffer->size, .DepthStride = buffer->size };
-        else if (heap->kind == DDI_HEAP_COLOR_IMAGE)
-            *info = (D3D12DDI_SUBRESOURCE_INFO){ .Offset = heap->image.layout.offset,
-                .RowStride = heap->image.layout.rowPitch, .DepthStride = heap->image.layout.rowPitch * heap->image.extent.height };
+        else if (image)
+            *info = (D3D12DDI_SUBRESOURCE_INFO){ .Offset = image->layout.offset,
+                .RowStride = image->layout.rowPitch, .DepthStride = image->layout.rowPitch * image->extent.height };
     }
     trace_ddi("CheckSubresourceInfo", subresource, info->RowStride);
 }
@@ -300,6 +314,36 @@ static HRESULT create_placed_buffer(const VenusDevice *venus, const D3D12DDIARG_
     return S_OK;
 }
 
+static HRESULT create_placed_image(const VenusDevice *venus, const D3D12DDIARG_CREATERESOURCE_0003 *resource,
+                                   DdiResource *object)
+{
+    const D3D12DDIARG_HRESOURCE_PLACEMENT base = resource->ReuseBufferGPUVA.BaseAddress.UMD;
+    trace_ddi("CreatePlacedTexture flags", resource->Flags, resource->InitialResourceState);
+    trace_ddi("CreatePlacedTexture layout", resource->Layout, base.Offset);
+    if (!object || !supported_color_image(resource) ||
+        (resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET) ||
+        (resource->Layout != D3D12DDI_TL_ROW_MAJOR && resource->Layout != D3D12DDI_TL_UNDEFINED) ||
+        (resource->InitialResourceState != D3D12DDI_RESOURCE_STATE_COMMON &&
+         resource->InitialResourceState != D3D12DDI_RESOURCE_STATE_COPY_DEST))
+        return DXGI_ERROR_UNSUPPORTED;
+
+    DdiHeap *heap = resource_heap(venus, base.hResource);
+    const VenusTransferBuffer *storage = resource_buffer(venus, base.hResource);
+    if (!storage || storage != &heap->buffer || !storage->memory || storage->mapped ||
+        !(heap->flags & D3D12DDI_HEAP_FLAG_NON_RT_DS_TEXTURES))
+        return DXGI_ERROR_UNSUPPORTED;
+    if (base.Offset % D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
+        return E_INVALIDARG;
+
+    *object = (DdiResource){0};
+    const HRESULT status = create_venus_placed_sampled_image(storage, base.Offset, color_image_format(resource->Format),
+                                                             (UINT32)resource->Width, resource->Height, &object->placed_image);
+    if (SUCCEEDED(status))
+        object->heap = heap;
+    trace_ddi("CreatePlacedTexture", (UINT)status, base.Offset);
+    return status;
+}
+
 static HRESULT APIENTRY create_heap_and_resource(
     D3D12DDI_HDEVICE device, const D3D12DDIARG_CREATEHEAP_0001 *heap, D3D12DDI_HHEAP driver_heap,
     D3D12DDI_HRTRESOURCE runtime_resource, const D3D12DDIARG_CREATERESOURCE_0003 *resource,
@@ -310,8 +354,12 @@ static HRESULT APIENTRY create_heap_and_resource(
     DdiHeap *backing = driver_heap.pDrvPrivate;
     DdiResource *object = driver_resource.pDrvPrivate;
     if (!heap && !backing && resource && venus && !protection.pDrvPrivate && !clear &&
-        resource->ReuseBufferGPUVA.BaseAddress.UMD.hResource.pDrvPrivate)
-        return create_placed_buffer(venus, resource, object);
+        resource->ReuseBufferGPUVA.BaseAddress.UMD.hResource.pDrvPrivate) {
+        return resource->ResourceType == D3D12DDI_RT_BUFFER ? create_placed_buffer(venus, resource, object)
+            : create_placed_image(venus, resource, object);
+    }
+    trace_ddi("CreateHeapAndResource arguments", (heap != NULL) | (backing != NULL) << 1 |
+              (object != NULL) << 2 | (clear != NULL) << 3, resource ? resource->ResourceType : 0);
     if (heap && resource) {
         trace_ddi("CreateHeapAndResource flags", resource->Flags, heap->Flags);
         trace_ddi("CreateHeapAndResource memory", heap->MemoryPool, heap->CPUPageProperty);
@@ -344,10 +392,10 @@ static HRESULT APIENTRY create_heap_and_resource(
     } else if (supported_color_image(resource) && heap->MemoryPool == D3D12DDI_MEMORY_POOL_L1 &&
                heap->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
                resource->Layout == D3D12DDI_TL_ROW_MAJOR) {
-        backing->color_upload = !(resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET);
-        if (!backing->color_upload || (!primary && resource->InitialResourceState == D3D12DDI_RESOURCE_STATE_COPY_DEST))
+        const BOOL color_upload = !(resource->Flags & D3D12DDI_RESOURCE_FLAG_0003_RENDER_TARGET);
+        if (!color_upload || (!primary && resource->InitialResourceState == D3D12DDI_RESOURCE_STATE_COPY_DEST))
             status = create_venus_color_image(venus, color_image_format(resource->Format), (UINT32)resource->Width,
-                                             resource->Height, backing->color_upload, &backing->image);
+                                             resource->Height, color_upload, &backing->image);
         if (SUCCEEDED(status)) {
             if (heap->ByteSize && heap->ByteSize < backing->image.requirements.size) {
                 destroy_venus_color_image(&backing->image);
@@ -369,6 +417,7 @@ static HRESULT APIENTRY create_heap_and_resource(
         }
 #endif
         backing->device = venus;
+        backing->flags = heap->Flags;
         object->heap = backing;
     }
     trace_ddi("CreateHeapAndResource result", (UINT)status, resource->Width);
@@ -380,7 +429,9 @@ static void APIENTRY destroy_heap_and_resource(D3D12DDI_HDEVICE device, D3D12DDI
 {
     DdiResource *object = resource.pDrvPrivate;
     if (object) {
-        const BOOL placed = object->placed_buffer.handle != NULL;
+        const BOOL placed = object->placed_buffer.handle || object->placed_image.handle;
+        if (object->placed_image.handle)
+            destroy_venus_color_image(&object->placed_image);
         *object = (DdiResource){0};
         if (placed)
             return;

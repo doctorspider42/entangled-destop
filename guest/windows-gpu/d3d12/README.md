@@ -808,6 +808,13 @@ non-render-target texture heap, before any UI frame reached the queue.
 See `ddi40-runtime-graphics-scalar-bindings/` and
 `ddi40-runtime-wintanyl-scalar-bindings/` under the lab share.
 
+The `--placed-texture` probe places an R8 atlas at a nonzero 64 KiB
+offset in a default heap for non-render-target textures. The Vulkan
+image is bound to the heap's device-local memory at that offset.
+Build `20.24.57.480` verified all 2,993 shaded pixels on the RTX 2070
+in 1.495 ms submit-to-fence. See `ddi40-runtime-placed-r8-texture/`
+under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

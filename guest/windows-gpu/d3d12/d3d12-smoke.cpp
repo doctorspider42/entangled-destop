@@ -428,7 +428,7 @@ struct DrawPipeline {
     ComPtr<ID3D12PipelineState> pipeline;
 };
 
-enum class ColorWork { Clear, Draw, TimedDraw, CalibratedDraw, Blend, Uniform, Upload, Sample, Atlas, Instance, Bindings };
+enum class ColorWork { Clear, Draw, TimedDraw, CalibratedDraw, Blend, Uniform, Upload, Sample, Atlas, PlacedAtlas, Instance, Bindings };
 
 static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT target_format, ColorWork work = ColorWork::Draw)
 {
@@ -484,7 +484,7 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
     )";
     const bool uniform = work == ColorWork::Uniform;
     const bool bindings = work == ColorWork::Bindings;
-    const bool sampled = work == ColorWork::Sample || work == ColorWork::Atlas || bindings;
+    const bool sampled = work == ColorWork::Sample || work == ColorWork::Atlas || work == ColorWork::PlacedAtlas || bindings;
     const bool instanced = work == ColorWork::Instance;
     const bool blend = work == ColorWork::Blend;
     const auto vertex = compile_shader(instanced ? instance_source : bindings ? bound_vertex_source : vertex_source, "vs_5_1");
@@ -782,7 +782,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
 {
     constexpr UINT width = 73, height = 41;
     const bool upload_texture = work == ColorWork::Upload;
-    const bool sample_atlas = work == ColorWork::Atlas;
+    const bool placed_atlas = work == ColorWork::PlacedAtlas;
+    const bool sample_atlas = work == ColorWork::Atlas || placed_atlas;
     const bool general_bindings = work == ColorWork::Bindings;
     const bool sample_texture = work == ColorWork::Sample || sample_atlas || general_bindings;
     const bool use_uniform = work == ColorWork::Uniform;
@@ -837,6 +838,7 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     DrawPipeline draw;
     DrawBindings bindings = {};
     ComPtr<ID3D12Resource> upload;
+    ComPtr<ID3D12Heap> atlas_heap;
     ComPtr<ID3D12Resource> sampled;
     ComPtr<ID3D12Resource> instances;
     ComPtr<ID3D12Resource> transforms;
@@ -878,9 +880,21 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
                                                                {upload_footprint}};
         D3D12_TEXTURE_COPY_LOCATION upload_target = src;
         if (sample_texture) {
-            check(device->CreateCommittedResource(&video_memory, D3D12_HEAP_FLAG_NONE, &upload_desc,
-                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&sampled)),
-                  "CreateCommittedResource (sampled texture)");
+            if (placed_atlas) {
+                const auto allocation = device->GetResourceAllocationInfo(0, 1, &upload_desc);
+                constexpr UINT64 offset = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+                if (allocation.Alignment != offset || !allocation.SizeInBytes || allocation.SizeInBytes > offset)
+                    check(E_FAIL, "unexpected placed atlas allocation");
+                const D3D12_HEAP_DESC heap = {offset + allocation.SizeInBytes, video_memory,
+                    offset, D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES};
+                check(device->CreateHeap(&heap, IID_PPV_ARGS(&atlas_heap)), "CreateHeap (placed atlas)");
+                check(device->CreatePlacedResource(atlas_heap.Get(), offset, &upload_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                    nullptr, IID_PPV_ARGS(&sampled)), "CreatePlacedResource (atlas)");
+            } else {
+                check(device->CreateCommittedResource(&video_memory, D3D12_HEAP_FLAG_NONE, &upload_desc,
+                                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&sampled)),
+                      "CreateCommittedResource (sampled texture)");
+            }
             upload_target.pResource = sampled.Get();
         }
         commands.list->CopyTextureRegion(&upload_target, 0, 0, 0, &upload_location, nullptr);
@@ -995,7 +1009,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     }
     std::wprintf(L"D3D12 %ls PASS: %ux%u verified pixels, submit-to-fence %lld us\n",
                  timed_draw ? L"TIMESTAMP DRAW" : blend ? L"BLEND" : general_bindings ? L"GRAPHICS BINDINGS" :
-                 sample_atlas ? L"R8 ATLAS SAMPLE" : sample_texture ? L"TEXTURE SAMPLE" : upload_texture ? L"TEXTURE UPLOAD" :
+                 placed_atlas ? L"PLACED R8 ATLAS" : sample_atlas ? L"R8 ATLAS SAMPLE" :
+                 sample_texture ? L"TEXTURE SAMPLE" : upload_texture ? L"TEXTURE UPLOAD" :
                  use_uniform ? L"CBV DRAW" : use_instances ? L"INSTANCE DRAW" : programmable ? L"DRAW" : L"CLEAR",
                  width, height, elapsed);
 }
@@ -1104,7 +1119,8 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, DeviceLocal, Placed, Compute, Clear, Draw, TimedDraw, Clock, Blend, Cbv, Upload, Sample, Atlas, Instance, Bindings, WgpuInit, Present, Composition, Fence, RenderFence };
+    enum class Probe { Copy, DeviceLocal, Placed, Compute, Clear, Draw, TimedDraw, Clock, Blend, Cbv, Upload,
+                       Sample, Atlas, PlacedAtlas, Instance, Bindings, WgpuInit, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -1133,6 +1149,8 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Sample;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--sample-atlas") == 0)
             probe = Probe::Atlas;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--placed-texture") == 0)
+            probe = Probe::PlacedAtlas;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--graphics-bindings") == 0)
             probe = Probe::Bindings;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--instance") == 0)
@@ -1149,7 +1167,7 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::RenderFence;
         else {
             std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --placed-buffer | --compute | --clear | --draw | --timestamps | --clock | --blend | --cbv | --upload-texture | "
-                       "--sample-texture | --sample-atlas | --instance | --graphics-bindings | --wgpu-init | "
+                       "--sample-texture | --sample-atlas | --placed-texture | --instance | --graphics-bindings | --wgpu-init | "
                        "--present | --composition | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
@@ -1177,6 +1195,8 @@ int wmain(int argc, wchar_t **argv)
             color_and_verify(device.Get(), ColorWork::Sample);
         else if (probe == Probe::Atlas)
             color_and_verify(device.Get(), ColorWork::Atlas);
+        else if (probe == Probe::PlacedAtlas)
+            color_and_verify(device.Get(), ColorWork::PlacedAtlas);
         else if (probe == Probe::Bindings)
             color_and_verify(device.Get(), ColorWork::Bindings);
         else if (probe == Probe::Instance)
