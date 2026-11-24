@@ -677,6 +677,16 @@ The draw verified all pixels at 1.935 ms submit-to-fence. The UMD checks
 heap ownership, range bounds and descriptor counts before copying. See
 `ddi40-runtime-descriptor-copy/` under the lab share.
 
+The `--wgpu-init` probe covers public API calls used during DX12 device
+initialization. Build `4.33.10.514` created command signatures for draw,
+indexed draw and dispatch, allocated a 2,048-slot shader-visible sampler
+heap, and created a null RTV. It also read back all 65,537 bytes from a
+custom L1 buffer initialized by a Vulkan fill, including the final odd
+byte. Signature creation stores metadata. Execution of indirect commands
+remains unsupported in this pilot. See `ddi40-runtime-wgpu-init/` under
+the lab share.
+[wgpu DX12 device initialization](https://github.com/gfx-rs/wgpu/blob/v30.0.2/wgpu-hal/src/dx12/device.rs#L58-L191).
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

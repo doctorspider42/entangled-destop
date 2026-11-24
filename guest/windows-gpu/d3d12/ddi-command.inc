@@ -25,6 +25,55 @@ typedef struct DdiCommandQueue {
     HANDLE context;
 } DdiCommandQueue;
 
+typedef struct DdiCommandSignature {
+    DdiDevice *device;
+    D3D12DDI_INDIRECT_ARGUMENT_TYPE type;
+    UINT stride;
+} DdiCommandSignature;
+
+static SIZE_T APIENTRY private_command_signature_size(D3D12DDI_HDEVICE device,
+                                                       const D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001 *args)
+{
+    return device.pDrvPrivate && args ? sizeof(DdiCommandSignature) : 0;
+}
+
+static UINT indirect_argument_size(D3D12DDI_INDIRECT_ARGUMENT_TYPE type)
+{
+    switch (type) {
+    case D3D12DDI_INDIRECT_ARGUMENT_TYPE_DRAW: return sizeof(D3D12DDI_DRAW_ARGUMENTS);
+    case D3D12DDI_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: return sizeof(D3D12DDI_DRAW_INDEXED_ARGUMENTS);
+    case D3D12DDI_INDIRECT_ARGUMENT_TYPE_DISPATCH: return sizeof(D3D12DDI_DISPATCH_ARGUMENTS);
+    default: return 0;
+    }
+}
+
+static HRESULT APIENTRY create_command_signature(D3D12DDI_HDEVICE device,
+                                                 const D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001 *args,
+                                                 D3D12DDI_HCOMMANDSIGNATURE handle)
+{
+    DdiCommandSignature *signature = handle.pDrvPrivate;
+    if (!device.pDrvPrivate || !signature || !args || !args->pArgumentDescs || !args->NumArgumentDescs)
+        return E_INVALIDARG;
+    if (args->NodeMask > 1 || args->NumArgumentDescs != 1 || args->hRootSignature.pDrvPrivate)
+        return DXGI_ERROR_UNSUPPORTED;
+    const D3D12DDI_INDIRECT_ARGUMENT_TYPE type = args->pArgumentDescs[0].Type;
+    const UINT size = indirect_argument_size(type);
+    if (!size)
+        return DXGI_ERROR_UNSUPPORTED;
+    if (args->ByteStride < size || args->ByteStride % sizeof(UINT32))
+        return E_INVALIDARG;
+    *signature = (DdiCommandSignature){ .device = device.pDrvPrivate, .type = type, .stride = args->ByteStride };
+    trace_ddi("CreateCommandSignature", type, signature->stride);
+    return S_OK;
+}
+
+static void APIENTRY destroy_command_signature(D3D12DDI_HDEVICE device, D3D12DDI_HCOMMANDSIGNATURE handle)
+{
+    DdiCommandSignature *signature = handle.pDrvPrivate;
+    if (signature && signature->device == device.pDrvPrivate)
+        *signature = (DdiCommandSignature){0};
+}
+
 typedef struct DdiDrawState {
     D3D12DDI_PRIMITIVE_TOPOLOGY topology;
     BOOL has_viewport;
@@ -88,6 +137,16 @@ static void require_transfer_state(D3D12DDI_HCOMMANDLIST handle, BOOL supported)
     DdiTransferList *list = recording_command_list(handle);
     if (list && !supported)
         set_command_list_status(list, DXGI_ERROR_UNSUPPORTED);
+}
+
+static void APIENTRY execute_unsupported_indirect(D3D12DDI_HCOMMANDLIST list, D3D12DDI_HCOMMANDSIGNATURE signature,
+                                                  UINT count, D3D12DDIARG_BUFFER_PLACEMENT args,
+                                                  D3D12DDIARG_BUFFER_PLACEMENT count_buffer)
+{
+    (void)signature;
+    (void)args;
+    (void)count_buffer;
+    require_transfer_state(list, count == 0);
 }
 
 static void APIENTRY set_transfer_topology(D3D12DDI_HCOMMANDLIST list, D3D12DDI_PRIMITIVE_TOPOLOGY topology)

@@ -29,7 +29,7 @@ HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize siz
                                      VkBufferUsageFlags uses, VenusTransferBuffer *buffer)
 {
     *buffer = (VenusTransferBuffer){0};
-    if (!size)
+    if (!size || size > UINT64_MAX - 3)
         return E_INVALIDARG;
 
     const PFN_vkCreateBuffer create = DEVICE_FN(device, vkCreateBuffer);
@@ -48,7 +48,7 @@ HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize siz
 
     const VkBufferCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = size,
+        .size = cpu_visible ? size : (size + 3) & ~UINT64_C(3),
         .usage = uses | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
             (address ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -638,6 +638,26 @@ HRESULT submit_venus_transfer_probe(const VenusTransferList *list)
 {
     /* Device initialization has not yet shared the queue with other callers. */
     return submit_venus_transfer_commands(list->device, 1, &list->command);
+}
+
+HRESULT zero_venus_default_buffer(const VenusTransferBuffer *buffer)
+{
+    const PFN_vkCmdFillBuffer fill = DEVICE_FN(buffer->device, vkCmdFillBuffer);
+    if (!fill)
+        return DXGI_ERROR_UNSUPPORTED;
+    VenusTransferList list;
+    HRESULT status = begin_venus_transfer_list(buffer->device, &list);
+    if (FAILED(status))
+        return status;
+    fill(list.command, buffer->handle, 0, VK_WHOLE_SIZE, 0);
+    status = record_venus_buffer_barrier(list.command, buffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    if (SUCCEEDED(status))
+        status = close_venus_transfer_list(&list);
+    if (SUCCEEDED(status))
+        status = submit_venus_transfer_probe(&list);
+    destroy_venus_transfer_list(&list);
+    return status;
 }
 
 void destroy_venus_transfer_list(VenusTransferList *list)

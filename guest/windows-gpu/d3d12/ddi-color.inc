@@ -11,6 +11,13 @@ static void APIENTRY create_color_rtv(D3D12DDI_HDEVICE device, const D3D12DDIARG
     const DdiHeap *heap = args ? resource_heap(venus_device(device), args->hDrvResource) : NULL;
     const VenusColorImage *image = heap && heap->kind == DDI_HEAP_COLOR_IMAGE && !heap->color_upload ? &heap->image : NULL;
     DdiDescriptor *descriptor = (DdiDescriptor *)destination.ptr;
+    if (descriptor && args && !args->hDrvResource.pDrvPrivate && color_image_format(args->Format) != VK_FORMAT_UNDEFINED &&
+        args->ResourceDimension == D3D12DDI_RD_TEXTURE2D && !args->Tex2D.MipSlice &&
+        !args->Tex2D.FirstArraySlice && !args->Tex2D.PlaneSlice && args->Tex2D.ArraySize == 1) {
+        *descriptor = (DdiDescriptor){ .kind = DDI_DESCRIPTOR_RTV, .desc.rtv = *args };
+        trace_ddi("CreateNullRenderTargetView", args->Format, 0);
+        return;
+    }
     if (!descriptor || !image || args->ResourceDimension != D3D12DDI_RD_TEXTURE2D ||
         (args->Format != DXGI_FORMAT_UNKNOWN && color_image_format(args->Format) != image->format) ||
         args->Tex2D.MipSlice || args->Tex2D.FirstArraySlice || args->Tex2D.PlaneSlice || args->Tex2D.ArraySize != 1) {

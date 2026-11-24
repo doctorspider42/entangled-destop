@@ -211,7 +211,7 @@ static D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY private_resource_sizes(
     };
 }
 
-static HRESULT create_transfer_backing(const VenusDevice *device, const D3D12DDIARG_CREATEHEAP_0001 *heap,
+static HRESULT create_transfer_backing(DdiDevice *owner, const D3D12DDIARG_CREATEHEAP_0001 *heap,
                                        const D3D12DDIARG_CREATERESOURCE_0003 *resource, VenusTransferBuffer *buffer)
 {
     const D3D12DDI_RESOURCE_FLAGS_0003 supported_flags = D3D12DDI_RESOURCE_FLAG_0003_SHADER_RESOURCE |
@@ -241,7 +241,17 @@ static HRESULT create_transfer_backing(const VenusDevice *device, const D3D12DDI
         uses |= VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     if (resource->Flags & D3D12DDI_RESOURCE_FLAG_0022_UNORDERED_ACCESS)
         uses |= VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    return create_venus_transfer_buffer(device, resource->Width, placement, uses, buffer);
+    HRESULT status = create_venus_transfer_buffer(&owner->venus, resource->Width, placement, uses, buffer);
+    if (SUCCEEDED(status) && placement == VENUS_BUFFER_DEVICE_LOCAL) {
+        /* Vulkan does not apply D3D12 default heap zero-initialization. */
+        AcquireSRWLockExclusive(&owner->queue_lock);
+        status = zero_venus_default_buffer(buffer);
+        ReleaseSRWLockExclusive(&owner->queue_lock);
+        if (FAILED(status))
+            destroy_venus_transfer_buffer(buffer);
+        trace_ddi("ZeroDefaultBuffer", (UINT)status, resource->Width);
+    }
+    return status;
 }
 
 static HRESULT APIENTRY create_committed_resource(
@@ -275,7 +285,7 @@ static HRESULT APIENTRY create_committed_resource(
     *object = (DdiResource){0};
     HRESULT status = DXGI_ERROR_UNSUPPORTED;
     if (resource->ResourceType == D3D12DDI_RT_BUFFER && !primary) {
-        status = create_transfer_backing(venus, heap, resource, &backing->buffer);
+        status = create_transfer_backing(device.pDrvPrivate, heap, resource, &backing->buffer);
         if (SUCCEEDED(status)) {
             backing->kind = DDI_HEAP_TRANSFER_BUFFER;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
@@ -561,6 +571,9 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnGetCPUDescriptorHandleForHeapStart = cpu_descriptor_heap_start,
     .pfnGetGPUDescriptorHandleForHeapStart = gpu_descriptor_heap_start,
     .pfnCreateRenderTargetView = create_color_rtv,
+    .pfnCalcPrivateCommandSignatureSize = private_command_signature_size,
+    .pfnCreateCommandSignature = create_command_signature,
+    .pfnDestroyCommandSignature = destroy_command_signature,
     .pfnCopyDescriptors = copy_descriptors,
     .pfnCopyDescriptorsSimple = copy_descriptors_simple,
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
@@ -641,6 +654,7 @@ static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
     .pfnCopyBufferRegion = copy_buffer_region,
     .pfnClearRenderTargetView = clear_color_rtv,
     .pfnResourceBarrier = transfer_resource_barriers,
+    .pfnExecuteIndirect = execute_unsupported_indirect,
     .pfnCopyTextureRegion = copy_color_texture_region,
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
     .pfnPresent = present_surface,

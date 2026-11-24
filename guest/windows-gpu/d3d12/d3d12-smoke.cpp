@@ -121,11 +121,9 @@ static ComPtr<ID3D12Device> create_device(const Adapter &adapter, bool hardware_
     return device;
 }
 
-static ComPtr<ID3D12Resource> buffer(ID3D12Device *device, UINT64 size, D3D12_HEAP_TYPE type,
-                                     D3D12_RESOURCE_STATES state)
+static ComPtr<ID3D12Resource> committed_buffer(ID3D12Device *device, UINT64 size, const D3D12_HEAP_PROPERTIES &heap,
+                                               D3D12_RESOURCE_STATES state)
 {
-    D3D12_HEAP_PROPERTIES heap = {type, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-                                  D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
     D3D12_RESOURCE_DESC resource = {};
     resource.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     resource.Width = size;
@@ -138,6 +136,13 @@ static ComPtr<ID3D12Resource> buffer(ID3D12Device *device, UINT64 size, D3D12_HE
     check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &resource, state, nullptr,
                                           IID_PPV_ARGS(&result)), "CreateCommittedResource (buffer)");
     return result;
+}
+
+static ComPtr<ID3D12Resource> buffer(ID3D12Device *device, UINT64 size, D3D12_HEAP_TYPE type,
+                                     D3D12_RESOURCE_STATES state)
+{
+    const D3D12_HEAP_PROPERTIES heap = {type, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    return committed_buffer(device, size, heap, state);
 }
 
 struct Recording {
@@ -430,6 +435,60 @@ static ComPtr<ID3D12DescriptorHeap> create_rtv_heap(ID3D12Device *device)
     return heap;
 }
 
+static void verify_wgpu_initialization(ID3D12Device *device)
+{
+    struct IndirectCommand {
+        D3D12_INDIRECT_ARGUMENT_TYPE type;
+        UINT stride;
+    };
+    constexpr IndirectCommand indirect[] = {
+        {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, sizeof(D3D12_DRAW_ARGUMENTS)},
+        {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)},
+        {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, sizeof(D3D12_DISPATCH_ARGUMENTS)},
+    };
+    ComPtr<ID3D12CommandSignature> signatures[ARRAYSIZE(indirect)];
+    for (UINT i = 0; i < ARRAYSIZE(indirect); ++i) {
+        D3D12_INDIRECT_ARGUMENT_DESC argument = {};
+        argument.Type = indirect[i].type;
+        const D3D12_COMMAND_SIGNATURE_DESC signature = {indirect[i].stride, 1, &argument, 0};
+        check(device->CreateCommandSignature(&signature, nullptr, IID_PPV_ARGS(&signatures[i])),
+              "CreateCommandSignature");
+    }
+
+    const D3D12_DESCRIPTOR_HEAP_DESC sampler_desc = {D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+        D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> samplers;
+    check(device->CreateDescriptorHeap(&sampler_desc, IID_PPV_ARGS(&samplers)), "CreateDescriptorHeap (2048 samplers)");
+    if (!samplers->GetGPUDescriptorHandleForHeapStart().ptr)
+        check(E_FAIL, "missing shader-visible sampler heap handle");
+    const auto rtv_heap = create_rtv_heap(device);
+    D3D12_RENDER_TARGET_VIEW_DESC null_rtv = {};
+    null_rtv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    null_rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    device->CreateRenderTargetView(nullptr, &null_rtv, rtv_heap->GetCPUDescriptorHandleForHeapStart());
+    check(device->GetDeviceRemovedReason(), "CreateRenderTargetView (null)");
+
+    constexpr SIZE_T size = 64 * 1024 + 1;
+    const D3D12_HEAP_PROPERTIES gpu_memory = {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+        D3D12_MEMORY_POOL_L1, 0, 0};
+    const auto zero = committed_buffer(device, size, gpu_memory, D3D12_RESOURCE_STATE_COMMON);
+    const auto destination = buffer(device, size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    const auto commands = begin_recording(device);
+    transition(commands.list.Get(), zero.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commands.list->CopyBufferRegion(destination.Get(), 0, zero.Get(), 0, size);
+    const auto elapsed = submit_and_wait(device, commands);
+    const D3D12_RANGE whole = {0, size}, empty = {};
+    void *mapped = nullptr;
+    check(destination->Map(0, &whole, &mapped), "Map initialized buffer readback");
+    const auto *bytes = static_cast<const uint8_t *>(mapped);
+    for (SIZE_T i = 0; i < size; ++i)
+        if (bytes[i])
+            check(E_FAIL, "default buffer was not initialized to zero");
+    destination->Unmap(0, &empty);
+    std::wprintf(L"D3D12 WGPU INIT PASS: three signatures, sampler heap, null RTV and %zu zeroed bytes, "
+                 L"submit-to-fence %lld us\n", size, elapsed);
+}
+
 static std::array<uint8_t, 4> uploaded_pixel(UINT x, UINT y)
 {
     return {static_cast<uint8_t>(x * 13 + y * 7), static_cast<uint8_t>(y * 17),
@@ -655,7 +714,7 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, DeviceLocal, Clear, Draw, Cbv, Upload, Sample, Present, Composition, Fence, RenderFence };
+    enum class Probe { Copy, DeviceLocal, Clear, Draw, Cbv, Upload, Sample, WgpuInit, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -672,6 +731,8 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Upload;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--sample-texture") == 0)
             probe = Probe::Sample;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--wgpu-init") == 0)
+            probe = Probe::WgpuInit;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--present") == 0)
             probe = Probe::Present;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--composition") == 0)
@@ -682,7 +743,7 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::RenderFence;
         else {
             std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --clear | --draw | --cbv | --upload-texture | "
-                       "--sample-texture | --present | --composition | --fence | --fence-render-context]\n", stderr);
+                       "--sample-texture | --wgpu-init | --present | --composition | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
     }
@@ -701,6 +762,8 @@ int wmain(int argc, wchar_t **argv)
             color_and_verify(device.Get(), ColorWork::Upload);
         else if (probe == Probe::Sample)
             color_and_verify(device.Get(), ColorWork::Sample);
+        else if (probe == Probe::WgpuInit)
+            verify_wgpu_initialization(device.Get());
         else if (probe == Probe::Present || probe == Probe::Composition)
             draw_and_present(device.Get(), probe == Probe::Composition);
         else

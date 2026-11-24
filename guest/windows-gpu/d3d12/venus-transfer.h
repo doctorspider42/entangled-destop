@@ -27,6 +27,7 @@ HRESULT record_venus_buffer_copy(VkCommandBuffer command, const VenusTransferBuf
 #ifdef ENTANGLED_D3D12_PROBE_COPY
 HRESULT record_venus_buffer_barrier(VkCommandBuffer command, const VenusTransferBuffer *buffer,
                                     VkAccessFlags before, VkAccessFlags after);
+HRESULT zero_venus_default_buffer(const VenusTransferBuffer *buffer);
 
 typedef struct VenusColorImage {
     const VenusDevice *device;
