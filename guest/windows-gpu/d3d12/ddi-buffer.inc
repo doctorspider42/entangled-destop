@@ -328,6 +328,18 @@ static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
     .pfnCloseCommandList = close_transfer_list,
     .pfnResetCommandList = reset_command_list,
     .pfnCopyBufferRegion = copy_buffer_region,
+    .pfnSetPredication = set_transfer_predication,
+    .pfnIaSetTopology = set_transfer_topology,
+    .pfnRsSetViewports = set_transfer_viewports,
+    .pfnRsSetScissorRects = set_transfer_scissors,
+    .pfnOmSetBlendFactor = set_transfer_blend_factor,
+    .pfnOmSetStencilRef = set_transfer_stencil_reference,
+    .pfnSetDescriptorHeaps = set_transfer_descriptor_heaps,
+    .pfnIASetIndexBuffer = set_transfer_index_buffer,
+    .pfnIASetVertexBuffers = set_transfer_vertex_buffers,
+    .pfnSOSetTargets = set_transfer_stream_output,
+    .pfnOMSetRenderTargets = set_transfer_attachments,
+    .pfnClearRootArguments = clear_transfer_root_arguments,
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     .pfnSetPipelineState = set_command_pipeline,
 #endif

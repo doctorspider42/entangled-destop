@@ -37,6 +37,115 @@ static void set_command_list_status(DdiTransferList *list, HRESULT status)
         list->device->callbacks->pfnSetCommandListErrorCb(list->runtime, status);
 }
 
+static void require_transfer_state(D3D12DDI_HCOMMANDLIST handle, BOOL supported)
+{
+    DdiTransferList *list = handle.pDrvPrivate;
+    if (!list || FAILED(list->status))
+        return;
+    if (!list->pool || list->closed)
+        set_command_list_status(list, E_INVALIDARG);
+    else if (!supported)
+        set_command_list_status(list, DXGI_ERROR_UNSUPPORTED);
+}
+
+static void APIENTRY set_transfer_topology(D3D12DDI_HCOMMANDLIST list, D3D12DDI_PRIMITIVE_TOPOLOGY topology)
+{
+    /* A copy list has no vertex processing. The runtime clears IA state at reset. */
+    require_transfer_state(list, topology == D3D12DDI_PRIMITIVE_TOPOLOGY_UNDEFINED);
+}
+
+static void APIENTRY set_transfer_descriptor_heaps(D3D12DDI_HCOMMANDLIST list, UINT count,
+                                                  D3D12DDI_HDESCRIPTORHEAP *heaps)
+{
+    (void)heaps;
+    require_transfer_state(list, count == 0);
+}
+
+static void APIENTRY set_transfer_vertex_buffers(D3D12DDI_HCOMMANDLIST list, UINT first, UINT count,
+                                                 const D3D12DDI_VERTEX_BUFFER_VIEW *views)
+{
+    const UINT max_slots = D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT;
+    if (first > max_slots || count > max_slots - first) {
+        require_transfer_state(list, FALSE);
+        return;
+    }
+    for (UINT i = 0; views && i < count; ++i) {
+        if (views[i].BufferLocation || views[i].SizeInBytes) {
+            require_transfer_state(list, FALSE);
+            return;
+        }
+    }
+    require_transfer_state(list, TRUE);
+}
+
+static void APIENTRY set_transfer_index_buffer(D3D12DDI_HCOMMANDLIST list, const D3D12DDI_INDEX_BUFFER_VIEW *view)
+{
+    require_transfer_state(list, !view || (!view->BufferLocation && !view->SizeInBytes));
+}
+
+static void APIENTRY set_transfer_stream_output(D3D12DDI_HCOMMANDLIST list, UINT first, UINT count,
+                                                const D3D12DDI_STREAM_OUTPUT_BUFFER_VIEW *views)
+{
+    const UINT max_slots = D3D12_SO_BUFFER_SLOT_COUNT;
+    if (first > max_slots || count > max_slots - first) {
+        require_transfer_state(list, FALSE);
+        return;
+    }
+    for (UINT i = 0; views && i < count; ++i) {
+        if (views[i].BufferLocation || views[i].BufferFilledSizeLocation || views[i].SizeInBytes) {
+            require_transfer_state(list, FALSE);
+            return;
+        }
+    }
+    require_transfer_state(list, TRUE);
+}
+
+static void APIENTRY set_transfer_attachments(D3D12DDI_HCOMMANDLIST list, UINT count,
+                                              const D3D12DDI_CPU_DESCRIPTOR_HANDLE *targets, BOOL contiguous,
+                                              const D3D12DDI_CPU_DESCRIPTOR_HANDLE *depth)
+{
+    (void)targets;
+    (void)contiguous;
+    require_transfer_state(list, !count && (!depth || !depth->ptr));
+}
+
+static void APIENTRY set_transfer_viewports(D3D12DDI_HCOMMANDLIST list, UINT count, const D3D12DDI_VIEWPORT *viewports)
+{
+    (void)viewports;
+    require_transfer_state(list, count == 0);
+}
+
+static void APIENTRY set_transfer_scissors(D3D12DDI_HCOMMANDLIST list, UINT count, const D3D12DDI_RECT *scissors)
+{
+    (void)scissors;
+    require_transfer_state(list, count == 0);
+}
+
+static void APIENTRY set_transfer_blend_factor(D3D12DDI_HCOMMANDLIST list, const FLOAT values[4])
+{
+    require_transfer_state(list, values && values[0] == 1.0f && values[1] == 1.0f &&
+                           values[2] == 1.0f && values[3] == 1.0f);
+}
+
+static void APIENTRY set_transfer_stencil_reference(D3D12DDI_HCOMMANDLIST list, UINT reference)
+{
+    require_transfer_state(list, reference == 0);
+}
+
+static void APIENTRY set_transfer_predication(D3D12DDI_HCOMMANDLIST list, D3D12DDI_HRESOURCE buffer, UINT64 offset,
+                                             D3D12DDI_PREDICATION_OP op)
+{
+    (void)offset;
+    (void)op;
+    require_transfer_state(list, !buffer.pDrvPrivate);
+}
+
+static void APIENTRY clear_transfer_root_arguments(D3D12DDI_HCOMMANDLIST list)
+{
+    /* The copy path accepts no shader root bindings. */
+    require_transfer_state(list, TRUE);
+}
+
 static void set_command_device_error(const DdiDevice *device, HRESULT status)
 {
     if (FAILED(status) && device && device->callbacks && device->callbacks->pfnSetErrorCb)

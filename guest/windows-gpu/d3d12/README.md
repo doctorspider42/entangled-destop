@@ -472,6 +472,19 @@ Build `2.30.51.496` bound the runtime's initial graphics pipeline to the
 Vulkan command buffer and advanced to input-assembler state initialization.
 See `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-bind-pso/`.
 
+Build `2.34.59.392` completed the first public API copy with scratch callbacks
+logging the runtime's empty graphics bindings. Build `2.37.26.896` repeated
+it with all exercised command-state callbacks implemented in this directory.
+The system D3D12 runtime recorded and closed the application list, the UMD
+submitted its Vulkan copy and waited for GPU retirement, and the application
+verified 65,536 bytes after its WDDM fence reached 1. In the second run, host
+Venus context `1992705` exposed the RTX 2070 and allocated both 65,536-byte
+buffers. The individual submit-to-fence times were 2.710 ms and 45.126 ms.
+They include guest, Venus, and WDDM synchronization. The smoke test has no
+rendering or presentation timing. See
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-empty-bindings/` and
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-public-copy/`.
+
 The experimental `_0040` queue and list callbacks now hold a WDDM context
 and Vulkan command pool, serialize recording on the shared pool and select
 the matching runtime table. The transfer submission callback waits for
