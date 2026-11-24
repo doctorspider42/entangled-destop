@@ -7,6 +7,9 @@ typedef struct DdiCommandPool {
     SIZE_T capacity;
     SIZE_T used;
     UINT64 generation;
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    VkDescriptorPool uniform_pool;
+#endif
 } DdiCommandPool;
 
 typedef struct DdiCommandRecorder {
@@ -30,6 +33,9 @@ typedef struct DdiDrawState {
     VkPipelineLayout root_layout;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     const DdiPipeline *pipeline;
+    VkDescriptorSetLayout uniform_set_layout;
+    const DdiDescriptorHeap *resource_heap;
+    const DdiDescriptor *uniform;
 #endif
 } DdiDrawState;
 
@@ -91,8 +97,34 @@ static void APIENTRY set_transfer_topology(D3D12DDI_HCOMMANDLIST list, D3D12DDI_
 static void APIENTRY set_transfer_descriptor_heaps(D3D12DDI_HCOMMANDLIST list, UINT count,
                                                   D3D12DDI_HDESCRIPTORHEAP *heaps)
 {
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    DdiTransferList *commands = recording_command_list(list);
+    if (!commands)
+        return;
+    const DdiDescriptorHeap *resource_heap = NULL;
+    if (count > 2 || (count && !heaps)) {
+        set_command_list_status(commands, E_INVALIDARG);
+        return;
+    }
+    for (UINT i = 0; i < count; ++i) {
+        const DdiDescriptorHeap *heap = heaps[i].pDrvPrivate;
+        if (!heap)
+            continue;
+        if (resource_heap || heap->device != commands->device ||
+            heap->args.Type != D3D12DDI_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+            !(heap->args.Flags & D3D12DDI_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) {
+            set_command_list_status(commands, DXGI_ERROR_UNSUPPORTED);
+            return;
+        }
+        resource_heap = heap;
+    }
+    if (commands->draw.resource_heap != resource_heap)
+        commands->draw.uniform = NULL;
+    commands->draw.resource_heap = resource_heap;
+#else
     (void)heaps;
     require_transfer_state(list, count == 0);
+#endif
 }
 
 static void APIENTRY set_transfer_vertex_buffers(D3D12DDI_HCOMMANDLIST list, UINT first, UINT count,
@@ -170,18 +202,45 @@ static void APIENTRY set_transfer_scissors(D3D12DDI_HCOMMANDLIST list, UINT coun
     commands->draw.has_scissor = TRUE;
 }
 
-static void APIENTRY set_empty_graphics_root(D3D12DDI_HCOMMANDLIST handle, D3D12DDI_HROOTSIGNATURE signature)
+static void APIENTRY set_transfer_graphics_root(D3D12DDI_HCOMMANDLIST handle, D3D12DDI_HROOTSIGNATURE signature)
 {
     DdiTransferList *commands = recording_command_list(handle);
     if (!commands)
         return;
     const DdiRootSignature *root = signature.pDrvPrivate;
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    commands->draw.uniform_set_layout = root ? root->uniform_set_layout : VK_NULL_HANDLE;
+    commands->draw.uniform = NULL;
+    if (commands->draw.uniform_set_layout) {
+        commands->draw.root_layout = root->uniform_pipeline_layout;
+        return;
+    }
+#endif
     if (root && !root->empty_layout) {
         set_command_list_status(commands, DXGI_ERROR_UNSUPPORTED);
         return;
     }
     commands->draw.root_layout = root ? root->empty_layout : VK_NULL_HANDLE;
 }
+
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+static void APIENTRY set_graphics_uniform_table(D3D12DDI_HCOMMANDLIST list, UINT parameter,
+                                                 D3D12DDI_GPU_DESCRIPTOR_HANDLE base)
+{
+    DdiTransferList *commands = recording_command_list(list);
+    if (!commands)
+        return;
+    const DdiDescriptorHeap *heap = commands->draw.resource_heap;
+    const UINT64 start = heap ? (UINT64)(UINT_PTR)(heap + 1) : 0;
+    const UINT64 offset = base.ptr - start;
+    if (parameter || !commands->draw.uniform_set_layout || !heap || base.ptr < start ||
+        offset % sizeof(DdiDescriptor) || offset / sizeof(DdiDescriptor) >= heap->args.NumDescriptors) {
+        set_command_list_status(commands, E_INVALIDARG);
+        return;
+    }
+    commands->draw.uniform = (const DdiDescriptor *)(UINT_PTR)base.ptr;
+}
+#endif
 
 static void APIENTRY set_transfer_blend_factor(D3D12DDI_HCOMMANDLIST list, const FLOAT values[4])
 {
@@ -204,8 +263,13 @@ static void APIENTRY set_transfer_predication(D3D12DDI_HCOMMANDLIST list, D3D12D
 
 static void APIENTRY clear_transfer_root_arguments(D3D12DDI_HCOMMANDLIST list)
 {
-    /* The copy path accepts no shader root bindings. */
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    DdiTransferList *commands = recording_command_list(list);
+    if (commands)
+        commands->draw.uniform = NULL;
+#else
     require_transfer_state(list, TRUE);
+#endif
 }
 
 static void set_command_device_error(const DdiDevice *device, HRESULT status)
@@ -295,6 +359,13 @@ static void APIENTRY reset_command_pool(D3D12DDI_HDEVICE handle, D3D12DDI_HCOMMA
         if (SUCCEEDED(status)) {
             pool->used = 0;
             ++pool->generation;
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+            if (pool->uniform_pool) {
+                const PFN_vkResetDescriptorPool reset = (PFN_vkResetDescriptorPool)
+                    device->venus.proc_addr(device->venus.handle, "vkResetDescriptorPool");
+                status = venus_hresult(reset(device->venus.handle, pool->uniform_pool, 0));
+            }
+#endif
         }
         ReleaseSRWLockExclusive(&pool->lock);
     }
@@ -308,6 +379,14 @@ static void APIENTRY destroy_command_pool(D3D12DDI_HDEVICE handle, D3D12DDI_HCOM
     if (!pool || !pool->device || pool->device != handle.pDrvPrivate)
         return;
     destroy_venus_command_pool(&pool->device->venus, pool->pool);
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    if (pool->uniform_pool) {
+        const VenusDevice *venus = &pool->device->venus;
+        const PFN_vkDestroyDescriptorPool destroy = (PFN_vkDestroyDescriptorPool)
+            venus->proc_addr(venus->handle, "vkDestroyDescriptorPool");
+        destroy(venus->handle, pool->uniform_pool, NULL);
+    }
+#endif
     if (pool->commands)
         HeapFree(GetProcessHeap(), 0, pool->commands);
     *pool = (DdiCommandPool){0};

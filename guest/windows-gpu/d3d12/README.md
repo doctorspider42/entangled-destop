@@ -642,6 +642,16 @@ shader register remapping, resource lifetime and execution tests.
 `--gpu-buffer` also passed in this run. See
 `ddi40-runtime-descriptor-capabilities/` under the lab share.
 
+The `--cbv` probe reads `b0` in an FXC Shader Model 5.1 pixel shader.
+It binds the second slot of a shader-visible CBV heap to a 256-byte
+range at a nonzero offset within an upload buffer. The UMD resolves the
+GPU address against live Venus buffers and creates a Vulkan uniform
+descriptor for the draw. Build `4.11.47.84` verified all 73 × 41 magenta
+pixels after the WDDM fence on the RTX 2070. It took 1.815 ms from submit
+to fence, including readback. The pilot accepts one pixel-stage CBV
+table and allocates up to 64 Vulkan sets per command pool generation.
+See `ddi40-runtime-cbv/` under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a

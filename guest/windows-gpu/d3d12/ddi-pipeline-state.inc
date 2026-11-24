@@ -38,6 +38,7 @@ typedef struct DdiPipeline {
     VkRenderPass render_pass;
     VkFormat color_format;
     VkPipelineLayout layout;
+    BOOL uniform_cbv;
 } DdiPipeline;
 
 static SIZE_T APIENTRY private_pipeline_size(D3D12DDI_HDEVICE device,
@@ -95,8 +96,10 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
     const D3D12DDI_RASTERIZER_DESC_0010 *raster = args->hRasterizerState.pDrvPrivate;
     const D3D12DDI_DEPTH_STENCIL_DESC_0025 *depth = args->hDepthStencilState.pDrvPrivate;
     const VkFormat format = color_image_format(args->RTVFormats[0]);
+    const VkPipelineLayout layout = !root || !pixel ? VK_NULL_HANDLE
+        : pixel->uniform_cbv ? root->uniform_pipeline_layout : root->empty_layout;
     if (!venus->dynamic_rendering || !vertex || !vertex->module || vertex->stage != VK_SHADER_STAGE_VERTEX_BIT ||
-        !pixel || !pixel->module || pixel->stage != VK_SHADER_STAGE_FRAGMENT_BIT || !root || !root->empty_layout ||
+        !pixel || !pixel->module || pixel->stage != VK_SHADER_STAGE_FRAGMENT_BIT || !layout ||
         args->hDomainShader.pDrvPrivate || args->hHullShader.pDrvPrivate || args->hGeometryShader.pDrvPrivate ||
         args->hElementLayout.pDrvPrivate || args->NumRenderTargets != 1 || format == VK_FORMAT_UNDEFINED ||
         args->DSVFormat != DXGI_FORMAT_UNKNOWN || args->SampleDesc.Count != 1 || args->SampleDesc.Quality ||
@@ -155,13 +158,13 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
         .stageCount = _countof(shaders), .pStages = shaders, .pVertexInputState = &vertices,
         .pInputAssemblyState = &assembly, .pViewportState = &viewport, .pRasterizationState = &rasterization,
         .pMultisampleState = &samples, .pColorBlendState = &blending, .pDynamicState = &dynamic,
-        .layout = root->empty_layout, .basePipelineIndex = -1,
+        .layout = layout, .basePipelineIndex = -1,
     };
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult result = create(venus->handle, VK_NULL_HANDLE, 1, &info, NULL, &pipeline);
     if (result == VK_SUCCESS) {
         *state = (DdiPipeline){ .device = venus, .pipeline = pipeline, .bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS,
-            .color_format = format, .layout = root->empty_layout };
+            .color_format = format, .layout = layout, .uniform_cbv = pixel->uniform_cbv };
     } else if (pipeline) {
         destroy(venus->handle, pipeline, NULL);
     }

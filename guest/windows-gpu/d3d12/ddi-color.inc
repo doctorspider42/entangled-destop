@@ -51,6 +51,60 @@ static void APIENTRY set_color_render_targets(D3D12DDI_HCOMMANDLIST handle, UINT
 }
 
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
+static HRESULT bind_uniform_cbv(DdiTransferList *list)
+{
+    const DdiDrawState *draw = &list->draw;
+    const DdiDescriptor *descriptor = draw->uniform;
+    VkDescriptorBufferInfo buffer;
+    if (!descriptor || descriptor->kind != DDI_DESCRIPTOR_CBV ||
+        !resolve_buffer_address(list->device, descriptor->desc.cbv.BufferLocation, descriptor->desc.cbv.SizeInBytes,
+                                &buffer))
+        return E_INVALIDARG;
+
+    const VenusDevice *device = list->venus.device;
+    const PFN_vkCreateDescriptorPool create = (PFN_vkCreateDescriptorPool)
+        device->proc_addr(device->handle, "vkCreateDescriptorPool");
+    const PFN_vkAllocateDescriptorSets allocate = (PFN_vkAllocateDescriptorSets)
+        device->proc_addr(device->handle, "vkAllocateDescriptorSets");
+    const PFN_vkUpdateDescriptorSets update = (PFN_vkUpdateDescriptorSets)
+        device->proc_addr(device->handle, "vkUpdateDescriptorSets");
+    const PFN_vkCmdBindDescriptorSets bind = (PFN_vkCmdBindDescriptorSets)
+        device->proc_addr(device->handle, "vkCmdBindDescriptorSets");
+    if (!create || !allocate || !update || !bind)
+        return E_FAIL;
+    if (!list->pool->uniform_pool) {
+        if (!device->proc_addr(device->handle, "vkDestroyDescriptorPool") ||
+            !device->proc_addr(device->handle, "vkResetDescriptorPool"))
+            return E_FAIL;
+        const VkDescriptorPoolSize capacity = { .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 64 };
+        const VkDescriptorPoolCreateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = capacity.descriptorCount,
+            .poolSizeCount = 1, .pPoolSizes = &capacity,
+        };
+        VkDescriptorPool pool;
+        const VkResult result = create(device->handle, &info, NULL, &pool);
+        if (result != VK_SUCCESS)
+            return venus_hresult(result);
+        list->pool->uniform_pool = pool;
+    }
+    const VkDescriptorSetAllocateInfo allocation = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = list->pool->uniform_pool,
+        .descriptorSetCount = 1, .pSetLayouts = &draw->uniform_set_layout,
+    };
+    VkDescriptorSet set;
+    const VkResult result = allocate(device->handle, &allocation, &set);
+    if (result != VK_SUCCESS)
+        return venus_hresult(result);
+    const VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0,
+        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &buffer,
+    };
+    update(device->handle, 1, &write, 0, NULL);
+    bind(list->venus.command, VK_PIPELINE_BIND_POINT_GRAPHICS, draw->root_layout, 0, 1, &set, 0, NULL);
+    trace_ddi("BindUniformCbv", 0, buffer.range);
+    return S_OK;
+}
+
 static void APIENTRY draw_color_target(D3D12DDI_HCOMMANDLIST handle, UINT vertex_count, UINT instance_count,
                                        UINT first_vertex, UINT first_instance)
 {
@@ -67,9 +121,12 @@ static void APIENTRY draw_color_target(D3D12DDI_HCOMMANDLIST handle, UINT vertex
     }
 
     AcquireSRWLockExclusive(&list->pool->lock);
-    const HRESULT status = list->generation == list->pool->generation
-        ? record_venus_color_draw(list->venus.command, image, &draw->viewport, &draw->scissor,
-                                  vertex_count, instance_count, first_vertex, first_instance) : E_INVALIDARG;
+    HRESULT status = list->generation == list->pool->generation ? S_OK : E_INVALIDARG;
+    if (SUCCEEDED(status) && draw->pipeline->uniform_cbv)
+        status = bind_uniform_cbv(list);
+    if (SUCCEEDED(status))
+        status = record_venus_color_draw(list->venus.command, image, &draw->viewport, &draw->scissor,
+                                         vertex_count, instance_count, first_vertex, first_instance);
     if (SUCCEEDED(status)) {
         list->written_color = image;
         list->color_rendered = TRUE;

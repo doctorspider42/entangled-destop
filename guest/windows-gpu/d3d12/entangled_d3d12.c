@@ -25,6 +25,13 @@ typedef struct DdiAdapter {
 #endif
 } DdiAdapter;
 
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+typedef struct DdiBufferAddress {
+    const VenusTransferBuffer *buffer;
+    struct DdiBufferAddress *next;
+} DdiBufferAddress;
+#endif
+
 typedef struct DdiDevice {
     VenusDevice venus;
     const DdiAdapter *adapter;
@@ -34,6 +41,10 @@ typedef struct DdiDevice {
     const D3DDDI_DEVICECALLBACKS *kernel;
 #endif
     SRWLOCK queue_lock;
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    SRWLOCK buffer_lock;
+    DdiBufferAddress *buffers;
+#endif
 } DdiDevice;
 
 static VenusDevice *venus_device(D3D12DDI_HDEVICE handle)

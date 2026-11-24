@@ -244,7 +244,7 @@ struct DrawPipeline {
     ComPtr<ID3D12PipelineState> pipeline;
 };
 
-static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT target_format)
+static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT target_format, bool uniform = false)
 {
     constexpr char vertex_source[] = R"(
         float4 main(uint vertex : SV_VertexID) : SV_Position {
@@ -255,11 +255,25 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
     constexpr char pixel_source[] = R"(
         float4 main() : SV_Target0 { return float4(0, 1, 0, 1); }
     )";
+    constexpr char uniform_source[] = R"(
+        cbuffer Tint : register(b0) { float4 tint; };
+        float4 main() : SV_Target0 { return tint; }
+    )";
     const auto vertex = compile_shader(vertex_source, "vs_5_1");
-    const auto pixel = compile_shader(pixel_source, "ps_5_1");
+    const auto pixel = compile_shader(uniform ? uniform_source : pixel_source, "ps_5_1");
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned_signature = {};
     versioned_signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
     versioned_signature.Desc_1_1 = {};
+    const D3D12_DESCRIPTOR_RANGE1 range = { D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0,
+        D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC, 0 };
+    D3D12_ROOT_PARAMETER1 parameter = {};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameter.DescriptorTable = { 1, &range };
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    if (uniform) {
+        versioned_signature.Desc_1_1.NumParameters = 1;
+        versioned_signature.Desc_1_1.pParameters = &parameter;
+    }
     ComPtr<ID3DBlob> root_bytes;
     check(D3D12SerializeVersionedRootSignature(&versioned_signature, &root_bytes, nullptr),
           "D3D12SerializeVersionedRootSignature");
@@ -293,13 +307,49 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
     return draw;
 }
 
+struct DrawUniform {
+    ComPtr<ID3D12Resource> resource;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    D3D12_GPU_DESCRIPTOR_HANDLE table;
+};
+
+static DrawUniform tint_buffer(ID3D12Device *device)
+{
+    constexpr UINT block = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+    const FLOAT tint[] = {1.0f, 0.0f, 1.0f, 1.0f};
+    DrawUniform uniform = {};
+    uniform.resource = buffer(device, 2 * block, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    const D3D12_RANGE empty = {}, tint_range = {block, block + sizeof(tint)};
+    void *mapped = nullptr;
+    check(uniform.resource->Map(0, &empty, &mapped), "Map shader constants");
+    std::memcpy(static_cast<uint8_t *>(mapped) + block, tint, sizeof(tint));
+    uniform.resource->Unmap(0, &tint_range);
+
+    const D3D12_DESCRIPTOR_HEAP_DESC heap = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    check(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&uniform.heap)), "CreateDescriptorHeap (shader-visible CBV)");
+    const UINT stride = device->GetDescriptorHandleIncrementSize(heap.Type);
+    auto cpu = uniform.heap->GetCPUDescriptorHandleForHeapStart();
+    uniform.table = uniform.heap->GetGPUDescriptorHandleForHeapStart();
+    cpu.ptr += stride;
+    uniform.table.ptr += stride;
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC descriptor = {uniform.resource->GetGPUVirtualAddress() + block, block};
+    device->CreateConstantBufferView(&descriptor, cpu);
+    return uniform;
+}
+
 static void record_draw(ID3D12GraphicsCommandList *commands, const DrawPipeline &draw,
-                         D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT width, UINT height)
+                         D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT width, UINT height, const DrawUniform *uniform = nullptr)
 {
     const D3D12_VIEWPORT viewport = {0, 0, static_cast<FLOAT>(width), static_cast<FLOAT>(height), 0, 1};
     const D3D12_RECT scissor = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     commands->SetGraphicsRootSignature(draw.root.Get());
     commands->SetPipelineState(draw.pipeline.Get());
+    if (uniform) {
+        ID3D12DescriptorHeap *const heaps[] = {uniform->heap.Get()};
+        commands->SetDescriptorHeaps(1, heaps);
+        commands->SetGraphicsRootDescriptorTable(0, uniform->table);
+    }
     commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commands->RSSetViewports(1, &viewport);
     commands->RSSetScissorRects(1, &scissor);
@@ -317,7 +367,7 @@ static ComPtr<ID3D12DescriptorHeap> create_rtv_heap(ID3D12Device *device)
     return heap;
 }
 
-static void color_and_verify(ID3D12Device *device, bool programmable)
+static void color_and_verify(ID3D12Device *device, bool programmable, bool use_uniform)
 {
     constexpr UINT width = 73, height = 41;
     const D3D12_HEAP_PROPERTIES video_memory = {D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
@@ -350,9 +400,12 @@ static void color_and_verify(ID3D12Device *device, bool programmable)
 
     const auto commands = begin_recording(device);
     DrawPipeline draw;
+    DrawUniform uniform = {};
     if (programmable) {
-        draw = create_draw_pipeline(device, desc.Format);
-        record_draw(commands.list.Get(), draw, rtv, width, height);
+        draw = create_draw_pipeline(device, desc.Format, use_uniform);
+        if (use_uniform)
+            uniform = tint_buffer(device);
+        record_draw(commands.list.Get(), draw, rtv, width, height, use_uniform ? &uniform : nullptr);
     } else {
         const FLOAT red[] = {1.0f, 0.0f, 0.0f, 1.0f};
         commands.list->ClearRenderTargetView(rtv, red, 0, nullptr);
@@ -371,8 +424,8 @@ static void color_and_verify(ID3D12Device *device, bool programmable)
     void *mapped = nullptr;
     check(readback->Map(0, &whole, &mapped), "Map rendered image readback");
     const auto pixels = static_cast<const uint8_t *>(mapped) + footprint.Offset;
-    constexpr uint8_t red[] = {255, 0, 0, 255}, green[] = {0, 255, 0, 255};
-    const uint8_t *expected = programmable ? green : red;
+    constexpr uint8_t red[] = {255, 0, 0, 255}, green[] = {0, 255, 0, 255}, magenta[] = {255, 0, 255, 255};
+    const uint8_t *expected = use_uniform ? magenta : programmable ? green : red;
     for (UINT y = 0; y < height; ++y) {
         const auto row = pixels + static_cast<SIZE_T>(y) * footprint.Footprint.RowPitch;
         for (UINT x = 0; x < width; ++x) {
@@ -382,7 +435,7 @@ static void color_and_verify(ID3D12Device *device, bool programmable)
     }
     readback->Unmap(0, &empty);
     std::wprintf(L"D3D12 %ls PASS: %ux%u verified pixels, submit-to-fence %lld us\n",
-                 programmable ? L"DRAW" : L"CLEAR", width, height, elapsed);
+                 use_uniform ? L"CBV DRAW" : programmable ? L"DRAW" : L"CLEAR", width, height, elapsed);
 }
 
 static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
@@ -489,7 +542,7 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
 int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
-    enum class Probe { Copy, DeviceLocal, Clear, Draw, Present, Composition, Fence, RenderFence };
+    enum class Probe { Copy, DeviceLocal, Clear, Draw, Cbv, Present, Composition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -500,6 +553,8 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Clear;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--draw") == 0)
             probe = Probe::Draw;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--cbv") == 0)
+            probe = Probe::Cbv;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--present") == 0)
             probe = Probe::Present;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--composition") == 0)
@@ -509,7 +564,7 @@ int wmain(int argc, wchar_t **argv)
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence-render-context") == 0)
             probe = Probe::RenderFence;
         else {
-            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --clear | --draw | --present | --composition | "
+            std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --clear | --draw | --cbv | --present | --composition | "
                        "--fence | --fence-render-context]\n", stderr);
             return 2;
         }
@@ -519,8 +574,8 @@ int wmain(int argc, wchar_t **argv)
         verify_wddm_fence(adapter.luid, probe == Probe::Fence);
     else {
         const auto device = create_device(adapter, hardware_control);
-        if (probe == Probe::Clear || probe == Probe::Draw)
-            color_and_verify(device.Get(), probe == Probe::Draw);
+        if (probe == Probe::Clear || probe == Probe::Draw || probe == Probe::Cbv)
+            color_and_verify(device.Get(), probe != Probe::Clear, probe == Probe::Cbv);
         else if (probe == Probe::Present || probe == Probe::Composition)
             draw_and_present(device.Get(), probe == Probe::Composition);
         else

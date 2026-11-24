@@ -15,6 +15,9 @@ typedef struct DdiHeap {
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
     DdiPresentSurface present;
 #endif
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    DdiBufferAddress address;
+#endif
 } DdiHeap;
 
 typedef struct DdiResource {
@@ -37,6 +40,66 @@ static const VenusTransferBuffer *resource_buffer(const VenusDevice *device, D3D
     const DdiHeap *heap = resource_heap(device, resource);
     return heap && heap->kind == DDI_HEAP_TRANSFER_BUFFER ? &heap->buffer : NULL;
 }
+
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+static void register_buffer_address(DdiDevice *device, DdiHeap *heap)
+{
+    if (!heap->buffer.address)
+        return;
+    AcquireSRWLockExclusive(&device->buffer_lock);
+    heap->address = (DdiBufferAddress){ .buffer = &heap->buffer, .next = device->buffers };
+    device->buffers = &heap->address;
+    ReleaseSRWLockExclusive(&device->buffer_lock);
+}
+
+static void unregister_buffer_address(DdiDevice *device, const DdiHeap *heap)
+{
+    if (!heap->address.buffer)
+        return;
+    AcquireSRWLockExclusive(&device->buffer_lock);
+    DdiBufferAddress **entry = &device->buffers;
+    while (*entry && *entry != &heap->address)
+        entry = &(*entry)->next;
+    if (*entry)
+        *entry = (*entry)->next;
+    ReleaseSRWLockExclusive(&device->buffer_lock);
+}
+
+static BOOL resolve_buffer_address(DdiDevice *device, D3D12DDI_GPU_VIRTUAL_ADDRESS address,
+                                   UINT64 size, VkDescriptorBufferInfo *binding)
+{
+    BOOL found = FALSE;
+    AcquireSRWLockShared(&device->buffer_lock);
+    for (const DdiBufferAddress *entry = device->buffers; entry; entry = entry->next) {
+        const VenusTransferBuffer *buffer = entry->buffer;
+        if (address < buffer->address)
+            continue;
+        const UINT64 offset = address - buffer->address;
+        if (offset < buffer->size && size <= buffer->size - offset) {
+            *binding = (VkDescriptorBufferInfo){ .buffer = buffer->handle, .offset = offset, .range = size };
+            found = TRUE;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&device->buffer_lock);
+    return found;
+}
+
+static void APIENTRY create_uniform_cbv(D3D12DDI_HDEVICE device, const D3D12DDI_CONSTANT_BUFFER_VIEW_DESC *view,
+                                        D3D12DDI_CPU_DESCRIPTOR_HANDLE destination)
+{
+    DdiDescriptor *descriptor = (DdiDescriptor *)destination.ptr;
+    if (!descriptor || !view || !view->BufferLocation || !view->SizeInBytes ||
+        view->BufferLocation % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT ||
+        view->SizeInBytes % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT ||
+        view->SizeInBytes > D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16) {
+        set_command_device_error(device.pDrvPrivate, DXGI_ERROR_UNSUPPORTED);
+        return;
+    }
+    *descriptor = (DdiDescriptor){ .kind = DDI_DESCRIPTOR_CBV, .desc.cbv = *view };
+    trace_ddi("CreateConstantBufferView", 0, view->SizeInBytes);
+}
+#endif
 
 static VkFormat color_image_format(DXGI_FORMAT format)
 {
@@ -210,8 +273,12 @@ static HRESULT APIENTRY create_committed_resource(
     HRESULT status = DXGI_ERROR_UNSUPPORTED;
     if (resource->ResourceType == D3D12DDI_RT_BUFFER && !primary) {
         status = create_transfer_backing(venus, heap, resource, &backing->buffer);
-        if (SUCCEEDED(status))
+        if (SUCCEEDED(status)) {
             backing->kind = DDI_HEAP_TRANSFER_BUFFER;
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+            register_buffer_address(device.pDrvPrivate, backing);
+#endif
+        }
     } else if (supported_color_image(resource) && heap->MemoryPool == D3D12DDI_MEMORY_POOL_L1 &&
                heap->CPUPageProperty == D3D12DDI_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
                resource->Layout == D3D12DDI_TL_ROW_MAJOR) {
@@ -257,8 +324,12 @@ static void APIENTRY destroy_committed_resource(D3D12DDI_HDEVICE device, D3D12DD
     if (heap->present.allocation)
         deallocate_present_surface(device.pDrvPrivate, &heap->present);
 #endif
-    if (heap->kind == DDI_HEAP_TRANSFER_BUFFER)
+    if (heap->kind == DDI_HEAP_TRANSFER_BUFFER) {
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+        unregister_buffer_address(device.pDrvPrivate, heap);
+#endif
         destroy_venus_transfer_buffer(&heap->buffer);
+    }
     else if (heap->kind == DDI_HEAP_COLOR_IMAGE)
         destroy_venus_color_image(&heap->image);
     *heap = (DdiHeap){0};
@@ -485,6 +556,9 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnGetCPUDescriptorHandleForHeapStart = cpu_descriptor_heap_start,
     .pfnGetGPUDescriptorHandleForHeapStart = gpu_descriptor_heap_start,
     .pfnCreateRenderTargetView = create_color_rtv,
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    .pfnCreateConstantBufferView = create_uniform_cbv,
+#endif
     .pfnCalcPrivateHeapAndResourceSizes = private_resource_sizes,
     .pfnCreateHeapAndResource = create_committed_resource,
     .pfnDestroyHeapAndResource = destroy_committed_resource,
@@ -572,7 +646,10 @@ static const D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 entangled_transfer_list_ddi = {
     .pfnOmSetBlendFactor = set_transfer_blend_factor,
     .pfnOmSetStencilRef = set_transfer_stencil_reference,
     .pfnSetDescriptorHeaps = set_transfer_descriptor_heaps,
-    .pfnSetGraphicsRootSignature = set_empty_graphics_root,
+    .pfnSetGraphicsRootSignature = set_transfer_graphics_root,
+#ifdef ENTANGLED_D3D12_PROBE_SHADER
+    .pfnSetGraphicsRootDescriptorTable = set_graphics_uniform_table,
+#endif
     .pfnIASetIndexBuffer = set_transfer_index_buffer,
     .pfnIASetVertexBuffers = set_transfer_vertex_buffers,
     .pfnSOSetTargets = set_transfer_stream_output,

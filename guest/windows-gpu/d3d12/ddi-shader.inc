@@ -28,6 +28,7 @@ typedef struct DxbcSignatureEntry {
 typedef struct DdiShader {
     VkShaderModule module;
     VkShaderStageFlagBits stage;
+    BOOL uniform_cbv;
 } DdiShader;
 
 typedef enum DxbcStage {
@@ -150,7 +151,19 @@ static HMODULE load_shader_compiler(void)
     return LoadLibraryExW(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
 }
 
-static HRESULT compile_shader_module(const VenusDevice *device, const DxbcHeader *blob, VkShaderModule *module)
+static dxil_spv_bool remap_pixel_cbv(void *context, const dxil_spv_d3d_binding *d3d,
+                                     dxil_spv_cbv_vulkan_binding *vulkan)
+{
+    if (d3d->stage != DXIL_SPV_STAGE_PIXEL || d3d->register_space || d3d->register_index || d3d->range_size != 1)
+        return 0;
+    *(BOOL *)context = TRUE;
+    *vulkan = (dxil_spv_cbv_vulkan_binding){
+        .vulkan.uniform_binding = { .set = 0, .binding = 0, .descriptor_type = DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_UBO },
+    };
+    return 1;
+}
+
+static HRESULT compile_shader_module(const VenusDevice *device, const DxbcHeader *blob, DdiShader *output)
 {
     HMODULE compiler = load_shader_compiler();
     if (!compiler) {
@@ -173,11 +186,14 @@ static HRESULT compile_shader_module(const VenusDevice *device, const DxbcHeader
     dxil_spv_result (*compiled)(dxil_spv_converter, dxil_spv_compiled_spirv *) =
         (dxil_spv_result (*)(dxil_spv_converter, dxil_spv_compiled_spirv *))(void *)
         GetProcAddress(compiler, "dxil_spv_converter_get_compiled_spirv");
+    void (*set_cbv)(dxil_spv_converter, dxil_spv_cbv_remapper_cb, void *) =
+        (void (*)(dxil_spv_converter, dxil_spv_cbv_remapper_cb, void *))(void *)
+        GetProcAddress(compiler, "dxil_spv_converter_set_cbv_remapper");
     const PFN_vkCreateShaderModule create_module = (PFN_vkCreateShaderModule)
         device->proc_addr(device->handle, "vkCreateShaderModule");
     const PFN_vkDestroyShaderModule destroy_module = (PFN_vkDestroyShaderModule)
         device->proc_addr(device->handle, "vkDestroyShaderModule");
-    if (!parse || !free_blob || !create || !free_converter || !convert || !compiled ||
+    if (!parse || !free_blob || !create || !free_converter || !convert || !compiled || !set_cbv ||
         !create_module || !destroy_module) {
         FreeLibrary(compiler);
         return DXGI_ERROR_UNSUPPORTED;
@@ -189,8 +205,10 @@ static HRESULT compile_shader_module(const VenusDevice *device, const DxbcHeader
     dxil_spv_result result = parse(blob, blob->size, &parsed);
     if (result == DXIL_SPV_SUCCESS)
         result = create(parsed, &converter);
-    if (result == DXIL_SPV_SUCCESS)
+    if (result == DXIL_SPV_SUCCESS) {
+        set_cbv(converter, remap_pixel_cbv, &output->uniform_cbv);
         result = convert(converter);
+    }
     if (result == DXIL_SPV_SUCCESS)
         result = compiled(converter, &code);
 
@@ -206,7 +224,7 @@ static HRESULT compile_shader_module(const VenusDevice *device, const DxbcHeader
         const VkResult created = create_module(device->handle, &info, NULL, &shader);
         status = venus_hresult(created);
         if (created == VK_SUCCESS)
-            *module = shader;
+            output->module = shader;
     }
     if (converter)
         free_converter(converter);
@@ -236,7 +254,7 @@ static HRESULT create_legacy_shader(D3D12DDI_HDEVICE device, const D3D12DDIARG_C
     DxbcHeader *blob = NULL;
     HRESULT status = make_legacy_dxbc(args, stage, &blob);
     if (SUCCEEDED(status)) {
-        status = compile_shader_module(venus_device(device), blob, &shader->module);
+        status = compile_shader_module(venus_device(device), blob, shader);
         HeapFree(GetProcessHeap(), 0, blob);
     }
     if (SUCCEEDED(status))
