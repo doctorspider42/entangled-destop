@@ -24,6 +24,7 @@ typedef struct VenusDevice {
     UINT32 graphics_queue_family;
     VkPhysicalDeviceMemoryProperties memory;
     BOOL maintenance5;
+    BOOL buffer_device_address;
 } VenusDevice;
 
 HRESULT open_venus_adapter(VenusAdapter *adapter);

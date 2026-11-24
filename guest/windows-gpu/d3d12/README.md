@@ -21,12 +21,11 @@ UMD in the fourth INF slot can change the reported DLL path while this kernel
 contract is still missing. See the [pinned miniport](https://github.com/max8rr8/kvm-guest-drivers-windows/tree/9ed3aab11fb46e55dc835ff008008623b290a6cf/viogpu/viogpu3d)
 and [Microsoft's D3D12 requirements](https://learn.microsoft.com/en-us/windows/win32/direct3d12/directx-12-getting-started).
 
-The lab miniport starts as WDDM 2.0 and creates a virtual synchronization
-context and monitored fences. The queued completion still times out after the
-CPU releases the gate. Validate GPUVA updates, residency, virtual submission
-and fence ordering before exposing D3D12 caps. Windows can queue monitored
-fence signals when the engine cannot write the fence directly. For submitted
-GPU work the signal must follow actual Venus completion.
+The lab miniport starts as WDDM 2.0. A virtual render context on node 1
+passed the monitored-fence ordering test after the CPU released the gate.
+Windows can queue monitored fence signals when the engine cannot write the
+fence directly. For submitted GPU work the signal must follow actual Venus
+completion. Residency and execution of nonempty WDDM DMA packets remain open.
 [GPU virtual memory](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpu-virtual-memory-in-wddm-2-0),
 [WDDM residency](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/driver-residency-in-wddm-2-0),
 [monitored fence callback](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dumddi/nc-d3dumddi-pfnd3dddi_signalsynchronizationobjectfromgpucb).
@@ -426,6 +425,39 @@ returned `DXGI_ERROR_DEVICE_REMOVED` before calling the allocation DDI.
 The same trace records a rejected GPUVA capability query (`0x887A0004`)
 and device removal for a bad UMD error. See
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-pool/`.
+
+Build `1.59.51.843` confirmed that Windows rejects a GPUVA capability of
+zero during device initialization. Build `2.5.50.688` reported the lab
+miniport's 44-bit address width and reached `CreateHeapAndResource` for the
+first application buffer. The runtime requested shader-resource and
+unordered-access capabilities even for this upload heap. The address-width
+query does not provide address translation or reserved resource support.
+See `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-gpuva-caps/` and
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-gpuva44/`.
+
+Build `2.8.38.235` allocated the application's first 64 KiB upload buffer
+through Venus on the host RTX 2070. Build `2.10.50.158` also returned its
+64 KiB allocation layout through `pfnCheckExistingResourceAllocationInfo`.
+Windows then called `pfnCheckResourceVirtualAddress`. These are public API
+allocations after `D3D12CreateDevice` returned. The internal copy diagnostic
+still supplies the executed workload in these builds. See
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-commands/` and
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-existing-buffer/`.
+
+Build `2.13.18.604` enabled Vulkan buffer device addresses for the transfer
+buffers. The upload buffer returned a nonzero Venus address, and ETW recorded
+its resource creation. That address identifies the Vulkan buffer for this
+device lifetime. It has no WDDM page-table mapping or KMT allocation handle.
+The runtime removed the device before creating the second committed buffer.
+The trace reports a UMD error, with the exact cause still open. See
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-bda/`.
+
+The experimental `_0040` queue and list callbacks now hold a WDDM context
+and Vulkan command pool, serialize recording on the shared pool and select
+the matching runtime table. The transfer submission callback waits for
+Vulkan completion before returning. The bootstrapping trace has yet to
+exercise those paths through the application's queue. The release build
+continues to decline the provisional DDI.
 
 ## End-to-end test criteria
 

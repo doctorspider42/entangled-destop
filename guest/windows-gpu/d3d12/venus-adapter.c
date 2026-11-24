@@ -215,6 +215,7 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
         .pQueueCreateInfos = &queue_info,
     };
     BOOL has_maintenance5 = FALSE;
+    BOOL has_buffer_device_address = FALSE;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
@@ -225,6 +226,27 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
         info.pNext = &maintenance5;
         info.enabledExtensionCount = 1;
         info.ppEnabledExtensionNames = &extension;
+    }
+#endif
+#ifdef ENTANGLED_D3D12_PROBE_COPY
+    VkPhysicalDeviceBufferDeviceAddressFeatures address = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
+    };
+    const PFN_vkGetPhysicalDeviceFeatures2 get_features = (PFN_vkGetPhysicalDeviceFeatures2)
+        adapter->instance_proc_addr(adapter->instance, "vkGetPhysicalDeviceFeatures2");
+    if (adapter->api_version >= VK_API_VERSION_1_2 && get_features) {
+        VkPhysicalDeviceFeatures2 features = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &address,
+        };
+        get_features(adapter->physical_device, &features);
+        has_buffer_device_address = address.bufferDeviceAddress != VK_FALSE;
+        if (has_buffer_device_address) {
+            address.bufferDeviceAddressCaptureReplay = VK_FALSE;
+            address.bufferDeviceAddressMultiDevice = VK_FALSE;
+            address.pNext = (void *)info.pNext;
+            info.pNext = &address;
+        }
     }
 #endif
     VkDevice handle;
@@ -252,6 +274,7 @@ HRESULT create_venus_device(const VenusAdapter *adapter, VenusDevice *device)
         .destroy = destroy,
         .graphics_queue_family = adapter->graphics_queue_family,
         .maintenance5 = has_maintenance5,
+        .buffer_device_address = has_buffer_device_address,
     };
     get_memory(adapter->physical_device, &device->memory);
     return S_OK;

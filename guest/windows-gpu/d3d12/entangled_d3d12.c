@@ -6,10 +6,17 @@
 #include <string.h>
 #include "venus-transfer.h"
 
+typedef struct DdiAdapter {
+    VenusAdapter venus;
+    D3D12DDI_HRTTABLE command_list_table;
+} DdiAdapter;
+
 typedef struct DdiDevice {
     VenusDevice venus;
+    const DdiAdapter *adapter;
     D3D12DDI_HRTDEVICE runtime;
     const D3D12DDI_CORELAYER_DEVICECALLBACKS_0022 *callbacks;
+    SRWLOCK queue_lock;
 } DdiDevice;
 
 static VenusDevice *venus_device(D3D12DDI_HDEVICE handle)
@@ -136,8 +143,8 @@ static SIZE_T APIENTRY private_device_size(D3D12DDI_HADAPTER adapter,
 
 static HRESULT APIENTRY create_device(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_CREATEDEVICE_0003 *args)
 {
-    const VenusAdapter *venus = adapter.pDrvPrivate;
-    if (!venus || !args)
+    const DdiAdapter *driver = adapter.pDrvPrivate;
+    if (!driver || !args)
         return E_INVALIDARG;
 #ifdef ENTANGLED_D3D12_PROBE_DDI
     trace_ddi("CreateDevice", args->Interface, args->Version);
@@ -147,8 +154,8 @@ static HRESULT APIENTRY create_device(D3D12DDI_HADAPTER adapter, const D3D12DDIA
     DdiDevice *device = args->hDrvDevice.pDrvPrivate;
     if (!device)
         return E_INVALIDARG;
-    *device = (DdiDevice){ .runtime = args->hRTDevice, .callbacks = args->p12UMCallbacks_0022 };
-    HRESULT result = create_venus_device(venus, &device->venus);
+    *device = (DdiDevice){ .adapter = driver, .runtime = args->hRTDevice, .callbacks = args->p12UMCallbacks_0022 };
+    HRESULT result = create_venus_device(&driver->venus, &device->venus);
 #ifdef ENTANGLED_D3D12_PROBE_COPY
     if (SUCCEEDED(result)) {
         trace_ddi("Venus copy begin", 0, 64 * 1024);
@@ -190,11 +197,11 @@ static HRESULT APIENTRY get_supported_versions(D3D12DDI_HADAPTER adapter,
 
 static HRESULT APIENTRY close_adapter(D3D12DDI_HADAPTER adapter)
 {
-    VenusAdapter *venus = adapter.pDrvPrivate;
-    if (!venus)
+    DdiAdapter *driver = adapter.pDrvPrivate;
+    if (!driver)
         return E_INVALIDARG;
-    close_venus_adapter(venus);
-    HeapFree(GetProcessHeap(), 0, venus);
+    close_venus_adapter(&driver->venus);
+    HeapFree(GetProcessHeap(), 0, driver);
     return S_OK;
 }
 
@@ -218,7 +225,8 @@ static HRESULT APIENTRY get_caps(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_GE
         return write_probe_caps(args, &options, sizeof(options));
     }
     if (args->Type == D3D12DDICAPS_TYPE_SHADER) {
-        const VenusAdapter *venus = adapter.pDrvPrivate;
+        const DdiAdapter *driver = adapter.pDrvPrivate;
+        const VenusAdapter *venus = &driver->venus;
         if (!venus->subgroup_size)
             return DXGI_ERROR_UNSUPPORTED;
         /* Windows 10 requires nonzero lane counts even with WaveOps disabled.
@@ -244,6 +252,18 @@ static HRESULT APIENTRY get_caps(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_GE
             return E_INVALIDARG;
         const D3D12DDI_MEMORY_ARCHITECTURE_CAPS memory = { .IOCoherent = TRUE };
         return write_probe_caps(args, &memory, sizeof(memory));
+    }
+    if (args->Type == D3D12DDICAPS_TYPE_GPUVA_CAPS) {
+        if (!args->pInfo || *(const UINT *)args->pInfo != 0)
+            return E_INVALIDARG;
+        /* Match the address width of the lab miniport's four 8-bit page-table levels. */
+        const D3D12DDI_GPUVA_CAPS_0004 gpuva = { .MaxGPUVirtualAddressBitsPerResource = 12 + 4 * 8 };
+        return write_probe_caps(args, &gpuva, sizeof(gpuva));
+    }
+    if (args->Type == D3D12DDICAPS_TYPE_EXECUTECOMMANDLISTS_PARALLELISM ||
+        args->Type == D3D12DDICAPS_TYPE_0073_SUPPORT_BATCHED_MARKERS) {
+        const BOOL supported = FALSE;
+        return write_probe_caps(args, &supported, sizeof(supported));
     }
     if (args->Type == D3D12DDICAPS_TYPE_0023_UMD_BASED_COMMAND_QUEUE_PRIORITY) {
         const D3D12DDICAPS_UMD_BASED_COMMAND_QUEUE_PRIORITY_DATA_0023 priority = {
@@ -298,6 +318,12 @@ static HRESULT APIENTRY fill_table(D3D12DDI_HADAPTER adapter, D3D12DDI_TABLE_TYP
 {
 #ifdef ENTANGLED_D3D12_PROBE_DDI
     trace_ddi("FillDDITable", type, size);
+#ifdef ENTANGLED_D3D12_PROBE_COPY
+    DdiAdapter *driver = adapter.pDrvPrivate;
+    if (driver && type == D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D && !index &&
+        table && size == sizeof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0040))
+        driver->command_list_table = runtime_table;
+#endif
     trace_ddi("FillDDITable index", type, index);
     if (type == D3D12DDI_TABLE_TYPE_0020_EXTENDED_FEATURES) {
         if (!adapter.pDrvPrivate || !table || size != sizeof(extended_features) || index)
@@ -341,19 +367,19 @@ __declspec(dllexport) HRESULT APIENTRY OpenAdapter12(D3D12DDIARG_OPENADAPTER *ar
         return E_INVALIDARG;
 
     OutputDebugStringA("Entangled D3D12: OpenAdapter12\n");
-    VenusAdapter *venus = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*venus));
-    if (!venus)
+    DdiAdapter *driver = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*driver));
+    if (!driver)
         return E_OUTOFMEMORY;
 
-    const HRESULT result = open_venus_adapter(venus);
+    const HRESULT result = open_venus_adapter(&driver->venus);
     if (FAILED(result)) {
-        close_venus_adapter(venus);
-        HeapFree(GetProcessHeap(), 0, venus);
+        close_venus_adapter(&driver->venus);
+        HeapFree(GetProcessHeap(), 0, driver);
         OutputDebugStringA("Entangled D3D12: failed to select a Venus graphics device\n");
         return result;
     }
 
-    args->hAdapter.pDrvPrivate = venus;
+    args->hAdapter.pDrvPrivate = driver;
     *args->pAdapterFuncs = adapter_functions;
     return S_OK;
 }

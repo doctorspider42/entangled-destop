@@ -2,6 +2,11 @@
 typedef struct DdiCommandPool {
     DdiDevice *device;
     VkCommandPool pool;
+    SRWLOCK lock;
+    VkCommandBuffer *commands;
+    SIZE_T capacity;
+    SIZE_T used;
+    UINT64 generation;
 } DdiCommandPool;
 
 typedef struct DdiCommandRecorder {
@@ -14,6 +19,23 @@ typedef struct DdiCommandQueue {
     D3D12DDI_HRTCOMMANDQUEUE runtime;
     HANDLE context;
 } DdiCommandQueue;
+
+typedef struct DdiTransferList {
+    VenusTransferList venus;
+    HRESULT status;
+    DdiDevice *device;
+    D3D12DDI_HRTCOMMANDLIST runtime;
+    DdiCommandPool *pool;
+    UINT64 generation;
+    BOOL closed;
+} DdiTransferList;
+
+static void set_command_list_status(DdiTransferList *list, HRESULT status)
+{
+    list->status = status;
+    if (FAILED(status) && list->device && list->device->callbacks->pfnSetCommandListErrorCb)
+        list->device->callbacks->pfnSetCommandListErrorCb(list->runtime, status);
+}
 
 static void set_command_device_error(const DdiDevice *device, HRESULT status)
 {
@@ -94,9 +116,17 @@ static HRESULT APIENTRY create_command_pool(D3D12DDI_HDEVICE handle,
 static void APIENTRY reset_command_pool(D3D12DDI_HDEVICE handle, D3D12DDI_HCOMMANDPOOL_0040 driver_pool)
 {
     DdiDevice *device = handle.pDrvPrivate;
-    const DdiCommandPool *pool = driver_pool.pDrvPrivate;
-    const HRESULT status = device && pool && pool->device == device
-        ? reset_venus_command_pool(&device->venus, pool->pool) : E_INVALIDARG;
+    DdiCommandPool *pool = driver_pool.pDrvPrivate;
+    HRESULT status = E_INVALIDARG;
+    if (device && pool && pool->device == device) {
+        AcquireSRWLockExclusive(&pool->lock);
+        status = reset_venus_command_pool(&device->venus, pool->pool);
+        if (SUCCEEDED(status)) {
+            pool->used = 0;
+            ++pool->generation;
+        }
+        ReleaseSRWLockExclusive(&pool->lock);
+    }
     trace_ddi("ResetCommandPool", (UINT)status, 0);
     set_command_device_error(device, status);
 }
@@ -107,6 +137,8 @@ static void APIENTRY destroy_command_pool(D3D12DDI_HDEVICE handle, D3D12DDI_HCOM
     if (!pool || !pool->device || pool->device != handle.pDrvPrivate)
         return;
     destroy_venus_command_pool(&pool->device->venus, pool->pool);
+    if (pool->commands)
+        HeapFree(GetProcessHeap(), 0, pool->commands);
     *pool = (DdiCommandPool){0};
 }
 
@@ -152,3 +184,140 @@ static void APIENTRY set_command_pool_as_target(D3D12DDI_HDEVICE handle,
     recorder->target = pool;
     trace_ddi("SetCommandPoolAsTarget", 0, pool != NULL);
 }
+
+static SIZE_T APIENTRY private_command_list_size(D3D12DDI_HDEVICE device,
+                                                 const D3D12DDIARG_CREATE_COMMAND_LIST_0040 *args)
+{
+    return device.pDrvPrivate && args ? sizeof(DdiTransferList) : 0;
+}
+
+static HRESULT APIENTRY create_command_list(D3D12DDI_HDEVICE handle, const D3D12DDIARG_CREATE_COMMAND_LIST_0040 *args,
+                                            D3D12DDI_HCOMMANDLIST driver_list, D3D12DDI_HRTCOMMANDLIST runtime)
+{
+    DdiDevice *device = handle.pDrvPrivate;
+    DdiTransferList *list = driver_list.pDrvPrivate;
+    if (!device || !args || !list || !device->callbacks || !device->callbacks->pfnSetCommandListDDITableCb)
+        return E_INVALIDARG;
+    if (args->NodeMask > 1 || args->CommandListFlags != D3D12DDI_COMMAND_LIST_FLAG_NONE ||
+        !supports_command_queue_flags(args->QueueFlags) || args->Type != D3D12DDI_COMMAND_LIST_TYPE_DIRECT)
+        return DXGI_ERROR_UNSUPPORTED;
+
+    *list = (DdiTransferList){ .device = device, .runtime = runtime, .closed = TRUE };
+    device->callbacks->pfnSetCommandListDDITableCb(runtime, device->adapter->command_list_table);
+    trace_ddi("CreateCommandList", args->Type, args->QueueFlags);
+    return S_OK;
+}
+
+static void APIENTRY destroy_command_list(D3D12DDI_HDEVICE handle, D3D12DDI_HCOMMANDLIST driver_list)
+{
+    DdiTransferList *list = driver_list.pDrvPrivate;
+    if (list && list->device == handle.pDrvPrivate)
+        *list = (DdiTransferList){0};
+    /* The allocator can retain submitted command buffers after the list is destroyed. */
+}
+
+static HRESULT reserve_command_buffer_slot(DdiCommandPool *pool)
+{
+    if (pool->used < pool->capacity)
+        return S_OK;
+    if (pool->capacity > SIZE_MAX / sizeof(*pool->commands) / 2)
+        return E_OUTOFMEMORY;
+    const SIZE_T capacity = pool->capacity ? pool->capacity * 2 : 8;
+    const SIZE_T bytes = capacity * sizeof(*pool->commands);
+    HANDLE process_heap = GetProcessHeap();
+    VkCommandBuffer *commands = pool->commands
+        ? HeapReAlloc(process_heap, HEAP_ZERO_MEMORY, pool->commands, bytes)
+        : HeapAlloc(process_heap, HEAP_ZERO_MEMORY, bytes);
+    if (!commands)
+        return E_OUTOFMEMORY;
+    pool->commands = commands;
+    pool->capacity = capacity;
+    return S_OK;
+}
+
+static void APIENTRY reset_command_list(D3D12DDI_HCOMMANDLIST driver_list, const D3D12DDIARG_RESETCOMMANDLIST_0040 *args)
+{
+    DdiTransferList *list = driver_list.pDrvPrivate;
+    const DdiCommandRecorder *recorder = args ? args->hDrvCommandRecorder.pDrvPrivate : NULL;
+    DdiCommandPool *pool = recorder ? recorder->target : NULL;
+    if (!list || !list->device)
+        return;
+    list->pool = NULL;
+    list->closed = FALSE;
+    list->venus = (VenusTransferList){0};
+    if (!pool || pool->device != list->device || recorder->device != list->device ||
+        args->CommandListFlags != D3D12DDI_COMMAND_LIST_FLAG_NONE) {
+        set_command_list_status(list, E_INVALIDARG);
+        return;
+    }
+
+    AcquireSRWLockExclusive(&pool->lock);
+    HRESULT status = reserve_command_buffer_slot(pool);
+    if (SUCCEEDED(status)) {
+        VkCommandBuffer *command = &pool->commands[pool->used++];
+        const VenusDevice *venus = &list->device->venus;
+        status = begin_venus_command_buffer(venus, pool->pool, 0, command);
+        if (SUCCEEDED(status)) {
+            list->pool = pool;
+            list->generation = pool->generation;
+            list->venus = (VenusTransferList){ .device = venus, .pool = pool->pool, .command = *command };
+        }
+    }
+    ReleaseSRWLockExclusive(&pool->lock);
+    trace_ddi("ResetCommandList", (UINT)status, 0);
+    set_command_list_status(list, status);
+}
+
+static HRESULT gather_transfer_commands(const DdiDevice *device, UINT count, const D3D12DDI_HCOMMANDLIST *lists,
+                                        VkCommandBuffer *commands)
+{
+    for (UINT i = 0; i < count; ++i) {
+        const DdiTransferList *list = lists[i].pDrvPrivate;
+        if (!list || list->device != device || !list->closed || !list->pool || FAILED(list->status))
+            return E_INVALIDARG;
+        DdiCommandPool *pool = list->pool;
+        AcquireSRWLockShared(&pool->lock);
+        const BOOL available = list->generation == pool->generation;
+        ReleaseSRWLockShared(&pool->lock);
+        if (!available)
+            return E_INVALIDARG;
+        commands[i] = list->venus.command;
+    }
+    return S_OK;
+}
+
+static void APIENTRY execute_transfer_lists(D3D12DDI_HCOMMANDQUEUE driver_queue, UINT count,
+                                           const D3D12DDI_HCOMMANDLIST *lists)
+{
+    DdiCommandQueue *queue = driver_queue.pDrvPrivate;
+    if (!queue || !queue->device || !count)
+        return;
+    DdiDevice *device = queue->device;
+    if (!lists || count > SIZE_MAX / sizeof(VkCommandBuffer)) {
+        set_command_device_error(device, E_INVALIDARG);
+        return;
+    }
+    VkCommandBuffer local[16];
+    VkCommandBuffer *commands = count <= _countof(local)
+        ? local : HeapAlloc(GetProcessHeap(), 0, (SIZE_T)count * sizeof(*commands));
+    if (!commands) {
+        set_command_device_error(device, E_OUTOFMEMORY);
+        return;
+    }
+
+    HRESULT status = gather_transfer_commands(device, count, lists, commands);
+    if (SUCCEEDED(status)) {
+        /* The lab completes Venus work before the runtime can signal its WDDM fence. */
+        AcquireSRWLockExclusive(&device->queue_lock);
+        status = submit_venus_transfer_commands(&device->venus, count, commands);
+        ReleaseSRWLockExclusive(&device->queue_lock);
+    }
+    if (commands != local)
+        HeapFree(GetProcessHeap(), 0, commands);
+    trace_ddi("ExecuteCommandLists retired", (UINT)status, count);
+    set_command_device_error(device, status);
+}
+
+static const D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 entangled_transfer_queue_ddi = {
+    .pfnExecuteCommandLists = execute_transfer_lists,
+};

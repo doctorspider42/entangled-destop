@@ -22,7 +22,7 @@ static UINT32 transfer_memory_type(const VkPhysicalDeviceMemoryProperties *memor
     return fallback;
 }
 
-HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize size, BOOL readback,
+HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize size, BOOL readback, VkBufferUsageFlags uses,
                                      VenusTransferBuffer *buffer)
 {
     *buffer = (VenusTransferBuffer){0};
@@ -34,7 +34,10 @@ HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize siz
     const PFN_vkAllocateMemory allocate = DEVICE_FN(device, vkAllocateMemory);
     const PFN_vkBindBufferMemory bind = DEVICE_FN(device, vkBindBufferMemory);
     const PFN_vkMapMemory map = DEVICE_FN(device, vkMapMemory);
+    const PFN_vkGetBufferDeviceAddress address = device->buffer_device_address
+        ? DEVICE_FN(device, vkGetBufferDeviceAddress) : NULL;
     if (!create || !requirements || !allocate || !bind || !map ||
+        (device->buffer_device_address && !address) ||
         !DEVICE_FN(device, vkDestroyBuffer) || !DEVICE_FN(device, vkFreeMemory) ||
         !DEVICE_FN(device, vkUnmapMemory))
         return E_FAIL;
@@ -42,7 +45,8 @@ HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize siz
     const VkBufferCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = size,
-        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .usage = uses | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            (address ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
     VkBuffer handle;
@@ -61,8 +65,13 @@ HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize siz
         return DXGI_ERROR_UNSUPPORTED;
     }
 
+    const VkMemoryAllocateFlagsInfo flags = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+    };
     const VkMemoryAllocateInfo allocation = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = address ? &flags : NULL,
         .allocationSize = req.size,
         .memoryTypeIndex = type,
     };
@@ -71,6 +80,17 @@ HRESULT create_venus_transfer_buffer(const VenusDevice *device, VkDeviceSize siz
     if (result == VK_SUCCESS) {
         buffer->memory = memory;
         result = bind(device->handle, handle, memory, 0);
+    }
+    if (result == VK_SUCCESS && address) {
+        const VkBufferDeviceAddressInfo address_info = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+            .buffer = handle,
+        };
+        buffer->address = address(device->handle, &address_info);
+        if (!buffer->address) {
+            destroy_venus_transfer_buffer(buffer);
+            return E_FAIL;
+        }
     }
     if (result == VK_SUCCESS) {
         void *mapped;
@@ -139,40 +159,47 @@ void destroy_venus_command_pool(const VenusDevice *device, VkCommandPool pool)
     DEVICE_FN(device, vkDestroyCommandPool)(device->handle, pool, NULL);
 }
 
-HRESULT begin_venus_transfer_list(const VenusDevice *device, VenusTransferList *list)
+HRESULT begin_venus_command_buffer(const VenusDevice *device, VkCommandPool pool,
+                                   VkCommandBufferUsageFlags flags, VkCommandBuffer *command)
 {
-    *list = (VenusTransferList){0};
     const PFN_vkAllocateCommandBuffers allocate = DEVICE_FN(device, vkAllocateCommandBuffers);
     const PFN_vkBeginCommandBuffer begin = DEVICE_FN(device, vkBeginCommandBuffer);
     if (!allocate || !begin)
         return E_FAIL;
 
+    if (!*command) {
+        const VkCommandBufferAllocateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VkCommandBuffer allocated;
+        VkResult result = allocate(device->handle, &info, &allocated);
+        if (result != VK_SUCCESS)
+            return venus_hresult(result);
+        *command = allocated;
+    }
+    const VkCommandBufferBeginInfo info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = flags,
+    };
+    return venus_hresult(begin(*command, &info));
+}
+
+HRESULT begin_venus_transfer_list(const VenusDevice *device, VenusTransferList *list)
+{
+    *list = (VenusTransferList){0};
     VkCommandPool pool;
-    const HRESULT status = create_venus_command_pool(device, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, &pool);
+    HRESULT status = create_venus_command_pool(device, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, &pool);
     if (FAILED(status))
         return status;
     list->device = device;
     list->pool = pool;
-
-    const VkCommandBufferAllocateInfo command_info = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = pool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1,
-    };
-    const VkCommandBufferBeginInfo begin_info = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    };
-    VkCommandBuffer command;
-    VkResult result = allocate(device->handle, &command_info, &command);
-    if (result == VK_SUCCESS)
-        result = begin(command, &begin_info);
-    if (result == VK_SUCCESS)
-        list->command = command;
-    else
+    status = begin_venus_command_buffer(device, pool, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, &list->command);
+    if (FAILED(status))
         destroy_venus_transfer_list(list);
-    return venus_hresult(result);
+    return status;
 }
 
 HRESULT close_venus_transfer_list(const VenusTransferList *list)
@@ -192,9 +219,8 @@ HRESULT close_venus_transfer_list(const VenusTransferList *list)
     return venus_hresult(end(list->command));
 }
 
-HRESULT submit_venus_transfer_probe(const VenusTransferList *list)
+HRESULT submit_venus_transfer_commands(const VenusDevice *device, UINT count, const VkCommandBuffer *commands)
 {
-    const VenusDevice *device = list->device;
     const PFN_vkCreateFence create_fence = DEVICE_FN(device, vkCreateFence);
     const PFN_vkDestroyFence destroy_fence = DEVICE_FN(device, vkDestroyFence);
     const PFN_vkQueueSubmit submit = DEVICE_FN(device, vkQueueSubmit);
@@ -209,10 +235,10 @@ HRESULT submit_venus_transfer_probe(const VenusTransferList *list)
         return venus_hresult(result);
     const VkSubmitInfo submission = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &list->command,
+        .commandBufferCount = count,
+        .pCommandBuffers = commands,
     };
-    /* The probe runs before CreateDevice gives the queue to any other caller. */
+    /* The caller serializes access to the queue. */
     result = submit(device->graphics_queue, 1, &submission, fence);
     if (result == VK_SUCCESS) {
         result = wait(device->handle, 1, &fence, VK_TRUE, 5 * UINT64_C(1000000000));
@@ -226,6 +252,12 @@ HRESULT submit_venus_transfer_probe(const VenusTransferList *list)
     }
     destroy_fence(device->handle, fence, NULL);
     return venus_hresult(result);
+}
+
+HRESULT submit_venus_transfer_probe(const VenusTransferList *list)
+{
+    /* Device initialization has not yet shared the queue with other callers. */
+    return submit_venus_transfer_commands(list->device, 1, &list->command);
 }
 
 void destroy_venus_transfer_list(VenusTransferList *list)
