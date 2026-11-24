@@ -561,6 +561,8 @@ static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
     .pfnGetCPUDescriptorHandleForHeapStart = cpu_descriptor_heap_start,
     .pfnGetGPUDescriptorHandleForHeapStart = gpu_descriptor_heap_start,
     .pfnCreateRenderTargetView = create_color_rtv,
+    .pfnCopyDescriptors = copy_descriptors,
+    .pfnCopyDescriptorsSimple = copy_descriptors_simple,
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     .pfnCreateConstantBufferView = create_uniform_cbv,
     .pfnCreateShaderResourceView = create_sampled_srv,

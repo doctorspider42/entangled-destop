@@ -357,26 +357,44 @@ static DrawBindings tint_bindings(ID3D12Device *device)
 static DrawBindings texture_bindings(ID3D12Device *device, ID3D12Resource *texture)
 {
     DrawBindings bindings = {};
-    D3D12_DESCRIPTOR_HEAP_DESC heap = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+    D3D12_DESCRIPTOR_HEAP_DESC heap = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     check(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&bindings.heap)), "CreateDescriptorHeap (sampled texture)");
+    D3D12_DESCRIPTOR_HEAP_DESC staging_desc = {heap.Type, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    ComPtr<ID3D12DescriptorHeap> staging;
+    check(device->CreateDescriptorHeap(&staging_desc, IID_PPV_ARGS(&staging)), "CreateDescriptorHeap (texture staging)");
+    const auto first = staging->GetCPUDescriptorHandleForHeapStart();
+    const UINT stride = device->GetDescriptorHandleIncrementSize(heap.Type);
+    const D3D12_CPU_DESCRIPTOR_HANDLE source_ranges[] = {first, {first.ptr + 2 * stride}};
+    const D3D12_CPU_DESCRIPTOR_HANDLE destination = bindings.heap->GetCPUDescriptorHandleForHeapStart();
+    const UINT destination_count = 2;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
     srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
-    device->CreateShaderResourceView(texture, &srv, bindings.heap->GetCPUDescriptorHandleForHeapStart());
+    for (const auto &source : source_ranges)
+        device->CreateShaderResourceView(texture, &srv, source);
+    device->CopyDescriptors(1, &destination, &destination_count, ARRAYSIZE(source_ranges), source_ranges, nullptr, heap.Type);
     bindings.table = bindings.heap->GetGPUDescriptorHandleForHeapStart();
+    bindings.table.ptr += stride;
 
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    heap.NumDescriptors = 1;
     check(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&bindings.sampler_heap)), "CreateDescriptorHeap (sampler)");
+    staging_desc.Type = heap.Type;
+    staging_desc.NumDescriptors = 1;
+    ComPtr<ID3D12DescriptorHeap> sampler_staging;
+    check(device->CreateDescriptorHeap(&staging_desc, IID_PPV_ARGS(&sampler_staging)), "CreateDescriptorHeap (sampler staging)");
     D3D12_SAMPLER_DESC sampler = {};
     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     sampler.MaxAnisotropy = 1;
     sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     sampler.MaxLOD = D3D12_FLOAT32_MAX;
-    device->CreateSampler(&sampler, bindings.sampler_heap->GetCPUDescriptorHandleForHeapStart());
+    const auto sampler_source = sampler_staging->GetCPUDescriptorHandleForHeapStart();
+    device->CreateSampler(&sampler, sampler_source);
+    device->CopyDescriptorsSimple(1, bindings.sampler_heap->GetCPUDescriptorHandleForHeapStart(), sampler_source, heap.Type);
     bindings.sampler_table = bindings.sampler_heap->GetGPUDescriptorHandleForHeapStart();
     return bindings;
 }

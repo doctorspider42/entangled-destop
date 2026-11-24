@@ -41,6 +41,10 @@ typedef struct DdiDevice {
     const D3DDDI_DEVICECALLBACKS *kernel;
 #endif
     SRWLOCK queue_lock;
+#ifdef ENTANGLED_D3D12_PROBE_COPY
+    SRWLOCK descriptor_lock;
+    struct DdiDescriptorHeap *descriptor_heaps;
+#endif
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     SRWLOCK buffer_lock;
     DdiBufferAddress *buffers;
@@ -174,6 +178,7 @@ static void APIENTRY query_node_map(D3D12DDI_HDEVICE device, UINT physical_adapt
 
 /* The WDK DDI headers define external C constants. Keep the callbacks in this translation unit. */
 static VkFormat color_image_format(DXGI_FORMAT format);
+static void set_command_device_error(const DdiDevice *device, HRESULT status);
 #include "ddi-root-signature.inc"
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
 #include "ddi-shader.inc"

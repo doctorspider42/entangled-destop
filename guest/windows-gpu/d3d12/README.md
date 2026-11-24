@@ -669,6 +669,14 @@ supports one RGBA8 or BGRA8 single-subresource image uploaded in the
 same command list, with point or linear clamp sampling. See
 `ddi40-runtime-texture-sample/` under the lab share.
 
+Build `4.28.50.357` populated the shader-visible heaps via descriptor
+copies. The test gathered two noncontiguous SRVs from a CPU-only heap
+with `CopyDescriptors` and copied the sampler with
+`CopyDescriptorsSimple`. It sampled the second copied SRV.
+The draw verified all pixels at 1.935 ms submit-to-fence. The UMD checks
+heap ownership, range bounds and descriptor counts before copying. See
+`ddi40-runtime-descriptor-copy/` under the lab share.
+
 ## End-to-end test criteria
 
 For GPU proof, correlate the guest workload with a new Venus context and a
