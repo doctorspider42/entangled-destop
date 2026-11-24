@@ -101,6 +101,7 @@ static void APIENTRY query_node_map(D3D12DDI_HDEVICE device, UINT physical_adapt
 }
 
 /* The WDK DDI headers define external C constants. Keep the callbacks in this translation unit. */
+#include "ddi-root-signature.inc"
 #include "ddi-buffer.inc"
 #endif
 
@@ -223,7 +224,7 @@ static HRESULT APIENTRY get_caps(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_GE
         /* The lab targets a single discrete adapter. */
         if (!args->pInfo || *(const UINT *)args->pInfo != 0)
             return E_INVALIDARG;
-        const D3D12DDI_MEMORY_ARCHITECTURE_CAPS memory = {0};
+        const D3D12DDI_MEMORY_ARCHITECTURE_CAPS memory = { .IOCoherent = TRUE };
         return write_probe_caps(args, &memory, sizeof(memory));
     }
     if (args->Type == D3D12DDICAPS_TYPE_0023_UMD_BASED_COMMAND_QUEUE_PRIORITY) {
@@ -235,6 +236,27 @@ static HRESULT APIENTRY get_caps(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_GE
     if (args->Type == D3D12DDICAPS_TYPE_0022_TEXTURE_LAYOUT && !args->pInfo) {
         const D3D12DDI_TEXTURE_LAYOUT_CAPS_0026 layout = {0};
         return write_probe_caps(args, &layout, sizeof(layout));
+    }
+    if (args->Type == D3D12DDICAPS_TYPE_TEXTURE_LAYOUT_SETS) {
+        const UINT *query = args->pInfo;
+        if (!query || query[0] != D3D12DDI_TL_ROW_MAJOR || query[1] > D3D12DDI_FUNCUNIT_COPY_DST)
+            return E_INVALIDARG;
+        trace_ddi("Row-major layout function", query[1], args->DataSize);
+        const UINT16 placement = (UINT16)D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+        const UINT16 pitch = (UINT16)D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+        const D3D12DDI_ROW_MAJOR_LAYOUT_CAPS layout = {
+            .SubCaps = {
+                {4, placement, pitch, pitch},
+                {16, placement, pitch, pitch},
+            },
+        };
+        return write_probe_caps(args, &layout, sizeof(layout));
+    }
+    if (args->Type == D3D12DDICAPS_TYPE_0022_CPU_PAGE_TABLE_FALSE_POSITIVES) {
+        if (!args->pInfo || *(const UINT *)args->pInfo != 0)
+            return E_INVALIDARG;
+        const D3D12DDI_COMMAND_QUEUE_FLAGS queues = D3D12DDI_COMMAND_QUEUE_FLAG_NONE;
+        return write_probe_caps(args, &queues, sizeof(queues));
     }
 #endif
     return DXGI_ERROR_UNSUPPORTED;

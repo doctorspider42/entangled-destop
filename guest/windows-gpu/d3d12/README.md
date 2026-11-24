@@ -330,6 +330,50 @@ that the lab's discrete adapter requires `IOCoherent`. The trace and
 clean rollback are in
 `F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-layout/`.
 
+Build `1.6.46.113` answered the coherent discrete memory query and all three
+row-major layout queries using Direct3D's 512-byte placement and 256-byte
+row-pitch alignments. Build `1.8.8.973` also answered the CPU page-table
+false-positive query with no affected queues. Windows then created its own
+root signature during `D3D12CreateDevice`, before the application's copy.
+Build `1.11.32.396` identified version 1.1, node mask 1, and zero root
+parameters and static samplers. Logs are in
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-root-sig/`.
+
+Build `1.17.4.597` created the runtime's empty root signature as a Vulkan
+pipeline layout. The UMD owns copies of nonempty root-signature descriptions
+and their nested tables for later pipeline construction. This build also
+used the allocation-size DDI to choose a 64 KiB alignment and a 128 KiB
+heap for the guarded transfer test. The 64 KiB GPU copy and byte check
+passed. Windows next passed a vertex shader with a raw Shader Model 4.0
+token stream of 15 DWORDs. The scratch build stopped in the vertex shader
+creation callback. The trace is in
+`F:/VMs/Entangled/d3d12-lab/share/ddi40-runtime-root-create/`.
+
+## Shader translation
+
+The stock vkd3d-proton Windows DLL exports the Direct3D runtime entry point.
+A private engine integration would need its own device factory and a Vulkan
+feature profile the Venus renderer can serve. Upstream requires Vulkan 1.3,
+descriptor indexing, robustness2 and push descriptors. Entangled currently
+withholds `VK_KHR_push_descriptor`. vkd3d-proton uses LGPL-2.1-or-later.
+[Driver requirements](https://github.com/HansKristian-Work/vkd3d-proton#drivers),
+[Windows exports](https://github.com/HansKristian-Work/vkd3d-proton/blob/master/libs/d3d12core/d3d12core.def),
+[license](https://github.com/HansKristian-Work/vkd3d-proton/blob/master/COPYING).
+
+The smaller shader-only candidate is `dxil-spirv` with its
+`dxbc-spirv` submodule, both MIT-licensed. The pinned scratch build
+(`53aac418` and `d82d9eaa`) compiled as a Windows x64 DLL with MSVC.
+A local probe translated a vertex shader compiled with FXC `vs_5_1`
+and with DXC `vs_6_0` through the public C API. It verified the vertex
+stage and SPIR-V magic for both outputs. The converter and evidence are
+in `F:/entangled-targets/d3d12/upstream/dxil-spirv-msvc/`. Driver
+packaging, raw DDI shader decoding and Vulkan pipeline execution remain
+separate steps.
+[dxil-spirv license](https://github.com/HansKristian-Work/dxil-spirv/blob/53aac41815f8203dff4e081969438ed5063dbff3/LICENSE.MIT),
+[dxbc-spirv license](https://github.com/doitsujin/dxbc-spirv/blob/d82d9eaa6cab5c7277a6839f328e1b4d2f146894/LICENSE).
+
+## End-to-end test criteria
+
 For GPU proof, correlate the guest workload with a new Venus context and a
 host GPU submission and retirement, then verify the bytes after the guest
 fence. For presentation, separately measure GPU work, `Present` and the time

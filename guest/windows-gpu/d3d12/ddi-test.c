@@ -131,6 +131,17 @@ static int check_adapter(PFND3D12DDI_OPENADAPTER open_adapter, BOOL require_venu
     };
     CHECK(functions.pfnGetCaps(args.hAdapter, &caps) == S_OK);
     CHECK(priority.SupportedQueueFlagsForGlobalRealtimeQueues == D3D12DDI_COMMAND_QUEUE_FLAG_NONE);
+    UINT node = 0;
+    D3D12DDI_MEMORY_ARCHITECTURE_CAPS memory;
+    caps = (D3D12DDIARG_GETCAPS){D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE, &node, &memory, sizeof(memory)};
+    CHECK(functions.pfnGetCaps(args.hAdapter, &caps) == S_OK);
+    CHECK(!memory.UMA && memory.IOCoherent && !memory.CacheCoherent);
+    UINT layout_query[] = {D3D12DDI_TL_ROW_MAJOR, D3D12DDI_FUNCUNIT_COPY_DST};
+    D3D12DDI_ROW_MAJOR_LAYOUT_CAPS layout;
+    caps = (D3D12DDIARG_GETCAPS){D3D12DDICAPS_TYPE_TEXTURE_LAYOUT_SETS, layout_query, &layout, sizeof(layout)};
+    CHECK(functions.pfnGetCaps(args.hAdapter, &caps) == S_OK);
+    CHECK(layout.SubCaps[0].BaseOffsetAlignment == D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    CHECK(layout.SubCaps[1].PitchAlignment == D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
 #else
     CHECK(functions.pfnGetCaps(args.hAdapter, &caps) == DXGI_ERROR_UNSUPPORTED);
     CHECK(depth == UINT_MAX);

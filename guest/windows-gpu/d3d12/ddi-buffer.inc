@@ -3,6 +3,28 @@ typedef struct DdiBufferResource {
     VenusTransferBuffer *backing;
 } DdiBufferResource;
 
+static void APIENTRY check_buffer_allocation(D3D12DDI_HDEVICE device,
+                                             const D3D12DDIARG_CREATERESOURCE_0003 *resource,
+                                             D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS optimization,
+                                             UINT32 alignment_restriction, UINT visible_node_mask,
+                                             D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 *info)
+{
+    (void)optimization;
+    const UINT32 alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    *info = (D3D12DDI_RESOURCE_ALLOCATION_INFO_0022){ .ResourceDataSize = UINT64_MAX };
+    if (!device.pDrvPrivate || !resource || resource->ResourceType != D3D12DDI_RT_BUFFER ||
+        (resource->Layout != D3D12DDI_TL_ROW_MAJOR && resource->Layout != D3D12DDI_TL_UNDEFINED) ||
+        visible_node_mask > 1 || (alignment_restriction && alignment_restriction < alignment) ||
+        !resource->Width || resource->Width > UINT64_MAX - (alignment - 1))
+        return;
+
+    *info = (D3D12DDI_RESOURCE_ALLOCATION_INFO_0022){
+        .ResourceDataSize = (resource->Width + alignment - 1) & ~((UINT64)alignment - 1),
+        .ResourceDataAlignment = alignment,
+        .Layout = D3D12DDI_TL_ROW_MAJOR,
+    };
+}
+
 static D3D12DDI_HEAP_AND_RESOURCE_SIZES APIENTRY private_buffer_sizes(
     D3D12DDI_HDEVICE device, const D3D12DDIARG_CREATEHEAP_0001 *heap,
     const D3D12DDIARG_CREATERESOURCE_0003 *resource, D3D12DDI_HPROTECTEDRESOURCESESSION_0030 protection)
@@ -76,12 +98,16 @@ static void APIENTRY unmap_buffer_heap(D3D12DDI_HDEVICE device, D3D12DDI_HHEAP h
     (void)heap;
 }
 
-static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_buffer_ddi = {
+static const D3D12DDI_DEVICE_FUNCS_CORE_0040 entangled_device_core_ddi = {
+    .pfnCalcPrivateRootSignatureSize = private_root_signature_size,
+    .pfnCreateRootSignature = create_root_signature,
+    .pfnDestroyRootSignature = destroy_root_signature,
     .pfnCalcPrivateHeapAndResourceSizes = private_buffer_sizes,
     .pfnCreateHeapAndResource = create_committed_buffer,
     .pfnDestroyHeapAndResource = destroy_committed_buffer,
     .pfnMapHeap = map_buffer_heap,
     .pfnUnmapHeap = unmap_buffer_heap,
+    .pfnCheckResourceAllocationInfo = check_buffer_allocation,
     .pfnGetImplicitPhysicalAdapterMask = implicit_physical_adapter_mask,
     .pfnQueryNodeMap = query_node_map,
 };
@@ -152,16 +178,13 @@ static HRESULT probe_d3d12_buffer_ddi(D3D12DDI_HDEVICE device)
     const UINT64 size = region.dstOffset + region.size + 16;
     const D3D12DDI_HPROTECTEDRESOURCESESSION_0030 protection = {0};
     const D3D12DDI_HRTRESOURCE runtime = {0};
-    const D3D12DDI_DEVICE_FUNCS_CORE_0040 *ddi = &entangled_buffer_ddi;
+    const D3D12DDI_DEVICE_FUNCS_CORE_0040 *ddi = &entangled_device_core_ddi;
     VenusTransferBuffer upload = {0}, readback = {0};
     DdiBufferResource src = {0}, dst = {0};
     const D3D12DDI_HHEAP upload_heap = { &upload }, readback_heap = { &readback };
     const D3D12DDI_HRESOURCE upload_handle = { &src }, readback_handle = { &dst };
 
     D3D12DDIARG_CREATEHEAP_0001 heap = {
-        .ByteSize = (size + D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT - 1) &
-                    ~((UINT64)D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT - 1),
-        .Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
         .MemoryPool = D3D12DDI_MEMORY_POOL_L0,
         .Flags = D3D12DDI_HEAP_FLAG_BUFFERS,
         .CPUPageProperty = D3D12DDI_CPU_PAGE_PROPERTY_WRITE_COMBINE,
@@ -175,9 +198,19 @@ static HRESULT probe_d3d12_buffer_ddi(D3D12DDI_HDEVICE device)
         .DepthOrArraySize = 1,
         .MipLevels = 1,
         .SampleDesc.Count = 1,
-        .Layout = D3D12DDI_TL_ROW_MAJOR,
         .InitialResourceState = D3D12DDI_RESOURCE_STATE_COPY_SOURCE,
     };
+    D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 allocation;
+    ddi->pfnCheckResourceAllocationInfo(device, &buffer, D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_NONE,
+                                        0, heap.VisibleNodeMask, &allocation);
+    if (allocation.ResourceDataSize != 2 * D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT ||
+        allocation.ResourceDataAlignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT ||
+        allocation.Layout != D3D12DDI_TL_ROW_MAJOR)
+        return E_UNEXPECTED;
+    heap.ByteSize = allocation.ResourceDataSize;
+    heap.Alignment = allocation.ResourceDataAlignment;
+    buffer.Layout = allocation.Layout;
+
     const D3D12DDI_HEAP_AND_RESOURCE_SIZES private_sizes =
         ddi->pfnCalcPrivateHeapAndResourceSizes(device, &heap, &buffer, protection);
     if (private_sizes.Heap != sizeof(upload) || private_sizes.Resource != sizeof(src))
