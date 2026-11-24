@@ -614,22 +614,27 @@ engine was preserved.
 
 ## Wintanyl F239
 
-The lab runtime also admits `wintanyl-explorer.exe` when both
-`ENTANGLED_RUNTIME_TABLES=1` and `ENTANGLED_WINTANYL_D3D12=1` are set.
-Build `3.58.45.44` tested the F239 executable with the SHA-256 from the
-F240/F241 control. The unchanged Explorer enumerated 80 test files. Its
-wgpu adapter probe created and released an Entangled D3D12 device, and
-the process loaded `d3d10warp.dll` and entered the window loop. The
-F239 binary uses wgpu-hal 30.0.2, which rejects Resource Binding Tier 1
-when it enumerates DX12 adapters. The driver reports Tier 1. The next
-rendering test needs shader access to a real bound resource before the
-driver can advance toward Tier 2.
+The unmodified F239 Explorer rendered and presented an 80-file directory
+on the physical RTX 2070 with build `20.37.42.380`. The guest DDI trace
+recorded the UI draws, completion of all seven lists in the frame
+submission, and a successful handoff of the WDDM allocation to DXGI.
+The headless host captured the composed list in `scanout.png`. The
+executable's SHA-256 is the F240/F241 control hash
+`7FCC6738C7CB66D402CDADFA286863EB15302855144B5FFC212F6611562EF17C`.
+See `ddi40-runtime-wintanyl-persistent-textures/` under the lab share.
+
+Set `ENTANGLED_D3D12_PROBE_WINTANYL=1` when building the disposable
+runtime-probe package. Inside its test guest, launch F239 with
+`ENTANGLED_RUNTIME_TABLES=1`, `ENTANGLED_WINTANYL_D3D12=1` and
+`WT_UI_WARP` unset. The package enables the DDI tables and a
+diagnostic Tier 2 reply for this process. Wgpu-hal 30.0.2 requires the
+Tier 2 reply before opening the adapter, and the UMD implements the
+subset used by this workload. Full Tier 2 conformance remains open.
 [wgpu-hal 30.0.2 DX12 adapter admission](https://github.com/gfx-rs/wgpu/blob/v30.0.2/wgpu-hal/src/dx12/adapter.rs#L208-L235).
 
-See `ddi40-runtime-wintanyl-f239/` under the lab share for the debugger
-log, ETW and application trace. The harness ended the process after
-22 seconds and restored `oem58.inf`. F239 has no verified hardware
-frame or scroll measurement in this run.
+The original Tier 1 trace in `ddi40-runtime-wintanyl-f239/` stopped at
+adapter admission. The F239 diagnostic traces below record the subsequent
+bring-up from device creation through composition.
 
 Build `4.4.34.384` queried descriptor indexing through the same Windows
 Venus ICD and physical RTX 2070. It reported runtime arrays, partially bound
@@ -656,8 +661,7 @@ The `--upload-texture` probe uploads a nonuniform RGBA8 pattern from a
 placed buffer footprint to a committed default texture, then transitions
 the texture and copies it back for verification. Build `4.17.1.982`
 verified all 73 × 41 pixels through the system runtime at 1.248 ms
-submit-to-fence. The pilot accepts one full, single-subresource upload
-per command list. See `ddi40-runtime-texture-upload/` under the lab share.
+submit-to-fence. See `ddi40-runtime-texture-upload/` under the lab share.
 
 The `--sample-texture` probe uploads that pattern to an optimal Vulkan
 image, transitions it for pixel shader access and binds a D3D12 SRV
@@ -814,6 +818,35 @@ image is bound to the heap's device-local memory at that offset.
 Build `20.24.57.480` verified all 2,993 shaded pixels on the RTX 2070
 in 1.495 ms submit-to-fence. See `ddi40-runtime-placed-r8-texture/`
 under the lab share.
+
+F239 diagnostic build `20.25.30.134` created a 1×1 fallback R8 texture,
+its SRV, and a 2,048×2,048 atlas. A resource barrier for the new atlas
+then removed the device before wgpu configured a presentation surface.
+See `ddi40-runtime-wintanyl-placed-atlas/` under the lab share.
+
+The `--texture-persistence` probe places two RGBA8 render targets at
+distinct offsets in the same heap. It clears both, draws two
+premultiplied overlays into the first, then samples it into the second
+in a new command list on the same queue. Build `20.35.2.863` verified
+all 2,993 pixels on the RTX 2070. The lists took 1.384 and 1.450 ms
+submit-to-fence, respectively. Its composition regression probe
+measured 1.414 ms draw-to-fence, 8.320 ms in `Present` and 18.955 ms in
+`DwmFlush`. See `ddi40-runtime-persistent-render-targets/` under the lab share.
+
+Each color image has one Vulkan backing for its supported uses. The
+pilot initializes its layout and contents on the queue at creation.
+The `GENERAL` layout remains stable across command-list recording,
+reset and submission. Explicit D3D12 transitions create Vulkan memory
+dependencies. Texture heaps support disjoint live placements. Aliasing
+overlapping textures requires a separate implementation.
+
+The extended atlas probe in build `20.37.42.380` verified the entire
+image after copying an 8×7 region from a nonzero source origin to a
+different destination origin. The `--wgpu-composition` probe opened a
+three-buffer, flip-discard, premultiplied swap chain with flags `0x840`
+and a working frame-latency waitable object. It measured 1.693 ms
+draw-to-fence, 7.795 ms in `Present` and 68.152 ms in `DwmFlush`.
+See `ddi40-runtime-wintanyl-persistent-textures/` under the lab share.
 
 ## End-to-end test criteria
 

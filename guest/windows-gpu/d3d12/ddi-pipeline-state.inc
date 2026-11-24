@@ -38,7 +38,6 @@ typedef struct DdiPipeline {
     VkRenderPass render_pass;
     VkFormat color_format;
     VkPipelineLayout layout;
-    BOOL blends;
     UINT minimum_vertex_stride;
     VkVertexInputRate vertex_rate;
     DdiComputeLayout compute;
@@ -259,7 +258,6 @@ static HRESULT create_color_pipeline(const VenusDevice *venus, const D3D12DDIARG
         state->pipeline = pipeline;
         state->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
         state->color_format = format;
-        state->blends = target->BlendEnable;
         state->minimum_vertex_stride = elements ? elements->minimum_stride : 0;
         state->vertex_rate = elements ? elements->rate : VK_VERTEX_INPUT_RATE_VERTEX;
     } else if (pipeline) {

@@ -142,8 +142,11 @@ static void APIENTRY present_surface(D3D12DDI_HCOMMANDLIST commands, D3D12DDI_HC
     }
 
     AcquireSRWLockExclusive(&device->queue_lock);
+    const LONGLONG start = queue_timing_start();
     const HRESULT status = write_present_allocation(device, &src->present);
     ReleaseSRWLockExclusive(&device->queue_lock);
+    if (SUCCEEDED(status))
+        trace_queue_duration("present-copy-to-wddm", start, 1);
     trace_ddi("Present Windows allocation", (UINT)status, src->present.allocation);
     if (FAILED(status)) {
         set_command_device_error(device, status);

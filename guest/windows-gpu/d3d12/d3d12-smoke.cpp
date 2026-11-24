@@ -157,12 +157,15 @@ struct Recording {
     ComPtr<ID3D12GraphicsCommandList> list;
 };
 
-static Recording begin_recording(ID3D12Device *device)
+static Recording begin_recording(ID3D12Device *device, ID3D12CommandQueue *queue = nullptr)
 {
     D3D12_COMMAND_QUEUE_DESC queue_desc = {};
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     Recording commands;
-    check(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&commands.queue)), "CreateCommandQueue");
+    if (queue)
+        commands.queue = queue;
+    else
+        check(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&commands.queue)), "CreateCommandQueue");
     check(device->CreateCommandAllocator(queue_desc.Type, IID_PPV_ARGS(&commands.allocator)), "CreateCommandAllocator");
     check(device->CreateCommandList(0, queue_desc.Type, commands.allocator.Get(), nullptr, IID_PPV_ARGS(&commands.list)),
           "CreateCommandList");
@@ -428,7 +431,8 @@ struct DrawPipeline {
     ComPtr<ID3D12PipelineState> pipeline;
 };
 
-enum class ColorWork { Clear, Draw, TimedDraw, CalibratedDraw, Blend, Uniform, Upload, Sample, Atlas, PlacedAtlas, Instance, Bindings };
+enum class ColorWork { Clear, Draw, TimedDraw, CalibratedDraw, Blend, Uniform, Upload, Sample,
+                       Atlas, PlacedAtlas, Persistence, Instance, Bindings };
 
 static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT target_format, ColorWork work = ColorWork::Draw)
 {
@@ -484,7 +488,8 @@ static DrawPipeline create_draw_pipeline(ID3D12Device *device, DXGI_FORMAT targe
     )";
     const bool uniform = work == ColorWork::Uniform;
     const bool bindings = work == ColorWork::Bindings;
-    const bool sampled = work == ColorWork::Sample || work == ColorWork::Atlas || work == ColorWork::PlacedAtlas || bindings;
+    const bool sampled = work == ColorWork::Sample || work == ColorWork::Atlas || work == ColorWork::PlacedAtlas ||
+                         work == ColorWork::Persistence || bindings;
     const bool instanced = work == ColorWork::Instance;
     const bool blend = work == ColorWork::Blend;
     const auto vertex = compile_shader(instanced ? instance_source : bindings ? bound_vertex_source : vertex_source, "vs_5_1");
@@ -784,8 +789,9 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     const bool upload_texture = work == ColorWork::Upload;
     const bool placed_atlas = work == ColorWork::PlacedAtlas;
     const bool sample_atlas = work == ColorWork::Atlas || placed_atlas;
+    const bool persist = work == ColorWork::Persistence;
     const bool general_bindings = work == ColorWork::Bindings;
-    const bool sample_texture = work == ColorWork::Sample || sample_atlas || general_bindings;
+    const bool sample_texture = work == ColorWork::Sample || sample_atlas || general_bindings || persist;
     const bool use_uniform = work == ColorWork::Uniform;
     const bool use_instances = work == ColorWork::Instance;
     const bool calibrated_draw = work == ColorWork::CalibratedDraw;
@@ -804,11 +810,25 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     desc.SampleDesc.Count = 1;
     desc.Flags = upload_texture ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
-    ComPtr<ID3D12Resource> target;
+    ComPtr<ID3D12Heap> image_heap;
+    ComPtr<ID3D12Resource> target, sampled;
     const D3D12_RESOURCE_STATES write_state = upload_texture
         ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_RENDER_TARGET;
-    check(device->CreateCommittedResource(&video_memory, D3D12_HEAP_FLAG_NONE, &desc,
-                                          write_state, nullptr, IID_PPV_ARGS(&target)), "CreateCommittedResource (color texture)");
+    if (persist) {
+        const auto allocation = device->GetResourceAllocationInfo(0, 1, &desc);
+        if (!allocation.Alignment || !allocation.SizeInBytes || allocation.SizeInBytes > UINT64_MAX / 2)
+            check(E_FAIL, "unexpected render target allocation info");
+        const D3D12_HEAP_DESC heap = {2 * allocation.SizeInBytes, video_memory, allocation.Alignment,
+            D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES};
+        check(device->CreateHeap(&heap, IID_PPV_ARGS(&image_heap)), "CreateHeap (two render targets)");
+        check(device->CreatePlacedResource(image_heap.Get(), 0, &desc, write_state, nullptr, IID_PPV_ARGS(&sampled)),
+              "CreatePlacedResource (first render target)");
+        check(device->CreatePlacedResource(image_heap.Get(), allocation.SizeInBytes, &desc, write_state, nullptr,
+                                            IID_PPV_ARGS(&target)), "CreatePlacedResource (second render target)");
+    } else {
+        check(device->CreateCommittedResource(&video_memory, D3D12_HEAP_FLAG_NONE, &desc, write_state, nullptr,
+                                               IID_PPV_ARGS(&target)), "CreateCommittedResource (color texture)");
+    }
     ComPtr<ID3D12DescriptorHeap> rtv_heap;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
     if (!upload_texture) {
@@ -838,13 +858,13 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     DrawPipeline draw;
     DrawBindings bindings = {};
     ComPtr<ID3D12Resource> upload;
-    ComPtr<ID3D12Heap> atlas_heap;
-    ComPtr<ID3D12Resource> sampled;
     ComPtr<ID3D12Resource> instances;
     ComPtr<ID3D12Resource> transforms;
     ComPtr<ID3D12Resource> indices, index_upload;
     D3D12_GPU_VIRTUAL_ADDRESS vertex_cbv = 0;
     D3D12_VERTEX_BUFFER_VIEW instance_view = {};
+    constexpr D3D12_BOX atlas_patch = {3, 5, 0, 11, 12, 1};
+    constexpr UINT patch_x = 35, patch_y = 27;
     D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
     src.pResource = target.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -853,7 +873,21 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     dst.PlacedFootprint = footprint;
     const D3D12_RANGE whole = {0, static_cast<SIZE_T>(bytes)}, empty = {};
     void *mapped = nullptr;
-    if (upload_texture || sample_texture) {
+    if (persist) {
+        const auto prior = begin_recording(device, commands.queue.Get());
+        const auto prior_heap = create_rtv_heap(device);
+        const auto prior_rtv = prior_heap->GetCPUDescriptorHandleForHeapStart();
+        device->CreateRenderTargetView(sampled.Get(), nullptr, prior_rtv);
+        const FLOAT blue[] = {0, 0, 1, 1}, green[] = {0, 1, 0, 1};
+        prior.list->ClearRenderTargetView(prior_rtv, blue, 0, nullptr);
+        prior.list->ClearRenderTargetView(rtv, green, 0, nullptr);
+        const auto overlay = create_draw_pipeline(device, desc.Format, ColorWork::Blend);
+        record_draw(prior.list.Get(), overlay, prior_rtv, width, height);
+        record_draw(prior.list.Get(), overlay, prior_rtv, width, height);
+        transition(prior.list.Get(), sampled.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        std::wprintf(L"D3D12 first render target submit-to-fence %lld us\n", submit_and_wait(device, prior));
+    } else if (upload_texture || sample_texture) {
         D3D12_RESOURCE_DESC upload_desc = desc;
         upload_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
         if (sample_atlas)
@@ -887,8 +921,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
                     check(E_FAIL, "unexpected placed atlas allocation");
                 const D3D12_HEAP_DESC heap = {offset + allocation.SizeInBytes, video_memory,
                     offset, D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES};
-                check(device->CreateHeap(&heap, IID_PPV_ARGS(&atlas_heap)), "CreateHeap (placed atlas)");
-                check(device->CreatePlacedResource(atlas_heap.Get(), offset, &upload_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                check(device->CreateHeap(&heap, IID_PPV_ARGS(&image_heap)), "CreateHeap (placed atlas)");
+                check(device->CreatePlacedResource(image_heap.Get(), offset, &upload_desc, D3D12_RESOURCE_STATE_COPY_DEST,
                                                     nullptr, IID_PPV_ARGS(&sampled)), "CreatePlacedResource (atlas)");
             } else {
                 check(device->CreateCommittedResource(&video_memory, D3D12_HEAP_FLAG_NONE, &upload_desc,
@@ -898,12 +932,14 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
             upload_target.pResource = sampled.Get();
         }
         commands.list->CopyTextureRegion(&upload_target, 0, 0, 0, &upload_location, nullptr);
+        if (placed_atlas)
+            commands.list->CopyTextureRegion(&upload_target, patch_x, patch_y, 0, &upload_location, &atlas_patch);
     }
     if (programmable) {
         draw = create_draw_pipeline(device, desc.Format, work);
         if (use_uniform)
             bindings = tint_bindings(device);
-        if (sample_texture) {
+        if (sample_texture && !persist) {
             transition(commands.list.Get(), sampled.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         }
@@ -966,11 +1002,14 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     const auto pixels = static_cast<const uint8_t *>(mapped) + footprint.Offset;
     constexpr uint8_t red[] = {255, 0, 0, 255}, green[] = {0, 255, 0, 255}, magenta[] = {255, 0, 255, 255};
     constexpr uint8_t blended[] = {96, 0, 64, 255};
-    const uint8_t *expected = use_uniform ? magenta : blend ? blended : programmable ? green : red;
+    const uint8_t *expected = use_uniform ? magenta : blend || persist ? blended : programmable ? green : red;
     for (UINT y = 0; y < height; ++y) {
         const auto row = pixels + static_cast<SIZE_T>(y) * footprint.Footprint.RowPitch;
         for (UINT x = 0; x < width; ++x) {
-            auto original = uploaded_pixel(x, y);
+            const bool patched = placed_atlas && x >= patch_x && x < patch_x + atlas_patch.right - atlas_patch.left &&
+                                 y >= patch_y && y < patch_y + atlas_patch.bottom - atlas_patch.top;
+            auto original = patched ? uploaded_pixel(x - patch_x + atlas_patch.left, y - patch_y + atlas_patch.top)
+                                    : uploaded_pixel(x, y);
             if (sample_atlas)
                 original[1] = original[2] = 0;
             if (general_bindings && (x & 1)) {
@@ -982,7 +1021,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
                     check(E_FAIL, "indexed linear sampler output differs from the reference");
                 continue;
             }
-            if (std::memcmp(row + 4 * x, (upload_texture || sample_texture) ? original.data() : expected, sizeof(red)) != 0)
+            const auto *reference = (upload_texture || sample_texture) && !persist ? original.data() : expected;
+            if (std::memcmp(row + 4 * x, reference, sizeof(red)) != 0)
                 check(E_FAIL, "texture readback differs from expected RGBA pixels");
         }
     }
@@ -1009,13 +1049,13 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
     }
     std::wprintf(L"D3D12 %ls PASS: %ux%u verified pixels, submit-to-fence %lld us\n",
                  timed_draw ? L"TIMESTAMP DRAW" : blend ? L"BLEND" : general_bindings ? L"GRAPHICS BINDINGS" :
-                 placed_atlas ? L"PLACED R8 ATLAS" : sample_atlas ? L"R8 ATLAS SAMPLE" :
+                 persist ? L"TEXTURE PERSISTENCE" : placed_atlas ? L"PLACED R8 ATLAS" : sample_atlas ? L"R8 ATLAS SAMPLE" :
                  sample_texture ? L"TEXTURE SAMPLE" : upload_texture ? L"TEXTURE UPLOAD" :
                  use_uniform ? L"CBV DRAW" : use_instances ? L"INSTANCE DRAW" : programmable ? L"DRAW" : L"CLEAR",
                  width, height, elapsed);
 }
 
-static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
+static void draw_and_present(ID3D12Device *device, bool composition_swapchain, bool wgpu_swapchain)
 {
     constexpr UINT width = 320, height = 240;
     constexpr wchar_t window_class[] = L"EntangledD3D12Smoke";
@@ -1054,7 +1094,21 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
     ComPtr<IDCompositionTarget> target;
     ComPtr<IDCompositionVisual> visual;
     if (composition_swapchain) {
-        description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        if (wgpu_swapchain) {
+            description.BufferCount = 3;
+            description.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+            ComPtr<IDXGIFactory5> feature_factory;
+            BOOL tearing = FALSE;
+            if (SUCCEEDED(factory.As(&feature_factory)) &&
+                SUCCEEDED(feature_factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing))) &&
+                tearing)
+                description.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+            std::printf("D3D12 wgpu composition configuration: buffers=%u flags=0x%x\n",
+                        description.BufferCount, description.Flags);
+            std::fflush(stdout);
+        } else {
+            description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        }
         description.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
         check(factory->CreateSwapChainForComposition(commands.queue.Get(), &description, nullptr, &created),
               "CreateSwapChainForComposition");
@@ -1070,7 +1124,18 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain)
     }
     ComPtr<IDXGISwapChain3> swapchain;
     check(created.As(&swapchain), "Query IDXGISwapChain3");
+    if (wgpu_swapchain) {
+        check(swapchain->SetMaximumFrameLatency(3), "SetMaximumFrameLatency");
+        const HANDLE available = swapchain->GetFrameLatencyWaitableObject();
+        if (!available)
+            check(E_FAIL, "GetFrameLatencyWaitableObject");
+        const DWORD signaled = WaitForSingleObject(available, 5000);
+        CloseHandle(available);
+        if (signaled != WAIT_OBJECT_0)
+            check(E_FAIL, "DXGI frame-latency waitable object did not signal");
+    }
     std::wprintf(L"D3D12 PRESENT: created %ux%u %ls swap chain\n", width, height,
+                 wgpu_swapchain ? L"flip-discard composition" :
                  composition_swapchain ? L"flip-sequential composition" : L"flip-discard HWND");
     std::fflush(stdout);
 
@@ -1120,7 +1185,8 @@ int wmain(int argc, wchar_t **argv)
 {
     bool hardware_control = false;
     enum class Probe { Copy, DeviceLocal, Placed, Compute, Clear, Draw, TimedDraw, Clock, Blend, Cbv, Upload,
-                       Sample, Atlas, PlacedAtlas, Instance, Bindings, WgpuInit, Present, Composition, Fence, RenderFence };
+                       Sample, Atlas, PlacedAtlas, Persistence, Instance, Bindings, WgpuInit, Present, Composition,
+                       WgpuComposition, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -1151,6 +1217,8 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Atlas;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--placed-texture") == 0)
             probe = Probe::PlacedAtlas;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--texture-persistence") == 0)
+            probe = Probe::Persistence;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--graphics-bindings") == 0)
             probe = Probe::Bindings;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--instance") == 0)
@@ -1161,14 +1229,16 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Present;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--composition") == 0)
             probe = Probe::Composition;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--wgpu-composition") == 0)
+            probe = Probe::WgpuComposition;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence") == 0)
             probe = Probe::Fence;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence-render-context") == 0)
             probe = Probe::RenderFence;
         else {
             std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --placed-buffer | --compute | --clear | --draw | --timestamps | --clock | --blend | --cbv | --upload-texture | "
-                       "--sample-texture | --sample-atlas | --placed-texture | --instance | --graphics-bindings | --wgpu-init | "
-                       "--present | --composition | --fence | --fence-render-context]\n", stderr);
+                       "--sample-texture | --sample-atlas | --placed-texture | --texture-persistence | --instance | --graphics-bindings | --wgpu-init | "
+                       "--present | --composition | --wgpu-composition | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
     }
@@ -1197,6 +1267,8 @@ int wmain(int argc, wchar_t **argv)
             color_and_verify(device.Get(), ColorWork::Atlas);
         else if (probe == Probe::PlacedAtlas)
             color_and_verify(device.Get(), ColorWork::PlacedAtlas);
+        else if (probe == Probe::Persistence)
+            color_and_verify(device.Get(), ColorWork::Persistence);
         else if (probe == Probe::Bindings)
             color_and_verify(device.Get(), ColorWork::Bindings);
         else if (probe == Probe::Instance)
@@ -1207,8 +1279,8 @@ int wmain(int argc, wchar_t **argv)
             verify_placed_buffers(device.Get());
         else if (probe == Probe::Compute)
             verify_compute_dispatch(device.Get());
-        else if (probe == Probe::Present || probe == Probe::Composition)
-            draw_and_present(device.Get(), probe == Probe::Composition);
+        else if (probe == Probe::Present || probe == Probe::Composition || probe == Probe::WgpuComposition)
+            draw_and_present(device.Get(), probe != Probe::Present, probe == Probe::WgpuComposition);
         else
             copy_and_verify(device.Get(), probe == Probe::DeviceLocal);
     }

@@ -64,31 +64,70 @@ static BOOL enabled_environment_flag(const char *name)
     return GetEnvironmentVariableA(name, enabled, sizeof(enabled)) == 1 && enabled[0] == '1';
 }
 
+static const WCHAR *runtime_program_name(WCHAR program[MAX_PATH])
+{
+    const DWORD length = GetModuleFileNameW(NULL, program, MAX_PATH);
+    if (!length || length >= MAX_PATH)
+        return NULL;
+    const WCHAR *filename = wcsrchr(program, L'\\');
+    return filename ? filename + 1 : NULL;
+}
+
+static BOOL wintanyl_probe_enabled(const WCHAR *filename)
+{
+#ifdef ENTANGLED_D3D12_PROBE_WINTANYL
+    return filename && !_wcsicmp(filename, L"wintanyl-explorer.exe") &&
+           enabled_environment_flag("ENTANGLED_WINTANYL_D3D12");
+#else
+    (void)filename;
+    return FALSE;
+#endif
+}
+
 static BOOL runtime_probe_enabled(void)
 {
     if (!enabled_environment_flag("ENTANGLED_RUNTIME_TABLES"))
         return FALSE;
-
     WCHAR program[MAX_PATH];
-    const DWORD length = GetModuleFileNameW(NULL, program, _countof(program));
-    if (!length || length >= _countof(program))
-        return FALSE;
-    const WCHAR *filename = wcsrchr(program, L'\\');
-    if (!filename)
-        return FALSE;
-    ++filename;
-    return !_wcsicmp(filename, L"d3d12-smoke.exe") ||
-           (!_wcsicmp(filename, L"wintanyl-explorer.exe") && enabled_environment_flag("ENTANGLED_WINTANYL_D3D12"));
+    const WCHAR *filename = runtime_program_name(program);
+    return filename && (!_wcsicmp(filename, L"d3d12-smoke.exe") || wintanyl_probe_enabled(filename));
 }
 #endif
 
 #ifdef ENTANGLED_D3D12_PROBE_DDI
 static void trace_ddi(const char *operation, UINT code, SIZE_T value)
 {
+#ifdef ENTANGLED_D3D12_PROBE_RUNTIME
+    if (enabled_environment_flag("ENTANGLED_D3D12_TIMINGS_ONLY"))
+        return;
+#endif
     char message[160];
     snprintf(message, sizeof(message), "Entangled D3D12: %s code=%u value=%zu\n", operation, code, value);
     OutputDebugStringA(message);
 }
+
+#ifdef ENTANGLED_D3D12_PROBE_COPY
+static LONGLONG queue_timing_start(void)
+{
+#ifdef ENTANGLED_D3D12_PROBE_RUNTIME
+    LARGE_INTEGER now;
+    if (enabled_environment_flag("ENTANGLED_D3D12_TIMINGS_ONLY") && QueryPerformanceCounter(&now))
+        return now.QuadPart;
+#endif
+    return 0;
+}
+
+static void trace_queue_duration(const char *operation, LONGLONG start, UINT count)
+{
+    LARGE_INTEGER end, frequency;
+    if (!start || !QueryPerformanceCounter(&end) || !QueryPerformanceFrequency(&frequency))
+        return;
+    const double us = (double)(end.QuadPart - start) * 1e6 / (double)frequency.QuadPart;
+    char message[160];
+    snprintf(message, sizeof(message), "Entangled D3D12 timing: %s qpc=%lld us=%.3f count=%u\n", operation, start, us, count);
+    OutputDebugStringA(message);
+}
+#endif
 
 static HRESULT write_probe_caps(const D3D12DDIARG_GETCAPS *args, const void *data, SIZE_T size)
 {
@@ -291,10 +330,19 @@ static HRESULT APIENTRY get_caps(D3D12DDI_HADAPTER adapter, const D3D12DDIARG_GE
         return write_probe_caps(args, &level, sizeof(level));
     }
     if (args->Type == D3D12DDICAPS_TYPE_D3D12_OPTIONS) {
-        const D3D12DDI_D3D12_OPTIONS_DATA_0033 options = {
+        D3D12DDI_D3D12_OPTIONS_DATA_0033 options = {
             .ResourceBindingTier = D3D12DDI_RESOURCE_BINDING_TIER_1,
             .ResourceHeapTier = D3D12DDI_RESOURCE_HEAP_TIER_1,
         };
+#ifdef ENTANGLED_D3D12_PROBE_WINTANYL
+        WCHAR program[MAX_PATH];
+        if (wintanyl_probe_enabled(runtime_program_name(program))) {
+            /* wgpu rejects Tier 1 before creating this device. The disposable
+               Wintanyl probe exercises a subset of the Tier 2 contract. */
+            options.ResourceBindingTier = D3D12DDI_RESOURCE_BINDING_TIER_2;
+            trace_ddi("Wintanyl diagnostic binding tier", 0, options.ResourceBindingTier);
+        }
+#endif
         return write_probe_caps(args, &options, sizeof(options));
     }
     if (args->Type == D3D12DDICAPS_TYPE_SHADER) {

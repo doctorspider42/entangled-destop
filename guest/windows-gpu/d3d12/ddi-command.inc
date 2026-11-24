@@ -145,11 +145,6 @@ typedef struct DdiTransferList {
     DdiCommandPool *pool;
     UINT64 generation;
     BOOL closed;
-    const VenusColorImage *written_color;
-    const VenusColorImage *uploaded_color;
-    const VenusColorImage *sampled_color;
-    const VenusColorImage *color_copy_source;
-    BOOL color_rendered;
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
     DdiPresentSurface *present;
 #endif
@@ -692,14 +687,9 @@ static void APIENTRY reset_command_list(D3D12DDI_HCOMMANDLIST driver_list, const
     list->pool = NULL;
     list->closed = FALSE;
     list->venus = (VenusTransferList){0};
-    list->written_color = NULL;
-    list->uploaded_color = NULL;
-    list->sampled_color = NULL;
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
     list->present = NULL;
 #endif
-    list->color_copy_source = NULL;
-    list->color_rendered = FALSE;
     list->draw = (DdiDrawState){0};
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
     list->compute = (DdiComputeState){0};
@@ -829,6 +819,7 @@ static void APIENTRY execute_transfer_lists(D3D12DDI_HCOMMANDQUEUE driver_queue,
     if (SUCCEEDED(status)) {
         /* The lab completes Venus work before the runtime can signal its WDDM fence. */
         AcquireSRWLockExclusive(&device->queue_lock);
+        const LONGLONG start = queue_timing_start();
         status = submit_venus_transfer_commands(&device->venus, count, commands);
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
         if (SUCCEEDED(status)) {
@@ -840,6 +831,8 @@ static void APIENTRY execute_transfer_lists(D3D12DDI_HCOMMANDQUEUE driver_queue,
         }
 #endif
         ReleaseSRWLockExclusive(&device->queue_lock);
+        if (SUCCEEDED(status))
+            trace_queue_duration("queue-submit-to-retire", start, count);
     }
     if (commands != local)
         HeapFree(GetProcessHeap(), 0, commands);

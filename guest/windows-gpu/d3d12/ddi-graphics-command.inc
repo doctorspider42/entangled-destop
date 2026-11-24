@@ -47,9 +47,9 @@ static HRESULT graphics_image_descriptor(DdiTransferList *list, VkDescriptorType
     if (descriptor->kind != DDI_DESCRIPTOR_SRV || descriptor->desc.srv.ResourceDimension != D3D12DDI_RD_TEXTURE2D)
         return E_INVALIDARG;
     const VenusColorImage *image = resource_color(list->venus.device, descriptor->desc.srv.hDrvResource);
-    if (!image || image != list->sampled_color)
+    if (!image || !(image->usage & VK_IMAGE_USAGE_SAMPLED_BIT))
         return E_INVALIDARG;
-    *info = (VkDescriptorImageInfo){ .imageView = image->sampled_view, .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    *info = (VkDescriptorImageInfo){ .imageView = image->view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
     return S_OK;
 }
 
