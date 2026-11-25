@@ -487,3 +487,15 @@ index 6929684..763d505 100644
     char *ptr = (char *)image->base.cpu_map;
     char *dptr = (char *)image->sw.ppvBits;
  
+diff --git a/src/virtio/vulkan/vn_device.c b/src/virtio/vulkan/vn_device.c
+--- a/src/virtio/vulkan/vn_device.c
++++ b/src/virtio/vulkan/vn_device.c
+@@ -307,5 +307,7 @@ vn_device_fix_create_info(const struct vn_device *dev,
++   /* The Windows ICD uses DMA-BUF on the renderer side for its private
++    * image sharing interface. It still exposes no Win32 memory extension. */
+    if (app_exts->KHR_external_memory_fd ||
+-       app_exts->EXT_external_memory_dma_buf || has_wsi) {
++       app_exts->EXT_external_memory_dma_buf || has_wsi || DETECT_OS_WINDOWS) {
+       if (physical_dev->external_memory.renderer_handle_type ==
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+          if (!app_exts->EXT_external_memory_dma_buf) {

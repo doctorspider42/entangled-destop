@@ -14,5 +14,6 @@ git -C $Dir apply --whitespace=nowarn (Join-Path $here '0001-venus-builds-with-c
 if ($LASTEXITCODE -ne 0) { throw 'the patch does not apply' }
 $venus = Join-Path $Dir 'src\virtio\vulkan'
 Copy-Item (Join-Path $here 'vn_renderer_entangled.c') $venus
+Copy-Item (Join-Path $here 'entangled_shared_image.h') $venus
 Copy-Item (Join-Path $here '..\driver\public.h') (Join-Path $venus 'entangled_gpu_public.h')
 Write-Output "prepared $Dir"

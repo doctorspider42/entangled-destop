@@ -2345,6 +2345,29 @@ uses queue-idle waits and staging readback to verify continuity. The
 DWM integration needs a GPU producer, a consumer copy or sample, and
 ordering for repeated surface generations before the animation comparison.
 
+#### The Venus ICD creates and imports the GPU image
+
+The Windows Venus ICD has a private interface for an optimal BGRA8
+texture backed by a dedicated device-local allocation. The producer can
+publish it as an unmapped blob and pass its token through the WDDM
+allocation. The importer attaches the blob, binds it to an image, and
+releases the temporary attachment after Vulkan has imported the backing
+memory. The caller handles external queue ownership and synchronization.
+
+On the lab Windows x64 guest running on the RTX 2070, `shared-image-test`
+opened two independent Venus instances without WSI extensions. It used
+the same published image for two GPU clears and verified all 65,536
+pixels of each color, including the second clear after the producer
+released its image and publication. It also verified that a same-context
+import was rejected without dropping the publication. The host recorded
+blob creation, attach, detach and release without a BAR map for the
+shared image. The staging buffers mapped by the test only serve pixel
+verification. Lab output and the host excerpt are in `share/venus-icd-image`.
+
+This exercises the ICD boundary the display UMD will call. The UMD
+still needs a GPU copy in each direction, ordering at surface generation
+boundaries, and a before/after animation trace with the desktop compositor.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

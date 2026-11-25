@@ -13,8 +13,15 @@
 #include <windows.h>
 #include <winioctl.h>
 
+#include "venus-protocol/vn_protocol_driver_device_memory.h"
+#include "venus-protocol/vn_protocol_driver_image.h"
+#include "vn_device.h"
+#include "vn_entrypoints.h"
+#include "vn_instance.h"
+#include "vn_physical_device.h"
 #include "vn_renderer.h"
 #include "entangled_gpu_public.h"
+#include "entangled_shared_image.h"
 
 #define VENUS_CAPSET_ID 4
 
@@ -36,6 +43,8 @@ struct entangled {
    const VkAllocationCallbacks *alloc;
    HANDLE dev;
    SRWLOCK lock;
+   SRWLOCK share_lock;
+   struct entangled_shared_image *owned_images;
    /* Ours alone: every process (and every instance in it) has a context of
     * its own on the host, so two Vulkan programs can run at once. */
    uint32_t ctx_id;
@@ -416,6 +425,200 @@ entangled_shmem_destroy(struct vn_renderer *renderer,
 }
 
 static VkResult
+entangled_share_image_memory(struct vn_device *dev,
+                             struct entangled_shared_image *shared,
+                             const VkMemoryRequirements *requirements,
+                             HANDLE import_token)
+{
+   struct entangled *gpu = (struct entangled *)dev->renderer;
+   VkDevice device = vn_device_to_handle(dev);
+   VkResult result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   uint32_t types = requirements->memoryTypeBits;
+   ENTANGLED_GPU_BLOB_REF ref = {gpu->ctx_id, 0};
+
+   const VkMemoryDedicatedAllocateInfo dedicated = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      .image = shared->image,
+   };
+   const VkExportMemoryAllocateInfo export = {
+      .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+      .pNext = &dedicated,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+   VkImportMemoryResourceInfoMESA import = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+      .pNext = &dedicated,
+   };
+
+   if (import_token) {
+      ENTANGLED_GPU_BLOB_TOKEN token = {(uintptr_t)import_token};
+      AcquireSRWLockExclusive(&gpu->lock);
+      const bool ok = ioctl(gpu, IOCTL_ENTANGLED_GPU_BLOB_ATTACH, &token,
+                            sizeof(token), &ref, sizeof(ref));
+      ReleaseSRWLockExclusive(&gpu->lock);
+      if (!ok)
+         return result;
+
+      /* Serialize attach through release on this context. The IOCTL returns
+       * the same resource id for repeated attaches to the same token. */
+      for (const struct entangled_shared_image *owner = gpu->owned_images;
+           owner; owner = owner->next_owned) {
+         if (owner->resource_id == ref.ResourceId)
+            return result;
+      }
+      import.resourceId = ref.ResourceId;
+      VkMemoryResourcePropertiesMESA props = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA,
+      };
+      result = vn_call_vkGetMemoryResourcePropertiesMESA(
+         dev->primary_ring, device, ref.ResourceId, &props);
+      if (result != VK_SUCCESS)
+         goto release;
+      types &= props.memoryTypeBits;
+   }
+
+   const VkPhysicalDeviceMemoryProperties *props =
+      &dev->physical_device->memory_properties;
+   uint32_t index;
+   for (index = 0; index < props->memoryTypeCount; index++) {
+      const VkMemoryPropertyFlags flags = props->memoryTypes[index].propertyFlags;
+      if ((types & (1u << index)) &&
+          (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+          !(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+         break;
+   }
+   if (index == props->memoryTypeCount) {
+      result = VK_ERROR_FEATURE_NOT_PRESENT;
+      goto release;
+   }
+
+   VkMemoryAllocateInfo alloc = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = requirements->size,
+      .memoryTypeIndex = index,
+   };
+   struct vn_device_memory *mem = vk_device_memory_create(
+      &dev->base.vk, &alloc, NULL, sizeof(*mem));
+   if (!mem) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto release;
+   }
+   vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
+   VkDeviceMemory memory = vn_device_memory_to_handle(mem);
+   alloc.pNext = import_token ? (const void *)&import : (const void *)&export;
+   result = vn_call_vkAllocateMemory(dev->primary_ring, device, &alloc, NULL,
+                                    &memory);
+   if (result != VK_SUCCESS) {
+      vk_device_memory_destroy(&dev->base.vk, NULL, &mem->base.vk);
+      goto release;
+   }
+   shared->memory = memory;
+
+   result = vn_call_vkBindImageMemory(dev->primary_ring, device, shared->image,
+                                     shared->memory, 0);
+   if (result != VK_SUCCESS || import_token)
+      goto release;
+
+   ENTANGLED_GPU_BLOB_IN in = {gpu->ctx_id, 0, align64(requirements->size, 4096),
+                              mem->base.id};
+   ENTANGLED_GPU_BLOB_OUT out = {0};
+   ENTANGLED_GPU_BLOB_TOKEN token = {0};
+   AcquireSRWLockExclusive(&gpu->lock);
+   bool published = ioctl(gpu, IOCTL_ENTANGLED_GPU_BLOB_CREATE_UNMAPPED, &in,
+                          sizeof(in), &out, sizeof(out));
+   if (published) {
+      ref.ResourceId = out.ResourceId;
+      published = ioctl(gpu, IOCTL_ENTANGLED_GPU_BLOB_PUBLISH, &ref,
+                        sizeof(ref), &token, sizeof(token));
+   }
+   ReleaseSRWLockExclusive(&gpu->lock);
+   if (published) {
+      shared->resource_id = out.ResourceId;
+      shared->token = (HANDLE)(uintptr_t)token.Handle;
+      shared->next_owned = gpu->owned_images;
+      gpu->owned_images = shared;
+      return VK_SUCCESS;
+   }
+   result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+release:
+   if (ref.ResourceId)
+      entangled_release(gpu, ref.ResourceId);
+   return result;
+}
+
+__declspec(dllexport) void VKAPI_CALL
+entangled_destroy_shared_image(VkDevice device, struct entangled_shared_image *shared)
+{
+   struct vn_device *dev = vn_device_from_handle(device);
+   if (shared->token) {
+      struct entangled *gpu = (struct entangled *)dev->renderer;
+      AcquireSRWLockExclusive(&gpu->share_lock);
+      struct entangled_shared_image **owner = &gpu->owned_images;
+      while (*owner != shared)
+         owner = &(*owner)->next_owned;
+      *owner = shared->next_owned;
+      CloseHandle(shared->token);
+      entangled_release(gpu, shared->resource_id);
+      ReleaseSRWLockExclusive(&gpu->share_lock);
+   }
+   vn_DestroyImage(device, shared->image, NULL);
+   vn_FreeMemory(device, shared->memory, NULL);
+   *shared = (struct entangled_shared_image){0};
+}
+
+__declspec(dllexport) VkResult VKAPI_CALL
+entangled_create_shared_image(VkDevice device, VkExtent2D extent,
+                              HANDLE import_token,
+                              struct entangled_shared_image *shared)
+{
+   struct vn_device *dev = vn_device_from_handle(device);
+   *shared = (struct entangled_shared_image){0};
+   if (dev->renderer->ops.destroy != entangled_destroy ||
+       dev->physical_device->external_memory.renderer_handle_type !=
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+
+   if (!extent.width || !extent.height)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   const VkExternalMemoryImageCreateInfo external = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+   const VkImageCreateInfo create = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .pNext = &external,
+      .flags = VK_IMAGE_CREATE_ALIAS_BIT,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = VK_FORMAT_B8G8R8A8_UNORM,
+      .extent = {extent.width, extent.height, 1},
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+   };
+   VkResult result = vn_CreateImage(device, &create, NULL, &shared->image);
+   if (result != VK_SUCCESS)
+      return result;
+
+   VkMemoryRequirements requirements;
+   dev->base.vk.dispatch_table.GetImageMemoryRequirements(device, shared->image,
+                                                          &requirements);
+   struct entangled *gpu = (struct entangled *)dev->renderer;
+   AcquireSRWLockExclusive(&gpu->share_lock);
+   result = entangled_share_image_memory(dev, shared, &requirements, import_token);
+   ReleaseSRWLockExclusive(&gpu->share_lock);
+   if (result != VK_SUCCESS)
+      entangled_destroy_shared_image(device, shared);
+   return result;
+}
+
+static VkResult
 entangled_bo_create_from_device_memory(
    struct vn_renderer *renderer,
    struct vn_renderer_submit_batch *batch,
@@ -619,6 +822,7 @@ vn_renderer_create_entangled(struct vn_instance *instance,
    if (trace_on())
       fprintf(stderr, "entangled: renderer for process %lu\n", GetCurrentProcessId());
    InitializeSRWLock(&gpu->lock);
+   InitializeSRWLock(&gpu->share_lock);
    gpu->alloc = alloc;
    static volatile LONG instances;
    gpu->ctx_id = (GetCurrentProcessId() & 0xffffff) << 8 |
