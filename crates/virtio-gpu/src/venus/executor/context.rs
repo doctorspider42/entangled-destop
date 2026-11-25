@@ -849,13 +849,17 @@ impl<H: HostVulkan> VulkanContext<H> {
         if let Some(devices) = &object.devices {
             return Ok(Ok(devices.len()));
         }
+        let enumerate_start = std::time::Instant::now();
         let handles = match host.enumerate_physical_devices(&object.host) {
             Ok(handles) => handles,
             Err(ret) => return Ok(Err(ret)),
         };
+        let enumerate_us = enumerate_start.elapsed().as_micros();
         let mut devices = Vec::new();
         for handle in handles {
+            let describe_start = std::time::Instant::now();
             let info = host.describe_physical_device(&object.host, handle);
+            let describe_us = describe_start.elapsed().as_micros();
             let name =
                 String::from_utf8_lossy(policy::c_name(&info.properties.properties.device_name))
                     .into_owned();
@@ -877,6 +881,8 @@ impl<H: HostVulkan> VulkanContext<H> {
                     tracing::info!(
                         ctx_id,
                         device = %name,
+                        enumerate_us,
+                        describe_us,
                         ?heaps,
                         host_visible_share = share,
                         zink_flush_threshold = policy::zink_flush_threshold(&guest.memory),
@@ -894,7 +900,7 @@ impl<H: HostVulkan> VulkanContext<H> {
                     });
                 }
                 Err(why) => {
-                    tracing::info!(ctx_id, device = %name, %why, "hiding a host Vulkan device from the guest");
+                    tracing::info!(ctx_id, device = %name, enumerate_us, describe_us, %why, "hiding a host Vulkan device from the guest");
                 }
             }
         }

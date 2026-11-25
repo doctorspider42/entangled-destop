@@ -255,11 +255,25 @@ impl AshVulkan {
         let info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&names);
+        let create_start = std::time::Instant::now();
         // SAFETY: `device` is ours; `info`, the queue array and the name
         // array are locals that outlive the call, and the extension is one
         // the device reported (the caller checked).
-        let probe = unsafe { instance.create_device(device, &info, None) }.ok()?;
+        let result = unsafe { instance.create_device(device, &info, None) };
+        let create_us = create_start.elapsed().as_micros();
+        let probe = match result {
+            Ok(probe) => probe,
+            Err(error) => {
+                tracing::debug!(
+                    create_us,
+                    ?error,
+                    "Vulkan host-memory import probe device creation failed"
+                );
+                return None;
+            }
+        };
 
+        let query_start = std::time::Instant::now();
         // Resolved by hand rather than through `ash::ext::external_memory_host`,
         // whose fallback for a missing entry point panics.
         // SAFETY: `probe` is a live device created with the extension
@@ -298,9 +312,18 @@ impl AshVulkan {
             drop(pages);
             (result == vk::Result::SUCCESS).then_some((out.memory_type_bits, align))
         });
+        let query_us = query_start.elapsed().as_micros();
+        let destroy_start = std::time::Instant::now();
         // SAFETY: `probe` was created above, owns no child, and is not used
         // after this.
         unsafe { probe.destroy_device(None) };
+        tracing::debug!(
+            create_us,
+            query_us,
+            destroy_us = destroy_start.elapsed().as_micros(),
+            importable = answer.is_some(),
+            "Vulkan host-memory import probe complete"
+        );
         answer
     }
 }

@@ -180,6 +180,7 @@ def main():
     stats = defaultdict(list)
     trace = defaultdict(list)
     dwm_trace = defaultdict(list)
+    dwm_longest = defaultdict(list)
     intervals = scene_intervals(args.scene_log, args.scene_pid, guest_time) if args.scene_log else None
     if args.scene_log and not intervals:
         cli.error("no scene timing rows for that PID")
@@ -218,6 +219,12 @@ def main():
             trace[action].append(lamp_stages(intervals, trigger, win_event, pixel))
         if composition:
             dwm_trace[action].append(dwm_stages(composition, send, win_event, scanout))
+            if pixel is not None:
+                # An earlier Present can block even when its frame produces
+                # no changed pixels in the capture region.
+                longest = max((end - begin for begin, end, _ in composition
+                               if trigger <= begin <= end <= pixel), default=None)
+                dwm_longest[action].append(None if longest is None else round(longest * 1e3, 1))
     print("Median / max by gesture")
     for action, group in stats.items():
         print(action, len(group), *(summarize(column) for column in zip(*group)))
@@ -230,6 +237,10 @@ def main():
         for action, group in dwm_trace.items():
             matched = sum(stages[-1] is not None for stages in group)
             print(action, f"{matched}/{len(group)}", *(summarize(column) for column in zip(*group)))
+        print("DWM med/max: longest complete Present between input and changed pixels")
+        for action, group in dwm_longest.items():
+            measured = sum(duration is not None for duration in group)
+            print(action, f"{measured}/{len(dwm_trace[action])}", summarize(group))
     return 1 if missing else 0
 
 

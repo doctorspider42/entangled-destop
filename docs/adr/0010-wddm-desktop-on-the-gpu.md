@@ -1787,6 +1787,68 @@ The capture prefix is `stock-dwm-sched`. The matching timestamps, module
 identity and scheduler breakdown are in `stock-dwm-sched-breakdown.txt`
 in the lab's `physical-wheel` directory.
 
+#### MSI-X completion trials and an earlier Present in a 345 ms restore
+
+Two lab miniports bound the render-only virtio-gpu control queue to one
+MSI-X message. The ISR queued a DPC to signal the command's event. The
+command verified the used index on every wake and also checked it after a
+10 ms relative wait expired. One variant used the event for every control
+command. The other reserved it for fenced commands, keeping the short
+poll and suppressing the interrupt for ordinary control commands. Both
+kept the single shared command slot and passed `gpu-test context-cleanup`
+after a reboot with the exact test package installed. The event counter
+increased by 6,618 in the first run and by 1,377 in the second between
+the readings around each test. These totals include guest background work.
+
+Each run repeated 12 `Win+M` and `Win+Shift+M` pairs in the same stock
+Notepad workload at 1920 × 1080, with WPR and the 500-pixel WGC threshold.
+Both traces had sub-millisecond clock bridge round trips and zero ETW
+events or buffers lost. Times are p50 / maximum in milliseconds.
+
+| Render-only completion | Minimize to pixels | Restore to pixels | Wait in the restore Present associated with the first pixel change |
+| --- | ---: | ---: | ---: |
+| Published `gpu3d-14`, polling | 63.7 / 81.6 | 137.3 / 378.0 | 13.35 / 46.81 |
+| MSI-X on all control commands | 62.8 / 75.8 | 146.9 / 350.5 | 12.87 / 18.70 |
+| MSI-X on fenced commands | 62.5 / 97.4 | 145.2 / 345.4 | 11.64 / 17.58 |
+
+Each mode had one 12-pair run. The two event variants shortened waits
+inside Presents matched to the first changed pixels, and neither improved
+the restore median. The lab was restored to the published miniport. The
+MSI-X driver patches were left in the lab for further experiments.
+
+In the 350.5 ms restore, 214.0 ms elapsed from the guest key hook to the
+guest `MINIMIZEEND` hook. The Windows message timestamps for the same
+events differed by 218 ms. In the 345.4 ms restore the guest received the
+key at 21.6 ms and `MINIMIZEEND` at 48.0 ms, relative to host send. DWM
+entered Present at 51.9 ms and returned at 273.5 ms. A second Present ran
+at 274.3 ms. WGC measured zero changed pixels after those two frames. The
+third Present reached the associated scanout at 333.8 ms and the first
+changed capture at 345.4 ms. A split based only on that third Present
+puts the earlier 221.6 ms Present inside the interval labelled
+`WinEvent-draw`. The analyzer also reports the longest complete Present
+between the input and the first changed pixels for each gesture.
+
+Inside the 221.6 ms scope, the DWM render thread waited for 194.5 ms,
+including one uninterrupted 187.8 ms wait. Its `ReadyThread` stack
+identifies the Zink worker at the same `futex_wake` and queue worker RVAs
+as in the polling run. The worker was waiting for 186.5 ms during that
+interval. Ten stack samples match the return address of the miniport's
+`KeWaitForSingleObject` on the control completion event. The only host
+fence retirement recorded during the wait came 187.5 ms into it and took
+101 us from deferral. About 1.4 ms before the DWM wake the host logged the
+completion of physical-device discovery for Venus context `2082817`.
+Mesa's context ID encodes guest PID `8136`, identified as `CalculatorApp.exe`
+by the WPR image events. A later `ReadyThread` stack ran on a Calculator
+thread inside the same miniport. The timestamps alone cannot assign the
+preceding gap to discovery. The shared command slot permits one client's
+initialization to delay another client's render submission. Separate
+enumeration, description and throwaway Vulkan device timings make that
+hypothesis measurable.
+
+The capture prefixes are `stock-dwm-msix` and `stock-dwm-fenced-msix` in
+`physical-wheel` and `share/animation-etw`. The `-worst.txt`,
+`-longest-present.txt` and `-waker.txt` extracts record the 345 ms case.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
