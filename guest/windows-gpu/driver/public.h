@@ -91,6 +91,11 @@ typedef struct _ENTANGLED_GPU_SUBMIT {
 #define IOCTL_ENTANGLED_GPU_BLOB_CREATE \
     CTL_CODE(ENTANGLED_GPU_TYPE, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+/* Same input and output as BLOB_CREATE, for a shareable HOST3D blob without
+ * a CPU mapping. Address and MapInfo are zero. The creating handle owns it. */
+#define IOCTL_ENTANGLED_GPU_BLOB_CREATE_UNMAPPED \
+    CTL_CODE(ENTANGLED_GPU_TYPE, 0x80B, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 typedef struct _ENTANGLED_GPU_BLOB_IN {
     unsigned long CtxId;
     unsigned long ResourceId;

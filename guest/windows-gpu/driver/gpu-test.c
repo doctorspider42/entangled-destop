@@ -8,6 +8,8 @@
  * <hardware id>` does the same for another function: the display one, for
  * entangled-display (guest/windows-gpu/display).
  * `gpu-test context-cleanup` checks context ownership across handle closes.
+ * `gpu-test unmapped-blob` checks the host-only blob lifecycle alongside a
+ * mapped allocation on the same handle.
  * `gpu-test hold-venus-ring` leaves a private ring waiting for its round
  * trip, to exercise independent clients on the same control queue. */
 #include <windows.h>
@@ -100,6 +102,74 @@ static int context_cleanup(void)
         }
     }
     printf("GPU-TEST PASS context cleanup (%#lx)\n", request.CtxId);
+    return 0;
+}
+
+static int unmapped_blob(void)
+{
+    ENTANGLED_GPU_CTX_CREATE ctx = {(GetCurrentProcessId() & 0xffffffu) << 8 | 2u, 4};
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        HANDLE dev = CreateFileW(ENTANGLED_GPU_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                                0, NULL);
+        if (dev == INVALID_HANDLE_VALUE) {
+            printf("GPU-TEST FAIL open: error %lu\n", GetLastError());
+            return 1;
+        }
+        ENTANGLED_GPU_RESPONSE resp = {0};
+        ENTANGLED_GPU_BLOB_IN create = {ctx.CtxId, 0, 4096, 0};
+        ENTANGLED_GPU_BLOB_OUT mapped = {0}, unmapped = {0};
+        const char *step = "create context";
+        if (!call(dev, IOCTL_ENTANGLED_GPU_CTX_CREATE, &ctx, sizeof(ctx), &resp, sizeof(resp)) ||
+            resp.Type != 0x1100) {
+            goto fail;
+        }
+        step = "create unmapped blob";
+        if (!call(dev, IOCTL_ENTANGLED_GPU_BLOB_CREATE_UNMAPPED, &create, sizeof(create),
+                  &unmapped, sizeof(unmapped)) || unmapped.Response != 0x1100 ||
+            unmapped.ResourceId == 0 || unmapped.Address != 0 || unmapped.MapInfo != 0) {
+            goto fail;
+        }
+        step = "create mapped blob";
+        if (!call(dev, IOCTL_ENTANGLED_GPU_BLOB_CREATE, &create, sizeof(create),
+                  &mapped, sizeof(mapped)) || mapped.Response != 0x1100 ||
+            mapped.ResourceId == 0 || mapped.ResourceId == unmapped.ResourceId ||
+            mapped.Address == 0) {
+            goto fail;
+        }
+        if (pass == 0) {
+            ENTANGLED_GPU_BLOB_REF destroy = {ctx.CtxId, unmapped.ResourceId};
+            step = "destroy unmapped blob";
+            if (!call(dev, IOCTL_ENTANGLED_GPU_BLOB_DESTROY, &destroy, sizeof(destroy),
+                      &resp, sizeof(resp)) || resp.Type != 0x1100) {
+                goto fail;
+            }
+            step = "repeat unmapped destruction";
+            if (call(dev, IOCTL_ENTANGLED_GPU_BLOB_DESTROY, &destroy, sizeof(destroy),
+                     &resp, sizeof(resp)) || GetLastError() != ERROR_NOT_FOUND) {
+                goto fail;
+            }
+            step = "recreate unmapped blob";
+            if (!call(dev, IOCTL_ENTANGLED_GPU_BLOB_CREATE_UNMAPPED, &create, sizeof(create),
+                      &unmapped, sizeof(unmapped)) || unmapped.Response != 0x1100 ||
+                unmapped.ResourceId == 0) {
+                goto fail;
+            }
+        }
+        /* Both blobs still belong to the handle when it closes. The second
+         * pass reuses the same context ID to check teardown. */
+        printf("BLOB pass=%u ctx=%#lx mapped=%#lx unmapped=%#lx\n", pass + 1, ctx.CtxId,
+               mapped.ResourceId, unmapped.ResourceId);
+        CloseHandle(dev);
+        continue;
+    fail:
+        printf("GPU-TEST FAIL %s on pass %u: error %lu response %#lx, mapped %#lx, "
+               "unmapped %#lx\n", step, pass + 1, GetLastError(), resp.Type, mapped.Response,
+               unmapped.Response);
+        CloseHandle(dev);
+        return 1;
+    }
+    printf("GPU-TEST PASS unmapped blob lifecycle\n");
     return 0;
 }
 
@@ -311,6 +381,9 @@ int wmain(int argc, wchar_t **argv)
     }
     if (argc == 2 && lstrcmpiW(argv[1], L"context-cleanup") == 0) {
         return context_cleanup();
+    }
+    if (argc == 2 && lstrcmpiW(argv[1], L"unmapped-blob") == 0) {
+        return unmapped_blob();
     }
     if (argc == 2 && lstrcmpiW(argv[1], L"hold-venus-ring") == 0) {
         return hold_venus_ring();

@@ -2237,6 +2237,38 @@ the producer and consumer's ordering while sharing the GPU backing is
 the next surface-sharing milestone. The scratch evidence uses the
 prefix `shell-hostrel-final-etw` in the same lab directories.
 
+#### Windows render miniport can create an unmapped Venus blob
+
+`IOCTL_ENTANGLED_GPU_BLOB_CREATE_UNMAPPED` creates a shareable HOST3D
+blob and attaches it to the caller's Venus context. It leaves the CPU
+address and map information zero and consumes no shared-memory BAR
+range. Both creation paths record ownership on the render-device file
+handle. Explicit destruction requires the recorded context and resource
+pair. File cleanup unmaps the mapped blobs and releases both kinds.
+
+The driver compiled with the default and parallel control queue settings.
+The Windows x64 lab VM booted the signed MSI-X variant (17.35.13.751,
+`oem21.inf`) on release host 0.2.176. `gpu-test unmapped-blob` created
+both blob kinds in one context, checked explicit destruction and a
+second destruction of the stale ID, then closed and reopened the same
+context. The host log showed three shareable creates and matching unrefs
+with no MAP or UNMAP for those IDs. The two mapped controls reused the
+same 4 KiB BAR range on consecutive passes. `gpu-test context-cleanup`
+and `gpu-test venus` also passed. The system D3D12 runtime verified a
+73×41 draw and the 320×240 flip-discard composition probe passed its
+DXGI and DWM calls. The Wintanyl release `04fe598` loaded the Entangled
+D3D12 UMD after the guest restart. Raw logs are in
+`share/unmapped-blob` under the Windows lab directory.
+
+The transport test uses `blob_id=0` (plain renderer memory). The next
+test needs a nonzero Venus memory ID backed by an exportable optimal
+image on the physical GPU. The host already supports opaque Win32
+external memory for cross-context Venus blobs. Connecting that path to
+WDDM requires access checked against the opened WDDM allocation and an
+explicit producer-to-consumer handoff before sampling. Until then the
+display UMD uses the existing CPU pixel path and these results give no
+new animation timings.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

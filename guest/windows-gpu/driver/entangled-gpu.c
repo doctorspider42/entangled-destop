@@ -107,6 +107,7 @@
 #define VIRTIO_GPU_RESP_OK_MAP_INFO 0x1106
 #define VIRTIO_GPU_BLOB_MEM_HOST3D 2
 #define VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE 1
+#define VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE 2
 /* The render-only function's shared-memory BAR (virtio_core's PLAIN
  * placement puts it at BARs 2-3). */
 #define SHM_BAR 2
@@ -323,20 +324,21 @@ typedef struct {
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetCtx)
 
 /* Zink alone keeps dozens of host-visible allocations. */
-#define MAX_MAPS 1024
-/* The blobs a handle mapped into its process, unmapped and released at
- * cleanup (a user mapping outliving its process is a bugcheck, and a blob
- * left on the host keeps its BAR range). */
+#define MAX_BLOBS 1024
+/* A handle owns its blobs until explicit destruction or file cleanup. A
+ * non-null MDL means the blob also occupies a BAR range and a user mapping. */
+typedef struct {
+    PMDL Mdl;
+    ULONG CtxId;
+    ULONG ResourceId;
+    PVOID User;
+    PVOID Kernel;
+    SIZE_T Size;
+    UINT64 Offset;
+} FILE_BLOB;
+
 struct FILE_CONTEXT {
-    struct {
-        PMDL Mdl;
-        ULONG CtxId;
-        ULONG ResourceId;
-        PVOID User;
-        PVOID Kernel;
-        SIZE_T Size;
-        UINT64 Offset;
-    } Maps[MAX_MAPS];
+    FILE_BLOB Blobs[MAX_BLOBS];
     ULONG Count;
     /* The Venus context this handle created, destroyed at cleanup so a
      * process that dies leaves nothing behind on the host; 0 for none. */
@@ -1397,12 +1399,13 @@ static NTSTATUS HostRelease(DEVICE_CONTEXT *ctx, ULONG ctxId, ULONG resourceId, 
     return HeaderCommand(ctx, sizeof(*req), type);
 }
 
-/* Create, attach and map one blob, and map its pages into the calling
- * process. Runs in the caller's context, with the lock held. */
+/* Create and attach a blob. A requested CPU mapping runs in the calling
+ * process's context. The caller holds the lock. */
 static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
-                           const ENTANGLED_GPU_BLOB_IN *in, ENTANGLED_GPU_BLOB_OUT *out)
+                           const ENTANGLED_GPU_BLOB_IN *in, ENTANGLED_GPU_BLOB_OUT *out,
+                           BOOLEAN mapToUser)
 {
-    UINT64 offset;
+    UINT64 offset = 0;
     ULONG res;
     ULONG type = 0;
     NTSTATUS status;
@@ -1415,11 +1418,12 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
     out->MapInfo = 0;
     out->ResourceId = 0;
     out->Response = VIRTIO_GPU_RESP_OK_NODATA;
-    if (in->Size == 0 || (in->Size & (PAGE_SIZE - 1)) != 0 || in->Size > 0x10000000 ||
-        file->Count >= MAX_MAPS || ctx->Bars[SHM_BAR].Base.QuadPart == 0) {
+    if (in->CtxId == 0 || in->CtxId != file->CtxId || in->Size == 0 ||
+        (in->Size & (PAGE_SIZE - 1)) != 0 || in->Size > 0x10000000 ||
+        file->Count >= MAX_BLOBS || (mapToUser && ctx->Bars[SHM_BAR].Base.QuadPart == 0)) {
         return STATUS_INVALID_PARAMETER;
     }
-    if (!ShmAlloc(ctx, in->Size, &offset)) {
+    if (mapToUser && !ShmAlloc(ctx, in->Size, &offset)) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     /* Ours, never 0 and clear of the display function's low ids. */
@@ -1435,12 +1439,15 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         req->Hdr.CtxId = in->CtxId;
         req->ResourceId = res;
         req->BlobMem = VIRTIO_GPU_BLOB_MEM_HOST3D;
-        req->BlobFlags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+        req->BlobFlags = mapToUser ? VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE
+                                  : VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
         req->BlobId = in->BlobId;
         req->Size = in->Size;
         status = HeaderCommand(ctx, sizeof(*req), &type);
         if (!NT_SUCCESS(status) || type != VIRTIO_GPU_RESP_OK_NODATA) {
-            ShmFree(ctx, offset);
+            if (mapToUser) {
+                ShmFree(ctx, offset);
+            }
             out->Response = type;
             return status;
         }
@@ -1455,10 +1462,20 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         if (!NT_SUCCESS(status) || type != VIRTIO_GPU_RESP_OK_NODATA) {
             ULONG ignored = 0;
             (void)HostRelease(ctx, in->CtxId, res, FALSE, &ignored);
-            ShmFree(ctx, offset);
+            if (mapToUser) {
+                ShmFree(ctx, offset);
+            }
             out->Response = type;
             return status;
         }
+    }
+    if (!mapToUser) {
+        FILE_BLOB blob = {0};
+        blob.CtxId = in->CtxId;
+        blob.ResourceId = res;
+        file->Blobs[file->Count++] = blob;
+        out->ResourceId = res;
+        return STATUS_SUCCESS;
     }
     {
         GPU_MAP_BLOB *req = (GPU_MAP_BLOB *)ctx->Cmd;
@@ -1509,38 +1526,39 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         ShmFree(ctx, offset);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    file->Maps[file->Count].Mdl = mdl;
-    file->Maps[file->Count].CtxId = in->CtxId;
-    file->Maps[file->Count].Offset = offset;
-    file->Maps[file->Count].ResourceId = res;
-    file->Maps[file->Count].User = user;
-    file->Maps[file->Count].Kernel = kernel;
-    file->Maps[file->Count].Size = (SIZE_T)in->Size;
-    file->Count++;
+    const FILE_BLOB blob = {mdl, in->CtxId, res, user, kernel, (SIZE_T)in->Size, offset};
+    file->Blobs[file->Count++] = blob;
     out->Address = (ULONG_PTR)user;
     out->ResourceId = res;
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS ReleaseFileBlob(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file, ULONG index,
+                                ULONG *type)
+{
+    const FILE_BLOB blob = file->Blobs[index];
+    if (blob.Mdl != NULL) {
+        MmUnmapLockedPages(blob.User, blob.Mdl);
+        IoFreeMdl(blob.Mdl);
+        MmUnmapIoSpace(blob.Kernel, blob.Size);
+        ShmFree(ctx, blob.Offset);
+    }
+    file->Count--;
+    file->Blobs[index] = file->Blobs[file->Count];
+    return HostRelease(ctx, blob.CtxId, blob.ResourceId, blob.Mdl != NULL, type);
 }
 
 /* Unmap one of this handle's blobs and release it on the host. */
 static NTSTATUS BlobDestroy(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
                             const ENTANGLED_GPU_BLOB_REF *in, ULONG *type)
 {
-    ULONG i;
-    BOOLEAN mapped = FALSE;
-    for (i = 0; i < file->Count; i++) {
-        if (file->Maps[i].ResourceId == in->ResourceId) {
-            MmUnmapLockedPages(file->Maps[i].User, file->Maps[i].Mdl);
-            IoFreeMdl(file->Maps[i].Mdl);
-            MmUnmapIoSpace(file->Maps[i].Kernel, file->Maps[i].Size);
-            ShmFree(ctx, file->Maps[i].Offset);
-            file->Maps[i] = file->Maps[file->Count - 1];
-            file->Count--;
-            mapped = TRUE;
-            break;
+    for (ULONG i = 0; i < file->Count; i++) {
+        if (file->Blobs[i].ResourceId == in->ResourceId &&
+            file->Blobs[i].CtxId == in->CtxId) {
+            return ReleaseFileBlob(ctx, file, i, type);
         }
     }
-    return HostRelease(ctx, in->CtxId, in->ResourceId, mapped, type);
+    return STATUS_NOT_FOUND;
 }
 
 VOID EgEvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
@@ -1553,8 +1571,9 @@ VOID EgEvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
 
     WDF_REQUEST_PARAMETERS_INIT(&params);
     WdfRequestGetParameters(Request, &params);
-    if (params.Type == WdfRequestTypeDeviceControl &&
-        params.Parameters.DeviceIoControl.IoControlCode == IOCTL_ENTANGLED_GPU_BLOB_DESTROY) {
+    const ULONG code = params.Type == WdfRequestTypeDeviceControl
+                           ? params.Parameters.DeviceIoControl.IoControlCode : 0;
+    if (code == IOCTL_ENTANGLED_GPU_BLOB_DESTROY) {
         ENTANGLED_GPU_BLOB_REF *ref = NULL;
         ENTANGLED_GPU_RESPONSE *resp = NULL;
         status = WdfRequestRetrieveInputBuffer(Request, sizeof(*ref), (PVOID *)&ref, NULL);
@@ -1575,8 +1594,8 @@ VOID EgEvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
                                           NT_SUCCESS(status) ? sizeof(*resp) : 0);
         return;
     }
-    if (params.Type != WdfRequestTypeDeviceControl ||
-        params.Parameters.DeviceIoControl.IoControlCode != IOCTL_ENTANGLED_GPU_BLOB_CREATE) {
+    if (code != IOCTL_ENTANGLED_GPU_BLOB_CREATE &&
+        code != IOCTL_ENTANGLED_GPU_BLOB_CREATE_UNMAPPED) {
         status = WdfDeviceEnqueueRequest(Device, Request);
         if (!NT_SUCCESS(status)) {
             WdfRequestComplete(Request, status);
@@ -1593,7 +1612,7 @@ VOID EgEvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
         WdfWaitLockAcquire(ctx->Lock, NULL);
         status = FileControlStatus(ctx, file);
         if (NT_SUCCESS(status)) {
-            status = BlobCreate(ctx, file, &copy, out);
+            status = BlobCreate(ctx, file, &copy, out, code == IOCTL_ENTANGLED_GPU_BLOB_CREATE);
         }
         WdfWaitLockRelease(ctx->Lock);
     }
@@ -1604,7 +1623,6 @@ VOID EgEvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
 VOID EgEvtFileCleanup(WDFFILEOBJECT FileObject)
 {
     FILE_CONTEXT *file = GetFileCtx(FileObject);
-    ULONG i;
     DEVICE_CONTEXT *ctx = GetCtx(WdfFileObjectGetDevice(FileObject));
     ULONG type = 0;
     WDFREQUEST canceled = NULL;
@@ -1622,14 +1640,9 @@ VOID EgEvtFileCleanup(WDFFILEOBJECT FileObject)
         }
         WdfSpinLockRelease(ctx->ControlLock);
     }
-    for (i = 0; i < file->Count; i++) {
-        MmUnmapLockedPages(file->Maps[i].User, file->Maps[i].Mdl);
-        IoFreeMdl(file->Maps[i].Mdl);
-        MmUnmapIoSpace(file->Maps[i].Kernel, file->Maps[i].Size);
-        ShmFree(ctx, file->Maps[i].Offset);
-        (void)HostRelease(ctx, file->Maps[i].CtxId, file->Maps[i].ResourceId, TRUE, &type);
+    while (file->Count != 0) {
+        (void)ReleaseFileBlob(ctx, file, file->Count - 1, &type);
     }
-    file->Count = 0;
     if (file->CtxId != 0) {
         (void)CtxDestroy(ctx, file->CtxId, &type);
         file->CtxId = 0;
