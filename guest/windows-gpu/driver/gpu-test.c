@@ -6,7 +6,8 @@
  * a Microsoft-signed driver (viogpudo) outranks a test-signed one there, so
  * pnputil alone leaves the function where it was. `gpu-test install <inf>
  * <hardware id>` does the same for another function: the display one, for
- * entangled-display (guest/windows-gpu/display). */
+ * entangled-display (guest/windows-gpu/display).
+ * `gpu-test context-cleanup` checks context ownership across handle closes. */
 #include <windows.h>
 #include <newdev.h>
 #include <stdio.h>
@@ -50,6 +51,33 @@ static BOOL call(HANDLE dev, DWORD code, void *in, DWORD inLen, void *out, DWORD
 {
     DWORD got = 0;
     return DeviceIoControl(dev, code, in, inLen, out, outLen, &got, NULL);
+}
+
+static int context_cleanup(void)
+{
+    ENTANGLED_GPU_CTX_CREATE request = {(GetCurrentProcessId() & 0xffffffu) << 8 | 1u, 4};
+    // Closing the first handle releases its context. Reopen the same one,
+    // as a client restarting its renderer would do.
+    for (unsigned i = 0; i < 2; ++i) {
+        HANDLE dev = CreateFileW(ENTANGLED_GPU_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                                0, NULL);
+        if (dev == INVALID_HANDLE_VALUE) {
+            printf("GPU-TEST FAIL open: error %lu\n", GetLastError());
+            return 1;
+        }
+        ENTANGLED_GPU_RESPONSE created = {0};
+        const BOOL ok = call(dev, IOCTL_ENTANGLED_GPU_CTX_CREATE, &request, sizeof(request),
+                             &created, sizeof(created));
+        CloseHandle(dev);
+        if (!ok || created.Type != 0x1100) {
+            printf("GPU-TEST FAIL context create on handle %u: answer %#lx\n", i + 1,
+                   created.Type);
+            return 1;
+        }
+    }
+    printf("GPU-TEST PASS context cleanup (%#lx)\n", request.CtxId);
+    return 0;
 }
 
 static unsigned long submit(HANDLE dev, unsigned long ctxId, const STREAM *s)
@@ -182,6 +210,9 @@ int wmain(int argc, wchar_t **argv)
     if ((argc == 3 || argc == 4) && lstrcmpiW(argv[1], L"install") == 0) {
         return install(argv[2],
                        argc == 4 ? argv[3] : L"PCI\\VEN_1AF4&DEV_1050&SUBSYS_00401AF4&REV_01");
+    }
+    if (argc == 2 && lstrcmpiW(argv[1], L"context-cleanup") == 0) {
+        return context_cleanup();
     }
     dev = CreateFileW(ENTANGLED_GPU_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE, 0, NULL,
                       OPEN_EXISTING, 0, NULL);

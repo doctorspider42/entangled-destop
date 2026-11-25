@@ -1661,6 +1661,27 @@ The archived host log is `run-before-jelly-recovery-20261125-1217.log`.
 The adjacent `jelly-device-removed-*.log` extracts and
 `input-zorder-final-follow-up.txt` preserve the relevant observations.
 
+#### Render-only context ownership on Windows
+
+The archived host log gives the reason for the two missing descriptor
+pools. In both new contexts, the immediately preceding
+`vkCreateDescriptorPool` needed 266,816 units with 33,427,552 already held
+of a renderer-wide 33,554,432. The following allocation used the pool
+that the host had just refused. The same engine recorded 70 context
+creates and nine destroys in the full run. In particular, neither of
+the two contexts belonging to the diagnostic shell or the two belonging
+to stock F239 had a destroy record after their processes exited.
+
+The render-only miniport uses `METHOD_BUFFERED`, so its IOCTL input and
+output share storage. It recorded a successful create's context ID from
+the input after replacing the first word with the response (`0x1100`).
+The cleanup callback then tried to destroy that value. Save the request
+ID before writing the reply, and on explicit destroy clear ownership
+only after the host acknowledges that exact context. `gpu-test
+context-cleanup` opens the render-only device, creates a context, closes
+the handle, and verifies that it can create the same context again.
+The resource caps are unchanged.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

@@ -1205,18 +1205,22 @@ VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLengt
         if (!NT_SUCCESS(status)) {
             break;
         }
+        // METHOD_BUFFERED aliases the input and output. Capture the context
+        // before HeaderCommand replaces the first word with a response type.
+        const ULONG ctxId = ((const ENTANGLED_GPU_CTX *)in)->CtxId;
         if (IoControlCode == IOCTL_ENTANGLED_GPU_CTX_CREATE) {
             FILE_CONTEXT *file = GetFileCtx(WdfRequestGetFileObject(Request));
             status = inLength >= sizeof(ENTANGLED_GPU_CTX_CREATE) && file->CtxId == 0
                          ? CtxCreate(ctx, (ENTANGLED_GPU_CTX_CREATE *)in, &out->Type)
                          : STATUS_INVALID_PARAMETER;
             if (NT_SUCCESS(status) && out->Type == VIRTIO_GPU_RESP_OK_NODATA) {
-                file->CtxId = ((ENTANGLED_GPU_CTX_CREATE *)in)->CtxId;
+                file->CtxId = ctxId;
             }
         } else if (IoControlCode == IOCTL_ENTANGLED_GPU_CTX_DESTROY) {
             FILE_CONTEXT *file = GetFileCtx(WdfRequestGetFileObject(Request));
-            status = CtxDestroy(ctx, ((ENTANGLED_GPU_CTX *)in)->CtxId, &out->Type);
-            if (file->CtxId == ((ENTANGLED_GPU_CTX *)in)->CtxId) {
+            status = CtxDestroy(ctx, ctxId, &out->Type);
+            if (NT_SUCCESS(status) && out->Type == VIRTIO_GPU_RESP_OK_NODATA &&
+                file->CtxId == ctxId) {
                 file->CtxId = 0;
             }
         } else {
