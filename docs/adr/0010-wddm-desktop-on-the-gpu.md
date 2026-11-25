@@ -1766,11 +1766,22 @@ The closest resolved user stacks before two Present waits of 26.5 and
 20.3 ms were sampled 0.20 and 0.44 ms before the respective switches.
 Both passed through `zink_end_batch` and `util_queue_add_job_locked`.
 The first was under `d3d10_wddm_flush`, the second under
-`d3d10_wddm_flush_frontbuffer`. The exact blocking call and the thread
-that released it were outside those stack samples. The first flush
-also publishes dirty shared surfaces. A trial of combining the render
-and overlay submissions needs to preserve that publication and the
-fallback present path.
+`d3d10_wddm_flush_frontbuffer`. The exact blocking call was outside
+those samples.
+
+The `ReadyThread` stack at each wakeup identifies the same Zink worker
+within DWM, calling `futex_wake` from `util_queue_thread_func`. During
+the first wait the worker was itself waiting for 17.3 ms. During the
+second it was scheduled to run for 19.2 ms, with sampled stacks in the
+render-only miniport and the Venus submission code. The host recorded
+one deferred fence completion inside each wait. Those completions took
+0.32 and 0.97 ms from their recorded deferral. The larger wait spans
+therefore include guest submission and worker time outside those
+measured host fence intervals.
+
+The first flush also publishes dirty shared surfaces. A trial of
+combining the render and overlay submissions needs to preserve that
+publication and the fallback present path.
 
 The capture prefix is `stock-dwm-sched`. The matching timestamps, module
 identity and scheduler breakdown are in `stock-dwm-sched-breakdown.txt`
