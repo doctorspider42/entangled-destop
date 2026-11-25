@@ -2496,6 +2496,13 @@ overlapped 1.4 ms of it. The shell's waits covered 1.8 ms. These are
 overlaps of the recorded host waits, and leave guest scheduling, DWM
 render scopes, and waits outside the deferred ring path unmeasured.
 
+The first cube turn was the 132.6 ms sample. Its introductory scene setup
+took 9.2 ms and the first `IDCompositionDevice::Commit` call took 48.6 ms.
+The corresponding commits for the seven later turns took 0.04–0.15 ms.
+This runs after the previously implemented backdrop preparation. The
+timestamps isolate the cold API call, and do not show where the service
+spent those 48.6 ms. The breakdown is in `gpu-flips-cpu-c-cube-commit.txt`.
+
 Guest Microsoft Defender blocked the hash check of `wintanyl.exe` before
 the GPU-only repeat could start. Only the control block ran. The earlier
 DirectComposition probe measured the GPU-only flip path. The shell test
