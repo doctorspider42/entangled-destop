@@ -2260,14 +2260,21 @@ DXGI and DWM calls. The Wintanyl release `04fe598` loaded the Entangled
 D3D12 UMD after the guest restart. Raw logs are in
 `share/unmapped-blob` under the Windows lab directory.
 
-The transport test uses `blob_id=0` (plain renderer memory). The next
-test needs a nonzero Venus memory ID backed by an exportable optimal
-image on the physical GPU. The host already supports opaque Win32
-external memory for cross-context Venus blobs. Connecting that path to
-WDDM requires access checked against the opened WDDM allocation and an
-explicit producer-to-consumer handoff before sampling. Until then the
-display UMD uses the existing CPU pixel path and these results give no
-new animation timings.
+The transport test uses `blob_id=0` (plain renderer memory). A separate
+raw Venus probe in the same VM created a 256×256 optimal BGRA8 image on
+the RTX 2070 and backed it with 262,144 bytes of device-local memory
+(type 1, flags `0x1`). The host exported `blob_id=112` as shareable
+resource 65957 and never mapped it. A second Vulkan device in the same
+Venus context imported that resource with `VkImportMemoryResourceInfoMESA`
+and bound another optimal image. The blob was then released. The probe
+reports creation, export, import and binding. It has no producer-to-consumer
+pixel check. Its source and output are in `share/unmapped-blob`.
+
+The WDDM handoff still needs to attach the producer's blob to the
+consumer's Venus context after checking access to the opened WDDM
+allocation. Both UMDs must order producer completion and the consumer's
+sampling. Until then the display UMD uses the existing CPU pixel path
+and these results give no new animation timings.
 
 ## Risks, in the order they are likely to bite
 
