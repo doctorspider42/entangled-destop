@@ -2445,6 +2445,44 @@ GPU publication submission remains synchronous. These measurements end
 at guest DwmFlush and do not measure host pixels or animation latency.
 Logs and per-block summaries are in `share/dwm-gpu-only`.
 
+#### Wintanyl animations with the flip comparison package
+
+The Windows x64 lab used the v0.2.176 release host, the signed display
+package `19.59.12.937` (`oem29.inf`), and Wintanyl shell source
+`04fe598434874268f654cba7f75b26edd18c9991`. Six minimize/restore pairs and
+eight cube turns went through virtio-input with two Notepad windows on the
+1920 × 1080 guest desktop. The D3D12 flip producer used its regular CPU
+handoff in this control. The onset was the first host Windows Graphics
+Capture frame with at least 500 pixels crossing the brightness threshold.
+The guest-to-host clock bridge had a minimum round trip below 1 ms.
+
+| Gesture | Samples | Host command to pixels, median / max | Last preceding scanout flush to pixels, median |
+| --- | ---: | ---: | ---: |
+| Minimize | 6 | 70.8 / 104.2 ms | 10.4 ms |
+| Restore | 6 | 146.0 / 303.6 ms | 6.2 ms |
+| Cube | 8 | 47.5 / 132.6 ms | 6.9 ms |
+
+In the 303.6 ms restore, the guest keyboard hook took 13.0 ms from the
+host command. The window event followed 50.5 ms later, and the shell's
+first lamp commit returned another 13.2 ms later. The first capture over
+the threshold took another 226.9 ms. Nine full-size scanout flushes fell
+between that commit and capture. The latest was 1.6 ms before the capture
+timestamp. The host trace and Windows Graphics Capture have no shared
+frame identifier. At thresholds of 150 and 1,500 pixels, the same restore
+crossed the threshold at 166.0 and 432.9 ms respectively. The time to a
+larger visible change varies even after the first detectable change.
+
+Guest Microsoft Defender blocked the hash check of `wintanyl.exe` before
+the GPU-only repeat could start. Only the control block ran. The earlier
+DirectComposition probe measured the GPU-only flip path. The shell test
+also animates surfaces owned by other Windows processes, and the current
+opt-in is applied by the D3D12 UMD on its own Present allocations. An
+animation comparison needs to identify the producer and handoff used by
+the affected shared surface. A fresh guest DWM trace would allow the
+post-commit interval to be assigned to rendering, waits and production of
+the scanout. Raw records use `gpu-flips-cpu-c` in the lab's
+`physical-wheel` directory and `cpu-c` in `share/dwm-animation-ab`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

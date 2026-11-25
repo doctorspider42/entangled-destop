@@ -168,10 +168,15 @@ def main():
 
     pixels = sorted(int(r["qpc_wgc"]) / 1e7 for r in rows(Path(f"{host_prefix}-frames.csv")) if int(r["changed"]) >= args.threshold)
     scanouts = []
+    trace_timestamp = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z) TRACE ")
     with args.log.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
             if "virtio-gpu flush resource=" in line and "width=1920 height=1080 three_d=true" in line:
-                utc = datetime.fromisoformat(line.split()[0]).timestamp()
+                # Guest serial output and host traces can share a line.
+                stamp = trace_timestamp.search(line)
+                if stamp is None:
+                    continue
+                utc = datetime.fromisoformat(stamp[1]).timestamp()
                 host = utc - host_wall_offset
                 if actions[0][0] - 1 <= host <= actions[-1][0] + 2:
                     scanouts.append(host)
