@@ -2368,6 +2368,31 @@ This exercises the ICD boundary the display UMD will call. The UMD
 still needs a GPU copy in each direction, ordering at surface generation
 boundaries, and a before/after animation trace with the desktop compositor.
 
+#### WDDM orders access to each GPU image generation
+
+The WDDM 2.0 lab miniport offers a private access escape for a published
+allocation. Only its allocating process can start a write. An opener on
+its own DXGK device can start a read when a new generation is available.
+The calling thread holds access until its submitted GPU work has finished
+and it has released external queue ownership. A completed write advances
+the generation. An unsuccessful claim returns immediately. The miniport
+does not wait for GPU work. If a thread abandons access or reports a
+failed submission, subsequent GPU access to the publication is refused
+because the backing image may still be in use.
+
+The x64 lab miniport on the RTX 2070 passed a two-process test with real
+DXGI resource handles and two Venus instances. It returned `STATUS_RETRY`
+to a reader while the writer was active, denied reader writes and
+foreign releases, skipped an already-consumed generation, and revoked
+the publication after a test thread exited with access held. The writer
+and reader each waited on the fence of their own submission. The reader
+verified 65,536 pixels each of two generations, including after the
+writer released its image and WDDM handles. The GPU work ran through an
+explicitly loaded lab ICD. The helper that created the DXGI allocation
+logged a Zink initialization error in its own D3D11 path. This run tests
+the allocation and GPU handoff, with no claim about the active DWM path.
+The source and results are in `share/wddm-share-sync` in the Windows lab.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

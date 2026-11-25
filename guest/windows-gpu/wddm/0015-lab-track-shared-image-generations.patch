@@ -1,0 +1,193 @@
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -653,14 +653,18 @@
+
+ #ifdef ENTANGLED_WDDM2_LAB
+     if (pVioGpuEscape->Type == ENTANGLED_WDDM_BIND_BLOB ||
+-        pVioGpuEscape->Type == ENTANGLED_WDDM_OPEN_BLOB)
+-    {
+-        if (size != sizeof(ENTANGLED_WDDM_BLOB_ESCAPE))
++        pVioGpuEscape->Type == ENTANGLED_WDDM_OPEN_BLOB ||
++        pVioGpuEscape->Type == ENTANGLED_WDDM_ACCESS_BLOB)
++    {
++        const bool access = pVioGpuEscape->Type == ENTANGLED_WDDM_ACCESS_BLOB;
++        if (size != (access ? sizeof(ENTANGLED_WDDM_BLOB_ACCESS_ESCAPE) : sizeof(ENTANGLED_WDDM_BLOB_ESCAPE)))
+         {
+             return STATUS_INVALID_BUFFER_SIZE;
+         }
+         auto *share = static_cast<ENTANGLED_WDDM_BLOB_ESCAPE *>(pEscape->pPrivateDriverData);
+-        if (share->Version != ENTANGLED_WDDM_SHARE_VERSION || pEscape->hDevice == NULL ||
++        auto *lease = static_cast<ENTANGLED_WDDM_BLOB_ACCESS_ESCAPE *>(pEscape->pPrivateDriverData);
++        const USHORT version = access ? lease->Version : share->Version;
++        if (version != ENTANGLED_WDDM_SHARE_VERSION || pEscape->hDevice == NULL ||
+             ExGetPreviousMode() != UserMode)
+         {
+             return STATUS_INVALID_PARAMETER;
+@@ -672,7 +676,7 @@
+
+         const bool bind = share->Type == ENTANGLED_WDDM_BIND_BLOB;
+         DXGKARGCB_GETHANDLEDATA lookup = {};
+-        lookup.hObject = share->Allocation;
++        lookup.hObject = access ? lease->Allocation : share->Allocation;
+         lookup.Type = DXGK_HANDLE_ALLOCATION;
+         DXGKARGCB_RELEASEHANDLEDATA reference = {};
+         reference.Type = DXGK_HANDLE_ALLOCATION;
+@@ -700,9 +704,18 @@
+             {
+                 if (opened->GetDevice() == static_cast<VioGpuDevice *>(pEscape->hDevice))
+                 {
+-                    HANDLE token = NULL;
+-                    status = allocation->OpenGpuShare(&token);
+-                    share->Token = reinterpret_cast<ULONG_PTR>(token);
++                    if (access)
++                    {
++                        status = lease->Reserved == 0
++                            ? allocation->AccessGpuShare(lease->Operation, &lease->Generation)
++                            : STATUS_INVALID_PARAMETER;
++                    }
++                    else
++                    {
++                        HANDLE token = NULL;
++                        status = allocation->OpenGpuShare(&token);
++                        share->Token = reinterpret_cast<ULONG_PTR>(token);
++                    }
+                 }
+                 m_DxgkInterface.DxgkCbReleaseHandleData(openedReference);
+             }
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -49,6 +49,10 @@
+     if (m_gpuShare != NULL)
+     {
+         auto *share = static_cast<GpuShare *>(m_gpuShare);
++        if (share->AccessThread != NULL)
++        {
++            ObDereferenceObject(share->AccessThread);
++        }
+         ZwClose(share->RenderFile);
+         ZwClose(share->Token);
+         delete share;
+@@ -106,6 +110,7 @@
+         return STATUS_INSUFFICIENT_RESOURCES;
+     }
+
++    ExInitializeFastMutex(&share->AccessLock);
+     status = ObOpenObjectByPointer(event, OBJ_KERNEL_HANDLE, NULL, SYNCHRONIZE,
+                                    *ExEventObjectType, KernelMode, &share->Token);
+     ObDereferenceObject(event);
+@@ -152,6 +157,90 @@
+     // its process. The source remains a private kernel handle.
+     return ZwDuplicateObject(NtCurrentProcess(), share->Token, NtCurrentProcess(),
+                              userToken, SYNCHRONIZE, 0, 0);
++}
++
++NTSTATUS VioGpuAllocation::AccessGpuShare(ULONG operation, ULONGLONG *generation)
++{
++    PAGED_CODE();
++    if (operation < ENTANGLED_WDDM_BEGIN_WRITE || operation > ENTANGLED_WDDM_ABORT_ACCESS)
++    {
++        return STATUS_INVALID_PARAMETER;
++    }
++    const bool writing = operation == ENTANGLED_WDDM_BEGIN_WRITE;
++    if (writing && PsGetCurrentProcess() != m_shareOwner)
++    {
++        return STATUS_ACCESS_DENIED;
++    }
++    auto *share = static_cast<GpuShare *>(InterlockedCompareExchangePointer(&m_gpuShare, NULL, NULL));
++    if (share == NULL)
++    {
++        return STATUS_NOT_FOUND;
++    }
++
++    const auto current = PsGetCurrentThread();
++    PETHREAD retired = NULL;
++    NTSTATUS status = STATUS_SUCCESS;
++    ExAcquireFastMutex(&share->AccessLock);
++    if (share->AccessThread != NULL && PsIsThreadTerminating(share->AccessThread))
++    {
++        // The GPU may still be touching this image. Do not hand it out again.
++        share->Revoked = true;
++        retired = share->AccessThread;
++        share->AccessThread = NULL;
++    }
++    if (share->Revoked)
++    {
++        status = STATUS_CANCELLED;
++    }
++    else if (operation == ENTANGLED_WDDM_END_ACCESS || operation == ENTANGLED_WDDM_ABORT_ACCESS)
++    {
++        if (share->AccessThread != current)
++        {
++            status = STATUS_ACCESS_DENIED;
++        }
++        else
++        {
++            retired = share->AccessThread;
++            share->AccessThread = NULL;
++            if (operation == ENTANGLED_WDDM_ABORT_ACCESS)
++            {
++                share->Revoked = true;
++            }
++            else
++            {
++                if (share->Writing && ++share->Generation == 0)
++                {
++                    ++share->Generation;
++                }
++                *generation = share->Generation;
++            }
++        }
++    }
++    else if (share->AccessThread != NULL)
++    {
++        status = STATUS_RETRY;
++    }
++    else if (!writing && share->Generation == 0)
++    {
++        status = STATUS_DEVICE_NOT_READY;
++    }
++    else if (!writing && *generation == share->Generation)
++    {
++        status = STATUS_NO_MORE_ENTRIES;
++    }
++    else
++    {
++        ObReferenceObject(current);
++        share->AccessThread = current;
++        share->Writing = writing;
++        *generation = share->Generation;
++    }
++    ExReleaseFastMutex(&share->AccessLock);
++    if (retired != NULL)
++    {
++        ObDereferenceObject(retired);
++    }
++    return status;
+ }
+ #endif
+
+diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
+--- a/viogpu/viogpu3d/viogpu_allocation.h
++++ b/viogpu/viogpu3d/viogpu_allocation.h
+@@ -19,6 +19,7 @@
+ #ifdef ENTANGLED_WDDM2_LAB
+     NTSTATUS BindGpuShare(HANDLE userToken);
+     NTSTATUS OpenGpuShare(HANDLE *userToken);
++    NTSTATUS AccessGpuShare(ULONG operation, ULONGLONG *generation);
+ #endif
+
+     UINT GetId(void)
+@@ -80,6 +81,11 @@
+     {
+         HANDLE Token;
+         HANDLE RenderFile;
++        FAST_MUTEX AccessLock;
++        PETHREAD AccessThread;
++        ULONGLONG Generation;
++        bool Writing;
++        bool Revoked;
+     };
+     // The allocation may outlive both the original device and process.
+     PEPROCESS m_shareOwner = NULL;

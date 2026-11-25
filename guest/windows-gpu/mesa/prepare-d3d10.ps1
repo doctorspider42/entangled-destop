@@ -32,6 +32,7 @@ git -C $Dir apply --whitespace=nowarn (Join-Path $here '0003-nine-on-mesa-26.2.p
 if ($LASTEXITCODE -ne 0) { throw '0003-nine-on-mesa-26.2.patch does not apply' }
 $venus = Join-Path $Dir 'src\virtio\vulkan'
 Copy-Item (Join-Path $here 'vn_renderer_entangled.c') $venus
+Copy-Item (Join-Path $here 'entangled_shared_image.h') $venus
 Copy-Item (Join-Path $here '..\driver\public.h') (Join-Path $venus 'entangled_gpu_public.h')
 $winsys = Join-Path $Dir 'src\gallium\winsys\sw\wddm'
 Copy-Item (Join-Path $here 'wddm_sw_winsys.c'), (Join-Path $here 'wddm_sw_winsys.h') $winsys
