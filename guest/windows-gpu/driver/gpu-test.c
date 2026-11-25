@@ -10,6 +10,7 @@
  * `gpu-test context-cleanup` checks context ownership across handle closes.
  * `gpu-test unmapped-blob` checks the host-only blob lifecycle alongside a
  * mapped allocation on the same handle.
+ * `gpu-test shared-blob` checks attachment and teardown of an unmapped blob.
  * `gpu-test hold-venus-ring` leaves a private ring waiting for its round
  * trip, to exercise independent clients on the same control queue. */
 #include <windows.h>
@@ -171,6 +172,78 @@ static int unmapped_blob(void)
     }
     printf("GPU-TEST PASS unmapped blob lifecycle\n");
     return 0;
+}
+
+static int shared_blob(void)
+{
+    HANDLE clients[3] = {INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE};
+    const ULONG base = (GetCurrentProcessId() & 0xffffffu) << 8;
+    ENTANGLED_GPU_CTX_CREATE ctx[3] = {{base | 3u, 4}, {base | 4u, 4}, {base | 5u, 4}};
+    ENTANGLED_GPU_RESPONSE resp = {0};
+    ENTANGLED_GPU_BLOB_IN create = {ctx[0].CtxId, 0, 4096, 0};
+    ENTANGLED_GPU_BLOB_OUT blob = {0};
+    ENTANGLED_GPU_BLOB_TOKEN token = {0};
+    ENTANGLED_GPU_BLOB_REF owner, imported;
+    int result = 1;
+    const char *step = "open clients";
+    for (unsigned i = 0; i < ARRAYSIZE(clients); ++i) {
+        clients[i] = CreateFileW(ENTANGLED_GPU_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (clients[i] == INVALID_HANDLE_VALUE ||
+            !call(clients[i], IOCTL_ENTANGLED_GPU_CTX_CREATE, &ctx[i], sizeof(ctx[i]),
+                  &resp, sizeof(resp)) || resp.Type != 0x1100) {
+            goto done;
+        }
+    }
+    step = "create unmapped blob";
+    if (!call(clients[0], IOCTL_ENTANGLED_GPU_BLOB_CREATE_UNMAPPED, &create, sizeof(create),
+              &blob, sizeof(blob)) || blob.ResourceId == 0 || blob.Response != 0x1100) {
+        goto done;
+    }
+    owner.CtxId = ctx[0].CtxId;
+    owner.ResourceId = blob.ResourceId;
+    step = "publish";
+    if (!call(clients[0], IOCTL_ENTANGLED_GPU_BLOB_PUBLISH, &owner, sizeof(owner),
+              &token, sizeof(token)) || token.Handle == 0) {
+        goto done;
+    }
+    step = "attach twice";
+    for (unsigned i = 0; i < 2; ++i) {
+        if (!call(clients[1], IOCTL_ENTANGLED_GPU_BLOB_ATTACH, &token, sizeof(token),
+                  &imported, sizeof(imported)) || imported.CtxId != ctx[1].CtxId ||
+            imported.ResourceId != owner.ResourceId) {
+            goto done;
+        }
+    }
+    printf("BLOB shared=%#lx owner=%#lx importer=%#lx\n", owner.ResourceId, owner.CtxId, imported.CtxId);
+    CloseHandle(clients[0]);
+    clients[0] = INVALID_HANDLE_VALUE;
+    step = "expire publication on owner close";
+    ENTANGLED_GPU_BLOB_REF expired;
+    if (call(clients[2], IOCTL_ENTANGLED_GPU_BLOB_ATTACH, &token, sizeof(token),
+             &expired, sizeof(expired)) || GetLastError() != ERROR_NOT_FOUND) {
+        goto done;
+    }
+    step = "release the last attachment";
+    if (!call(clients[1], IOCTL_ENTANGLED_GPU_BLOB_DESTROY, &imported, sizeof(imported),
+              &resp, sizeof(resp)) || resp.Type != 0x1100) {
+        goto done;
+    }
+    printf("GPU-TEST PASS shared blob lifecycle\n");
+    result = 0;
+done:
+    if (result != 0) {
+        printf("GPU-TEST FAIL %s: error %lu response %#lx\n", step, GetLastError(), resp.Type);
+    }
+    if (token.Handle != 0) {
+        CloseHandle((HANDLE)(ULONG_PTR)token.Handle);
+    }
+    for (unsigned i = 0; i < ARRAYSIZE(clients); ++i) {
+        if (clients[i] != INVALID_HANDLE_VALUE) {
+            CloseHandle(clients[i]);
+        }
+    }
+    return result;
 }
 
 static unsigned long submit_stream(HANDLE dev, unsigned long ctxId, const STREAM *s, BOOL fenced)
@@ -384,6 +457,9 @@ int wmain(int argc, wchar_t **argv)
     }
     if (argc == 2 && lstrcmpiW(argv[1], L"unmapped-blob") == 0) {
         return unmapped_blob();
+    }
+    if (argc == 2 && lstrcmpiW(argv[1], L"shared-blob") == 0) {
+        return shared_blob();
     }
     if (argc == 2 && lstrcmpiW(argv[1], L"hold-venus-ring") == 0) {
         return hold_venus_ring();

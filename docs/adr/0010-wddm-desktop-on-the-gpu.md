@@ -2284,6 +2284,42 @@ allocation. Both UMDs must order producer completion and the consumer's
 sampling. Until then the display UMD uses the existing CPU pixel path
 and these results give no new animation timings.
 
+#### Windows processes can attach the same Venus texture
+
+An owner publishes its unmapped blob through the render miniport and
+receives an unnamed Windows event handle. The event identifies the share.
+The driver neither signals nor waits on it. A receiver passes a duplicate
+to the render miniport, which checks the object and attaches the blob to
+that file's Venus context. The owner and every attached file hold a
+reference. Owner exit retires publication and leaves existing attachments
+live. The last release drops the host resource. A retained blob also
+reserves its original context ID until it is released because Venus can
+resolve a blob directly in its owner's context.
+
+On the release 0.2.176 host and the Windows x64 lab guest, the signed
+MSI-X render miniport 18.5.43.237 (`oem22.inf`) passed `gpu-test
+shared-blob`, `unmapped-blob`, `context-cleanup`, and `venus`. The
+shared-blob test attaches twice on one file, closes the publisher, and
+checks that a fresh file cannot attach using the retired handle. The
+normal D3D12 draw and flip-discard composition probes also passed.
+
+Two Windows processes with distinct Venus contexts then passed an actual
+RTX 2070 texture between them. The producer cleared an unmapped 256×256
+BGRA8 texture and released GPU ownership. The receiver duplicated the
+Windows handle, attached and imported the allocation, acquired GPU
+ownership, and verified all 65,536 pixels through a staging buffer. Both
+close orders passed. In the first test the producer had exited before
+the receiver imported the Vulkan allocation. The host log shows an
+attach, detach and final unref for resources 65876 and 65882 without
+BAR mapping either resource. Probe source and logs are in
+`share/shared-blob` under the Windows lab directory.
+
+The remaining connection is between this publication and the DXGI
+allocation that WDDM already authorizes and shares. That allocation
+must control the blob's lifetime and surface generations. The probe uses
+queue-idle waits for ordering. The DWM path needs producer completion
+and consumer release without putting a global wait on either UI thread.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

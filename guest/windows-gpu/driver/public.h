@@ -112,6 +112,23 @@ typedef struct _ENTANGLED_GPU_BLOB_REF {
     unsigned long ResourceId;
 } ENTANGLED_GPU_BLOB_REF;
 
+/* Publish one owned, unmapped blob. In BLOB_REF, out BLOB_TOKEN. The token
+ * is an unnamed Windows handle with SYNCHRONIZE access. Close it with
+ * CloseHandle and transfer it with DuplicateHandle. Each blob may be
+ * published once, and new attachments stop when its owner releases it. */
+#define IOCTL_ENTANGLED_GPU_BLOB_PUBLISH \
+    CTL_CODE(ENTANGLED_GPU_TYPE, 0x80C, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _ENTANGLED_GPU_BLOB_TOKEN {
+    unsigned long long Handle;
+} ENTANGLED_GPU_BLOB_TOKEN;
+
+/* Attach the token's blob to the calling file's Venus context. In
+ * BLOB_TOKEN, out BLOB_REF. Repeating an attachment returns the existing
+ * reference. BLOB_DESTROY (or closing the context) releases it. */
+#define IOCTL_ENTANGLED_GPU_BLOB_ATTACH \
+    CTL_CODE(ENTANGLED_GPU_TYPE, 0x80D, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 /* ADR-0009 phase E: show a blob's BGRA pixels at a place of the desktop, over
  * it, instead of copying them through the window (the render-only function's
  * scanout is the host display's overlay plane). ResourceId 0 hides it. In

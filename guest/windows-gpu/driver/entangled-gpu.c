@@ -17,7 +17,7 @@
  * The device is the host's, which this guest trusts; the checks below guard
  * against a misconfigured machine, not a hostile one.
  */
-#include <ntddk.h>
+#include <ntifs.h>
 #include <wdf.h>
 #include <initguid.h>
 #include <wdmguid.h>
@@ -95,6 +95,7 @@
 #define VIRTIO_GPU_CMD_SUBMIT_3D 0x0207
 #define VIRTIO_GPU_RESP_OK_CAPSET_INFO 0x1102
 #define VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE 0x0202
+#define VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE 0x0203
 #define VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB 0x010c
 #define VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB 0x0208
 #define VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB 0x0209
@@ -317,6 +318,8 @@ typedef struct {
     ULONG RangeCount;
     /* The next blob resource id (ENTANGLED_GPU_BLOB_OUT::ResourceId). */
     ULONG NextResource;
+    LIST_ENTRY SharedBlobs;
+    ULONG SharedBlobCount;
     /* Protects staged legacy commands and file/blob metadata. The slot
      * lock serializes used-ring processing and is never held across MMIO. */
     WDFWAITLOCK Lock;
@@ -325,6 +328,17 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetCtx)
 
 /* Zink alone keeps dozens of host-visible allocations. */
 #define MAX_BLOBS 1024
+#define MAX_SHARED_BLOBS 1024
+typedef struct {
+    LIST_ENTRY Entry;
+    WDFMEMORY Memory;
+    PKEVENT Token;
+    ULONG OwnerCtxId;
+    ULONG ResourceId;
+    ULONG References;
+    BOOLEAN Published;
+} SHARED_BLOB;
+
 /* A handle owns its blobs until explicit destruction or file cleanup. A
  * non-null MDL means the blob also occupies a BAR range and a user mapping. */
 typedef struct {
@@ -335,6 +349,8 @@ typedef struct {
     PVOID Kernel;
     SIZE_T Size;
     UINT64 Offset;
+    SHARED_BLOB *Share;
+    BOOLEAN Imported;
 } FILE_BLOB;
 
 struct FILE_CONTEXT {
@@ -483,6 +499,7 @@ NTSTATUS EgEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
         return status;
     }
     ctx = GetCtx(device);
+    InitializeListHead(&ctx->SharedBlobs);
     ctx->ParallelControl = ENTANGLED_GPU_PARALLEL_CONTROL != 0;
     status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &ctx->Lock);
     if (!NT_SUCCESS(status)) {
@@ -754,8 +771,8 @@ NTSTATUS EgEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
     DEVICE_CONTEXT *ctx = GetCtx(Device);
     ULONG i;
     UNREFERENCED_PARAMETER(Translated);
+    WdfWaitLockAcquire(ctx->Lock, NULL);
     if (ctx->ParallelControl) {
-        WdfWaitLockAcquire(ctx->Lock, NULL);
         WdfSpinLockAcquire(ctx->ControlLock);
         ctx->Ready = FALSE;
         WdfSpinLockRelease(ctx->ControlLock);
@@ -793,9 +810,7 @@ NTSTATUS EgEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
         ctx->WaitDma = NULL;
     }
     ctx->Common = ctx->NotifyBase = ctx->DeviceCfg = ctx->Isr = NULL;
-    if (ctx->ParallelControl) {
-        WdfWaitLockRelease(ctx->Lock);
-    }
+    WdfWaitLockRelease(ctx->Lock);
     return STATUS_SUCCESS;
 }
 
@@ -1166,6 +1181,9 @@ static NTSTATUS Submit3d(DEVICE_CONTEXT *ctx, const ENTANGLED_GPU_SUBMIT *in, si
 static NTSTATUS FileControlStatus(DEVICE_CONTEXT *ctx, const FILE_CONTEXT *file)
 {
     NTSTATUS status = STATUS_SUCCESS;
+    if (!ctx->Ready) {
+        return STATUS_DEVICE_NOT_READY;
+    }
     if (ctx->ParallelControl && file != NULL) {
         WdfSpinLockAcquire(ctx->ControlLock);
         if (file->Closing) {
@@ -1384,6 +1402,9 @@ static VOID ShmFree(DEVICE_CONTEXT *ctx, UINT64 offset)
 static NTSTATUS HostRelease(DEVICE_CONTEXT *ctx, ULONG ctxId, ULONG resourceId, BOOLEAN mapped,
                             ULONG *type)
 {
+    if (!ctx->Ready) {
+        return STATUS_DEVICE_NOT_READY;
+    }
     GPU_CTX_RESOURCE *req = (GPU_CTX_RESOURCE *)ctx->Cmd;
     if (mapped) {
         RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
@@ -1394,6 +1415,21 @@ static NTSTATUS HostRelease(DEVICE_CONTEXT *ctx, ULONG ctxId, ULONG resourceId, 
     }
     RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
     req->Hdr.Type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    req->Hdr.CtxId = ctxId;
+    req->ResourceId = resourceId;
+    return HeaderCommand(ctx, sizeof(*req), type);
+}
+
+static NTSTATUS HostAttachment(DEVICE_CONTEXT *ctx, ULONG ctxId, ULONG resourceId,
+                               BOOLEAN attach, ULONG *type)
+{
+    if (!ctx->Ready) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    GPU_CTX_RESOURCE *req = (GPU_CTX_RESOURCE *)ctx->Cmd;
+    RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
+    req->Hdr.Type = attach ? VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE
+                           : VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
     req->Hdr.CtxId = ctxId;
     req->ResourceId = resourceId;
     return HeaderCommand(ctx, sizeof(*req), type);
@@ -1453,12 +1489,7 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         }
     }
     {
-        GPU_CTX_RESOURCE *req = (GPU_CTX_RESOURCE *)ctx->Cmd;
-        RtlZeroMemory(ctx->Cmd, PAGE_SIZE);
-        req->Hdr.Type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
-        req->Hdr.CtxId = in->CtxId;
-        req->ResourceId = res;
-        status = HeaderCommand(ctx, sizeof(*req), &type);
+        status = HostAttachment(ctx, in->CtxId, res, TRUE, &type);
         if (!NT_SUCCESS(status) || type != VIRTIO_GPU_RESP_OK_NODATA) {
             ULONG ignored = 0;
             (void)HostRelease(ctx, in->CtxId, res, FALSE, &ignored);
@@ -1526,39 +1557,231 @@ static NTSTATUS BlobCreate(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
         ShmFree(ctx, offset);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    const FILE_BLOB blob = {mdl, in->CtxId, res, user, kernel, (SIZE_T)in->Size, offset};
+    const FILE_BLOB blob = {mdl, in->CtxId, res, user, kernel, (SIZE_T)in->Size, offset, NULL, FALSE};
     file->Blobs[file->Count++] = blob;
     out->Address = (ULONG_PTR)user;
     out->ResourceId = res;
     return STATUS_SUCCESS;
 }
 
+static FILE_BLOB *FindFileBlob(FILE_CONTEXT *file, ULONG resourceId)
+{
+    for (ULONG i = 0; i < file->Count; i++) {
+        if (file->Blobs[i].ResourceId == resourceId) {
+            return &file->Blobs[i];
+        }
+    }
+    return NULL;
+}
+
+static BOOLEAN HasRetainedShare(DEVICE_CONTEXT *ctx, ULONG ctxId)
+{
+    for (LIST_ENTRY *it = ctx->SharedBlobs.Flink; it != &ctx->SharedBlobs; it = it->Flink) {
+        const SHARED_BLOB *share = CONTAINING_RECORD(it, SHARED_BLOB, Entry);
+        if (share->OwnerCtxId == ctxId) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* Called under the wait lock in the publishing process. ZwCreateEvent adds
+ * an unnamed handle to that process's handle table. The reference in the
+ * shared blob keeps the object identity stable while attachments exist. */
+static NTSTATUS BlobPublish(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
+                            const ENTANGLED_GPU_BLOB_REF *in, ENTANGLED_GPU_BLOB_TOKEN *out)
+{
+    FILE_BLOB *blob = FindFileBlob(file, in->ResourceId);
+    if (file->CtxId == 0 || file->CtxId != in->CtxId || blob == NULL ||
+        blob->CtxId != in->CtxId || blob->Mdl != NULL || blob->Imported || blob->Share != NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (ctx->SharedBlobCount >= MAX_SHARED_BLOBS) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    WDFMEMORY memory;
+    SHARED_BLOB *share;
+    NTSTATUS status = WdfMemoryCreate(WDF_NO_OBJECT_ATTRIBUTES, NonPagedPoolNx, 'sBgE',
+                                     sizeof(*share), &memory, (PVOID *)&share);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+    HANDLE handle;
+    OBJECT_ATTRIBUTES attributes;
+    InitializeObjectAttributes(&attributes, NULL, 0, NULL, NULL);
+    status = ZwCreateEvent(&handle, SYNCHRONIZE, &attributes, NotificationEvent, FALSE);
+    if (NT_SUCCESS(status)) {
+        status = ObReferenceObjectByHandle(handle, SYNCHRONIZE, *ExEventObjectType, UserMode,
+                                           (PVOID *)&share->Token, NULL);
+        if (!NT_SUCCESS(status)) {
+            ZwClose(handle);
+        }
+    }
+    if (!NT_SUCCESS(status)) {
+        WdfObjectDelete(memory);
+        return status;
+    }
+    share->Memory = memory;
+    share->OwnerCtxId = blob->CtxId;
+    share->ResourceId = blob->ResourceId;
+    share->References = 1;
+    share->Published = TRUE;
+    InsertTailList(&ctx->SharedBlobs, &share->Entry);
+    ctx->SharedBlobCount++;
+    blob->Share = share;
+    out->Handle = (ULONG_PTR)handle;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS BlobAttach(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file, PKEVENT token,
+                           ENTANGLED_GPU_BLOB_REF *out)
+{
+    if (file->CtxId == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    SHARED_BLOB *share = NULL;
+    for (LIST_ENTRY *it = ctx->SharedBlobs.Flink; it != &ctx->SharedBlobs; it = it->Flink) {
+        SHARED_BLOB *candidate = CONTAINING_RECORD(it, SHARED_BLOB, Entry);
+        if (candidate->Token == token && candidate->Published) {
+            share = candidate;
+            break;
+        }
+    }
+    if (share == NULL) {
+        return STATUS_NOT_FOUND;
+    }
+    if (FindFileBlob(file, share->ResourceId) == NULL) {
+        if (file->Count >= MAX_BLOBS) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        ULONG type = 0;
+        NTSTATUS status = HostAttachment(ctx, file->CtxId, share->ResourceId, TRUE, &type);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+        if (type != VIRTIO_GPU_RESP_OK_NODATA) {
+            return STATUS_DEVICE_PROTOCOL_ERROR;
+        }
+        FILE_BLOB blob = {0};
+        blob.CtxId = file->CtxId;
+        blob.ResourceId = share->ResourceId;
+        blob.Share = share;
+        blob.Imported = TRUE;
+        file->Blobs[file->Count++] = blob;
+        share->References++;
+    }
+    out->CtxId = file->CtxId;
+    out->ResourceId = share->ResourceId;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS ReleaseSharedBlob(DEVICE_CONTEXT *ctx, const FILE_BLOB *blob, ULONG *type)
+{
+    SHARED_BLOB *share = blob->Share;
+    NTSTATUS status = STATUS_SUCCESS;
+    *type = VIRTIO_GPU_RESP_OK_NODATA;
+    if (blob->Imported) {
+        status = HostAttachment(ctx, blob->CtxId, blob->ResourceId, FALSE, type);
+    } else {
+        share->Published = FALSE;
+    }
+    if (--share->References == 0) {
+        ULONG released = 0;
+        NTSTATUS releaseStatus = HostRelease(ctx, share->OwnerCtxId, share->ResourceId,
+                                             FALSE, &released);
+        if (NT_SUCCESS(status) && *type == VIRTIO_GPU_RESP_OK_NODATA) {
+            status = releaseStatus;
+            *type = released;
+        }
+        RemoveEntryList(&share->Entry);
+        ctx->SharedBlobCount--;
+        ObDereferenceObject(share->Token);
+        WdfObjectDelete(share->Memory);
+    }
+    return status;
+}
+
 static NTSTATUS ReleaseFileBlob(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file, ULONG index,
                                 ULONG *type)
 {
     const FILE_BLOB blob = file->Blobs[index];
-    if (blob.Mdl != NULL) {
+    const BOOLEAN mapped = blob.Mdl != NULL;
+    file->Count--;
+    file->Blobs[index] = file->Blobs[file->Count];
+    if (blob.Share != NULL) {
+        return ReleaseSharedBlob(ctx, &blob, type);
+    }
+    if (mapped) {
         MmUnmapLockedPages(blob.User, blob.Mdl);
         IoFreeMdl(blob.Mdl);
         MmUnmapIoSpace(blob.Kernel, blob.Size);
         ShmFree(ctx, blob.Offset);
     }
-    file->Count--;
-    file->Blobs[index] = file->Blobs[file->Count];
-    return HostRelease(ctx, blob.CtxId, blob.ResourceId, blob.Mdl != NULL, type);
+    return HostRelease(ctx, blob.CtxId, blob.ResourceId, mapped, type);
 }
 
 /* Unmap one of this handle's blobs and release it on the host. */
 static NTSTATUS BlobDestroy(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file,
                             const ENTANGLED_GPU_BLOB_REF *in, ULONG *type)
 {
-    for (ULONG i = 0; i < file->Count; i++) {
-        if (file->Blobs[i].ResourceId == in->ResourceId &&
-            file->Blobs[i].CtxId == in->CtxId) {
-            return ReleaseFileBlob(ctx, file, i, type);
-        }
+    FILE_BLOB *blob = FindFileBlob(file, in->ResourceId);
+    if (blob != NULL && blob->CtxId == in->CtxId) {
+        return ReleaseFileBlob(ctx, file, (ULONG)(blob - file->Blobs), type);
     }
     return STATUS_NOT_FOUND;
+}
+
+static VOID ReleaseFileBlobs(DEVICE_CONTEXT *ctx, FILE_CONTEXT *file)
+{
+    while (file->Count != 0) {
+        ULONG ignored = 0;
+        (void)ReleaseFileBlob(ctx, file, file->Count - 1, &ignored);
+    }
+}
+
+static VOID ShareBlobRequest(DEVICE_CONTEXT *ctx, WDFREQUEST request, ULONG code)
+{
+    const BOOLEAN publish = code == IOCTL_ENTANGLED_GPU_BLOB_PUBLISH;
+    const size_t inputSize = publish ? sizeof(ENTANGLED_GPU_BLOB_REF)
+                                    : sizeof(ENTANGLED_GPU_BLOB_TOKEN);
+    const size_t outputSize = publish ? sizeof(ENTANGLED_GPU_BLOB_TOKEN)
+                                     : sizeof(ENTANGLED_GPU_BLOB_REF);
+    WDFFILEOBJECT object = WdfRequestGetFileObject(request);
+    if (object == NULL || WdfRequestGetRequestorMode(request) != UserMode) {
+        WdfRequestComplete(request, STATUS_INVALID_DEVICE_REQUEST);
+        return;
+    }
+    PVOID input = NULL;
+    PVOID output = NULL;
+    NTSTATUS status = WdfRequestRetrieveInputBuffer(request, inputSize, &input, NULL);
+    if (NT_SUCCESS(status)) {
+        status = WdfRequestRetrieveOutputBuffer(request, outputSize, &output, NULL);
+    }
+    PKEVENT token = NULL;
+    if (NT_SUCCESS(status) && !publish) {
+        const ENTANGLED_GPU_BLOB_TOKEN *in = input;
+        status = ObReferenceObjectByHandle((HANDLE)(ULONG_PTR)in->Handle, SYNCHRONIZE,
+                                           *ExEventObjectType, UserMode, (PVOID *)&token, NULL);
+    }
+    if (NT_SUCCESS(status)) {
+        FILE_CONTEXT *file = GetFileCtx(object);
+        WdfWaitLockAcquire(ctx->Lock, NULL);
+        status = FileControlStatus(ctx, file);
+        if (NT_SUCCESS(status)) {
+            if (publish) {
+                const ENTANGLED_GPU_BLOB_REF copy = *(const ENTANGLED_GPU_BLOB_REF *)input;
+                status = BlobPublish(ctx, file, &copy, output);
+            } else {
+                status = BlobAttach(ctx, file, token, output);
+            }
+        }
+        WdfWaitLockRelease(ctx->Lock);
+    }
+    if (token != NULL) {
+        ObDereferenceObject(token);
+    }
+    WdfRequestCompleteWithInformation(request, status, NT_SUCCESS(status) ? outputSize : 0);
 }
 
 VOID EgEvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
@@ -1573,6 +1796,10 @@ VOID EgEvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
     WdfRequestGetParameters(Request, &params);
     const ULONG code = params.Type == WdfRequestTypeDeviceControl
                            ? params.Parameters.DeviceIoControl.IoControlCode : 0;
+    if (code == IOCTL_ENTANGLED_GPU_BLOB_PUBLISH || code == IOCTL_ENTANGLED_GPU_BLOB_ATTACH) {
+        ShareBlobRequest(ctx, Request, code);
+        return;
+    }
     if (code == IOCTL_ENTANGLED_GPU_BLOB_DESTROY) {
         ENTANGLED_GPU_BLOB_REF *ref = NULL;
         ENTANGLED_GPU_RESPONSE *resp = NULL;
@@ -1640,13 +1867,11 @@ VOID EgEvtFileCleanup(WDFFILEOBJECT FileObject)
         }
         WdfSpinLockRelease(ctx->ControlLock);
     }
-    while (file->Count != 0) {
-        (void)ReleaseFileBlob(ctx, file, file->Count - 1, &type);
-    }
-    if (file->CtxId != 0) {
+    ReleaseFileBlobs(ctx, file);
+    if (file->CtxId != 0 && ctx->Ready) {
         (void)CtxDestroy(ctx, file->CtxId, &type);
-        file->CtxId = 0;
     }
+    file->CtxId = 0;
     WdfWaitLockRelease(ctx->Lock);
     if (canceled != NULL) {
         WdfRequestComplete(canceled, STATUS_CANCELLED);
@@ -1663,14 +1888,13 @@ VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLengt
     UNREFERENCED_PARAMETER(InputLength);
 
     WdfWaitLockAcquire(ctx->Lock, NULL);
-    if (ctx->ParallelControl) {
-        WDFFILEOBJECT object = WdfRequestGetFileObject(Request);
-        NTSTATUS available = FileControlStatus(ctx, object != NULL ? GetFileCtx(object) : NULL);
-        if (!NT_SUCCESS(available)) {
-            WdfWaitLockRelease(ctx->Lock);
-            WdfRequestComplete(Request, available);
-            return;
-        }
+    WDFFILEOBJECT object = WdfRequestGetFileObject(Request);
+    FILE_CONTEXT *file = object != NULL ? GetFileCtx(object) : NULL;
+    const NTSTATUS available = FileControlStatus(ctx, file);
+    if (!NT_SUCCESS(available)) {
+        WdfWaitLockRelease(ctx->Lock);
+        WdfRequestComplete(Request, available);
+        return;
     }
     switch (IoControlCode) {
     case IOCTL_ENTANGLED_GPU_CONTROL_STATS: {
@@ -1727,7 +1951,8 @@ VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLengt
         }
         if (NT_SUCCESS(status)) {
             ENTANGLED_GPU_OVERLAY copy = *in;
-            status = Overlay(ctx, &copy, &out->Type);
+            status = copy.ResourceId == 0 || (file != NULL && FindFileBlob(file, copy.ResourceId))
+                         ? Overlay(ctx, &copy, &out->Type) : STATUS_INVALID_HANDLE;
             if (NT_SUCCESS(status)) {
                 written = sizeof(*out);
             }
@@ -1777,32 +2002,33 @@ VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLengt
         // METHOD_BUFFERED aliases the input and output. Capture the context
         // before HeaderCommand replaces the first word with a response type.
         const ULONG ctxId = ((const ENTANGLED_GPU_CTX *)in)->CtxId;
+        if (file == NULL || ctxId == 0 ||
+            (IoControlCode != IOCTL_ENTANGLED_GPU_CTX_CREATE && file->CtxId != ctxId)) {
+            status = STATUS_INVALID_HANDLE;
+            break;
+        }
         if (IoControlCode == IOCTL_ENTANGLED_GPU_CTX_CREATE) {
-            FILE_CONTEXT *file = GetFileCtx(WdfRequestGetFileObject(Request));
-            status = inLength >= sizeof(ENTANGLED_GPU_CTX_CREATE) && file->CtxId == 0
+            /* A surviving share still names the old owner's context on the host. */
+            status = inLength >= sizeof(ENTANGLED_GPU_CTX_CREATE) && file->CtxId == 0 &&
+                             !HasRetainedShare(ctx, ctxId)
                          ? CtxCreate(ctx, (ENTANGLED_GPU_CTX_CREATE *)in, &out->Type)
                          : STATUS_INVALID_PARAMETER;
             if (NT_SUCCESS(status) && out->Type == VIRTIO_GPU_RESP_OK_NODATA) {
                 file->CtxId = ctxId;
             }
         } else if (IoControlCode == IOCTL_ENTANGLED_GPU_CTX_DESTROY) {
-            FILE_CONTEXT *file = GetFileCtx(WdfRequestGetFileObject(Request));
+            ReleaseFileBlobs(ctx, file);
             status = CtxDestroy(ctx, ctxId, &out->Type);
-            if (NT_SUCCESS(status) && out->Type == VIRTIO_GPU_RESP_OK_NODATA &&
-                file->CtxId == ctxId) {
+            if (NT_SUCCESS(status) && out->Type == VIRTIO_GPU_RESP_OK_NODATA) {
                 file->CtxId = 0;
             }
         } else {
             if (inLength < sizeof(ENTANGLED_GPU_SUBMIT)) {
                 status = STATUS_INVALID_PARAMETER;
             } else {
-                if (ctx->ParallelControl) {
-                    WDFFILEOBJECT object = WdfRequestGetFileObject(Request);
-                    FILE_CONTEXT *file = object != NULL ? GetFileCtx(object) : NULL;
-                    if (DeferFencedWait(ctx, Request, file, in, inLength, out)) {
-                        WdfWaitLockRelease(ctx->Lock);
-                        return;
-                    }
+                if (DeferFencedWait(ctx, Request, file, in, inLength, out)) {
+                    WdfWaitLockRelease(ctx->Lock);
+                    return;
                 }
                 status = Submit3d(ctx, in, inLength, &out->Type);
             }
