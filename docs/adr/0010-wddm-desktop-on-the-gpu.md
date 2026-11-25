@@ -2560,6 +2560,23 @@ establishes DWM import and cadence, with no measured animation latency
 gain for the Wintanyl shell. The proof and timings are in
 `dcomp-host-proof.txt` and `dcomp-cadence-summary.txt`.
 
+#### Zink keeps the current graphics program alive
+
+The [D3D11 shader replacement probe](../../tests/windows/d3d11-shader-rebind.cpp)
+reproduced the DirectComposition device teardown failure on `20.43.25.803`.
+It draws through one pixel shader, binds its replacement, releases the old
+shader, and reads back before drawing again or destroying the device. The
+lab's UMD trace and linker map located the fault at the same instruction as
+the cadence fixture, inside `bind_gfx_stage` reading the previous program's
+`last_variant_hash` on shader unbind.
+
+The prepared Mesa tree now gives the current graphics and mesh program
+slots their own references. Pruning the cache when a shader is deleted or
+retiring the last batch may release their references independently. A slot
+releases its reference on replacement, unbind, or context destruction.
+The WDDM build uses this patch for both the sharing experiment and the
+regular CPU handoff.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

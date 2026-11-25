@@ -30,8 +30,10 @@ git -C $Dir checkout $nineTag -- src/gallium/frontends/nine include/D3D9 include
 if ($LASTEXITCODE -ne 0) { throw "cannot take Nine from $nineTag" }
 git -C $Dir apply --whitespace=nowarn (Join-Path $here '0003-nine-on-mesa-26.2.patch')
 if ($LASTEXITCODE -ne 0) { throw '0003-nine-on-mesa-26.2.patch does not apply' }
-git -C $Dir apply --whitespace=nowarn (Join-Path $here '0004-zink-import-wddm-images.patch')
-if ($LASTEXITCODE -ne 0) { throw '0004-zink-import-wddm-images.patch does not apply' }
+foreach ($patch in '0004-zink-import-wddm-images.patch', '0005-zink-own-current-graphics-programs.patch') {
+    git -C $Dir apply --whitespace=nowarn (Join-Path $here $patch)
+    if ($LASTEXITCODE -ne 0) { throw "$patch does not apply" }
+}
 $venus = Join-Path $Dir 'src\virtio\vulkan'
 Copy-Item (Join-Path $here 'vn_renderer_entangled.c') $venus
 Copy-Item (Join-Path $here 'entangled_shared_image.h') $venus

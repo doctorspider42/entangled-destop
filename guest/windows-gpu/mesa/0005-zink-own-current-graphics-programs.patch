@@ -1,0 +1,69 @@
+diff --git a/src/gallium/drivers/zink/zink_program.c b/src/gallium/drivers/zink/zink_program.c
+--- a/src/gallium/drivers/zink/zink_program.c
++++ b/src/gallium/drivers/zink/zink_program.c
+@@ -660,5 +660,5 @@
+       if (prog && prog != ctx->curr_program)
+          zink_batch_reference_program(ctx, &prog->base);
+-      ctx->curr_program = prog;
++      zink_gfx_program_reference(zink_screen(ctx->base.screen), &ctx->curr_program, prog);
+       ctx->gfx_pipeline_state.final_hash ^= ctx->curr_program->last_variant_hash;
+       ctx->gfx_dirty = false;
+@@ -817,5 +817,5 @@
+       if (prog && prog != ctx->curr_program)
+          zink_batch_reference_program(ctx, &prog->base);
+-      ctx->curr_program = prog;
++      zink_gfx_program_reference(screen, &ctx->curr_program, prog);
+       ctx->gfx_pipeline_state.final_hash ^= ctx->curr_program->last_variant_hash;
+    } else if (ctx->dirty_gfx_stages) {
+@@ -835,6 +835,7 @@
+          simple_mtx_lock(&ctx->program_lock[zink_program_cache_stages(ctx->shader_stages)]);
+          struct hash_entry *entry = _mesa_hash_table_search_pre_hashed(ht, hash, ctx->gfx_stages);
+-         ctx->curr_program = replace_separable_prog(ctx, entry, prog);
++         struct zink_gfx_program *replacement = replace_separable_prog(ctx, entry, prog);
+          simple_mtx_unlock(&ctx->program_lock[zink_program_cache_stages(ctx->shader_stages)]);
++         zink_gfx_program_reference(screen, &ctx->curr_program, replacement);
+       }
+       update_gfx_program_optimal(ctx, ctx->curr_program);
+@@ -904,5 +905,5 @@
+       if (prog && prog != ctx->mesh_program)
+          zink_batch_reference_program(ctx, &prog->base);
+-      ctx->mesh_program = prog;
++      zink_gfx_program_reference(screen, &ctx->mesh_program, prog);
+       ctx->gfx_pipeline_state.mesh_final_hash ^= ctx->mesh_program->last_variant_hash;
+    } else if (ctx->dirty_mesh_stages) {
+@@ -920,6 +921,7 @@
+          simple_mtx_lock(lock);
+          struct hash_entry *entry = _mesa_hash_table_search_pre_hashed(ht, hash, ctx->gfx_stages);
+-         ctx->mesh_program = replace_separable_prog(ctx, entry, prog);
++         struct zink_gfx_program *replacement = replace_separable_prog(ctx, entry, prog);
+          simple_mtx_unlock(lock);
++         zink_gfx_program_reference(screen, &ctx->mesh_program, replacement);
+       }
+       update_mesh_program_optimal(ctx, ctx->mesh_program);
+@@ -2032,10 +2034,10 @@
+          if (ctx->curr_program)
+             ctx->gfx_pipeline_state.final_hash ^= ctx->curr_program->last_variant_hash;
+-         ctx->curr_program = NULL;
++         zink_gfx_program_reference(zink_screen(ctx->base.screen), &ctx->curr_program, NULL);
+       }
+       if (stage == MESA_SHADER_FRAGMENT || stage > MESA_SHADER_COMPUTE) {
+          if (ctx->mesh_program)
+             ctx->gfx_pipeline_state.mesh_final_hash ^= ctx->mesh_program->last_variant_hash;
+-         ctx->mesh_program = NULL;
++         zink_gfx_program_reference(zink_screen(ctx->base.screen), &ctx->mesh_program, NULL);
+       }
+       ctx->shader_stages &= ~BITFIELD_BIT(stage);
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -153,4 +153,10 @@
+       }
+    }
++
++   /* Shader deletion can evict a program from the cache before the
++    * next bind. These references belong to the context, independently
++    * of the cache and the batches that use the programs. */
++   zink_gfx_program_reference(screen, &ctx->curr_program, NULL);
++   zink_gfx_program_reference(screen, &ctx->mesh_program, NULL);
+
+    for (unsigned i = 0; i < ARRAY_SIZE(ctx->program_cache); i++) {
