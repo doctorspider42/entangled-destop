@@ -7,6 +7,7 @@ from collections import defaultdict
 import csv
 from datetime import datetime
 from pathlib import Path
+import re
 from statistics import median
 
 
@@ -47,6 +48,34 @@ def summarize(values):
     return f"{median(available):.1f}/{max(available):.1f}" if available else "-"
 
 
+def scene_intervals(path, pid, guest_time):
+    intervals = defaultdict(list)
+    record = re.compile(rf"\[{pid}\].*scene-qpc,(\d+),(\d+),(.+)$")
+    with path.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            if match := record.search(line.strip()):
+                begin, end, name = match.groups()
+                intervals[name].append((guest_time(begin), guest_time(end)))
+    for spans in intervals.values():
+        spans.sort()
+    return intervals
+
+
+def lamp_stages(intervals, key, win_event, pixel):
+    begins = [span for span in intervals["efekt lamp: enter"] if key - 0.004 <= span[0] <= key + 0.45]
+    if not begins:
+        return (None,) * 6
+    # A focus event may run a separate, short lamp entry to arm capture.
+    entered, attached = max(begins, key=lambda span: span[1] - span[0])
+    commit_begin, commit_end = next(
+        ((a, b) for a, b in intervals["Commit"] if attached <= a <= key + 0.65), (None, None))
+    first_frame = next((a for a, _ in intervals["efekt lamp: frame"] if attached <= a <= key + 0.60), None)
+    z_order = [milliseconds(a, b) for a, b in intervals["węzeł: przypisanie viewportu"]
+               if key - 0.005 <= a <= b <= entered]
+    return (milliseconds(win_event, entered), sum(z_order) if z_order else None, milliseconds(entered, attached),
+            milliseconds(commit_begin, commit_end), milliseconds(commit_end, first_frame), milliseconds(commit_end, pixel))
+
+
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("tag")
@@ -54,9 +83,13 @@ def main():
     cli.add_argument("--guest", type=Path, required=True, help="directory containing TAG-pre.csv, TAG-post.csv and TAG-keys.csv")
     cli.add_argument("--log", type=Path, required=True, help="host engine log covering the measurement")
     cli.add_argument("--threshold", type=int, default=150, help="minimum changed pixels per captured frame")
+    cli.add_argument("--scene-log", type=Path, help="optional Wintanyl shell.log with WT_BENCH_SCENE_QPC=1")
+    cli.add_argument("--scene-pid", type=int, help="Wintanyl process ID for the scene trace")
     args = cli.parse_args()
     if args.threshold < 1:
         cli.error("--threshold must be positive")
+    if (args.scene_log is None) != (args.scene_pid is None):
+        cli.error("--scene-log and --scene-pid are used together")
 
     host_prefix = args.host / args.tag
     guest_prefix = args.guest / args.tag
@@ -70,11 +103,14 @@ def main():
     if not actions:
         cli.error("no host input markers")
 
+    def guest_time(qpc):
+        guest = int(qpc) / pre[3]
+        mix = (guest - pre[1]) / (post[1] - pre[1])
+        return guest + pre[2] + mix * (post[2] - pre[2])
+
     events = defaultdict(list)
     for row in rows(Path(f"{guest_prefix}-keys.csv")):
-        guest = int(row["qpc"]) / pre[3]
-        mix = (guest - pre[1]) / (post[1] - pre[1])
-        events[row["event"]].append(guest + pre[2] + mix * (post[2] - pre[2]))
+        events[row["event"]].append(guest_time(row["qpc"]))
     for times in events.values():
         times.sort()
 
@@ -90,6 +126,10 @@ def main():
     scanouts.sort()
 
     stats = defaultdict(list)
+    trace = defaultdict(list)
+    intervals = scene_intervals(args.scene_log, args.scene_pid, guest_time) if args.scene_log else None
+    if args.scene_log and not intervals:
+        cli.error("no scene timing rows for that PID")
     missing = 0
     print(f"Clock bridge minimum round trips {pre[0] * 1e3:.3f}/{post[0] * 1e3:.3f} ms, pixel threshold {args.threshold}")
     print("action host-key key-WinEvent WinEvent-flush key-flush flush-pixels host-pixels changes")
@@ -115,9 +155,15 @@ def main():
         )
         print(action, *result)
         stats[action.split("_")[0]].append(result)
+        if intervals and action in ("minimize", "restore"):
+            trace[action].append(lamp_stages(intervals, key, win_event, pixel))
     print("Median / max by gesture")
     for action, group in stats.items():
         print(action, len(group), *(summarize(column) for column in zip(*group)))
+    if trace:
+        print("Scene med/max: WinEvent-enter Z-placement enter Commit return-first-frame return-pixels")
+        for action, group in trace.items():
+            print(action, len(group), *(summarize(column) for column in zip(*group)))
     return 1 if missing else 0
 
 

@@ -1583,6 +1583,58 @@ The timing artifacts use `input-cube-cold-control` and
 `input-cube-prewarmed`. After the check, the lab returned to stock F239
 on the same hardware Entangled WDDM adapter.
 
+#### Timing the first restore commit and native Z placement
+
+Wintanyl's `WT_BENCH_SCENE_QPC=1` (commit `04fe598`) writes guest QPC spans around window
+model processing, effect entry and frames, and dirty DirectComposition
+commits. The input joiner reads these spans with `--scene-log` and
+`--scene-pid`. The timestamps use the same guest clock as the existing
+input probe. The first pixel remains a thresholded change in the host
+window, and the first scene commit can precede the first noncollapsed
+lamp geometry.
+
+With the raster lamp, eight restores had a median 53.3 ms from
+`EVENT_SYSTEM_MINIMIZEEND` delivery to lamp entry. The entry and first
+`Commit` each took less than 1 ms. The first follow-up lamp frame was
+39.6 ms after commit return, and the first changed host pixels were
+104.5 ms after it. The source of the first delay was the synchronous
+native `SetWindowPos` used to raise the restored top-level window above
+the viewport floor. In a separate six-restore control, registering the
+thumbnail took 0.8 ms and window placement took 53.6 ms at the median.
+Reusing the old thumbnail reduced its own step to 0.1 ms but left
+window placement at 57.0 ms, so the reuse variant was removed.
+
+The opt-in `WT_BENCH_RESTORE_Z=async` path queues that one raise with
+`SWP_ASYNCWINDOWPOS` for an ownerless window restored to the active
+viewport. After 200 ms, it checks the window, current viewport and
+actual Z order before a synchronous retry if necessary. Group and
+viewport reordering continue to use their existing synchronous paths.
+With `SWP_NOSENDCHANGING` alone the placement step still took 55.4 ms,
+so that variant was removed. [SetWindowPos flags](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos)
+
+| Raster restore test | Samples | Native placement p50 | Event to lamp entry p50 | Host command to first pixel p50 / max |
+| --- | ---: | ---: | ---: | ---: |
+| Synchronous control | 6 | 53.6 ms | 56.2 ms | 204 / 219 ms |
+| Asynchronous trial | 5 | <1 ms | 2.8 ms | 171 / 185 ms |
+| Asynchronous with verification | 5 | 0.1 ms | 2.9 ms | 175 / 209 ms |
+
+The native Z-order probe confirmed that Explorer was visible, restored
+and above the floor after the final run. The asynchronous path moves
+some work after the first commit. In the final run it still took a
+median 132 ms from commit return to first changed host pixels, compared
+with 106 ms in the synchronous control. The final run also had fewer
+thresholded pixel updates in the 1.2 s observation window (median 11
+versus 15), so the earlier onset does not establish a cadence gain.
+This breakdown does not attribute the time after commit to individual
+DWM operations. The one-window tested path remains opt-in.
+
+Raw captures use `input-node-control`, `input-node-reused`,
+`input-zorder-no-changing`, `input-zorder-async2` and `input-zorder-final`
+in the same lab directories. The additional unprivileged DWM timing
+trial, `input-raster-dwmapi`, returned success in 4,739 samples with
+zero `qpcFrameDisplayed` and `qpcFrameComplete` values, so it could not
+split composition and presentation.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
