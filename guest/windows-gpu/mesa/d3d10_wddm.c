@@ -27,7 +27,10 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#define WIN32_NO_STATUS
 #include <windows.h>
+#undef WIN32_NO_STATUS
+#include <ntstatus.h>
 
 #include "util/hash_table.h"
 #include "util/simple_mtx.h"
@@ -49,6 +52,12 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "wddm/wddm_sw_winsys.h"
+
+#if defined(GALLIUM_ZINK) && defined(_WIN64)
+#include "entangled_shared_image.h"
+#include "wddm-share.h"
+#define ENTANGLED_WDDM_GPU_IMPORT 1
+#endif
 
 struct pipe_screen *
 d3d10_create_screen(struct gdikmt_device *device);
@@ -351,6 +360,11 @@ struct d3d10_wddm_screen {
    struct sw_winsys *winsys;
    struct gdikmt_device *device;
    bool gpu;
+#ifdef ENTANGLED_WDDM_GPU_IMPORT
+   VkDevice import_device;
+   PFN_entangled_create_shared_image import_image;
+   PFN_entangled_destroy_shared_image destroy_image;
+#endif
    /* The host shows this screen's presents (ADR-0010 phase W2); and the
     * device they were shown from, for taking the plane down. */
    bool overlaid;
@@ -395,6 +409,10 @@ struct d3d10_wddm_shared {
    /* The frame as the host reads it: a buffer in memory it can see, filled
     * by a copy on the GPU. */
    struct pipe_resource *frame;
+#ifdef ENTANGLED_WDDM_GPU_IMPORT
+   struct entangled_shared_image imported;
+   uint64_t imported_generation;
+#endif
 };
 
 struct d3d10_wddm_context {
@@ -671,6 +689,87 @@ d3d10_wddm_readback(struct d3d10_wddm_screen *ws, struct pipe_context *pipe,
    InterlockedAdd64(&d3d10_wddm_copied, (LONG64)shared->width * shared->height * 4);
 }
 
+#ifdef ENTANGLED_WDDM_GPU_IMPORT
+static void
+d3d10_wddm_enable_gpu_import(struct d3d10_wddm_screen *ws)
+{
+   if (!ws->gpu || GetFileAttributesW(L"C:\\Program Files\\EntangledGpuShareLab\\enable") == INVALID_FILE_ATTRIBUTES)
+      return;
+   HMODULE icd = GetModuleHandleA("vulkan_virtio.dll");
+   if (!icd)
+      return;
+   ws->import_device = zink_entangled_device(ws->screen);
+   if (!ws->import_device)
+      return;
+   ws->destroy_image = (PFN_entangled_destroy_shared_image)(void *)
+      GetProcAddress(icd, "entangled_destroy_shared_image");
+   if (ws->destroy_image)
+      ws->import_image = (PFN_entangled_create_shared_image)(void *)
+         GetProcAddress(icd, "entangled_create_shared_image");
+}
+
+static bool
+d3d10_wddm_gpu_upload(struct d3d10_wddm_screen *ws, struct pipe_context *pipe,
+                      struct pipe_resource *res, struct d3d10_wddm_shared *shared)
+{
+   struct d3d10_wddm_context *wc = d3d10_wddm_context(pipe);
+   if (!ws->import_image || !wc)
+      return false;
+
+   ENTANGLED_WDDM_BLOB_ACCESS_ESCAPE access = {
+      .Type = ENTANGLED_WDDM_ACCESS_BLOB,
+      .Version = ENTANGLED_WDDM_SHARE_VERSION,
+      .Allocation = wddm_sw_winsys_allocation(shared->dt),
+      .Operation = ENTANGLED_WDDM_BEGIN_READ,
+      .Generation = shared->imported_generation,
+   };
+   NTSTATUS status = ws->device->escape(ws->device, &access, sizeof(access));
+   if (status == STATUS_NO_MORE_ENTRIES ||
+       (status == STATUS_RETRY && shared->imported_generation))
+      return true;
+   if (status != STATUS_SUCCESS)
+      return false;
+
+   if (!shared->imported.image) {
+      ENTANGLED_WDDM_BLOB_ESCAPE open = {
+         .Type = ENTANGLED_WDDM_OPEN_BLOB,
+         .Version = ENTANGLED_WDDM_SHARE_VERSION,
+         .Allocation = access.Allocation,
+      };
+      if (ws->device->escape(ws->device, &open, sizeof(open)) == STATUS_SUCCESS && open.Token) {
+         HANDLE token = (HANDLE)(uintptr_t)open.Token;
+         const VkExtent2D extent = {shared->width, shared->height};
+         ws->import_image(ws->import_device, extent, token, &shared->imported);
+         CloseHandle(token);
+      }
+   }
+
+   /* Release the lease after this copy's fence. A failed import has not used
+    * the backing image and can release it without revoking the publication. */
+   bool copied = false;
+   access.Operation = ENTANGLED_WDDM_END_ACCESS;
+   if (shared->imported.image && zink_entangled_import_frame(pipe, res, shared->imported.image)) {
+      struct pipe_fence_handle *fence = NULL;
+      wc->flush(pipe, &fence, 0);
+      if (fence) {
+         copied = ws->screen->fence_finish(ws->screen, NULL, fence, OS_TIMEOUT_INFINITE);
+         ws->screen->fence_reference(ws->screen, &fence, NULL);
+      }
+      if (!copied)
+         access.Operation = ENTANGLED_WDDM_ABORT_ACCESS;
+   }
+   status = ws->device->escape(ws->device, &access, sizeof(access));
+   if (copied && status == STATUS_SUCCESS) {
+      if (!shared->imported_generation)
+         d3d10_wddm_log("GPU shared allocation %x now at generation %llu",
+                        (unsigned)access.Allocation, access.Generation);
+      shared->imported_generation = access.Generation;
+      return true;
+   }
+   return false;
+}
+#endif
+
 /* The allocation into its GPU texture: what another process drew. */
 static void
 d3d10_wddm_upload(struct d3d10_wddm_screen *ws, struct pipe_context *pipe,
@@ -679,6 +778,10 @@ d3d10_wddm_upload(struct d3d10_wddm_screen *ws, struct pipe_context *pipe,
    struct pipe_box box;
    const void *src;
 
+#ifdef ENTANGLED_WDDM_GPU_IMPORT
+   if (d3d10_wddm_gpu_upload(ws, pipe, res, shared))
+      return;
+#endif
    src = ws->winsys->displaytarget_map(ws->winsys, shared->dt, PIPE_MAP_READ);
    if (!src)
       return;
@@ -848,6 +951,10 @@ d3d10_wddm_resource_destroy(struct pipe_screen *screen,
       }
       simple_mtx_unlock(&ws->lock);
       if (shared) {
+#ifdef ENTANGLED_WDDM_GPU_IMPORT
+         if (shared->imported.image)
+            ws->destroy_image(ws->import_device, &shared->imported);
+#endif
          if (shared->frame)
             ws->resource_destroy(screen, shared->frame);
          ws->winsys->displaytarget_destroy(ws->winsys, shared->dt);
@@ -1514,8 +1621,14 @@ d3d10_wddm_screen_destroy(struct pipe_screen *screen)
    if (d3d10_wddm_log_device == ws->device)
       d3d10_wddm_log_device = NULL;
    if (ws->shared) {
-      hash_table_foreach(ws->shared, entry)
-         FREE(entry->data);
+      hash_table_foreach(ws->shared, entry) {
+         struct d3d10_wddm_shared *shared = entry->data;
+#ifdef ENTANGLED_WDDM_GPU_IMPORT
+         if (shared->imported.image)
+            ws->destroy_image(ws->import_device, &shared->imported);
+#endif
+         FREE(shared);
+      }
       _mesa_hash_table_destroy(ws->shared, NULL);
       ws->shared = NULL;
    }
@@ -1606,6 +1719,9 @@ d3d10_create_screen(struct gdikmt_device *device)
       wddm_sw_winsys_lock_per_map(winsys);
    ws->device = device;
    ws->gpu = gpu;
+#ifdef ENTANGLED_WDDM_GPU_IMPORT
+   d3d10_wddm_enable_gpu_import(ws);
+#endif
    ws->destroy = screen->destroy;
    ws->context_create = screen->context_create;
    ws->resource_create = screen->resource_create;

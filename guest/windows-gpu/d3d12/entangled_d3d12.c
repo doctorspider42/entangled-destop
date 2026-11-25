@@ -8,12 +8,17 @@
 #include "venus-transfer.h"
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
 #include <viogpum.h>
+#include "../driver/wddm-share.h"
+#include "../mesa/entangled_shared_image.h"
 
 typedef struct DdiPresentSurface {
     HANDLE runtime_resource;
     D3DKMT_HANDLE allocation;
     VenusTransferBuffer pixels;
     BOOL ready;
+    BOOL mirror_unavailable;
+    struct entangled_shared_image mirror;
+    PFN_entangled_destroy_shared_image destroy_mirror;
 } DdiPresentSurface;
 #endif
 

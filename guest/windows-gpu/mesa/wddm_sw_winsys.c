@@ -72,6 +72,12 @@ wddm_sw_displaytarget(struct sw_displaytarget *dt)
    return (struct wddm_sw_displaytarget *)dt;
 }
 
+unsigned
+wddm_sw_winsys_allocation(struct sw_displaytarget *dt)
+{
+   return wddm_sw_displaytarget(dt)->hAllocation;
+}
+
 static unsigned
 wddm_sw_format(enum pipe_format format)
 {

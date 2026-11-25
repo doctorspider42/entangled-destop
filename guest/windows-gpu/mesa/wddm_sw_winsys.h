@@ -29,6 +29,10 @@ wddm_sw_winsys_describe(struct sw_winsys *ws, struct winsys_handle *whandle,
 bool
 wddm_sw_winsys_changed(struct sw_winsys *ws, struct sw_displaytarget *dt);
 
+/* Device-local DXGK handle for the opened or allocated display target. */
+unsigned
+wddm_sw_winsys_allocation(struct sw_displaytarget *dt);
+
 /* Hands `size` bytes of pixels (rows packed) to whoever opened `dt`. */
 bool
 wddm_sw_winsys_write(struct sw_winsys *ws, struct sw_displaytarget *dt,

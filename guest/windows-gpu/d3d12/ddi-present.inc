@@ -53,6 +53,8 @@ static HRESULT allocate_present_surface(const DdiDevice *device, D3D12DDI_HRTRES
 
 static void deallocate_present_surface(const DdiDevice *device, DdiPresentSurface *surface)
 {
+    if (surface->mirror.image)
+        surface->destroy_mirror(device->venus.handle, &surface->mirror);
     const D3D12DDICB_DEALLOCATE_0022 deallocate = { .hResource = surface->runtime_resource };
     const HRESULT status = device->callbacks->pfnDeallocateCb(device->runtime, &deallocate);
     trace_ddi("DeallocatePresentSurface", (UINT)status, surface->allocation);
@@ -83,12 +85,20 @@ static D3DKMT_HANDLE APIENTRY check_present_allocation(D3D12DDI_HDEVICE device, 
     return allocation;
 }
 
+static HRESULT present_escape(const DdiDevice *device, void *data, UINT size)
+{
+    if (!device->kernel || !device->kernel->pfnEscapeCb || !device->adapter->runtime.handle)
+        return DXGI_ERROR_UNSUPPORTED;
+    const D3DDDICB_ESCAPE escape = {
+        .hDevice = device->runtime.handle, .pPrivateDriverData = data, .PrivateDriverDataSize = size,
+    };
+    return device->kernel->pfnEscapeCb(device->adapter->runtime.handle, &escape);
+}
+
 static HRESULT write_present_allocation(const DdiDevice *device, const DdiPresentSurface *surface)
 {
     if (!surface->ready)
         return DXGI_ERROR_INVALID_CALL;
-    if (!device->kernel || !device->kernel->pfnEscapeCb || !device->adapter->runtime.handle)
-        return DXGI_ERROR_UNSUPPORTED;
 
     /* Same WDDM pixel handoff as the Mesa UMD. An opened allocation's
        compositor can read these pixels even when VidMm never maps its pages. */
@@ -106,12 +116,120 @@ static HRESULT write_present_allocation(const DdiDevice *device, const DdiPresen
         .size = surface->pixels.size,
     };
     _Static_assert(sizeof(pixels) == 24, "WDDM pixel escape layout");
-    const D3DDDICB_ESCAPE escape = {
-        .hDevice = device->runtime.handle,
-        .pPrivateDriverData = &pixels,
-        .PrivateDriverDataSize = sizeof(pixels),
+    return present_escape(device, &pixels, sizeof(pixels));
+}
+
+static HRESULT create_present_mirror(const DdiDevice *device, const VenusColorImage *image, DdiPresentSurface *surface)
+{
+    const HMODULE icd = GetModuleHandleW(L"vulkan_virtio.dll");
+    if (!icd)
+        return DXGI_ERROR_UNSUPPORTED;
+    const PFN_entangled_create_shared_image create = (PFN_entangled_create_shared_image)(void *)
+        GetProcAddress(icd, "entangled_create_shared_image");
+    surface->destroy_mirror = (PFN_entangled_destroy_shared_image)(void *)
+        GetProcAddress(icd, "entangled_destroy_shared_image");
+    if (!create || !surface->destroy_mirror)
+        return DXGI_ERROR_UNSUPPORTED;
+
+    const VkExtent2D extent = {image->extent.width, image->extent.height};
+    HRESULT status = venus_hresult(create(device->venus.handle, extent, NULL, &surface->mirror));
+    if (FAILED(status))
+        return status;
+    ENTANGLED_WDDM_BLOB_ESCAPE bind = {
+        .Type = ENTANGLED_WDDM_BIND_BLOB,
+        .Version = ENTANGLED_WDDM_SHARE_VERSION,
+        .Allocation = surface->allocation,
+        .Token = (UINT64)(UINT_PTR)surface->mirror.token,
     };
-    return device->kernel->pfnEscapeCb(device->adapter->runtime.handle, &escape);
+    status = present_escape(device, &bind, sizeof(bind));
+    if (status != S_OK)
+        surface->destroy_mirror(device->venus.handle, &surface->mirror);
+    return status;
+}
+
+static HRESULT copy_present_mirror(const VenusColorImage *source, VkImage mirror, BOOL first)
+{
+    const VenusDevice *device = source->device;
+    const PFN_vkCmdCopyImage copy = (PFN_vkCmdCopyImage)device->proc_addr(device->handle, "vkCmdCopyImage");
+    const PFN_vkCmdPipelineBarrier barrier = (PFN_vkCmdPipelineBarrier)device->proc_addr(device->handle,
+                                                                                       "vkCmdPipelineBarrier");
+    if (!copy || !barrier)
+        return DXGI_ERROR_UNSUPPORTED;
+    VenusTransferList list;
+    HRESULT status = begin_venus_transfer_list(device, &list);
+    if (FAILED(status))
+        return status;
+    status = record_venus_color_barrier(list.command, source, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    if (SUCCEEDED(status)) {
+        const VkImageMemoryBarrier acquire = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = first ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = first ? VK_QUEUE_FAMILY_IGNORED : VK_QUEUE_FAMILY_EXTERNAL,
+            .dstQueueFamilyIndex = first ? VK_QUEUE_FAMILY_IGNORED : device->graphics_queue_family,
+            .image = mirror,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        };
+        barrier(list.command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                0, NULL, 0, NULL, 1, &acquire);
+        const VkImageCopy region = {
+            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .extent = source->extent,
+        };
+        copy(list.command, source->handle, VK_IMAGE_LAYOUT_GENERAL, mirror, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+             1, &region);
+        VkImageMemoryBarrier release = acquire;
+        release.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        release.dstAccessMask = 0;
+        release.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        release.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        release.srcQueueFamilyIndex = device->graphics_queue_family;
+        release.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+        barrier(list.command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                0, NULL, 0, NULL, 1, &release);
+        status = close_venus_transfer_list(&list);
+    }
+    if (SUCCEEDED(status))
+        status = submit_venus_transfer_commands(device, 1, &list.command);
+    destroy_venus_transfer_list(&list);
+    return status;
+}
+
+/* Diagnostic: publish the present source while keeping the regular pixel
+ * handoff. The destination of a WDDM blit may be a different allocation. */
+static void mirror_present_allocation(const DdiDevice *device, DdiHeap *source, D3DKMT_HANDLE destination)
+{
+    DdiPresentSurface *surface = &source->present;
+    if (surface->mirror_unavailable || !enabled_environment_flag("ENTANGLED_D3D12_GPU_SHARE"))
+        return;
+    if (!surface->mirror.image) {
+        const HRESULT opened = create_present_mirror(device, &source->image, surface);
+        trace_ddi("Bind present GPU image", (UINT)opened, surface->allocation);
+        if (opened != S_OK) {
+            surface->mirror_unavailable = TRUE;
+            return;
+        }
+    }
+    ENTANGLED_WDDM_BLOB_ACCESS_ESCAPE access = {
+        .Type = ENTANGLED_WDDM_ACCESS_BLOB,
+        .Version = ENTANGLED_WDDM_SHARE_VERSION,
+        .Allocation = surface->allocation,
+        .Operation = ENTANGLED_WDDM_BEGIN_WRITE,
+    };
+    const HRESULT begun = present_escape(device, &access, sizeof(access));
+    if (begun != S_OK) {
+        trace_ddi("Begin present GPU image", (UINT)begun, surface->allocation);
+        return;
+    }
+    const HRESULT copied = copy_present_mirror(&source->image, surface->mirror.image, access.Generation == 0);
+    access.Operation = SUCCEEDED(copied) ? ENTANGLED_WDDM_END_ACCESS : ENTANGLED_WDDM_ABORT_ACCESS;
+    const HRESULT finished = present_escape(device, &access, sizeof(access));
+    trace_ddi("Publish GPU present source", (UINT)copied, surface->allocation);
+    trace_ddi("Publish GPU present destination", (UINT)finished, destination);
+    if (FAILED(copied) || finished != S_OK)
+        surface->mirror_unavailable = TRUE;
 }
 
 static UINT APIENTRY present_private_data_size(D3D12DDI_HDEVICE device, const D3D12DDIARG_PRESENT_0001 *args)
@@ -130,7 +248,7 @@ static void APIENTRY present_surface(D3D12DDI_HCOMMANDLIST commands, D3D12DDI_HC
     if (!queue || !queue->device)
         return;
     DdiDevice *device = queue->device;
-    const DdiHeap *src = args && args->SurfacesToPresent == 1 && args->phSurfacesToPresent &&
+    DdiHeap *src = args && args->SurfacesToPresent == 1 && args->phSurfacesToPresent &&
         !args->phSurfacesToPresent->SubResourceIndex
         ? resource_heap(&device->venus, args->phSurfacesToPresent->hSurface) : NULL;
     const DdiHeap *dst = args && args->hDstResource.pDrvPrivate && !args->DstSubResourceIndex
@@ -144,9 +262,11 @@ static void APIENTRY present_surface(D3D12DDI_HCOMMANDLIST commands, D3D12DDI_HC
     AcquireSRWLockExclusive(&device->queue_lock);
     const LONGLONG start = queue_timing_start();
     const HRESULT status = write_present_allocation(device, &src->present);
-    ReleaseSRWLockExclusive(&device->queue_lock);
-    if (SUCCEEDED(status))
+    if (SUCCEEDED(status)) {
         trace_queue_duration("present-copy-to-wddm", start, 1);
+        mirror_present_allocation(device, src, dst ? dst->present.allocation : 0);
+    }
+    ReleaseSRWLockExclusive(&device->queue_lock);
     trace_ddi("Present Windows allocation", (UINT)status, src->present.allocation);
     if (FAILED(status)) {
         set_command_device_error(device, status);

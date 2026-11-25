@@ -1,0 +1,109 @@
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -4780,6 +4780,85 @@
+    ctx->bs->has_work = true;
+ }
+
++#ifdef _WIN32
++VkDevice
++zink_entangled_device(struct pipe_screen *pscreen)
++{
++   struct zink_screen *screen = zink_screen(pscreen);
++   return screen->info.driver_props.driverID == VK_DRIVER_ID_MESA_VENUS
++      ? screen->dev : VK_NULL_HANDLE;
++}
++
++bool
++zink_entangled_import_frame(struct pipe_context *pctx, struct pipe_resource *ptex,
++                            VkImage shared)
++{
++   struct zink_context *ctx = zink_context(pctx);
++   struct zink_screen *screen = zink_screen(pctx->screen);
++   struct zink_resource *tex = zink_resource(ptex);
++
++   if (ptex->target != PIPE_TEXTURE_2D || ptex->last_level ||
++       ptex->array_size != 1 || ptex->nr_samples > 1 ||
++       (tex->format != VK_FORMAT_B8G8R8A8_UNORM &&
++        tex->format != VK_FORMAT_B8G8R8A8_SRGB))
++      return false;
++
++   /* The EXTERNAL barriers and the copy run in the same ordered buffer. */
++   const bool no_reorder = ctx->no_reorder;
++   ctx->no_reorder = true;
++   zink_fb_clears_discard(ctx, ptex);
++   zink_batch_no_rp(ctx);
++   const VkImageLayout layout = screen->driver_workarounds.general_layout
++      ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++   screen->image_barrier(ctx, tex, layout, VK_ACCESS_TRANSFER_WRITE_BIT,
++                         VK_PIPELINE_STAGE_TRANSFER_BIT);
++   VkCommandBuffer cmd = zink_get_cmdbuf(ctx, NULL, tex);
++   zink_batch_reference_resource_rw(ctx, tex, true);
++
++   const VkImageMemoryBarrier acquire = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
++      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
++      .dstQueueFamilyIndex = screen->gfx_queue,
++      .image = shared,
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
++   };
++   VKCTX(CmdPipelineBarrier)(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                             VK_PIPELINE_STAGE_TRANSFER_BIT,
++                             0, 0, NULL, 0, NULL, 1, &acquire);
++   const VkImageCopy region = {
++      .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++      .extent = {ptex->width0, ptex->height0, 1},
++   };
++   VKCTX(CmdCopyImage)(cmd, shared, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                      tex->obj->image, tex->layout, 1, &region);
++
++   VkImageMemoryBarrier release = acquire;
++   release.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++   release.dstAccessMask = 0;
++   release.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++   release.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++   release.srcQueueFamilyIndex = screen->gfx_queue;
++   release.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
++   VKCTX(CmdPipelineBarrier)(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                             0, 0, NULL, 0, NULL, 1, &release);
++
++   zink_resource_disable_unordered(tex, true);
++   if (tex->fb_bind_count)
++      ctx->rp_tc_info_updated = true;
++   if (ctx->track_renderpasses) {
++      ctx->needs_transfer_sync = true;
++      tex->obj->transfer_rp = ctx->rp_counter;
++   }
++   ctx->no_reorder = no_reorder;
++   return true;
++}
++#endif
++
+ void
+ zink_flush_memory_barrier(struct zink_context *ctx)
+ {
+diff --git a/src/gallium/drivers/zink/zink_public.h b/src/gallium/drivers/zink/zink_public.h
+--- a/src/gallium/drivers/zink/zink_public.h
++++ b/src/gallium/drivers/zink/zink_public.h
+@@ -48,4 +48,16 @@
+ zink_entangled_frame(struct pipe_context *pctx, struct pipe_resource *buf,
+                      struct pipe_resource *tex, void **device,
+                      uint64_t *memory);
++
++#ifdef _WIN32
++#include <vulkan/vulkan_core.h>
++
++VkDevice
++zink_entangled_device(struct pipe_screen *screen);
++
++/* The shared image must remain valid through this batch's fence. */
++bool
++zink_entangled_import_frame(struct pipe_context *pctx, struct pipe_resource *ptex,
++                            VkImage shared);
+ #endif
++#endif

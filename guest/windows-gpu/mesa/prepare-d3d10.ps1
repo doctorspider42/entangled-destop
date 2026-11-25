@@ -30,13 +30,17 @@ git -C $Dir checkout $nineTag -- src/gallium/frontends/nine include/D3D9 include
 if ($LASTEXITCODE -ne 0) { throw "cannot take Nine from $nineTag" }
 git -C $Dir apply --whitespace=nowarn (Join-Path $here '0003-nine-on-mesa-26.2.patch')
 if ($LASTEXITCODE -ne 0) { throw '0003-nine-on-mesa-26.2.patch does not apply' }
+git -C $Dir apply --whitespace=nowarn (Join-Path $here '0004-zink-import-wddm-images.patch')
+if ($LASTEXITCODE -ne 0) { throw '0004-zink-import-wddm-images.patch does not apply' }
 $venus = Join-Path $Dir 'src\virtio\vulkan'
 Copy-Item (Join-Path $here 'vn_renderer_entangled.c') $venus
 Copy-Item (Join-Path $here 'entangled_shared_image.h') $venus
 Copy-Item (Join-Path $here '..\driver\public.h') (Join-Path $venus 'entangled_gpu_public.h')
 $winsys = Join-Path $Dir 'src\gallium\winsys\sw\wddm'
 Copy-Item (Join-Path $here 'wddm_sw_winsys.c'), (Join-Path $here 'wddm_sw_winsys.h') $winsys
-Copy-Item (Join-Path $here 'd3d10_wddm.c') (Join-Path $Dir 'src\gallium\targets\d3d10umd')
+$d3d10 = Join-Path $Dir 'src\gallium\targets\d3d10umd'
+Copy-Item (Join-Path $here 'd3d10_wddm.c'), (Join-Path $here 'entangled_shared_image.h'), `
+          (Join-Path $here '..\driver\wddm-share.h') $d3d10
 # The Direct3D 9 driver's target: the DDI front, the Nine side and their build.
 $d3d9 = Join-Path $Dir 'src\gallium\targets\d3d9umd'
 New-Item -ItemType Directory -Force $d3d9 | Out-Null

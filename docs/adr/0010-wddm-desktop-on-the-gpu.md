@@ -2393,6 +2393,33 @@ logged a Zink initialization error in its own D3D11 path. This run tests
 the allocation and GPU handoff, with no claim about the active DWM path.
 The source and results are in `share/wddm-share-sync` in the Windows lab.
 
+#### DWM imports the D3D12 present source
+
+With the test ICD registered and the protected guest marker
+`C:\Program Files\EntangledGpuShareLab\enable` present, the D3D10 UMD
+tries the GPU generation before its CPU upload. Zink acquires the image
+from the external queue family, copies into the compositor's existing
+texture, and releases ownership. The UMD finishes the read after the
+copy's fence and reuses its local texture for an unchanged generation.
+The regular CPU upload covers allocations without a GPU publication.
+
+Opting into `ENTANGLED_D3D12_GPU_SHARE=1` publishes a VRAM copy of the
+D3D12 present source alongside the existing CPU handoff. In the Windows
+x64 lab, a D3D11 process used `OpenSharedResource1` and verified all
+65,536 pixels of each of two GPU-only generations on the RTX 2070.
+An HWND flip-discard probe and a DirectComposition flip-sequential
+probe each logged an import in `dwm.exe`. Both had no separate D3D12
+present destination. The original Wintanyl F239 binary loaded the lab
+D3D12 UMD and the compositor imported generations from two unmapped
+4,587,520-byte Venus blobs published during the run. Test outputs and
+host excerpts are in `share/dwm-gpu-import`.
+
+The experiment establishes that DWM can consume the producer's image in
+the flip paths used by F239. The diagnostic writer still does both
+copies. A performance comparison needs the producer to skip its CPU
+readback after the compositor has acknowledged a GPU generation, and
+to retain the CPU handoff for legacy or failed imports.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
