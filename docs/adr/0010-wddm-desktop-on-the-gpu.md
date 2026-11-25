@@ -1928,6 +1928,64 @@ The Windows lab report is `venus-guest-ring-wait-results.md` in
 `physical-wheel`. Raw A/B captures use `stock-dwm-ring-*`, and the reboot
 and per-context records are in `run-init-cache-live.log`.
 
+#### Trial of waking a synchronous host wait from ring progress
+
+The ring worker published its own cursor and signaled a host condition
+variable after advancing it or stopping. One host build parked the
+control worker on this signal immediately. A second kept the existing
+short yield window before parking. Both held the control command and the
+Windows miniport's shared slot until the wait completed. The client ICD
+and WDDM driver were the same in all runs.
+
+Each build rendered six runs of 300 D3D11 frames on the RTX 2070 and
+verified the final readback `(252, 127, 2)`. The workload used a copy
+swap chain. Each animation capture sent 12 Notepad minimize/restore
+pairs through virtio-input and used the first host window capture with
+at least 500 changed pixels. Timings are median / maximum.
+
+| Host wait | D3D11 frames/s, median (range) | Minimize to pixels | Restore to pixels | Restore flush to pixels |
+| --- | ---: | ---: | ---: | ---: |
+| Polling | 361.2 (296.7–397.2) | 80.3 / 118.3 ms | 165.9 / 232.7 ms | 13.4 / 16.0 ms |
+| Immediate park | 316.7 (118.9–371.7) | 70.0 / 150.6 ms | 167.8 / 246.5 ms | 11.6 / 23.9 ms |
+| Short yield, then park | 175.3 (137.1–234.7) | 96.2 / 133.4 ms | 198.4 / 274.1 ms | 13.2 / 23.7 ms |
+| Polling restored | 325.2 (282.7–355.7) | 73.2 / 114.2 ms | 182.3 / 210.7 ms | 9.8 / 20.0 ms |
+
+The D3D11 logs recorded exactly 302 ring waits and 301 GPU ring fences
+per process in all runs. The median sum of ring waits per run was
+327.1 ms with polling, 396.9 ms with immediate parking, 624.3 ms with a
+short yield followed by parking, and 389.7 ms when polling was restored.
+This is time inside the host dependency wait, including worker scheduling
+and completion detection. The profiles do not isolate those two costs.
+Immediate parking overlapped the repeat control's throughput and showed
+no consistent restore latency gain. The short yield variant was
+substantially slower than either control. The two park variants were left
+in the lab. Polling remains the production behavior.
+
+In the repeat control the dominant restore interval was from the guest
+window event to the corresponding scanout flush, at 131.2 ms median.
+The 210.7 ms capture spent 5.6 ms delivering the key, 56.3 ms from key to
+window event, 136.9 ms from the event to scanout flush, and 12.0 ms after
+flush before the pixel threshold. The event-to-flush interval includes
+guest rendering and transport and does not by itself assign time to
+individual DWM Present calls.
+
+The next transport change should make an unrelated context runnable
+while a ring dependency is pending. The Windows Venus queue signal sends
+a standalone wait in a fenced `SUBMIT_3D` (`vn_queue.c` and the Windows
+renderer backend `vn_renderer_entangled.c`). This is a narrow case to
+defer first. Keep the validated response descriptor and the same-context
+ordering until the ring advances, then issue the normal GPU fence. A
+failed ring dependency must complete its own descriptor with an error
+without retiring older GPU fences on that timeline. The guest miniport
+needs independently owned slots and must match completions to those
+slots. A two-context test with one deliberately parked ring can verify
+that independence before measuring animation tails.
+
+The host logs are `run-init-cache-live.log` and `run-venus-ring-*.log`
+in `physical-wheel`. The six runs per build are in
+`share/venus-guest-ring-wait/d3d11-host-*.txt`. Raw gesture captures
+use the prefix `stock-dwm-host-*`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
