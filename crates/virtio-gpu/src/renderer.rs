@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use virtio_core::{GuestMem, HostWaker};
 
@@ -51,6 +52,27 @@ pub const MAX_3D_RESOURCES: usize = 16384;
 /// flushes at 16k dwords (64 KiB) by default; 1 MiB leaves room for enlarged
 /// cmdbufs while bounding what one submit can stage.
 pub const MAX_SUBMIT_BYTES: usize = 1 << 20;
+
+/// A submitted command whose CPU-side dependency is still in flight. The
+/// renderer asks the device worker to check it when it can make progress.
+pub struct SubmitWait {
+    pub(crate) deadline: Instant,
+    pub(crate) poll: Box<dyn Fn() -> Option<Result<(), CommandError>> + Send>,
+}
+
+impl SubmitWait {
+    /// `poll` returns `None` while the dependency is outstanding. It must
+    /// produce an in-band result by `deadline`, without blocking.
+    pub fn new(
+        deadline: Instant,
+        poll: impl Fn() -> Option<Result<(), CommandError>> + Send + 'static,
+    ) -> Self {
+        Self {
+            deadline,
+            poll: Box::new(poll),
+        }
+    }
+}
 
 /// Per-axis limit for texture height/depth, and the array-size limit —
 /// matches the largest GL texture any plausible host offers.
@@ -211,6 +233,20 @@ pub trait Renderer3d: Send {
 
     /// Executes one validated command stream in `ctx_id`.
     fn submit(&mut self, ctx_id: u32, stream: &[u8]) -> Result<(), CommandError>;
+
+    /// Starts a wait-only submission, if it can be completed without holding
+    /// the device worker. Returning `None` leaves execution to `submit`.
+    fn defer_submit_wait(
+        &mut self,
+        _ctx_id: u32,
+        _stream: &[u8],
+        _waker: Arc<dyn HostWaker>,
+    ) -> Option<SubmitWait> {
+        None
+    }
+
+    /// Configures ring progress reporting before contexts can be opened.
+    fn set_deferred_ring_waits(&mut self, _enabled: bool) {}
 
     /// Reads `rect` (level 0, layer 0) of a resource as tightly packed BGRA
     /// rows into `out` (cleared and resized by the implementation) — the
@@ -1051,6 +1087,25 @@ impl Gpu3d {
             ));
         }
         self.renderer.submit(ctx_id, stream)
+    }
+
+    pub(crate) fn defer_submit_wait(
+        &mut self,
+        ctx_id: u32,
+        stream: &[u8],
+        waker: Arc<dyn HostWaker>,
+    ) -> Option<SubmitWait> {
+        if self.contexts.get(&ctx_id) != Some(&crate::CAPSET_VENUS)
+            || stream.len() > MAX_SUBMIT_BYTES
+            || stream.len() % 4 != 0
+        {
+            return None;
+        }
+        self.renderer.defer_submit_wait(ctx_id, stream, waker)
+    }
+
+    pub(crate) fn set_deferred_ring_waits(&mut self, enabled: bool) {
+        self.renderer.set_deferred_ring_waits(enabled);
     }
 
     /// Scanout/cursor readback (GPU-010): `rect` of level 0 as packed BGRA.

@@ -116,6 +116,7 @@ struct Shared {
     changed: Condvar,
     /// Asks the thread to leave, from its condvar *and* from the pause gate.
     stopping: AtomicBool,
+    running: AtomicBool,
 }
 
 impl Shared {
@@ -156,6 +157,10 @@ impl HostWaker for SlotWaker {
     fn wake(&self) {
         self.shared.raise(self.slot);
     }
+
+    fn can_wake(&self) -> bool {
+        self.shared.running.load(Ordering::Acquire)
+    }
 }
 
 /// A synchronous-kick bus's host-wake worker. See the module docs.
@@ -185,6 +190,7 @@ impl<T: WakeTarget> HostWakeService<T> {
                 signal: Mutex::new(false),
                 changed: Condvar::new(),
                 stopping: AtomicBool::new(false),
+                running: AtomicBool::new(false),
             }),
             transports: Mutex::new(Vec::new()),
             quiesce: Arc::new(Mutex::new(Quiesce::new())),
@@ -232,7 +238,11 @@ impl<T: WakeTarget> HostWakeService<T> {
         let quiesce = Arc::clone(&self.quiesce);
         let spawned = std::thread::Builder::new()
             .name(format!("{HOST_WAKE_THREAD_PREFIX}-{}", T::transport_name()))
-            .spawn(move || service_loop(&shared, &transports, &quiesce));
+            .spawn(move || {
+                shared.running.store(true, Ordering::Release);
+                service_loop(&shared, &transports, &quiesce);
+                shared.running.store(false, Ordering::Release);
+            });
         match spawned {
             Ok(handle) => {
                 *self.worker.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);

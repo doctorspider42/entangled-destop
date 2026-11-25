@@ -97,7 +97,7 @@
 //! [`Pass`]: virtio_core::quiesce::Pass
 
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -260,6 +260,7 @@ pub enum Step {
 pub struct RingService<S> {
     pump: RingPump,
     sink: S,
+    observe_progress: bool,
     /// When the pump last made progress, or the ring last woke.
     last_progress: Duration,
     /// Polls in a row that found nothing, for [`relax_backoff`].
@@ -288,6 +289,7 @@ impl<S: RingSink> RingService<S> {
         Self {
             pump,
             sink,
+            observe_progress: false,
             last_progress: now,
             relax_iter: 0,
             spin: Duration::ZERO,
@@ -323,6 +325,11 @@ impl<S: RingSink> RingService<S> {
     #[must_use]
     pub fn with_spin(mut self, spin: Duration) -> Self {
         self.spin = spin;
+        self
+    }
+
+    pub(super) fn with_progress_observer(mut self, enabled: bool) -> Self {
+        self.observe_progress = enabled;
         self
     }
 
@@ -527,12 +534,81 @@ struct WorkerShared {
     stop: AtomicBool,
     /// Set by the thread as it leaves, whatever the reason.
     ended: AtomicBool,
+    progress: Option<Arc<RingProgress>>,
     /// `true` while a doorbell has arrived that the worker has not acted on.
     doorbell: Mutex<bool>,
     changed: Condvar,
     capture_requested: AtomicBool,
     capture: Mutex<checkpoint_worker::CaptureState>,
     capture_done: Condvar,
+}
+
+#[derive(Default)]
+struct RingProgress {
+    cursor: AtomicU32,
+    armed: AtomicBool,
+    waiter: Mutex<Option<(u32, Arc<dyn virtio_core::HostWaker>)>>,
+}
+
+impl std::fmt::Debug for RingProgress {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("RingProgress")
+            .field("cursor", &self.cursor.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl RingProgress {
+    fn wake_if_ready(&self, cursor: u32, ended: bool) {
+        // The publisher stores the cursor (or exit) before reading `armed`.
+        // The device arms before checking the cursor and exit. SeqCst pairs
+        // those operations so one side must observe the other's publication.
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut slot = relock(&self.waiter);
+        if slot
+            .as_ref()
+            .is_some_and(|(target, _)| ended || seqno_reached(cursor, *target))
+        {
+            let ready = slot.take();
+            self.armed.store(false, Ordering::SeqCst);
+            drop(slot);
+            if let Some((_, waker)) = ready {
+                waker.wake();
+            }
+        }
+    }
+}
+
+pub(super) fn seqno_reached(cursor: u32, target: u32) -> bool {
+    cursor.wrapping_sub(target) <= i32::MAX as u32
+}
+
+/// A device worker's single deferred wait on this ring. The cursor is
+/// host-owned, so checking it from another thread never reads guest memory.
+pub(super) struct RingWatch {
+    shared: Arc<WorkerShared>,
+    progress: Arc<RingProgress>,
+    target: u32,
+}
+
+impl RingWatch {
+    pub fn reached(&self) -> bool {
+        seqno_reached(self.progress.cursor.load(Ordering::SeqCst), self.target)
+    }
+
+    pub fn ended(&self) -> bool {
+        self.shared.ended.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for RingWatch {
+    fn drop(&mut self) {
+        let mut slot = relock(&self.progress.waiter);
+        *slot = None;
+        self.progress.armed.store(false, Ordering::SeqCst);
+    }
 }
 
 impl WorkerShared {
@@ -670,7 +746,15 @@ impl RingWorker {
     where
         S: RingSink + Send + 'static,
     {
-        let shared = Arc::new(WorkerShared::default());
+        let shared = Arc::new(WorkerShared {
+            progress: service.observe_progress.then(|| {
+                Arc::new(RingProgress {
+                    cursor: AtomicU32::new(service.pump().cursor()),
+                    ..RingProgress::default()
+                })
+            }),
+            ..WorkerShared::default()
+        });
         service
             .sink_mut()
             .attach_stop(StopSignal(Arc::clone(&shared)));
@@ -680,7 +764,10 @@ impl RingWorker {
             let quiesce = Arc::clone(&quiesce);
             std::thread::Builder::new().name(name).spawn(move || {
                 let pump = serve(service, &pages, &quiesce, &shared);
-                shared.ended.store(true, Ordering::Release);
+                shared.ended.store(true, Ordering::SeqCst);
+                if let Some(progress) = &shared.progress {
+                    progress.wake_if_ready(pump.cursor(), true);
+                }
                 drop(guard);
                 pump
             })?
@@ -702,6 +789,22 @@ impl RingWorker {
     #[must_use]
     pub fn has_ended(&self) -> bool {
         self.shared.ended.load(Ordering::Acquire)
+    }
+
+    pub(super) fn watch(
+        &self,
+        target: u32,
+        waker: Arc<dyn virtio_core::HostWaker>,
+    ) -> Option<RingWatch> {
+        let progress = self.shared.progress.as_ref()?;
+        let mut slot = relock(&progress.waiter);
+        *slot = Some((target, waker));
+        progress.armed.store(true, Ordering::SeqCst);
+        Some(RingWatch {
+            shared: Arc::clone(&self.shared),
+            progress: Arc::clone(progress),
+            target,
+        })
     }
 
     /// Ask the thread to stop without waiting for it. Lets a caller stopping
@@ -775,6 +878,13 @@ fn serve<S: RingSink>(
         }
         let step = service.step(now, pages);
         drop(pass);
+        if let Some(progress) = &shared.progress {
+            let cursor = service.pump().cursor();
+            if cursor != progress.cursor.load(Ordering::Relaxed) {
+                progress.cursor.store(cursor, Ordering::SeqCst);
+                progress.wake_if_ready(cursor, false);
+            }
+        }
         let mut mark = |state: WorkerState, since: Duration| {
             if let Some(profile) = profile.as_mut() {
                 profile.add(state, origin.elapsed().saturating_sub(since));

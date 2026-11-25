@@ -295,6 +295,11 @@ pub trait HostWaker: Send + Sync {
     /// Requests a queue-0 `notify` from the device's worker context. Must be
     /// cheap, non-blocking and callable from any thread.
     fn wake(&self);
+
+    /// Whether a future wake can be serviced without another guest kick.
+    fn can_wake(&self) -> bool {
+        false
+    }
 }
 
 /// A [`HostWaker`] that can be handed to a device **before** the host
@@ -359,6 +364,14 @@ impl DeferredWaker {
 }
 
 impl HostWaker for DeferredWaker {
+    fn can_wake(&self) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .is_some_and(|waker| waker.can_wake())
+    }
+
     fn wake(&self) {
         // Cloned out from under the lock: `wake` may be called from any
         // thread, and the real waker's own `wake` must not run with our lock

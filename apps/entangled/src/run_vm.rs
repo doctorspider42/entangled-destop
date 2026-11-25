@@ -134,6 +134,7 @@ const VENUS_CAPTURE_ENV: &str = "ENTANGLED_VENUS_CAPTURE";
 const VENUS_ENV: &str = "ENTANGLED_VENUS";
 /// Developer-only opt-in while native checkpoint coverage is incomplete.
 const VENUS_CHECKPOINT_ENV: &str = "ENTANGLED_VENUS_CHECKPOINT";
+const VENUS_DEFER_RING_WAITS_ENV: &str = "ENTANGLED_VENUS_DEFER_RING_WAITS";
 
 /// Why the Venus executor was attached, for its log line and its errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -762,6 +763,11 @@ fn build_devices(
         // (ADR-0009 phase E).
         let overlay = display_handle.overlay_sink();
         let mut gpu = virtio_gpu::GpuDevice::with_renderer(display_handle, Box::new(renderer));
+        let defer_ring_waits = std::env::var(VENUS_DEFER_RING_WAITS_ENV).as_deref() == Ok("1");
+        gpu.set_deferred_ring_waits(defer_ring_waits);
+        if defer_ring_waits {
+            tracing::info!("experimental Venus ring wait deferral enabled");
+        }
         let checkpoint_override = std::env::var(VENUS_CHECKPOINT_ENV).as_deref() == Ok("1");
         if cfg.display.venus_checkpoints || checkpoint_override {
             gpu.enable_accelerated_checkpoints(64 << 20)
@@ -788,7 +794,8 @@ fn build_devices(
                 .with_gpu_memory(cfg.display.gpu_memory_mib.map(|mib| u64::from(mib) << 20));
             let renderer = virtio_gpu::VenusRenderer::new(sinks)
                 .with_host_visible_bytes(venus_host_visible_bytes(&cfg.display));
-            let render = virtio_gpu::GpuDevice::with_renderer(overlay, Box::new(renderer));
+            let mut render = virtio_gpu::GpuDevice::with_renderer(overlay, Box::new(renderer));
+            render.set_deferred_ring_waits(defer_ring_waits);
             tracing::info!("attaching a render-only Venus function (ADR-0009 phase A0)");
             devices.push(Box::new(render));
         }

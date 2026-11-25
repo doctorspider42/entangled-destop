@@ -1986,6 +1986,47 @@ in `physical-wheel`. The six runs per build are in
 `share/venus-guest-ring-wait/d3d11-host-*.txt`. Raw gesture captures
 use the prefix `stock-dwm-host-*`.
 
+#### Deferred Venus ring waits on the host
+
+`ENTANGLED_VENUS_DEFER_RING_WAITS=1` enables the host experiment. An
+eligible fenced `SUBMIT_3D` consists of a single `vkWaitRingSeqnoMESA`
+on a GPU ring timeline. While its cursor is outstanding, the device
+retains the response segments and reserves a fence slot. The ring worker
+requests a queue wake when its host-owned cursor reaches the target or
+the ring exits. A single per-device timer requests a wake at the earliest
+timeout, including when a driver call stops the ring worker. Both use the
+normal device worker to return the descriptor. That keeps writes behind
+the VM's pause gate.
+
+The device submits the GPU fence after ring progress, then waits for the
+normal fence completion. A failure returns an error for just that
+descriptor. The VirtIO GPU header treats fence IDs on a ring as part of
+its context-specific timeline. The split queue can complete independent
+descriptors in completion order. See the
+[VirtIO 1.3 specification](https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html)
+and its GPU control header and split virtqueue sections.
+
+Ordinary submissions keep their existing path. A later request from the
+same context settles the earlier dependency before dispatch, using the
+synchronous wait when necessary. The Windows ICD already serializes
+IOCTLs in each context. The option requires a live host waker and is
+disabled by default. Checkpoints refuse outstanding CPU dependencies
+and a reset drops their descriptors and stops the deadline timer.
+
+The split-queue test leaves one context parked, completes the second
+context's GPU fence, and then steps the first context through cursor
+progress and GPU completion separately. The timeout test verifies that a
+timer wake returns only the failed wait and leaves an older fence on its
+timeline pending. A real ring-worker test verifies that advancing the
+cursor requests the device wake. The Windows render miniport still has
+one command slot. Independent GPU clients in the guest need multiple
+slots and used-ID matching before this path can reduce their contention.
+
+The opt-in host booted the four-vCPU Windows lab with the existing
+Windows Venus ICD and WDDM 21.22.46.312. The RTX 2070 log records real
+`SUBMIT_3D` descriptors deferred and completed through the new path in
+`physical-wheel/run-venus-host-deferred.log`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

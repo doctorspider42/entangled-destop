@@ -325,7 +325,8 @@ impl<F: SinkFactory> VenusRenderer<F> {
             for (saved_ring, page, layout, pump, sink, seqno) in rings {
                 let service =
                     RingService::from_checkpoint(pump, sink, Duration::ZERO, page.as_ref())
-                        .with_spin(HOST_SPIN);
+                        .with_spin(HOST_SPIN)
+                        .with_progress_observer(self.deferred_ring_waits);
                 let worker = RingWorker::spawn(
                     format!("venus-{}-{:x}", saved.ctx_id, saved_ring.ring),
                     service,

@@ -30,14 +30,14 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use display::DisplayHandle;
 use virtio_core::chain::VIRTQ_DESC_F_WRITE;
 use virtio_core::testing::{guest_memory, SplitRing, TestIrqLine};
 use virtio_core::{mmio, status, GuestMem, HostWaker, MmioTransport, VirtioDevice};
 use virtio_gpu::protocol::{cmd, resp, MemEntry, Rect, ResourceCreate3d, Transfer3d, CTRL_HDR_LEN};
-use virtio_gpu::renderer::{CapsetInfo, FenceOutcome, FenceTimeline, Renderer3d};
+use virtio_gpu::renderer::{CapsetInfo, FenceOutcome, FenceTimeline, Renderer3d, SubmitWait};
 use virtio_gpu::{CommandError, GpuDevice, NullRenderer, MAX_PENDING_FENCES};
 use vm_memory::{Bytes, GuestAddress};
 
@@ -73,6 +73,7 @@ struct FenceState {
     created_on: Vec<(FenceTimeline, u32)>,
     /// Timeline fences the next poll will report.
     retire_on: Vec<(FenceTimeline, u32)>,
+    submit_wait: Option<(Duration, Arc<AtomicUsize>)>,
 }
 
 #[derive(Clone, Default)]
@@ -124,8 +125,13 @@ struct DeferringRenderer {
 
 impl DeferringRenderer {
     fn new(control: FenceControl) -> Self {
+        let venus = control.with(|s| s.submit_wait.is_some());
         Self {
-            inner: NullRenderer::new(),
+            inner: if venus {
+                NullRenderer::with_venus()
+            } else {
+                NullRenderer::new()
+            },
             control,
             waker: None,
         }
@@ -220,6 +226,28 @@ impl Renderer3d for DeferringRenderer {
         self.inner.submit(ctx_id, stream)
     }
 
+    fn defer_submit_wait(
+        &mut self,
+        ctx_id: u32,
+        stream: &[u8],
+        _waker: Arc<dyn HostWaker>,
+    ) -> Option<SubmitWait> {
+        if ctx_id != 1 || stream != b"wait" {
+            return None;
+        }
+        let (timeout, ready) = self.control.with(|s| s.submit_wait.clone())?;
+        let deadline = Instant::now() + timeout;
+        Some(SubmitWait::new(deadline, move || {
+            if ready.load(Ordering::Acquire) != 0 {
+                Some(Ok(()))
+            } else if Instant::now() >= deadline {
+                Some(Err(CommandError::Renderer("ring wait timed out".into())))
+            } else {
+                None
+            }
+        }))
+    }
+
     fn read_rect_bgra(
         &mut self,
         resource_id: u32,
@@ -305,6 +333,10 @@ impl Renderer3d for DeferringRenderer {
 struct CountingWaker(AtomicUsize);
 
 impl HostWaker for CountingWaker {
+    fn can_wake(&self) -> bool {
+        true
+    }
+
     fn wake(&self) {
         self.0.fetch_add(1, Ordering::Release);
     }
@@ -468,6 +500,7 @@ struct Harness {
     slots: u16,
     /// Used-ring entries already collected.
     collected: u16,
+    host_waker: Arc<CountingWaker>,
     #[allow(dead_code)]
     display: DisplayHandle,
 }
@@ -505,16 +538,19 @@ impl Harness {
         checkpoint: bool,
     ) -> Self {
         let display = DisplayHandle::detached(64, 64).expect("detached display");
+        let pending_waits = control.with(|s| s.submit_wait.is_some());
         let mut device =
             GpuDevice::with_renderer(display.clone(), Box::new(DeferringRenderer::new(control)));
+        device.set_deferred_ring_waits(pending_waits);
         if checkpoint {
             device.enable_accelerated_checkpoints(4096).unwrap();
         }
         // The machine layer hands every device a waker before it reaches its
         // transport, on both hosts (KVM's queue worker, WHP's host-wake
         // thread).
+        let host_waker = Arc::new(CountingWaker::default());
         if waker {
-            device.set_host_waker(Arc::new(CountingWaker::default()));
+            device.set_host_waker(host_waker.clone());
         }
         if let Some(timeout) = timeout {
             device.set_fence_timeout(timeout);
@@ -531,6 +567,7 @@ impl Harness {
             ring_size,
             slots: 0,
             collected: 0,
+            host_waker,
             display,
         };
         harness.bring_up();
@@ -701,6 +738,103 @@ fn assert_ok(response: &Response) {
 }
 
 // ================================================================= tests
+
+fn venus_context(id: u32) -> Request {
+    Request::new(cmd::CTX_CREATE)
+        .ctx(id)
+        .u32(4)
+        .u32(virtio_gpu::CAPSET_VENUS)
+        .raw(&[0; 64])
+}
+
+#[test]
+fn a_venus_ring_dependency_does_not_hold_another_contexts_fence() {
+    let available = Arc::new(AtomicUsize::new(0));
+    let control = FenceControl::default();
+    control.with(|state| state.submit_wait = Some((Duration::from_secs(10), available.clone())));
+    let mut vm = Harness::new(control.clone());
+    assert_ok(&vm.run_one(&venus_context(1)));
+    assert_ok(&vm.run_one(&venus_context(2)));
+
+    let parked = vm.publish(&submit_3d(1, b"wait").fenced(1).on_ring(1));
+    let independent = vm.publish(&submit_3d(2, &[]).fenced(2).on_ring(1));
+    let a = FenceTimeline::Ring {
+        ctx_id: 1,
+        ring_idx: 1,
+    };
+    let b = FenceTimeline::Ring {
+        ctx_id: 2,
+        ring_idx: 1,
+    };
+    vm.kick();
+    assert!(vm.collect().is_empty());
+    assert_eq!(control.created_on(), vec![(b, 2)]);
+
+    control.retire_on(b, 2);
+    vm.kick();
+    let done = vm.collect();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].head, independent);
+    assert_ok(&done[0]);
+
+    available.store(1, Ordering::Release);
+    vm.kick();
+    assert!(
+        vm.collect().is_empty(),
+        "ring progress cannot retire the GPU fence"
+    );
+    assert_eq!(control.created_on(), vec![(b, 2), (a, 1)]);
+    control.retire_on(a, 1);
+    vm.kick();
+    let done = vm.collect();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].head, parked);
+    assert_ok(&done[0]);
+}
+
+#[test]
+fn a_ring_wait_timeout_wakes_the_queue_without_retiring_an_older_fence() {
+    let control = FenceControl::default();
+    control.with(|state| {
+        state.submit_wait = Some((Duration::from_millis(250), Arc::new(AtomicUsize::new(0))));
+    });
+    let mut vm = Harness::new(control.clone());
+    assert_ok(&vm.run_one(&venus_context(1)));
+
+    let timeline = FenceTimeline::Ring {
+        ctx_id: 1,
+        ring_idx: 1,
+    };
+    let older = vm.publish(&submit_3d(1, &[]).fenced(5).on_ring(1));
+    vm.kick();
+    assert!(vm.collect().is_empty());
+    let began = vm.host_waker.0.load(Ordering::Acquire);
+    let expired = vm.publish(&submit_3d(1, b"wait").fenced(6).on_ring(1));
+    vm.kick();
+    assert!(vm.collect().is_empty());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while vm.host_waker.0.load(Ordering::Acquire) == began {
+        assert!(
+            Instant::now() < deadline,
+            "deadline did not request a queue wake"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    vm.kick(); // Service the host wake.
+    let done = vm.collect();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].head, expired);
+    assert_eq!(done[0].kind(), resp::ERR_UNSPEC);
+    assert_eq!(done[0].fence_id(), 6);
+    assert_eq!(control.created_on(), vec![(timeline, 5)]);
+
+    control.retire_on(timeline, 5);
+    vm.kick();
+    let done = vm.collect();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].head, older);
+    assert_ok(&done[0]);
+}
 
 /// The core of phase 2: a fenced submit produces **no** used-ring entry until
 /// the host fence retires, and then produces exactly the right one.

@@ -48,6 +48,7 @@ use vm_memory::{Bytes, GuestAddress};
 use crate::blob::{BlobSupport, BlobTable, MAX_BLOB_ENTRIES};
 
 pub mod checkpoint;
+mod submit_wait;
 use crate::error::CommandError;
 use crate::fence::{FenceQueue, FenceTimeline, MAX_PENDING_FENCES};
 use crate::pacing::FramePacing;
@@ -66,6 +67,7 @@ use crate::{
     MAX_CURSOR_DIM, VIRTIO_GPU_F_CONTEXT_INIT, VIRTIO_GPU_F_EDID, VIRTIO_GPU_F_RESOURCE_BLOB,
     VIRTIO_GPU_F_VIRGL,
 };
+use submit_wait::{DeadlineWake, HeldWait};
 
 /// `VIRTIO_GPU_EVENT_DISPLAY` in `events_read`: the display configuration
 /// changed, ask for it again.
@@ -204,9 +206,8 @@ const FENCED_3D_COMMANDS: [u32; 3] = [
 enum Served {
     /// The response is written; `.0` bytes went into the used ring.
     Done(u32),
-    /// The response is held in [`GpuDevice::pending_fences`] until the host
-    /// fence retires, so the chain must *not* be returned to the used ring
-    /// yet.
+    /// The device holds the response until its ring wait or GPU fence
+    /// finishes. The chain must stay out of the used ring.
     Deferred,
 }
 
@@ -385,6 +386,9 @@ pub struct GpuDevice<S: ScanoutSink> {
     /// Always empty on a 2D device and on a renderer that fences
     /// synchronously.
     pending_fences: FenceQueue<PendingResponse>,
+    deferred_ring_waits: bool,
+    pending_waits: Vec<HeldWait>,
+    wait_deadline: Option<DeadlineWake>,
     fence_stats: FenceStats,
     /// Watchdog deadline for a deferred response ([`FENCE_TIMEOUT`] unless
     /// [`GpuDevice::set_fence_timeout`] changed it).
@@ -477,6 +481,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
             flush_buf: Vec::new(),
             cursor_commands: 0,
             pending_fences: FenceQueue::new(),
+            deferred_ring_waits: false,
+            pending_waits: Vec::new(),
+            wait_deadline: None,
             fence_stats: FenceStats::default(),
             fence_timeout: FENCE_TIMEOUT,
             fence_mode: FenceMode::default(),
@@ -641,8 +648,6 @@ impl<S: ScanoutSink> GpuDevice<S> {
         mem: &Arc<GuestMem>,
         interrupt: &dyn Interrupt,
     ) -> Result<(), DeviceError> {
-        let desc_table = queue.desc_table();
-        let queue_size = queue.size();
         // `served` drives the interrupt (used-ring entries added); `taken`
         // drives the budget (chains popped), and the two differ once a fenced
         // chain is held back — a deferred chain has been taken off the
@@ -654,21 +659,21 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // was busy frees a descriptor the guest may be waiting for, so
         // completing before draining keeps the ring moving.
         served += self.complete_fences(queue, mem)?;
+        served += self.complete_submit_waits(queue, mem, None)?;
 
         while let Some(head) = queue
             .pop_descriptor_chain(Arc::clone(mem))
             .map(|chain| chain.head_index())
         {
             taken += 1;
-            match self.handle_command(mem, desc_table, queue_size, head) {
+            match self.handle_command(mem, queue, head, &mut served)? {
                 Served::Done(written) => {
                     queue
                         .add_used(mem.as_ref(), head, written)
                         .map_err(|e| DeviceError::Queue(e.to_string()))?;
                     served += 1;
                 }
-                // The chain stays out of the used ring until its fence
-                // retires; `complete_fences` puts it back.
+                // A later drain puts it back when its dependency completes.
                 Served::Deferred => (),
             }
             if taken >= CHAINS_PER_NOTIFY {
@@ -681,6 +686,9 @@ impl<S: ScanoutSink> GpuDevice<S> {
             }
         }
 
+        // A newly armed dependency can already be ready, and the deadline
+        // timer must cover all waits before we leave the device worker.
+        served += self.complete_submit_waits(queue, mem, None)?;
         if served > 0
             && queue
                 .needs_notification(mem.as_ref())
@@ -916,26 +924,25 @@ impl<S: ScanoutSink> GpuDevice<S> {
     /// many bytes went into the used ring) or defers it until a host fence
     /// retires (ADR-0004 phase 2).
     ///
-    /// Never returns an error: see the module-level failure policy.
     fn handle_command(
         &mut self,
         mem: &Arc<GuestMem>,
-        desc_table: u64,
-        queue_size: u16,
+        queue: &mut Queue,
         head: u16,
-    ) -> Served {
-        let segments = match chain::walk(mem, desc_table, queue_size, head) {
+        served: &mut usize,
+    ) -> Result<Served, DeviceError> {
+        let segments = match chain::walk(mem, queue.desc_table(), queue.size(), head) {
             Ok(segments) => segments,
             Err(error) => {
                 tracing::warn!(head, %error, "dropping malformed virtio-gpu descriptor chain");
-                return Served::Done(0);
+                return Ok(Served::Done(0));
             }
         };
         let (readable, writable) = match chain::split_rw(&segments) {
             Ok(split) => split,
             Err(error) => {
                 tracing::warn!(head, %error, "dropping virtio-gpu chain");
-                return Served::Done(0);
+                return Ok(Served::Done(0));
             }
         };
         let capacity: u64 = writable.iter().map(|s| u64::from(s.len)).sum();
@@ -945,7 +952,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 capacity,
                 "virtio-gpu chain has no room for a response header; dropping it"
             );
-            return Served::Done(0);
+            return Ok(Served::Done(0));
         }
 
         // Gather the request into the reusable staging buffer. Taken out of
@@ -954,37 +961,62 @@ impl<S: ScanoutSink> GpuDevice<S> {
         let mut request = std::mem::take(&mut self.req_buf);
         request.clear();
         let gathered = gather_request(mem, readable, &mut request, self.max_command_bytes());
-        let (resp_hdr, body, fence) = match gathered.and_then(|()| {
+        let parsed = gathered.and_then(|()| {
             CtrlHdr::parse(&request).ok_or(CommandError::Truncated {
                 kind: 0,
                 len: request.len(),
                 expected: CtrlHdr::LEN,
             })
-        }) {
+        });
+        let result = match parsed {
             Ok(hdr) => {
                 // One tick of the frame's command clock (GAME-2105): the
                 // first command after a present is what separates a guest
                 // that is *waiting* from one that is *working*.
                 self.pacing.note_command();
-                let reply = self.dispatch(mem, &hdr, &request);
-                let fence = self.fence_for(&hdr, reply.code);
-                (hdr.response(reply.code), reply.body, fence)
+                let before = if self.pending_waits.is_empty() {
+                    Ok(0)
+                } else {
+                    self.complete_submit_waits(queue, mem, Some(hdr.ctx_id))
+                };
+                before.map(|completed| {
+                    *served += completed;
+                    if self.try_defer_wait(head, hdr, &request, writable) {
+                        Served::Deferred
+                    } else {
+                        let reply = self.dispatch(mem, &hdr, &request);
+                        self.respond(mem, head, writable, hdr, reply)
+                    }
+                })
             }
             Err(error) => {
                 tracing::warn!(head, %error, "unusable virtio-gpu request");
                 // No parsed header, so no fence information to echo.
-                (
-                    CtrlHdr {
-                        kind: resp::ERR_UNSPEC,
-                        ..CtrlHdr::default()
-                    },
-                    Vec::new(),
-                    None,
-                )
+                Ok(self.respond(
+                    mem,
+                    head,
+                    writable,
+                    CtrlHdr::default(),
+                    Reply::error(resp::ERR_UNSPEC),
+                ))
             }
         };
         self.req_buf = request;
+        result
+    }
 
+    fn respond(
+        &mut self,
+        mem: &GuestMem,
+        head: u16,
+        writable: &[Segment],
+        hdr: CtrlHdr,
+        reply: Reply,
+    ) -> Served {
+        let Reply { code, body } = reply;
+        let fence = self.fence_for(&hdr, code);
+        let resp_hdr = hdr.response(code);
+        let capacity: u64 = writable.iter().map(|s| u64::from(s.len)).sum();
         let needed = CtrlHdr::LEN as u64 + body.len() as u64;
         if capacity < needed {
             // The driver did not offer room for the body it asked for. Answering
@@ -1077,7 +1109,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         // renderer's fence list until it retires), and a guest that fences
         // everything without collecting must fall back to phase 1's
         // synchronous completion rather than pin more chains.
-        if self.pending_fences.is_full() {
+        if self.fence_slots_full() {
             self.fence_stats.over_cap = self.fence_stats.over_cap.saturating_add(1);
             tracing::warn!(
                 cap = MAX_PENDING_FENCES,
@@ -1116,6 +1148,12 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 None
             }
         }
+    }
+
+    fn fence_slots_full(&self) -> bool {
+        // Each held CPU dependency reserves a slot for the GPU fence that
+        // follows it. The dependency leaves pending_waits before promotion.
+        self.pending_fences.len() + self.pending_waits.len() >= MAX_PENDING_FENCES
     }
 
     /// Retires host fences and returns the chains they were holding to the
@@ -1228,7 +1266,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
             return Vec::new();
         }
         self.renderer_lost = true;
-        let held: Vec<PendingResponse> = self
+        let mut held: Vec<PendingResponse> = self
             .pending_fences
             .drain_all()
             .into_iter()
@@ -1239,6 +1277,8 @@ impl<S: ScanoutSink> GpuDevice<S> {
                 entry
             })
             .collect();
+        held.extend(self.pending_waits.drain(..).map(HeldWait::failed));
+        self.wait_deadline = None;
         // Dropping the renderer releases the host GL state (and, for an
         // isolated renderer, the dead worker's socket).
         self.three_d = None;
@@ -1279,6 +1319,15 @@ impl<S: ScanoutSink> GpuDevice<S> {
     /// phase-2 before/after measurement is taken on one binary.
     pub fn set_fence_mode(&mut self, mode: FenceMode) {
         self.fence_mode = mode;
+    }
+
+    /// Opt into deferring standalone Venus ring waits. Call before the
+    /// device is activated so new rings track their host-owned cursor.
+    pub fn set_deferred_ring_waits(&mut self, enabled: bool) {
+        self.deferred_ring_waits = enabled;
+        if let Some(gpu) = self.three_d.as_mut() {
+            gpu.set_deferred_ring_waits(enabled);
+        }
     }
 
     /// Mirrors the frame statistics into `path` as JSON, rewritten every
@@ -3054,6 +3103,9 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
     /// (a Venus context's host Vulkan objects). Everything else this device
     /// owns is either saved or honestly counted — see [`Self::save_device`].
     fn snapshot_refusal(&self) -> Option<String> {
+        if !self.pending_waits.is_empty() {
+            return Some("virtio-gpu: a Venus ring wait has a pending response".into());
+        }
         if self.accelerated_checkpoints {
             // Explicit experimental opt-in pairs this device with a streamed
             // native section. That writer still refuses unsupported state;
@@ -3279,6 +3331,8 @@ impl<S: ScanoutSink> VirtioDevice for GpuDevice<S> {
     }
 
     fn reset(&mut self) {
+        self.wait_deadline = None;
+        self.pending_waits.clear();
         // Fenced responses the guest will never collect: the driver is
         // tearing the queues down, so the chains they pinned simply go away
         // with the rest of the queue state. Dropping them before the queues

@@ -149,7 +149,7 @@ use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use virtio_core::{GuestMem, HostWaker, Quiesce, ShmBacking};
@@ -165,7 +165,9 @@ use crate::error::CommandError;
 use crate::protocol::{
     MemEntry, Rect, ResourceCreate3d, ResourceCreateBlob, Transfer3d, BLOB_MEM_HOST3D,
 };
-use crate::renderer::{CapsetInfo, FenceOutcome, FenceTimeline, Renderer3d, ScanoutBlobSpec};
+use crate::renderer::{
+    CapsetInfo, FenceOutcome, FenceTimeline, Renderer3d, ScanoutBlobSpec, SubmitWait,
+};
 
 use super::capset::{VenusCapset, VENUS_CAPSET_LEN, VENUS_CAPSET_MAX_VERSION};
 use super::executor::modifier::CanonicalImage;
@@ -174,7 +176,7 @@ use super::pump::RingPump;
 use super::pump::{Batch, Consumed, RingBacking, RingSink};
 use super::ring::{RingCreateInfo, RingLayout, RingLayoutError};
 use super::service::{
-    monitor_period, LiveThreads, RingMonitor, RingService, RingWorker, HOST_SPIN,
+    monitor_period, seqno_reached, LiveThreads, RingMonitor, RingService, RingWorker, HOST_SPIN,
 };
 use super::shmem::{Publication, RingPages, ShmemError};
 use super::transport::{
@@ -2465,6 +2467,7 @@ impl Drop for Context {
 pub struct VenusRenderer<F> {
     /// Makes each new ring's sink.
     sinks: F,
+    deferred_ring_waits: bool,
     capset: VenusCapset,
     /// The host-visible window, once the machine layer has supplied one.
     window: Option<Arc<dyn ShmBacking>>,
@@ -2566,6 +2569,7 @@ impl<F> VenusRenderer<F> {
             memory_blobs: 0,
             memory_blob_use: HashMap::new(),
             contexts: HashMap::new(),
+            deferred_ring_waits: false,
             observed: 0,
             quiesce: Quiesce::new(),
             live: LiveThreads::new(),
@@ -3578,7 +3582,9 @@ impl<F: SinkFactory> VenusRenderer<F> {
 
         let worker = RingWorker::spawn(
             format!("venus-ring-{ctx_id}-{ring:x}"),
-            RingService::new(pump, sink, Duration::ZERO).with_spin(HOST_SPIN),
+            RingService::new(pump, sink, Duration::ZERO)
+                .with_spin(HOST_SPIN)
+                .with_progress_observer(self.deferred_ring_waits),
             Arc::clone(&pages),
             quiesce,
             &live,
@@ -3851,7 +3857,7 @@ impl<F: SinkFactory> VenusRenderer<F> {
             .ok_or(VenusError::UnknownRing { ctx_id, ring })?;
         // The ring position is 32 bits; vkr compares the low half too.
         let target = seqno as u32;
-        let reached = |position: u32| position.wrapping_sub(target) <= i32::MAX as u32;
+        let reached = |position: u32| seqno_reached(position, target);
         let refuse = |why| VenusError::RingSeqno {
             ctx_id,
             ring,
@@ -3981,6 +3987,56 @@ impl<F: SinkFactory> Renderer3d for VenusRenderer<F> {
         }
         result?;
         Ok(())
+    }
+
+    fn set_deferred_ring_waits(&mut self, enabled: bool) {
+        self.deferred_ring_waits = enabled;
+    }
+
+    fn defer_submit_wait(
+        &mut self,
+        ctx_id: u32,
+        bytes: &[u8],
+        waker: Arc<dyn HostWaker>,
+    ) -> Option<SubmitWait> {
+        let mut stream = TransportStream::new(bytes);
+        let TransportCommand::WaitRingSeqno { ring, seqno } = stream.next_command()?.ok()?.command
+        else {
+            return None;
+        };
+        if stream.position() != bytes.len() {
+            return None;
+        }
+        let context = self.contexts.get(&ctx_id).filter(|ctx| !ctx.poisoned)?;
+        let live = context.rings.get(&ring)?;
+        let target = seqno as u32;
+        if !seqno_reached(live.pages.load_guest_word(&live.layout.tail()), target) {
+            return None;
+        }
+        let watch = live.worker.watch(target, waker)?;
+        if watch.reached() || watch.ended() {
+            return None;
+        }
+        let deadline = Instant::now() + WAIT_RING_SEQNO_TIMEOUT;
+        live.worker.notify();
+        Some(SubmitWait::new(deadline, move || {
+            let why = if watch.reached() {
+                return Some(Ok(()));
+            } else if watch.ended() {
+                "the ring stopped first"
+            } else if Instant::now() >= deadline {
+                "the wait timed out"
+            } else {
+                return None;
+            };
+            Some(Err(VenusError::RingSeqno {
+                ctx_id,
+                ring,
+                seqno,
+                why,
+            }
+            .into()))
+        }))
     }
 
     /// Only a blob accepted for scanout ([`Self::scanout_blob`]) has pixels
@@ -4884,6 +4940,59 @@ mod tests {
     fn tap_rig() -> (Rig<impl SinkFactory<Sink = Tap>>, Tap) {
         let tap = Tap::default();
         (Rig::new(tap.factory()), tap)
+    }
+
+    #[test]
+    fn a_deferred_wait_is_woken_when_the_ring_worker_publishes_its_cursor() {
+        struct Gate(Arc<std::sync::atomic::AtomicBool>);
+        impl RingSink for Gate {
+            fn consume(&mut self, batch: Batch<'_>) -> Consumed {
+                if self.0.load(Ordering::Acquire) {
+                    batch.all()
+                } else {
+                    batch.blocked(0)
+                }
+            }
+        }
+        #[derive(Default)]
+        struct WakeCount(AtomicU32);
+        impl HostWaker for WakeCount {
+            fn wake(&self) {
+                self.0.fetch_add(1, Ordering::Release);
+            }
+        }
+
+        let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::clone(&opened);
+        let mut rig = Rig::new(move |_, _| Ok(Gate(Arc::clone(&release))));
+        rig.renderer.set_deferred_ring_waits(true);
+        rig.create_ring();
+        rig.wait_parked();
+        assert!(rig.guest().submit(&ENUMERATE_INSTANCE_VERSION));
+        let mut enc = Encoder::new();
+        enc.command_header(CommandHeader {
+            opcode: Opcode::WaitRingSeqno.as_u32(),
+            flags: 0,
+        })
+        .unwrap();
+        enc.u64(RING).unwrap();
+        enc.u64(ENUMERATE_INSTANCE_VERSION.len() as u64).unwrap();
+        let bytes = enc.finish().unwrap();
+
+        let waker = Arc::new(WakeCount::default());
+        let wait = rig
+            .renderer
+            .defer_submit_wait(CTX, &bytes, waker.clone())
+            .unwrap();
+        assert!((wait.poll)().is_none());
+        assert_eq!(waker.0.load(Ordering::Acquire), 0);
+        opened.store(true, Ordering::Release);
+        rig.doorbell();
+        eventually("the ring to wake the device", || {
+            waker.0.load(Ordering::Acquire) == 1
+        });
+        assert!(matches!((wait.poll)(), Some(Ok(()))));
+        assert_eq!(rig.head(), ENUMERATE_INSTANCE_VERSION.len() as u32);
     }
 
     // -------------------------------------------------------- what we advertise

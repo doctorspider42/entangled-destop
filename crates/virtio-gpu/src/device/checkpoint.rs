@@ -45,6 +45,11 @@ impl<S: ScanoutSink> GpuDevice<S> {
     /// Completed responses/IRQs are returned before CPU/APIC capture; work that
     /// still needs a future guest signal remains pending and refuses capture.
     pub fn prepare_accelerated_checkpoint(&mut self) -> Result<(), DeviceError> {
+        if !self.pending_waits.is_empty() {
+            return Err(DeviceError::Backend(
+                "GPU checkpoint has a pending ring wait".into(),
+            ));
+        }
         if self.renderer_lost
             || self.restored_3d_lost
             || self.three_d.as_ref().is_none_or(|gpu| !gpu.is_alive())
@@ -108,7 +113,11 @@ impl<S: ScanoutSink> GpuDevice<S> {
         out: &mut dyn Write,
         timeout: Duration,
     ) -> Result<(), CommandError> {
-        if !self.pending_fences.is_empty() || self.renderer_lost || self.restored_3d_lost {
+        if !self.pending_waits.is_empty()
+            || !self.pending_fences.is_empty()
+            || self.renderer_lost
+            || self.restored_3d_lost
+        {
             return Err(invalid(
                 "GPU checkpoint has pending responses or lost renderer state",
             ));
@@ -265,6 +274,7 @@ impl<S: ScanoutSink> GpuDevice<S> {
         if !self.blobs.is_empty()
             || self.blobs.window().mapping_count() != 0
             || !self.pending_fences.is_empty()
+            || !self.pending_waits.is_empty()
             || self
                 .three_d
                 .as_ref()

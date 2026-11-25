@@ -186,6 +186,10 @@ struct EventFdWaker {
 }
 
 impl HostWaker for EventFdWaker {
+    fn can_wake(&self) -> bool {
+        true
+    }
+
     fn wake(&self) {
         if let Err(error) = self.event.write(1) {
             tracing::warn!(
