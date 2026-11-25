@@ -2266,9 +2266,17 @@ the RTX 2070 and backed it with 262,144 bytes of device-local memory
 (type 1, flags `0x1`). The host exported `blob_id=112` as shareable
 resource 65957 and never mapped it. A second Vulkan device in the same
 Venus context imported that resource with `VkImportMemoryResourceInfoMESA`
-and bound another optimal image. The blob was then released. The probe
-reports creation, export, import and binding. It has no producer-to-consumer
-pixel check. Its source and output are in `share/unmapped-blob`.
+and bound another optimal image. The blob was then released.
+
+The pixel probe repeated that setup with aliased images. The producer
+cleared its image on the RTX and released ownership to the external
+queue family. The second Vulkan device acquired ownership and copied
+the image to a staging buffer. All 65,536 BGRA pixels matched in two
+runs (resources 66023 and 66045). The shared texture stayed unmapped.
+Only the staging buffer and the command transport were mapped.
+The probe waited for each GPU queue to finish before it moved on, which
+checks pixel continuity with an explicit ordering on this GPU.
+The sources and output are in `share/unmapped-blob`.
 
 The WDDM handoff still needs to attach the producer's blob to the
 consumer's Venus context after checking access to the opened WDDM
