@@ -1501,6 +1501,88 @@ The dedicated VM returned to the stock F239 shell after both runs.
 Raw results are `fx-snapshot-reused-device` and `fx-snapshot-abba` in
 the lab's `physical-wheel` directory.
 
+#### Driving the lamp and cube with the guest keyboard
+
+The dedicated lab accepted `chord win m`, `chord win shift m`, and
+`chord ctrl alt left/right` through its control pipe and the virtio
+keyboard. The launcher's host timestamp includes its command-file
+handoff. The first action used just the Explorer fixture so `Win+M`
+minimized one window. The cube used Explorer and Notepad on separate
+viewports. The [guest helper](../../tests/windows/animation-input-qpc.cpp)
+records only these shortcuts and the specified Explorer HWND's minimize
+and restore WinEvents. Build with x64 MSVC and link `user32.lib`. Its CLI
+takes the hex HWND and the observation length in seconds.
+
+A QPC clock bridge before and after each run had minimum round trips
+of 0.62–0.75 ms. Host Windows Graphics Capture sampled the VM viewport
+through the dock. A change means at least 150 pixels crossing the
+brightness threshold. The [joiner](../../tests/windows/analyze-animation-input.py)
+pairs the first change with the last preceding full-screen flush as a
+timing proxy. There is no shared frame ID at those boundaries, and
+first visible change can include immediate shell or dock feedback.
+
+| Effect and source | Host command to first visible change p50 / max | Changed frames p50 in 1.2 s |
+| --- | ---: | ---: |
+| Minimize, live surfaces | 143 / 253 ms | 3 |
+| Minimize, shared GPU raster | 118 / 140 ms | 12 |
+| Restore, live surfaces | 141 / 270 ms | 2 |
+| Restore, shared GPU raster | 193 / 216 ms | 15 |
+| Cube, stock build mode | 70 / 226 ms | 19.5 |
+| Cube, raster lamp enabled | 85 / 232 ms | 18 |
+
+Each lamp result has five gestures and each cube result has six turns.
+In the raster arm, the median time from the guest keyboard marker to
+WinEvent delivery was 13 ms for minimize and 27 ms for restore. From the
+WinEvent to the preceding flush it was 89 and 144 ms respectively. From
+flush to the sampled pixels it was 9 and 10 ms. This locates the major
+remaining interval in the guest before the scanout, but does not split
+it between Wintanyl's scene work, DWM draw and guest Present. The
+elevated ETW launcher failed with `0xC0000005` for this run. The earlier
+ETW trace in this ADR is a separate observation of the stock lamp.
+
+The first cube turn took 226–232 ms to the first change. The ten
+subsequent turns took 58–92 ms. In the raster-enabled run the first cube
+turn spent 35 ms setting up the skybox and 14 ms creating the faces.
+Later turns reported 0 ms for both counters. The cold path also took
+199 ms from the guest `WM_HOTKEY` log to the first rotation log, which
+includes the cube's initial pull phase.
+
+One GPU-raster variant started the restore at the end of the fully
+collapsed interval. The geometry from that point onward and its speed
+were identical. At the default 320 ms duration it removed 32 ms of
+invisible timeline. The five restored windows reached the first sampled
+pixel in 193 ms at the median, matching the run with the interval intact.
+The candidate was removed. The result points to work on the initial
+composition and handoff, rather than a delay in the progress track.
+
+The host records use `input-legacy-direct` and `input-raster-direct` in
+the lab's `physical-wheel` directory. The guest QPC markers are in
+`share/animation-etw` under the matching prefixes. The collapsed-interval
+trial uses `input-raster-no-hold`.
+
+#### Preparing the cube backdrop after startup
+
+Wintanyl `e3ebdab` moves the static skybox upload to a delayed task after
+scene setup. It prepares the same cached surface brush used by the cube,
+without adding a visual to the scene or requesting animation frames.
+The first shortcut still has a lazy fallback if the scheduled task did
+not populate the cache.
+
+In one paired fresh-shell run, the control took 146 ms to prepare the
+backdrop while handling the first shortcut and another 73 ms to prepare
+faces. The delayed task took 48 ms, after `SHELL GOTOWY`. In that shell the
+first shortcut spent 0 ms in the backdrop step and 22 ms on faces. Host
+command to first visible change was 720 ms in the control and 144 ms
+with the cached backdrop. The earlier controls reached their first
+changed pixels in 226–232 ms, so the single paired result does not
+isolate a 576 ms saving from the backdrop change. The next five turns
+on the new build were 67–79 ms. The first-turn result was unchanged
+when the pixel threshold was raised from 150 to 500.
+
+The timing artifacts use `input-cube-cold-control` and
+`input-cube-prewarmed`. After the check, the lab returned to stock F239
+on the same hardware Entangled WDDM adapter.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
