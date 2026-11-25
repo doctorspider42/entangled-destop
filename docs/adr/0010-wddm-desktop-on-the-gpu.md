@@ -2229,6 +2229,24 @@ DriverStore D3D10 image hash matched the DLL from the linker map.
 The longest observed DWM ring wait between the window event and
 this flush was 1.46 ms.
 
+Joining the same ETW trace to all 20 gestures found that five of the six
+restores spent 32–45 ms between DWM draw return and `Present`. The render
+thread ran on a guest vCPU for 31–44 ms in those intervals. Of 164 distinct
+user-mode sampling instants on that thread, 149 had both the
+`d3d10_wddm_fetch` and `zink_image_subdata` upload call sites on the
+stack. Two minimizes also had 36–48 ms of render-thread CPU time with
+that stack in most samples. The cube turns had zero upload-stack hits in
+72 user-mode samples in the matched post-draw intervals. The samples
+identify code paths. Their ratios do not measure exact time in a function.
+
+The [animation analyzer](../../tests/windows/analyze-animation-input.py)
+can repeat that join using the lab's `shell-hostrel-final-etw-stacks.csv`
+with `--dwm-stack-log` and `--dwm-upload-rva 0x5f52 --dwm-upload-rva 0x7fa52`.
+Those RVAs are call return addresses from the linker map for this exact
+guest `entangled_d3d10.dll`. The analyzer resolves the image base from the
+trace and uses the thread of the matched DWM `Present`. The lab exporter
+source is `etw-wait-stacks.cpp` beside the CSV.
+
 The shared-window path is distinct from the desktop scanout path.
 `d3d10_wddm_fetch` reads a changed WDDM allocation into a CPU buffer
 and uploads it into a process-local GPU texture before sampling.

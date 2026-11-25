@@ -76,7 +76,7 @@ def lamp_stages(intervals, key, win_event, pixel):
             milliseconds(commit_begin, commit_end), milliseconds(commit_end, first_frame), milliseconds(commit_end, pixel))
 
 
-def dwm_frames(path, pid, guest_time):
+def dwm_frames(path, pid, guest_time, present_threads=None):
     # Dwm-Core draw (59/60) and Present (15/16) scopes on the same render
     # thread. Consume the draw once so an unrelated later Present cannot use it.
     threads = defaultdict(list)
@@ -85,7 +85,7 @@ def dwm_frames(path, pid, guest_time):
         if row["provider"] == "dwm" and int(row["pid"]) == pid and event in (59, 60, 15, 16):
             threads[int(row["tid"])].append((int(row["qpc"]), event))
     frames = []
-    for events in threads.values():
+    for tid, events in threads.items():
         draw_start = draw = present_start = present_draw = None
         for stamp, event in sorted(events, key=lambda row: row[0]):
             when = guest_time(stamp)
@@ -100,26 +100,61 @@ def dwm_frames(path, pid, guest_time):
                 present_draw = draw
                 draw = None
             elif event == 16 and present_start is not None:
-                frames.append((present_start, when, present_draw))
+                frame = (present_start, when, present_draw)
+                frames.append(frame)
+                if present_threads is not None:
+                    present_threads[frame] = tid
                 present_start = present_draw = None
     return frames
 
 
-def dwm_stages(frames, send, win_event, scanout):
+def dwm_frame_at(frames, scanout):
     if scanout is None:
-        return (None,) * 5
+        return None
     # Prefer containment to a clock-alignment tolerance at adjacent scopes.
     candidates = [frame for frame in frames if frame[0] <= scanout <= frame[1]]
     if not candidates:
         candidates = [frame for frame in frames if frame[0] - 0.004 <= scanout <= frame[1] + 0.004]
-    if len(candidates) != 1:
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def dwm_stages(frame, send, win_event, scanout):
+    if frame is None:
         return (None,) * 5
-    present, _, draw = candidates[0]
+    present, _, draw = frame
     if draw is None:
         return (None, None, None, None, milliseconds(present, scanout))
     start, end = draw
     return (milliseconds(send, start), milliseconds(win_event, start), milliseconds(start, end),
             milliseconds(end, present), milliseconds(present, scanout))
+
+
+def dwm_upload_samples(path, pid, guest_time, upload_rvas):
+    # WPR may emit separate kernel and user stacks at the same timestamp.
+    # Keep one observation for each timestamp on the DWM render thread.
+    image_ranges = set()
+    stacks = defaultdict(set)
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        for row in csv.reader(stream):
+            if row[:2] == ["image", str(pid)] and row[4].lower() == "entangled_d3d10.dll":
+                image_ranges.add((int(row[2], 16), int(row[3], 16)))
+            elif row[:1] == ["stack"] and row[2] == str(pid):
+                addresses = tuple(int(value, 16) for value in row[4:] if value)
+                if addresses and addresses[0] < 1 << 47:
+                    stacks[(int(row[3]), int(row[1]))].add(addresses)
+
+    if len(image_ranges) != 1:
+        raise ValueError("expected one loaded entangled_d3d10.dll image for the DWM process")
+    base, size = image_ranges.pop()
+    if any(rva <= 0 or rva >= size for rva in upload_rvas):
+        raise ValueError("upload stack RVA outside the loaded D3D10 UMD image")
+    frames = {base + rva for rva in upload_rvas}
+    by_thread = defaultdict(list)
+    for (tid, tick), samples in stacks.items():
+        by_thread[tid].append((guest_time(tick), any(frames.issubset(stack) for stack in samples)))
+    for samples in by_thread.values():
+        samples.sort()
+    return by_thread
 
 
 def main():
@@ -133,6 +168,10 @@ def main():
     cli.add_argument("--scene-pid", type=int, help="Wintanyl process ID for the scene trace")
     cli.add_argument("--dwm-log", type=Path, help="optional CSV from etw-display-qpc.exe")
     cli.add_argument("--dwm-pid", type=int, help="guest DWM process ID for the ETW trace")
+    cli.add_argument("--dwm-stack-log", type=Path,
+                     help="WPR CSV with image,pid,base,size,name and stack,qpc,pid,tid,address... records")
+    cli.add_argument("--dwm-upload-rva", action="append", type=lambda value: int(value, 0),
+                     help="required frame RVA in an upload stack, from the exact loaded UMD; may repeat")
     cli.add_argument("--host-input-only", action="store_true", help="use host action timestamps when the guest input probe was absent")
     args = cli.parse_args()
     if args.threshold < 1:
@@ -141,6 +180,10 @@ def main():
         cli.error("--scene-log and --scene-pid are used together")
     if (args.dwm_log is None) != (args.dwm_pid is None):
         cli.error("--dwm-log and --dwm-pid are used together")
+    if args.dwm_stack_log and (not args.dwm_log or not args.dwm_upload_rva):
+        cli.error("--dwm-stack-log requires --dwm-log and --dwm-upload-rva")
+    if args.dwm_upload_rva and not args.dwm_stack_log:
+        cli.error("--dwm-upload-rva requires --dwm-stack-log")
 
     host_prefix = args.host / args.tag
     guest_prefix = args.guest / args.tag
@@ -189,15 +232,25 @@ def main():
     intervals = scene_intervals(args.scene_log, args.scene_pid, guest_time) if args.scene_log else None
     if args.scene_log and not intervals:
         cli.error("no scene timing rows for that PID")
-    composition = dwm_frames(args.dwm_log, args.dwm_pid, guest_time) if args.dwm_log else None
+    present_threads = {} if args.dwm_stack_log else None
+    composition = dwm_frames(args.dwm_log, args.dwm_pid, guest_time, present_threads) if args.dwm_log else None
     if args.dwm_log and not composition:
         cli.error("no paired DWM Present events for that PID")
+    upload_samples = None
+    if args.dwm_stack_log:
+        try:
+            upload_samples = dwm_upload_samples(args.dwm_stack_log, args.dwm_pid, guest_time, args.dwm_upload_rva)
+        except ValueError as error:
+            cli.error(str(error))
+        if not upload_samples:
+            cli.error("no user-mode DWM stacks for that PID")
+    upload_rows = []
     missing = 0
     print(f"Clock bridge minimum round trips {pre[0] * 1e3:.3f}/{post[0] * 1e3:.3f} ms, pixel threshold {args.threshold}")
     if args.host_input_only:
         print("Using host action timestamps for matching")
     print("action host-key key-WinEvent WinEvent-flush key-flush flush-pixels host-pixels changes")
-    for send, action in actions:
+    for ordinal, (send, action) in enumerate(actions, 1):
         key = first_in(events[f"key_{action}"], send - 0.003, send + 0.350)
         if key is None and not args.host_input_only:
             print(action, "missing key")
@@ -223,7 +276,12 @@ def main():
         if intervals and action in ("minimize", "restore"):
             trace[action].append(lamp_stages(intervals, trigger, win_event, pixel))
         if composition:
-            dwm_trace[action].append(dwm_stages(composition, send, win_event, scanout))
+            frame = dwm_frame_at(composition, scanout)
+            dwm_trace[action].append(dwm_stages(frame, send, win_event, scanout))
+            if upload_samples is not None and frame and frame[2]:
+                present, _, (_, draw_end) = frame
+                samples = [hit for time, hit in upload_samples[present_threads[frame]] if draw_end <= time < present]
+                upload_rows.append((ordinal, action, milliseconds(draw_end, present), sum(samples), len(samples)))
             if pixel is not None:
                 # An earlier Present can block even when its frame produces
                 # no changed pixels in the capture region.
@@ -246,6 +304,10 @@ def main():
         for action, group in dwm_longest.items():
             measured = sum(duration is not None for duration in group)
             print(action, f"{measured}/{len(dwm_trace[action])}", summarize(group))
+    if args.dwm_stack_log:
+        print("DWM upload stack samples between draw return and Present: action# gesture ms upload user-total")
+        for upload in upload_rows:
+            print(*upload)
     return 1 if missing else 0
 
 
