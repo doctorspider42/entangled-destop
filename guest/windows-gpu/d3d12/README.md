@@ -627,9 +627,11 @@ Set `ENTANGLED_D3D12_PROBE_WINTANYL=1` when building the disposable
 runtime-probe package. Inside its test guest, launch F239 with
 `ENTANGLED_RUNTIME_TABLES=1`, `ENTANGLED_WINTANYL_D3D12=1` and
 `WT_UI_WARP` unset. The package enables the DDI tables and a
-diagnostic Tier 2 reply for this process. Wgpu-hal 30.0.2 requires the
-Tier 2 reply before opening the adapter, and the UMD implements the
-subset used by this workload. Full Tier 2 conformance remains open.
+diagnostic Tier 2 reply for `wintanyl.exe`, `wintanyl-explorer.exe`, and
+`wintanyl-terminal.exe`. This reproduces the application scope of the
+full-shell lab package. Wgpu-hal 30.0.2 requires the Tier 2 reply before
+opening the adapter, and the UMD implements the subset tested in the
+lab. Full Tier 2 conformance remains open.
 [wgpu-hal 30.0.2 DX12 adapter admission](https://github.com/gfx-rs/wgpu/blob/v30.0.2/wgpu-hal/src/dx12/adapter.rs#L208-L235).
 
 The original Tier 1 trace in `ddi40-runtime-wintanyl-f239/` stopped at

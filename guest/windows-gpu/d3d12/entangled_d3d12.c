@@ -76,7 +76,9 @@ static const WCHAR *runtime_program_name(WCHAR program[MAX_PATH])
 static BOOL wintanyl_probe_enabled(const WCHAR *filename)
 {
 #ifdef ENTANGLED_D3D12_PROBE_WINTANYL
-    return filename && !_wcsicmp(filename, L"wintanyl-explorer.exe") &&
+    return filename && (!_wcsicmp(filename, L"wintanyl-explorer.exe") ||
+                        !_wcsicmp(filename, L"wintanyl.exe") ||
+                        !_wcsicmp(filename, L"wintanyl-terminal.exe")) &&
            enabled_environment_flag("ENTANGLED_WINTANYL_D3D12");
 #else
     (void)filename;
