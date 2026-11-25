@@ -1740,6 +1740,42 @@ Raw measurements use `stock-dwm-fixed`, `stock-dwm-input` and
 `stock-dwm-api` in the lab's `physical-wheel` and `share/animation-etw`
 directories.
 
+#### Scheduler trace of a 378 ms stock restore
+
+A 12-pair keyboard repeat with the published render-only miniport and
+WPR's CPU profile kept the stock restore median at 137 ms and captured
+one 378 ms restore. The QPC clock bridge round trips were below 1 ms, and
+both ETL headers reported zero lost events and buffers. The first
+84.8 ms elapsed before `MINIMIZEEND`, including 26.9 ms from host send
+to the guest key and 57.9 ms from the key to the event. After that event,
+150.5 ms elapsed to the matched draw. The draw took 73.2 ms, Present
+reached the scanout about 51.9 ms after entry, and the host window
+showed changed pixels 17.4 ms after the flush.
+
+The render thread was scheduled to run in the guest for 60.5 ms during
+the draw. It was waiting for 46.8 ms of the following 53.6 ms Present
+scope. The guest scheduler shows thread state on virtual CPUs. In the
+draw, 25 of the resolved samples outside switch and ready timestamps
+contained the D3D10 UMD, including 15 in the vectorized memory-copy loop
+called by `ResourceUpdateSubResourceUP`. The symbol map was matched to
+the installed UMD by SHA-256. This was a CPU texture update on a stock
+window restore, separate from the per-strip cost in the legacy lamp.
+[WPR wait analysis](https://learn.microsoft.com/en-us/troubleshoot/windows-server/support-tools/support-tools-xperf-wpa-wpr)
+
+The closest resolved user stacks before two Present waits of 26.5 and
+20.3 ms were sampled 0.20 and 0.44 ms before the respective switches.
+Both passed through `zink_end_batch` and `util_queue_add_job_locked`.
+The first was under `d3d10_wddm_flush`, the second under
+`d3d10_wddm_flush_frontbuffer`. The exact blocking call and the thread
+that released it were outside those stack samples. The first flush
+also publishes dirty shared surfaces. A trial of combining the render
+and overlay submissions needs to preserve that publication and the
+fallback present path.
+
+The capture prefix is `stock-dwm-sched`. The matching timestamps, module
+identity and scheduler breakdown are in `stock-dwm-sched-breakdown.txt`
+in the lab's `physical-wheel` directory.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
