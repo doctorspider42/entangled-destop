@@ -2420,6 +2420,31 @@ copies. A performance comparison needs the producer to skip its CPU
 readback after the compositor has acknowledged a GPU generation, and
 to retain the CPU handoff for legacy or failed imports.
 
+#### The flip producer skips CPU readback after a successful GPU read
+
+`ENTANGLED_D3D12_GPU_SHARE_ONLY=1` enables the lab flip path. The
+miniport records the first completed GPU read of each allocation. The
+producer keeps the CPU handoff until a reader has acknowledged its image.
+Once acknowledged, an eligible flip copies the rendered image into the
+VRAM publication and retires that submission before returning from
+Present. Blits and failed GPU handoffs can stage CPU pixels on demand.
+When a publication is disabled, a later CPU frame cannot be hidden by
+the consumer's cached GPU generation.
+
+On the signed Windows x64 lab package, a 24-frame, 320 × 240
+DirectComposition flip-discard probe verified alternating desktop colors.
+The debug trace showed 21 GPU-only presents after the three swapchain
+buffers acquired a reader. The original F239 binary also logged a
+GPU-only present and closed normally. A same-package A/B/B/A run without
+a debugger verified 24 colors in every block. After the three warm-up
+frames of each block, the 42 baseline and 42 GPU samples gave median
+draw-to-fence times of 1.083 and 0.803 ms, Present times of 0.481 and
+1.016 ms, and DwmFlush times of 14.610 and 11.884 ms respectively. The
+medians of the per-frame sums were 16.364 and 13.973 ms. The additional
+GPU publication submission remains synchronous. These measurements end
+at guest DwmFlush and do not measure host pixels or animation latency.
+Logs and per-block summaries are in `share/dwm-gpu-only`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

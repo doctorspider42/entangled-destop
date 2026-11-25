@@ -16,6 +16,9 @@ typedef struct DdiPresentSurface {
     D3DKMT_HANDLE allocation;
     VenusTransferBuffer pixels;
     BOOL ready;
+    BOOL cpu_ready;
+    volatile LONG prefer_gpu;
+    BOOL gpu_only_used;
     BOOL mirror_unavailable;
     struct entangled_shared_image mirror;
     PFN_entangled_destroy_shared_image destroy_mirror;

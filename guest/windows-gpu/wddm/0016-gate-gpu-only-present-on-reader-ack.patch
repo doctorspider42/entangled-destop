@@ -1,0 +1,81 @@
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -162,12 +162,14 @@
+ NTSTATUS VioGpuAllocation::AccessGpuShare(ULONG operation, ULONGLONG *generation)
+ {
+     PAGED_CODE();
+-    if (operation < ENTANGLED_WDDM_BEGIN_WRITE || operation > ENTANGLED_WDDM_ABORT_ACCESS)
++    if (operation < ENTANGLED_WDDM_BEGIN_WRITE || operation > ENTANGLED_WDDM_DISABLE_GPU_ACCESS)
+     {
+         return STATUS_INVALID_PARAMETER;
+     }
+-    const bool writing = operation == ENTANGLED_WDDM_BEGIN_WRITE;
+-    if (writing && PsGetCurrentProcess() != m_shareOwner)
++    const bool afterRead = operation == ENTANGLED_WDDM_BEGIN_WRITE_AFTER_READ;
++    const bool writing = operation == ENTANGLED_WDDM_BEGIN_WRITE || afterRead;
++    const bool disable = operation == ENTANGLED_WDDM_DISABLE_GPU_ACCESS;
++    if ((writing || disable) && PsGetCurrentProcess() != m_shareOwner)
+     {
+         return STATUS_ACCESS_DENIED;
+     }
+@@ -188,9 +190,9 @@
+         retired = share->AccessThread;
+         share->AccessThread = NULL;
+     }
+-    if (share->Revoked)
+-    {
+-        status = STATUS_CANCELLED;
++    if (disable)
++    {
++        share->Revoked = true;
+     }
+     else if (operation == ENTANGLED_WDDM_END_ACCESS || operation == ENTANGLED_WDDM_ABORT_ACCESS)
+     {
+@@ -206,9 +208,17 @@
+             {
+                 share->Revoked = true;
+             }
++            else if (share->Revoked)
++            {
++                status = STATUS_CANCELLED;
++            }
+             else
+             {
+-                if (share->Writing && ++share->Generation == 0)
++                if (!share->Writing)
++                {
++                    share->ReaderAcknowledged = true;
++                }
++                else if (++share->Generation == 0)
+                 {
+                     ++share->Generation;
+                 }
+@@ -216,11 +226,15 @@
+             }
+         }
+     }
++    else if (share->Revoked)
++    {
++        status = STATUS_CANCELLED;
++    }
+     else if (share->AccessThread != NULL)
+     {
+         status = STATUS_RETRY;
+     }
+-    else if (!writing && share->Generation == 0)
++    else if ((afterRead && !share->ReaderAcknowledged) || (!writing && share->Generation == 0))
+     {
+         status = STATUS_DEVICE_NOT_READY;
+     }
+diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
+--- a/viogpu/viogpu3d/viogpu_allocation.h
++++ b/viogpu/viogpu3d/viogpu_allocation.h
+@@ -85,6 +85,7 @@
+         PETHREAD AccessThread;
+         ULONGLONG Generation;
+         bool Writing;
++        bool ReaderAcknowledged;
+         bool Revoked;
+     };
+     // The allocation may outlive both the original device and process.

@@ -1055,7 +1055,8 @@ static void color_and_verify(ID3D12Device *device, ColorWork work)
                  width, height, elapsed);
 }
 
-static void draw_and_present(ID3D12Device *device, bool composition_swapchain, bool wgpu_swapchain)
+static void draw_and_present(ID3D12Device *device, bool composition_swapchain, bool wgpu_swapchain,
+                             UINT frames = 1)
 {
     constexpr UINT width = 320, height = 240;
     constexpr wchar_t window_class[] = L"EntangledD3D12Smoke";
@@ -1139,30 +1140,68 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain, b
                  composition_swapchain ? L"flip-sequential composition" : L"flip-discard HWND");
     std::fflush(stdout);
 
-    ComPtr<ID3D12Resource> image;
-    check(swapchain->GetBuffer(swapchain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&image)), "GetBuffer (swap chain)");
     const auto descriptors = create_rtv_heap(device);
     const auto rtv = descriptors->GetCPUDescriptorHandleForHeapStart();
-    device->CreateRenderTargetView(image.Get(), nullptr, rtv);
     const auto draw = create_draw_pipeline(device, description.Format);
-    transition(commands.list.Get(), image.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    record_draw(commands.list.Get(), draw, rtv, width, height);
-    transition(commands.list.Get(), image.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
-    const auto render_us = submit_and_wait(device, commands);
+    for (UINT frame = 0; frame < frames; ++frame) {
+        if (frame) {
+            check(commands.allocator->Reset(), "Reset command allocator");
+            check(commands.list->Reset(commands.allocator.Get(), nullptr), "Reset command list");
+        }
+        ComPtr<ID3D12Resource> image;
+        const UINT buffer_index = swapchain->GetCurrentBackBufferIndex();
+        check(swapchain->GetBuffer(buffer_index, IID_PPV_ARGS(&image)), "GetBuffer (swap chain)");
+        device->CreateRenderTargetView(image.Get(), nullptr, rtv);
+        transition(commands.list.Get(), image.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const bool red = !(frame % 2);
+        if (frames > 1) {
+            const FLOAT color[] = {red ? 1.0f : 0.0f, red ? 0.0f : 1.0f, 0.0f, 1.0f};
+            commands.list->ClearRenderTargetView(rtv, color, 0, nullptr);
+        } else {
+            record_draw(commands.list.Get(), draw, rtv, width, height);
+        }
+        transition(commands.list.Get(), image.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        const auto render_us = submit_and_wait(device, commands);
 
-    const auto present_start = std::chrono::steady_clock::now();
-    const HRESULT presented = swapchain->Present(1, 0);
-    check(presented, "Present (swap chain)");
-    const auto present_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - present_start).count();
-    const auto composition_start = std::chrono::steady_clock::now();
-    const HRESULT composition = DwmFlush();
-    const auto composition_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - composition_start).count();
-    std::wprintf(L"D3D12 PRESENT: draw-to-fence %lld us, Present %lld us, DwmFlush %lld us (0x%08lX)\n",
-                 render_us, static_cast<long long>(present_us), static_cast<long long>(composition_us),
-                 static_cast<unsigned long>(composition));
-    std::fflush(stdout);
+        const auto present_start = std::chrono::steady_clock::now();
+        const HRESULT presented = swapchain->Present(1, 0);
+        check(presented, "Present (swap chain)");
+        if (presented != S_OK)
+            check(DXGI_ERROR_INVALID_CALL, "Present did not submit a frame");
+        const auto present_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - present_start).count();
+        const auto composition_start = std::chrono::steady_clock::now();
+        const HRESULT composition = DwmFlush();
+        const auto composition_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - composition_start).count();
+        check(composition, "DwmFlush");
+        std::wprintf(L"D3D12 PRESENT: draw-to-fence %lld us, Present %lld us, DwmFlush %lld us (0x%08lX)\n",
+                     render_us, static_cast<long long>(present_us), static_cast<long long>(composition_us),
+                     static_cast<unsigned long>(composition));
+        if (frames > 1) {
+            POINT point = {12, 12};
+            if (!ClientToScreen(window, &point))
+                check(HRESULT_FROM_WIN32(GetLastError()), "ClientToScreen");
+            const HDC desktop = GetDC(nullptr);
+            if (!desktop)
+                check(E_FAIL, "GetDC desktop");
+            const COLORREF expected = red ? RGB(255, 0, 0) : RGB(0, 255, 0);
+            COLORREF seen = CLR_INVALID;
+            const auto pixel_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+            do {
+                seen = GetPixel(desktop, point.x, point.y);
+                if (seen == expected)
+                    break;
+                Sleep(1);
+            } while (std::chrono::steady_clock::now() < pixel_deadline);
+            ReleaseDC(nullptr, desktop);
+            std::wprintf(L"D3D12 FRAME %u buffer %u pixel %06lx expected %06lx\n", frame, buffer_index,
+                         static_cast<unsigned long>(seen), static_cast<unsigned long>(expected));
+            if (seen != expected)
+                check(E_FAIL, "composited frame does not match the submitted color");
+        }
+        std::fflush(stdout);
+    }
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -1175,9 +1214,6 @@ static void draw_and_present(ID3D12Device *device, bool composition_swapchain, b
     }
     DestroyWindow(window);
     UnregisterClassW(window_class, instance);
-    if (presented != S_OK)
-        check(DXGI_ERROR_INVALID_CALL, "Present did not submit a frame");
-    check(composition, "DwmFlush");
     std::puts("D3D12 PRESENT: DXGI and DWM calls passed");
 }
 
@@ -1186,7 +1222,7 @@ int wmain(int argc, wchar_t **argv)
     bool hardware_control = false;
     enum class Probe { Copy, DeviceLocal, Placed, Compute, Clear, Draw, TimedDraw, Clock, Blend, Cbv, Upload,
                        Sample, Atlas, PlacedAtlas, Persistence, Instance, Bindings, WgpuInit, Present, Composition,
-                       WgpuComposition, Fence, RenderFence };
+                       WgpuComposition, CompositionSeries, Fence, RenderFence };
     Probe probe = Probe::Copy;
     for (int i = 1; i < argc; ++i) {
         if (!hardware_control && std::wcscmp(argv[i], L"--hardware") == 0)
@@ -1229,6 +1265,8 @@ int wmain(int argc, wchar_t **argv)
             probe = Probe::Present;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--composition") == 0)
             probe = Probe::Composition;
+        else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--composition-series") == 0)
+            probe = Probe::CompositionSeries;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--wgpu-composition") == 0)
             probe = Probe::WgpuComposition;
         else if (probe == Probe::Copy && std::wcscmp(argv[i], L"--fence") == 0)
@@ -1238,7 +1276,7 @@ int wmain(int argc, wchar_t **argv)
         else {
             std::fputs("usage: d3d12-smoke.exe [--hardware] [--gpu-buffer | --placed-buffer | --compute | --clear | --draw | --timestamps | --clock | --blend | --cbv | --upload-texture | "
                        "--sample-texture | --sample-atlas | --placed-texture | --texture-persistence | --instance | --graphics-bindings | --wgpu-init | "
-                       "--present | --composition | --wgpu-composition | --fence | --fence-render-context]\n", stderr);
+                       "--present | --composition | --composition-series | --wgpu-composition | --fence | --fence-render-context]\n", stderr);
             return 2;
         }
     }
@@ -1281,6 +1319,8 @@ int wmain(int argc, wchar_t **argv)
             verify_compute_dispatch(device.Get());
         else if (probe == Probe::Present || probe == Probe::Composition || probe == Probe::WgpuComposition)
             draw_and_present(device.Get(), probe != Probe::Present, probe == Probe::WgpuComposition);
+        else if (probe == Probe::CompositionSeries)
+            draw_and_present(device.Get(), true, true, 24);
         else
             copy_and_verify(device.Get(), probe == Probe::DeviceLocal);
     }

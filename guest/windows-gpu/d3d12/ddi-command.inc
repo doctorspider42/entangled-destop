@@ -147,6 +147,7 @@ typedef struct DdiTransferList {
     BOOL closed;
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
     DdiPresentSurface *present;
+    BOOL present_cpu_copy;
 #endif
     DdiDrawState draw;
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
@@ -689,6 +690,7 @@ static void APIENTRY reset_command_list(D3D12DDI_HCOMMANDLIST driver_list, const
     list->venus = (VenusTransferList){0};
 #ifdef ENTANGLED_D3D12_PROBE_PRESENT
     list->present = NULL;
+    list->present_cpu_copy = FALSE;
 #endif
     list->draw = (DdiDrawState){0};
 #ifdef ENTANGLED_D3D12_PROBE_SHADER
@@ -825,8 +827,10 @@ static void APIENTRY execute_transfer_lists(D3D12DDI_HCOMMANDQUEUE driver_queue,
         if (SUCCEEDED(status)) {
             for (UINT i = 0; i < count; ++i) {
                 const DdiTransferList *list = lists[i].pDrvPrivate;
-                if (list->present)
+                if (list->present) {
                     list->present->ready = TRUE;
+                    list->present->cpu_ready = list->present_cpu_copy;
+                }
             }
         }
 #endif

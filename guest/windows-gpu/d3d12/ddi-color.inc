@@ -292,10 +292,14 @@ static HRESULT transition_resource(DdiTransferList *list, const D3D12DDIARG_RESO
     if (heap->present.allocation && after == D3D12DDI_RESOURCE_STATE_COMMON) {
         if (list->present && list->present != &heap->present)
             return DXGI_ERROR_UNSUPPORTED;
-        const HRESULT copied = copy_venus_color_to_buffer(list->venus.command, image, &heap->present.pixels,
-                                                         0, image->extent.width * 4);
-        if (SUCCEEDED(copied))
+        const BOOL cpu_copy = InterlockedCompareExchange(&heap->present.prefer_gpu, 0, 0) == 0;
+        const HRESULT copied = cpu_copy
+            ? copy_venus_color_to_buffer(list->venus.command, image, &heap->present.pixels, 0, image->extent.width * 4)
+            : record_venus_color_barrier(list->venus.command, image, color_access(before), 0);
+        if (SUCCEEDED(copied)) {
             list->present = &heap->present;
+            list->present_cpu_copy = cpu_copy;
+        }
         return copied;
     }
 #endif

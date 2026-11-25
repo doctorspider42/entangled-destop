@@ -45,6 +45,7 @@ static HRESULT allocate_present_surface(const DdiDevice *device, D3D12DDI_HRTRES
     if (SUCCEEDED(status)) {
         surface->runtime_resource = resource.handle;
         surface->allocation = info.hAllocation;
+        surface->prefer_gpu = enabled_environment_flag("ENTANGLED_D3D12_GPU_SHARE_ONLY");
     } else
         destroy_venus_transfer_buffer(&surface->pixels);
     trace_ddi("AllocatePresentSurface", (UINT)status, info.hAllocation);
@@ -95,10 +96,27 @@ static HRESULT present_escape(const DdiDevice *device, void *data, UINT size)
     return device->kernel->pfnEscapeCb(device->adapter->runtime.handle, &escape);
 }
 
-static HRESULT write_present_allocation(const DdiDevice *device, const DdiPresentSurface *surface)
+static HRESULT write_present_allocation(const DdiDevice *device, DdiHeap *source)
 {
+    DdiPresentSurface *surface = &source->present;
     if (!surface->ready)
         return DXGI_ERROR_INVALID_CALL;
+    if (!surface->cpu_ready) {
+        VenusTransferList list;
+        HRESULT status = begin_venus_transfer_list(&device->venus, &list);
+        if (FAILED(status))
+            return status;
+        status = copy_venus_color_to_buffer(list.command, &source->image, &surface->pixels, 0,
+                                           source->image.extent.width * 4);
+        if (SUCCEEDED(status))
+            status = close_venus_transfer_list(&list);
+        if (SUCCEEDED(status))
+            status = submit_venus_transfer_commands(&device->venus, 1, &list.command);
+        destroy_venus_transfer_list(&list);
+        if (FAILED(status))
+            return status;
+        surface->cpu_ready = TRUE;
+    }
 
     /* Same WDDM pixel handoff as the Mesa UMD. An opened allocation's
        compositor can read these pixels even when VidMm never maps its pages. */
@@ -197,39 +215,58 @@ static HRESULT copy_present_mirror(const VenusColorImage *source, VkImage mirror
     return status;
 }
 
-/* Diagnostic: publish the present source while keeping the regular pixel
- * handoff. The destination of a WDDM blit may be a different allocation. */
-static void mirror_present_allocation(const DdiDevice *device, DdiHeap *source, D3DKMT_HANDLE destination)
+static HRESULT mirror_present_allocation(const DdiDevice *device, DdiHeap *source,
+                                        D3DKMT_HANDLE destination, BOOL require_reader)
 {
     DdiPresentSurface *surface = &source->present;
-    if (surface->mirror_unavailable || !enabled_environment_flag("ENTANGLED_D3D12_GPU_SHARE"))
-        return;
+    if (surface->mirror_unavailable || (!InterlockedCompareExchange(&surface->prefer_gpu, 0, 0) &&
+        !enabled_environment_flag("ENTANGLED_D3D12_GPU_SHARE")))
+        return DXGI_ERROR_UNSUPPORTED;
     if (!surface->mirror.image) {
         const HRESULT opened = create_present_mirror(device, &source->image, surface);
         trace_ddi("Bind present GPU image", (UINT)opened, surface->allocation);
         if (opened != S_OK) {
             surface->mirror_unavailable = TRUE;
-            return;
+            InterlockedExchange(&surface->prefer_gpu, 0);
+            return opened;
         }
     }
     ENTANGLED_WDDM_BLOB_ACCESS_ESCAPE access = {
         .Type = ENTANGLED_WDDM_ACCESS_BLOB,
         .Version = ENTANGLED_WDDM_SHARE_VERSION,
         .Allocation = surface->allocation,
-        .Operation = ENTANGLED_WDDM_BEGIN_WRITE,
+        .Operation = require_reader ? ENTANGLED_WDDM_BEGIN_WRITE_AFTER_READ : ENTANGLED_WDDM_BEGIN_WRITE,
     };
     const HRESULT begun = present_escape(device, &access, sizeof(access));
     if (begun != S_OK) {
         trace_ddi("Begin present GPU image", (UINT)begun, surface->allocation);
-        return;
+        return begun;
     }
     const HRESULT copied = copy_present_mirror(&source->image, surface->mirror.image, access.Generation == 0);
     access.Operation = SUCCEEDED(copied) ? ENTANGLED_WDDM_END_ACCESS : ENTANGLED_WDDM_ABORT_ACCESS;
     const HRESULT finished = present_escape(device, &access, sizeof(access));
     trace_ddi("Publish GPU present source", (UINT)copied, surface->allocation);
     trace_ddi("Publish GPU present destination", (UINT)finished, destination);
-    if (FAILED(copied) || finished != S_OK)
+    if (FAILED(copied) || finished != S_OK) {
         surface->mirror_unavailable = TRUE;
+        if (!surface->gpu_only_used)
+            InterlockedExchange(&surface->prefer_gpu, 0);
+    }
+    return FAILED(copied) ? copied : finished;
+}
+
+static void disable_gpu_present(const DdiDevice *device, DdiPresentSurface *surface)
+{
+    ENTANGLED_WDDM_BLOB_ACCESS_ESCAPE access = {
+        .Type = ENTANGLED_WDDM_ACCESS_BLOB,
+        .Version = ENTANGLED_WDDM_SHARE_VERSION,
+        .Allocation = surface->allocation,
+        .Operation = ENTANGLED_WDDM_DISABLE_GPU_ACCESS,
+    };
+    const HRESULT status = present_escape(device, &access, sizeof(access));
+    trace_ddi("Fall back to CPU present", (UINT)status, surface->allocation);
+    surface->mirror_unavailable = TRUE;
+    InterlockedExchange(&surface->prefer_gpu, 0);
 }
 
 static UINT APIENTRY present_private_data_size(D3D12DDI_HDEVICE device, const D3D12DDIARG_PRESENT_0001 *args)
@@ -261,10 +298,28 @@ static void APIENTRY present_surface(D3D12DDI_HCOMMANDLIST commands, D3D12DDI_HC
 
     AcquireSRWLockExclusive(&device->queue_lock);
     const LONGLONG start = queue_timing_start();
-    const HRESULT status = write_present_allocation(device, &src->present);
-    if (SUCCEEDED(status)) {
-        trace_queue_duration("present-copy-to-wddm", start, 1);
-        mirror_present_allocation(device, src, dst ? dst->present.allocation : 0);
+    DdiPresentSurface *surface = &src->present;
+    HRESULT status = DXGI_ERROR_UNSUPPORTED;
+    if (surface->ready && !dst && surface->mirror.image &&
+        InterlockedCompareExchange(&surface->prefer_gpu, 0, 0))
+        status = mirror_present_allocation(device, src, 0, TRUE);
+    if (status == S_OK) {
+        surface->gpu_only_used = TRUE;
+        trace_queue_duration("present-gpu-handoff", start, 1);
+        trace_ddi("GPU-only Present", 0, surface->allocation);
+    } else {
+        /* Keep the CPU path for blits and for allocations whose GPU read
+         * has yet to be acknowledged. A failed GPU-only surface switches
+         * back permanently so the opener can see new CPU writes. */
+        if (surface->gpu_only_used && InterlockedCompareExchange(&surface->prefer_gpu, 0, 0))
+            disable_gpu_present(device, surface);
+        status = write_present_allocation(device, src);
+        if (SUCCEEDED(status)) {
+            trace_queue_duration("present-copy-to-wddm", start, 1);
+            const HRESULT mirrored = mirror_present_allocation(device, src, dst ? dst->present.allocation : 0, FALSE);
+            if (mirrored != S_OK && surface->mirror.image && !surface->gpu_only_used)
+                disable_gpu_present(device, surface);
+        }
     }
     ReleaseSRWLockExclusive(&device->queue_lock);
     trace_ddi("Present Windows allocation", (UINT)status, src->present.allocation);

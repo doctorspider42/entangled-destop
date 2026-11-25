@@ -24,6 +24,8 @@ typedef struct _ENTANGLED_WDDM_BLOB_ESCAPE {
 #define ENTANGLED_WDDM_BEGIN_READ 2
 #define ENTANGLED_WDDM_END_ACCESS 3
 #define ENTANGLED_WDDM_ABORT_ACCESS 4
+#define ENTANGLED_WDDM_BEGIN_WRITE_AFTER_READ 5
+#define ENTANGLED_WDDM_DISABLE_GPU_ACCESS 6
 
 /* Access is nonblocking. The calling thread owns the lease on successful
  * BEGIN and finishes it only after its GPU fence and external ownership
@@ -31,7 +33,9 @@ typedef struct _ENTANGLED_WDDM_BLOB_ESCAPE {
  * BEGIN_READ passes the last copied generation and returns the latest one
  * on success. STATUS_NO_MORE_ENTRIES means the image is already current;
  * STATUS_RETRY means that another thread owns the lease. An abandoned or
- * aborted lease disables GPU access to the publication for its lifetime. */
+ * aborted lease disables GPU access to the publication for its lifetime.
+ * BEGIN_WRITE_AFTER_READ requires one previously completed GPU read.
+ * A producer can disable further GPU access when reverting to CPU pixels. */
 typedef struct _ENTANGLED_WDDM_BLOB_ACCESS_ESCAPE {
     unsigned short Type;
     unsigned short Version;
