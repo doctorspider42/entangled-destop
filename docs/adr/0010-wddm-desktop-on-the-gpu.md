@@ -2123,6 +2123,44 @@ other request returned its expected five-second timeout. The trace is
 `physical-wheel/run-venus-parallel-msix.log`. The guest counters and
 held-client logs are in `share/parallel-msix/`.
 
+#### Full Wintanyl with MSI-X and a 430 ms first cube transition
+
+The opt-in D3D12 UMD from `d7e31cf` rebuilds the full-shell lab UMD
+from the repository. The rebuilt DLL differed from the installed
+21.22.46.312 package DLL only in the PE COFF and debug-directory
+timestamps. The current Wintanyl shell, built from `04fe598`, loaded the
+installed DLL. Its UI and scene devices reported Entangled DX12. Shell
+PID 3664 owned Venus contexts 937985 and 937986 on the physical RTX
+2070. The render miniport was in MSI-X mode. Windows Defender real-time
+protection remained enabled.
+
+The fixture used two Notepad windows and the default Wintanyl effects.
+The host script sent the Windows and cube shortcuts through virtio-input.
+A guest keyboard hook, the shell's scene QPC markers, full-size 3D
+scanout flushes and host-window WGC placed the stages on one timeline.
+The minimum clock-bridge round trips were 0.60 and 0.66 ms.
+
+| Action | Samples | Host command to changed pixels, median / maximum | Last flush to pixels, median | Effect ticks in 1.35 s, median |
+| --- | ---: | ---: | ---: | ---: |
+| Minimize | 6 | 248.8 / 353.6 ms | 12.6 ms | 3 |
+| Restore | 6 | 153.6 / 221.0 ms | 12.8 ms | 3.5 |
+| Cube | 8 | 78.3 / 430.1 ms | 10.7 ms | 13 |
+
+The first cube shortcut reached the guest keyboard at 8.5 ms. Setup
+ended at 18.8 ms, and its first DirectComposition `Commit` returned at
+53.4 ms. The first full-size scanout flush after that commit was at
+423.1 ms, and WGC recorded changed pixels at 430.1 ms. The shell's first
+rotation tick began at 491.4 ms. The first visible change therefore
+preceded the first rotation tick. The three observed shell-owned Venus
+waits before 430.1 ms completed by 41.4 ms, with a maximum duration of
+3.6 ms. These waits cover the shell's contexts. The trace still needs
+the guest compositor's work and wait states to attribute the interval
+after the first commit. The host flush is a timing match to WGC, with
+no shared frame identifier. Thresholds of 150 and 500 changed pixels
+gave the same onset timings. Raw probes and state are in
+`F:/VMs/Entangled/d3d12-lab/share/repro-shell/` and
+`F:/VMs/Entangled/d3d12-lab/physical-wheel/` (prefix `shell-msix-current`).
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
