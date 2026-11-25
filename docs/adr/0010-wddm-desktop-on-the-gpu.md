@@ -2161,6 +2161,46 @@ gave the same onset timings. Raw probes and state are in
 `F:/VMs/Entangled/d3d12-lab/share/repro-shell/` and
 `F:/VMs/Entangled/d3d12-lab/physical-wheel/` (prefix `shell-msix-current`).
 
+#### Repeating the animation trace with the release host engine
+
+The 430 ms cube trace used a debug host engine built from `6fbf7e6`.
+The published Windows engine in v0.2.176 comes from `1352c24`, which
+has identical host code under `apps/` and `crates/`. Only the
+standalone engine executable was extracted from the installer. The
+lab used the same VM disk, 1920 × 1080 guest mode, display UMD,
+MSI-X render miniport, Wintanyl build, two Notepad fixtures and trace
+settings. Each series contained six minimize and restore pairs and
+eight cube shortcuts through virtio-input. The onset threshold was
+500 changed pixels in the Entangled window.
+
+| Host engine | Minimize median / max | Restore median / max | Cube median / max |
+| --- | ---: | ---: | ---: |
+| Debug, warmed guest | 205.8 / 241.0 ms | 179.8 / 210.8 ms | 75.6 / 103.6 ms |
+| Release v0.2.176, fresh guest boot | 122.3 / 197.3 ms | 160.0 / 172.6 ms | 55.1 / 144.0 ms |
+| Debug, fresh guest boot | 185.5 / 430.2 ms | 219.7 / 265.2 ms | 116.2 / 315.2 ms |
+
+The median summed DWM ring overlap from input to changed pixels during
+minimize was 95.5 ms and 103.9 ms in debug, and 13.2 ms in release.
+The longest individual wait overlapping any of the 20 actions was
+115.7 ms in the warmed debug series, 205.7 ms after the fresh debug
+boot, and 9.95 ms in release. The median shell-context ring reply over
+the full series was 1.01 and 1.15 ms in debug, and 0.19 ms in release.
+The waits are timeline overlaps and the trace carries no frame ID that
+links each of them to WGC.
+
+The DWM command profile averaged 40.8 µs of elapsed time per command in
+the sampled two-second windows of the warmed debug run and 11.2 µs in
+release. The corresponding averages for `CmdPipelineBarrier2` were
+61.1 and 6.5 µs. The number of commands and frames differs between
+runs. The comparison covers the full build profiles including debug
+assertions and optimization. The reversion to debug reproduced the
+long ring delays after another boot. Use a release host engine for
+latency baselines, with debug runs for instrumentation and diagnosis.
+The remaining release restore delay warrants its own host/guest trace.
+Raw times are in the same lab directories with prefixes
+`shell-hostdbg-ab1`, `shell-hostrel-ab1` and
+`shell-hostdbg-cold-ab3`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
