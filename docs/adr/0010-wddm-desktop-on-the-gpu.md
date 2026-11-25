@@ -2452,7 +2452,8 @@ package `19.59.12.937` (`oem29.inf`), and Wintanyl shell source
 `04fe598434874268f654cba7f75b26edd18c9991`. Six minimize/restore pairs and
 eight cube turns went through virtio-input with two Notepad windows on the
 1920 × 1080 guest desktop. The D3D12 flip producer used its regular CPU
-handoff in this control. The onset was the first host Windows Graphics
+handoff in this control. The host had Venus ring-wait deferral enabled.
+The onset was the first host Windows Graphics
 Capture frame with at least 500 pixels crossing the brightness threshold.
 The guest-to-host clock bridge had a minimum round trip below 1 ms.
 
@@ -2471,6 +2472,11 @@ timestamp. The host trace and Windows Graphics Capture have no shared
 frame identifier. At thresholds of 150 and 1,500 pixels, the same restore
 crossed the threshold at 166.0 and 432.9 ms respectively. The time to a
 larger visible change varies even after the first detectable change.
+The deferred Venus ring waits recorded for the DWM process covered
+7.6 ms of the 226.9 ms post-commit interval. The longest recorded wait
+overlapped 1.4 ms of it. The shell's waits covered 1.8 ms. These are
+overlaps of the recorded host waits, and leave guest scheduling, DWM
+render scopes, and waits outside the deferred ring path unmeasured.
 
 Guest Microsoft Defender blocked the hash check of `wintanyl.exe` before
 the GPU-only repeat could start. Only the control block ran. The earlier
