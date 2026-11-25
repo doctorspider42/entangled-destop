@@ -2178,13 +2178,15 @@ eight cube shortcuts through virtio-input. The onset threshold was
 | Debug, warmed guest | 205.8 / 241.0 ms | 179.8 / 210.8 ms | 75.6 / 103.6 ms |
 | Release v0.2.176, fresh guest boot | 122.3 / 197.3 ms | 160.0 / 172.6 ms | 55.1 / 144.0 ms |
 | Debug, fresh guest boot | 185.5 / 430.2 ms | 219.7 / 265.2 ms | 116.2 / 315.2 ms |
+| Release v0.2.176, another fresh guest boot | 125.4 / 160.2 ms | 159.4 / 181.3 ms | 48.9 / 194.4 ms |
 
 The median summed DWM ring overlap from input to changed pixels during
 minimize was 95.5 ms and 103.9 ms in debug, and 13.2 ms in release.
 The longest individual wait overlapping any of the 20 actions was
 115.7 ms in the warmed debug series, 205.7 ms after the fresh debug
-boot, and 9.95 ms in release. The median shell-context ring reply over
-the full series was 1.01 and 1.15 ms in debug, and 0.19 ms in release.
+boot, and 9.95 and 12.52 ms in the two release series. The median
+shell-context ring reply over the full series was 1.01 and 1.15 ms in
+debug, and 0.19 and 0.14 ms in release.
 The waits are timeline overlaps and the trace carries no frame ID that
 links each of them to WGC.
 
@@ -2196,10 +2198,44 @@ runs. The comparison covers the full build profiles including debug
 assertions and optimization. The reversion to debug reproduced the
 long ring delays after another boot. Use a release host engine for
 latency baselines, with debug runs for instrumentation and diagnosis.
-The remaining release restore delay warrants its own host/guest trace.
 Raw times are in the same lab directories with prefixes
-`shell-hostdbg-ab1`, `shell-hostrel-ab1` and
-`shell-hostdbg-cold-ab3`.
+`shell-hostdbg-ab1`, `shell-hostrel-ab1`, `shell-hostdbg-cold-ab3` and
+`shell-hostrel-final-ab4`. A warm release repeat was excluded when the
+host capture stopped on a window resize.
+
+#### Restoring a window still uploads its shared texture on the CPU
+
+The release engine also completed a separate run with Dwm-Core, DxgKrnl
+and WPR CPU traces. The ETL headers reported no lost events or buffers.
+The clock bridge round trips were 0.685 and 0.749 ms. Restore in this
+instrumented series had a median of 223.6 ms and a maximum of 269.7 ms.
+The two release baseline series above omit WPR and guest ETW recording.
+
+In the 269.7 ms sample, the guest keyboard hook was at 21.3 ms and
+`MINIMIZEEND` at 95.1 ms. The Wintanyl lamp started entering at 141.0 ms
+and its next DirectComposition commit returned at 146.6 ms. The DWM
+draw scope matched to the first changed pixels ran from 206.7 to
+212.0 ms, Present began at 256.7 ms, the host flush was at 262.7 ms and
+WGC saw the change at 269.7 ms. Earlier flushes within the interval
+left the observed region unchanged. The association uses timestamps.
+
+Between draw return and Present entry, the guest scheduler showed the
+DWM render thread running for 44.1 of 44.7 ms. In 26 of 33 distinct
+user-space sampling timestamps, the instruction pointer was at the same
+`YmmLoopNT` offset. The stack led through `util_copy_box`,
+`u_default_texture_subdata`, `zink_image_subdata` and
+`d3d10_wddm_fetch` from `d3d10_wddm_set_sampler_views`. The
+DriverStore D3D10 image hash matched the DLL from the linker map.
+The longest observed DWM ring wait between the window event and
+this flush was 1.46 ms.
+
+The shared-window path is distinct from the desktop scanout path.
+`d3d10_wddm_fetch` reads a changed WDDM allocation into a CPU buffer
+and uploads it into a process-local GPU texture before sampling.
+The generation check already skips unchanged allocations. Preserving
+the producer and consumer's ordering while sharing the GPU backing is
+the next surface-sharing milestone. The scratch evidence uses the
+prefix `shell-hostrel-final-etw` in the same lab directories.
 
 ## Risks, in the order they are likely to bite
 
