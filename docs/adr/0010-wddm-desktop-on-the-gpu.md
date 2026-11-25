@@ -2514,6 +2514,52 @@ post-commit interval to be assigned to rendering, waits and production of
 the scanout. Raw records use `gpu-flips-cpu-c` in the lab's
 `physical-wheel` directory and `cpu-c` in `share/dwm-animation-ab`.
 
+#### Dual publication for D3D10/11 shared textures
+
+Lab builds can publish a GPU image from the D3D10/11 UMD's own nonprimary
+shared allocations. Set `ENTANGLED_D3D11_GPU_SHARE=1` for a producer while
+the existing protected `EntangledGpuShareLab\enable` marker is present. A
+protected `publish-d3d11` marker beside `enable` opts all lab producers in.
+Without producer opt-in, the driver uses the existing CPU handoff.
+
+The producer writes the CPU snapshot for compatibility and uses Zink to
+copy the same frame into the shareable Venus image. The display miniport
+requires the full CPU snapshot on the same thread and write lease before
+publishing a GPU generation. A store outside the paired lease, including
+a kernel `CopyFrom` into the destination, revokes GPU access so a reader
+can fall back to the CPU copy. The earlier D3D12 publication protocol is
+unchanged. The producer still pays for CPU readback and a GPU copy. The
+experiment targets the consumer's upload and does not accelerate a
+surface populated exclusively by a kernel blit.
+
+The D3D10/11 UMD and both display miniport variants built on x64. A local
+state test of the miniport code covered the existing publication, a
+successful paired write/read, and revocation on a missing snapshot or a
+CPU write outside the lease. The signed lab package `20.43.25.803` booted
+on the RTX 2070 after restarting the VM from Entangled when Windows stayed
+on its restart screen. In the guest, two D3D11 processes verified all 65,536
+BGRA pixels with ordinary DXGI and keyed NT handles in the CPU controls.
+With GPU publication enabled, the ordinary handle and six keyed NT runs
+verified all pixels and logged a matching first GPU generation on the
+producer and consumer. An earlier keyed NT recipient hit `0xc0000005` in
+`ntdll.dll` after logging the import. Five repeats of the original fixture
+and one instrumented repeat completed successfully. The cause is open.
+The proof is in the lab's `share/d3d11-gpu-share/paired-pixels.txt`.
+
+The DirectComposition cadence fixture published a 3,670,016-byte Venus
+blob from process 2448. The host trace shows `dwm.exe` (PID 1028)
+attaching the same resource, 66081, and the compositor UMD logged its
+import at generation 2. The GPU run completed all three phases and exited
+normally. The first CPU control completed all phases and then crashed
+during device teardown in Zink's `bind_gfx_stage`, while accessing the
+previous graphics program. The CPU control repeat exited normally.
+Across the three phases of these clean runs, median `DwmFlush` was
+15.25–15.59 ms with CPU publication and 15.47–15.58 ms with GPU
+publication. The fixture animates a mostly static source image, so this
+establishes DWM import and cadence, with no measured animation latency
+gain for the Wintanyl shell. The proof and timings are in
+`dcomp-host-proof.txt` and `dcomp-cadence-summary.txt`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

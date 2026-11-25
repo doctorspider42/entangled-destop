@@ -1,0 +1,118 @@
+diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
+--- a/viogpu/viogpu3d/viogpu_allocation.h
++++ b/viogpu/viogpu3d/viogpu_allocation.h
+@@ -86,8 +86,11 @@
+         ULONGLONG Generation;
+         bool Writing;
+         bool ReaderAcknowledged;
++        bool PairedWithCpu;
++        bool CpuSnapshotWritten;
+         bool Revoked;
+     };
++    void NoteGpuShareCpuWrite(bool producerSnapshot);
+     // The allocation may outlive both the original device and process.
+     PEPROCESS m_shareOwner = NULL;
+     PVOID volatile m_gpuShare = NULL;
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -162,12 +162,36 @@
++// Map locks may be held here; AccessGpuShare never takes a map lock.
++void VioGpuAllocation::NoteGpuShareCpuWrite(bool producerSnapshot)
++{
++    auto *share = static_cast<GpuShare *>(InterlockedCompareExchangePointer(&m_gpuShare, NULL, NULL));
++    if (share == NULL)
++    {
++        return;
++    }
++    ExAcquireFastMutex(&share->AccessLock);
++    if (share->PairedWithCpu)
++    {
++        if (producerSnapshot && share->Writing && share->AccessThread == PsGetCurrentThread())
++        {
++            share->CpuSnapshotWritten = true;
++        }
++        else
++        {
++            share->Revoked = true;
++        }
++    }
++    ExReleaseFastMutex(&share->AccessLock);
++}
++
+ NTSTATUS VioGpuAllocation::AccessGpuShare(ULONG operation, ULONGLONG *generation)
+ {
+     PAGED_CODE();
+-    if (operation < ENTANGLED_WDDM_BEGIN_WRITE || operation > ENTANGLED_WDDM_DISABLE_GPU_ACCESS)
++    if (operation < ENTANGLED_WDDM_BEGIN_WRITE || operation > ENTANGLED_WDDM_BEGIN_WRITE_WITH_CPU_SNAPSHOT)
+     {
+         return STATUS_INVALID_PARAMETER;
+     }
+     const bool afterRead = operation == ENTANGLED_WDDM_BEGIN_WRITE_AFTER_READ;
+-    const bool writing = operation == ENTANGLED_WDDM_BEGIN_WRITE || afterRead;
++    const bool paired = operation == ENTANGLED_WDDM_BEGIN_WRITE_WITH_CPU_SNAPSHOT;
++    const bool writing = operation == ENTANGLED_WDDM_BEGIN_WRITE || afterRead || paired;
+     const bool disable = operation == ENTANGLED_WDDM_DISABLE_GPU_ACCESS;
+     if ((writing || disable) && PsGetCurrentProcess() != m_shareOwner)
+     {
+@@ -208,8 +232,9 @@
+             {
+                 share->Revoked = true;
+             }
+-            else if (share->Revoked)
+-            {
++            else if (share->Revoked || (share->Writing && share->PairedWithCpu && !share->CpuSnapshotWritten))
++            {
++                share->Revoked = true;
+                 status = STATUS_CANCELLED;
+             }
+             else
+@@ -230,6 +255,10 @@
+     {
+         status = STATUS_CANCELLED;
+     }
++    else if (writing && share->PairedWithCpu && !paired)
++    {
++        status = STATUS_INVALID_PARAMETER;
++    }
+     else if (share->AccessThread != NULL)
+     {
+         status = STATUS_RETRY;
+@@ -247,6 +276,11 @@
+         ObReferenceObject(current);
+         share->AccessThread = current;
+         share->Writing = writing;
++        if (paired)
++        {
++            share->PairedWithCpu = true;
++            share->CpuSnapshotWritten = false;
++        }
+         *generation = share->Generation;
+     }
+     ExReleaseFastMutex(&share->AccessLock);
+@@ -464,9 +498,15 @@
+             ProbeForRead(user, size, 1);
+             RtlCopyMemory(m_pShared, user, size);
+             m_sharedWrites++;
++#ifdef ENTANGLED_WDDM2_LAB
++            NoteGpuShareCpuWrite(size == m_sharedSize);
++#endif
+         }
+         __except (EXCEPTION_EXECUTE_HANDLER)
+         {
++#ifdef ENTANGLED_WDDM2_LAB
++            NoteGpuShareCpuWrite(false);
++#endif
+             status = STATUS_ACCESS_VIOLATION;
+         }
+     }
+@@ -618,6 +658,9 @@
+             (SIZE_T)(dstY + height - 1) * dstPitch + (SIZE_T)(dstX + width) * 4 <= dstLimit &&
+             (SIZE_T)(srcY + height - 1) * srcPitch + (SIZE_T)(srcX + width) * 4 <= srcLimit)
+         {
++#ifdef ENTANGLED_WDDM2_LAB
++            NoteGpuShareCpuWrite(false);
++#endif
+             PBYTE to = dstBase + (SIZE_T)dstY * dstPitch + (SIZE_T)dstX * 4;
+             PBYTE from = srcBase + (SIZE_T)srcY * srcPitch + (SIZE_T)srcX * 4;
+             for (LONG row = 0; row < height; row++)
