@@ -1635,6 +1635,32 @@ trial, `input-raster-dwmapi`, returned success in 4,739 samples with
 zero `qpcFrameDisplayed` and `qpcFrameComplete` values, so it could not
 split composition and presentation.
 
+The second dirty scene commit came about 41 ms after the first in the
+verified asynchronous run. From the second commit return to the last
+full-screen flush before the first visible change, the median was 73 ms
+versus 52 ms with synchronous placement. The five asynchronous intervals
+contained 7–13 deferred fence responses each, with a maximum recorded
+host-side response of 2.30 ms. The matching flush is a timing proxy and
+shares no frame identifier with the window capture. These fence timings
+leave repeated guest waits and time before submission unmeasured.
+
+The diagnostic shell exited with `0xC0000005` in `ntdll.dll` while
+processing `quit` after all five measured restores and the native order
+check. The original F239 shell started afterwards on the hardware adapter.
+During a later cold jelly drag it logged `DXGI_ERROR_DEVICE_REMOVED`, then
+the guard returned to Explorer after three shell failures. In two restart
+attempts the host reported `vkAllocateDescriptorSets` on missing pools
+and marked the two Venus contexts fatal, as in the earlier recovery
+failure above. Those warnings followed the first jelly failure. The
+renderer process exited with `0xC0000005` during the subsequent guest
+shutdown. A fresh engine and guest boot brought the stock F239 shell back
+on Entangled WDDM/D3D12. The first jelly failure and the later missing
+descriptor pools still lack a common causal trace.
+
+The archived host log is `run-before-jelly-recovery-20261125-1217.log`.
+The adjacent `jelly-device-removed-*.log` extracts and
+`input-zorder-final-follow-up.txt` preserve the relevant observations.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
