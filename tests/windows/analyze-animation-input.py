@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Join the animation lab's host actions, WinEvents, scanouts and window pixels."""
+"""Join animation input, guest composition, scanouts and host window pixels."""
 
 import argparse
 from bisect import bisect_left, bisect_right
@@ -76,6 +76,52 @@ def lamp_stages(intervals, key, win_event, pixel):
             milliseconds(commit_begin, commit_end), milliseconds(commit_end, first_frame), milliseconds(commit_end, pixel))
 
 
+def dwm_frames(path, pid, guest_time):
+    # Dwm-Core draw (59/60) and Present (15/16) scopes on the same render
+    # thread. Consume the draw once so an unrelated later Present cannot use it.
+    threads = defaultdict(list)
+    for row in rows(path):
+        event = int(row["event"])
+        if row["provider"] == "dwm" and int(row["pid"]) == pid and event in (59, 60, 15, 16):
+            threads[int(row["tid"])].append((int(row["qpc"]), event))
+    frames = []
+    for events in threads.values():
+        draw_start = draw = present_start = present_draw = None
+        for stamp, event in sorted(events, key=lambda row: row[0]):
+            when = guest_time(stamp)
+            if event == 59:
+                draw_start = when
+                draw = None
+            elif event == 60 and draw_start is not None:
+                draw = (draw_start, when)
+                draw_start = None
+            elif event == 15:
+                present_start = when
+                present_draw = draw
+                draw = None
+            elif event == 16 and present_start is not None:
+                frames.append((present_start, when, present_draw))
+                present_start = present_draw = None
+    return frames
+
+
+def dwm_stages(frames, send, win_event, scanout):
+    if scanout is None:
+        return (None,) * 5
+    # Prefer containment to a clock-alignment tolerance at adjacent scopes.
+    candidates = [frame for frame in frames if frame[0] <= scanout <= frame[1]]
+    if not candidates:
+        candidates = [frame for frame in frames if frame[0] - 0.004 <= scanout <= frame[1] + 0.004]
+    if len(candidates) != 1:
+        return (None,) * 5
+    present, _, draw = candidates[0]
+    if draw is None:
+        return (None, None, None, None, milliseconds(present, scanout))
+    start, end = draw
+    return (milliseconds(send, start), milliseconds(win_event, start), milliseconds(start, end),
+            milliseconds(end, present), milliseconds(present, scanout))
+
+
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("tag")
@@ -85,11 +131,16 @@ def main():
     cli.add_argument("--threshold", type=int, default=150, help="minimum changed pixels per captured frame")
     cli.add_argument("--scene-log", type=Path, help="optional Wintanyl shell.log with WT_BENCH_SCENE_QPC=1")
     cli.add_argument("--scene-pid", type=int, help="Wintanyl process ID for the scene trace")
+    cli.add_argument("--dwm-log", type=Path, help="optional CSV from etw-display-qpc.exe")
+    cli.add_argument("--dwm-pid", type=int, help="guest DWM process ID for the ETW trace")
+    cli.add_argument("--host-input-only", action="store_true", help="use host action timestamps when the guest input probe was absent")
     args = cli.parse_args()
     if args.threshold < 1:
         cli.error("--threshold must be positive")
     if (args.scene_log is None) != (args.scene_pid is None):
         cli.error("--scene-log and --scene-pid are used together")
+    if (args.dwm_log is None) != (args.dwm_pid is None):
+        cli.error("--dwm-log and --dwm-pid are used together")
 
     host_prefix = args.host / args.tag
     guest_prefix = args.guest / args.tag
@@ -109,8 +160,9 @@ def main():
         return guest + pre[2] + mix * (post[2] - pre[2])
 
     events = defaultdict(list)
-    for row in rows(Path(f"{guest_prefix}-keys.csv")):
-        events[row["event"]].append(guest_time(row["qpc"]))
+    if not args.host_input_only:
+        for row in rows(Path(f"{guest_prefix}-keys.csv")):
+            events[row["event"]].append(guest_time(row["qpc"]))
     for times in events.values():
         times.sort()
 
@@ -127,28 +179,35 @@ def main():
 
     stats = defaultdict(list)
     trace = defaultdict(list)
+    dwm_trace = defaultdict(list)
     intervals = scene_intervals(args.scene_log, args.scene_pid, guest_time) if args.scene_log else None
     if args.scene_log and not intervals:
         cli.error("no scene timing rows for that PID")
+    composition = dwm_frames(args.dwm_log, args.dwm_pid, guest_time) if args.dwm_log else None
+    if args.dwm_log and not composition:
+        cli.error("no paired DWM Present events for that PID")
     missing = 0
     print(f"Clock bridge minimum round trips {pre[0] * 1e3:.3f}/{post[0] * 1e3:.3f} ms, pixel threshold {args.threshold}")
+    if args.host_input_only:
+        print("Using host action timestamps for matching")
     print("action host-key key-WinEvent WinEvent-flush key-flush flush-pixels host-pixels changes")
     for send, action in actions:
         key = first_in(events[f"key_{action}"], send - 0.003, send + 0.350)
-        if key is None:
+        if key is None and not args.host_input_only:
             print(action, "missing key")
             missing += 1
             continue
-        win_event = first_in(events[f"window_{action}"], key - 0.004, key + 0.9)
-        pixel = first_in(pixels, key - 0.003, key + 1.25)
+        trigger = send if key is None else key
+        win_event = first_in(events[f"window_{action}"], trigger - 0.004, trigger + 0.9)
+        pixel = first_in(pixels, trigger - 0.003, trigger + 1.25)
         scanout = None
         if pixel is not None:
             # The last preceding full-screen flush is a timing proxy. The
             # window capture and virtio-gpu trace do not carry a shared frame ID.
             index = bisect_right(scanouts, pixel)
-            if index and max(key - 0.002, pixel - 0.13) <= scanouts[index - 1]:
+            if index and max(trigger - 0.002, pixel - 0.13) <= scanouts[index - 1]:
                 scanout = scanouts[index - 1]
-        changes = bisect_right(pixels, key + 1.20) - bisect_left(pixels, key - 0.003)
+        changes = bisect_right(pixels, trigger + 1.20) - bisect_left(pixels, trigger - 0.003)
         result = (
             milliseconds(send, key), milliseconds(key, win_event), milliseconds(win_event, scanout),
             milliseconds(key, scanout), milliseconds(scanout, pixel), milliseconds(send, pixel), changes,
@@ -156,7 +215,9 @@ def main():
         print(action, *result)
         stats[action.split("_")[0]].append(result)
         if intervals and action in ("minimize", "restore"):
-            trace[action].append(lamp_stages(intervals, key, win_event, pixel))
+            trace[action].append(lamp_stages(intervals, trigger, win_event, pixel))
+        if composition:
+            dwm_trace[action].append(dwm_stages(composition, send, win_event, scanout))
     print("Median / max by gesture")
     for action, group in stats.items():
         print(action, len(group), *(summarize(column) for column in zip(*group)))
@@ -164,6 +225,11 @@ def main():
         print("Scene med/max: WinEvent-enter Z-placement enter Commit return-first-frame return-pixels")
         for action, group in trace.items():
             print(action, len(group), *(summarize(column) for column in zip(*group)))
+    if dwm_trace:
+        print("DWM med/max: host-draw WinEvent-draw draw draw-Present Present-flush")
+        for action, group in dwm_trace.items():
+            matched = sum(stages[-1] is not None for stages in group)
+            print(action, f"{matched}/{len(group)}", *(summarize(column) for column in zip(*group)))
     return 1 if missing else 0
 
 

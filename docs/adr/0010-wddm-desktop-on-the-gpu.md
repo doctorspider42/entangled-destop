@@ -1682,6 +1682,64 @@ context-cleanup` opens the render-only device, creates a context, closes
 the handle, and verifies that it can create the same context again.
 The resource caps are unchanged.
 
+The published `gpu3d-14` render-only miniport (`11.38.1.423`) passed the
+same cleanup check on the dedicated guest. The host recorded two creates
+and two destroys for the test context. All 31 package assets matched the
+published sizes and SHA-256 digests, and `enable-3d --package` accepted
+the full directory and built its installer disc. This guest test
+installed the render-only miniport from the package.
+[Windows GPU package](https://github.com/doctorspider42/entangled-destop/releases/tag/gpu3d-14)
+
+#### Stock Windows animation after the render-only driver fix
+
+The guest showed one Windows 10 Notepad window in the capture region. Six
+`Win+M` and `Win+Shift+M` pairs ran through virtio input at 1920 × 1080.
+The hardware WDDM adapter and host engine were the same as in the lamp
+tests, with the context cleanup fix installed in the render-only miniport.
+On the same guest, six more pairs posted `ShowWindowAsync` with
+`SW_MINIMIZE` and `SW_RESTORE` directly to the Notepad window and checked
+its final iconic state. The API runs start at a guest QPC timestamp.
+
+The [animation analyzer](../../tests/windows/analyze-animation-input.py)
+accepts `--dwm-log` and `--dwm-pid` to join Dwm-Core ETW draw and Present
+scopes from the same thread with the existing input and pixel data. It
+looks for the Present bracketing the last full-screen flush before the
+observed change. The flush and host capture have no common frame ID, so
+this is a timing attribution. The guest clock bridge round trips were
+under 0.7 ms, and the ETW headers reported zero lost events and buffers.
+Raising the pixel threshold from 150 to 500 did not materially change the
+onset. The region included the window and excluded the taskbar.
+
+| Restore trigger | Samples | Trigger to changed pixels p50 / max | WinEvent to matched draw p50 | Matched draw p50 | Present entry to flush p50 | Flush to pixels p50 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Host shortcut through virtio | 6 | 137 / 184 ms | 82 ms | 10 ms | 13 ms | 10 ms |
+| Guest `ShowWindowAsync` | 6 | 133 / 145 ms | 80 ms | 0.5 ms | 7 ms | 4 ms |
+
+A separate six-pair keyboard run with no guest key probe gave a 134 ms
+median restore onset. In the run with WinEvents, one or two earlier
+full-screen flushes commonly occurred after restore and before the first
+captured content change. The 80–82 ms is time to the matched draw, and
+can include these earlier composition cycles. Posting the operation
+directly preserved the wait after the WinEvent. The stock window and
+gesture use different visuals from Wintanyl's lamp.
+
+One keyboard minimize took 157 ms from host command to changed pixels.
+After the WinEvent, DWM spent about 97 ms inside its DirectComposition
+queue scope (`MILEVENT_MEDIA_UCE_PROCESSQUEUEEVENT`), drew for 1 ms,
+and handed off the first post-event scanout about 124 ms after the event.
+Guest vblank interrupts continued at roughly 16.7 ms throughout the
+queue stall. The DWM render thread had a 96 ms gap between its ETW
+events within the queue scope. The host recorded two 24-byte submits
+from DWM, zero deferred fence responses and zero scanout flushes in
+that scope. The other five minimize onsets were 45–62 ms in this run.
+The next stage to trace is what the DWM thread waits on inside queue
+processing. The older legacy-lamp trace also has a separate long draw
+after that stage.
+
+Raw measurements use `stock-dwm-fixed`, `stock-dwm-input` and
+`stock-dwm-api` in the lab's `physical-wheel` and `share/animation-etw`
+directories.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
