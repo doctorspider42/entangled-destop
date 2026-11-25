@@ -2027,6 +2027,55 @@ Windows Venus ICD and WDDM 21.22.46.312. The RTX 2070 log records real
 `SUBMIT_3D` descriptors deferred and completed through the new path in
 `physical-wheel/run-venus-host-deferred.log`.
 
+#### Parallel fenced waits in the Windows render miniport
+
+The lab driver builds with `CL=/DENTANGLED_GPU_PARALLEL_CONTROL=1`.
+Use it with `ENTANGLED_VENUS_DEFER_RING_WAITS=1` on the host. The guest
+uses slot zero for ordinary control commands and up to seven additional
+slots for standalone fenced ring waits owned by different handles.
+The driver identifies completions by the used descriptor ID and validates
+the length and fence ID before completing the request asynchronously.
+A one-millisecond timer reaps used entries while requests are pending.
+
+Each slot owns its DMA buffers. An abandoned request may return an error
+or cancellation to the client before the slot is reusable. The buffer
+remains reserved until the used entry arrives or the device resets.
+The lab path refuses overlapping IOCTLs on the same handle during one of
+these waits. The Mesa Windows backend serializes the relevant IOCTLs per
+renderer handle. Default builds retain the sequential dispatcher.
+
+`gpu-test hold-venus-ring` published a wait for a roundtrip that would
+never be signaled in its private context. A second process started a
+300-frame D3D11 rendering probe during the five-second wait. Both tests
+used the same Windows lab, RTX 2070 and host ring deferral.
+
+| Render driver | Successful waits from the D3D11 client while the first context waited | D3D11 probe finished relative to the held reply |
+| --- | ---: | ---: |
+| Released one-slot driver | 0 | 9,261 ms after |
+| Signed lab driver, run 1 | 300 | 213 ms before |
+| Signed lab driver, run 2 | 300 | 99 ms after |
+| Signed lab driver, run 3 | 300 | 454 ms before |
+
+The host recorded the held request on descriptor 2 and the independent
+work on descriptor 4 in all three lab runs. Each D3D11 probe verified the
+last frame's RGB value `(252, 127, 2)`. Each held request returned
+`ERR_INVALID_PARAMETER` (`0x1205`) at the normal host timeout. Context
+cleanup passed after installing and rebooting into render driver
+`15.45.52.509`. These runs verify cross-client progress under a held
+dependency.
+
+In a warm run without the held client, the lab driver restored Notepad
+in 146.4 ms median and 160.2 ms maximum across twelve gestures. The
+previous one-slot run with the same host option recorded 164.1 ms median
+and 187.0 ms maximum. The D3D11 smoke median fell from 341.5 to 218.1
+frames/s across six readback-verified runs per driver. These measurements
+come from separate boots and do not measure Wintanyl's own animations.
+Keep the feature opt-in. Measure interrupt-driven completion alongside
+the polled lab path before deciding on a driver default.
+
+The raw host log is `physical-wheel/run-venus-parallel-control.log` and the
+guest QPC samples are `share/parallel-control/*.out`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

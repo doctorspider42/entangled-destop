@@ -7,7 +7,9 @@
  * pnputil alone leaves the function where it was. `gpu-test install <inf>
  * <hardware id>` does the same for another function: the display one, for
  * entangled-display (guest/windows-gpu/display).
- * `gpu-test context-cleanup` checks context ownership across handle closes. */
+ * `gpu-test context-cleanup` checks context ownership across handle closes.
+ * `gpu-test hold-venus-ring` leaves a private ring waiting for its round
+ * trip, to exercise independent clients on the same control queue. */
 #include <windows.h>
 #include <newdev.h>
 #include <stdio.h>
@@ -80,7 +82,7 @@ static int context_cleanup(void)
     return 0;
 }
 
-static unsigned long submit(HANDLE dev, unsigned long ctxId, const STREAM *s)
+static unsigned long submit_stream(HANDLE dev, unsigned long ctxId, const STREAM *s, BOOL fenced)
 {
     struct {
         ENTANGLED_GPU_SUBMIT head;
@@ -90,12 +92,21 @@ static unsigned long submit(HANDLE dev, unsigned long ctxId, const STREAM *s)
     memset(&req.head, 0, sizeof(req.head));
     req.head.CtxId = ctxId;
     req.head.Size = s->n;
+    if (fenced) {
+        req.head.Flags = ENTANGLED_GPU_SUBMIT_FENCE;
+        req.head.RingIdx = 1;
+    }
     memcpy(req.bytes, s->b, s->n);
     if (!call(dev, IOCTL_ENTANGLED_GPU_SUBMIT_3D, &req, sizeof(req.head) + s->n, &resp,
               sizeof(resp))) {
         return 0;
     }
     return resp.Type;
+}
+
+static unsigned long submit(HANDLE dev, unsigned long ctxId, const STREAM *s)
+{
+    return submit_stream(dev, ctxId, s, FALSE);
 }
 
 /* `gpu-test venus`: a Venus ring in a blob of our own, and the host's
@@ -106,6 +117,85 @@ static unsigned long submit(HANDLE dev, unsigned long ctxId, const STREAM *s)
 #define RING_SIZE 0x11000ULL
 #define RING_BUFFER_OFFSET 0x100
 #define RING_BUFFER_SIZE 0x10000
+
+static unsigned long create_ring(HANDLE dev, unsigned long ctx, unsigned long resource)
+{
+    STREAM s = {0};
+    put32(&s, 188); put32(&s, 0);    /* vkCreateRingMESA */
+    put64(&s, 1);                    /* ring handle */
+    put64(&s, 1);                    /* pCreateInfo */
+    put32(&s, 1000384000);           /* VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA */
+    put64(&s, 0);                    /* pNext */
+    put32(&s, 0);                    /* flags */
+    put32(&s, resource);
+    put64(&s, 0); put64(&s, RING_SIZE);
+    put64(&s, 1000000);              /* idleTimeout, ns */
+    put64(&s, 0); put64(&s, 4); put64(&s, 8); /* head, tail, status */
+    put64(&s, RING_BUFFER_OFFSET); put64(&s, RING_BUFFER_SIZE);
+    put64(&s, RING_BUFFER_OFFSET + RING_BUFFER_SIZE); put64(&s, 4); /* extra */
+    return submit(dev, ctx, &s);
+}
+
+static int hold_venus_ring(void)
+{
+    const unsigned long ctx = ((GetCurrentProcessId() & 0xffffffu) << 8) | 1u;
+    HANDLE dev = CreateFileW(ENTANGLED_GPU_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (dev == INVALID_HANDLE_VALUE) {
+        printf("HELD-RING FAIL open %lu\n", GetLastError());
+        return 1;
+    }
+    ENTANGLED_GPU_CTX_CREATE create = {ctx, 4};
+    ENTANGLED_GPU_RESPONSE created = {0};
+    ENTANGLED_GPU_BLOB_IN ring_in = {ctx, 0, RING_SIZE};
+    ENTANGLED_GPU_BLOB_OUT ring = {0};
+    if (!call(dev, IOCTL_ENTANGLED_GPU_CTX_CREATE, &create, sizeof(create), &created,
+              sizeof(created)) || created.Type != 0x1100 ||
+        !call(dev, IOCTL_ENTANGLED_GPU_BLOB_CREATE, &ring_in, sizeof(ring_in), &ring,
+              sizeof(ring)) || ring.Address == 0 ||
+        create_ring(dev, ctx, ring.ResourceId) != 0x1100) {
+        printf("HELD-RING FAIL setup %lu\n", GetLastError());
+        CloseHandle(dev);
+        return 1;
+    }
+
+    /* A legal ring dependency on a private roundtrip which this test does
+     * not signal. The context-stream wait is therefore expected to time out
+     * on the host while the independent client exercises the GPU. */
+    STREAM blocked = {0};
+    put32(&blocked, 252); put32(&blocked, 0); /* vkWaitVirtqueueSeqnoMESA */
+    put64(&blocked, 1);
+    volatile unsigned char *pages = (volatile unsigned char *)(ULONG_PTR)ring.Address;
+    for (unsigned long i = 0; i < blocked.n; i++) {
+        pages[RING_BUFFER_OFFSET + i] = blocked.b[i];
+    }
+    MemoryBarrier();
+    *(volatile unsigned long *)(pages + 4) = blocked.n;
+    MemoryBarrier();
+
+    STREAM wait = {0};
+    put32(&wait, 253); put32(&wait, 0); /* vkWaitRingSeqnoMESA */
+    put64(&wait, 1); put64(&wait, blocked.n);
+    LARGE_INTEGER clock, begin, end;
+    QueryPerformanceFrequency(&clock);
+    QueryPerformanceCounter(&begin);
+    printf("WAIT_BEGIN pid=%lu ctx=%lu qpc=%lld freq=%lld\n",
+           GetCurrentProcessId(), ctx, begin.QuadPart, clock.QuadPart);
+    fflush(stdout);
+    const unsigned long response = submit_stream(dev, ctx, &wait, TRUE);
+    QueryPerformanceCounter(&end);
+    const double ms = 1000.0 * (double)(end.QuadPart - begin.QuadPart) / (double)clock.QuadPart;
+    printf("WAIT_END response=%#lx qpc=%lld elapsed_ms=%.2f\n", response, end.QuadPart, ms);
+    fflush(stdout);
+    CloseHandle(dev);
+    if (response < 0x1200 || ms < 4000.0 || ms > 8000.0) {
+        printf("HELD-RING FAIL expected an in-band host timeout\n");
+        return 1;
+    }
+    printf("HELD-RING PASS\n");
+    return 0;
+}
+
 static int venus_round_trip(HANDLE dev)
 {
     ENTANGLED_GPU_CTX_CREATE create = {CTX, 4};
@@ -136,20 +226,7 @@ static int venus_round_trip(HANDLE dev)
     printf("ring blob at %#llx (map info %#lx), reply blob at %#llx\n", ring.Address,
            ring.MapInfo, reply.Address);
 
-    /* vkCreateRingMESA on the context stream. */
-    put32(&s, 188); put32(&s, 0);
-    put64(&s, 1);                    /* ring handle */
-    put64(&s, 1);                    /* pCreateInfo */
-    put32(&s, 1000384000);           /* VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA */
-    put64(&s, 0);                    /* pNext */
-    put32(&s, 0);                    /* flags */
-    put32(&s, ring.ResourceId);
-    put64(&s, 0); put64(&s, RING_SIZE);
-    put64(&s, 1000000);              /* idleTimeout, ns */
-    put64(&s, 0); put64(&s, 4); put64(&s, 8); /* head, tail, status */
-    put64(&s, RING_BUFFER_OFFSET); put64(&s, RING_BUFFER_SIZE);
-    put64(&s, RING_BUFFER_OFFSET + RING_BUFFER_SIZE); put64(&s, 4); /* extra */
-    type = submit(dev, CTX, &s);
+    type = create_ring(dev, CTX, ring.ResourceId);
     if (type != 0x1100) {
         printf("VENUS FAIL vkCreateRingMESA: answer %#lx\n", type);
         return 1;
@@ -213,6 +290,9 @@ int wmain(int argc, wchar_t **argv)
     }
     if (argc == 2 && lstrcmpiW(argv[1], L"context-cleanup") == 0) {
         return context_cleanup();
+    }
+    if (argc == 2 && lstrcmpiW(argv[1], L"hold-venus-ring") == 0) {
+        return hold_venus_ring();
     }
     dev = CreateFileW(ENTANGLED_GPU_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE, 0, NULL,
                       OPEN_EXISTING, 0, NULL);
