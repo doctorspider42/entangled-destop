@@ -26,6 +26,7 @@
 #define VIRTIO_PCI_CAP_VENDOR 0x09
 #define VIRTIO_PCI_CAP_COMMON 1
 #define VIRTIO_PCI_CAP_NOTIFY 2
+#define VIRTIO_PCI_CAP_ISR 3
 #define VIRTIO_PCI_CAP_DEVICE 4
 
 /* virtio_pci_common_cfg */
@@ -58,6 +59,7 @@
 
 #define VIRTQ_DESC_F_NEXT 1
 #define VIRTQ_DESC_F_WRITE 2
+#define VIRTQ_AVAIL_F_NO_INTERRUPT 1
 
 #define MAX_QUEUE_SIZE 64
 /* Each command: the request in the first half of the page, the answer in
@@ -79,6 +81,8 @@
 #define VENUS_WAIT_RING_SEQNO 253
 #define VENUS_WAIT_RING_SEQNO_BYTES 24
 #define WAIT_TIMEOUT_TICKS (8ULL * 1000 * 1000 * 10)
+#define CONTROL_POLL_TICKS (10 * 1000)
+#define CONTROL_WATCHDOG_TICKS (16 * 10 * 1000)
 #define VIRTIO_GPU_CMD_GET_CAPSET 0x0109
 #define VIRTIO_GPU_CMD_RESOURCE_UNREF 0x0102
 #define VIRTIO_GPU_RESP_OK_CAPSET 0x1103
@@ -259,6 +263,7 @@ typedef struct {
     volatile UCHAR *NotifyBase;
     ULONG NotifyMultiplier;
     volatile UCHAR *DeviceCfg;
+    volatile UCHAR *Isr;
 
     PUCHAR Ring; /* descriptors, available ring, used ring: one page */
     PHYSICAL_ADDRESS RingPa;
@@ -277,6 +282,11 @@ typedef struct {
     PHYSICAL_ADDRESS WaitDmaPa;
     WDFSPINLOCK ControlLock;
     WDFTIMER ControlTimer;
+    WDFINTERRUPT ControlInterrupt;
+    volatile LONG ControlMsixEnabled;
+    UINT64 InterruptCompletions;
+    UINT64 TimerCompletions;
+    ULONG PendingWaits;
     BOOLEAN ParallelControl;
     BOOLEAN TimerArmed;
 
@@ -343,6 +353,10 @@ DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD EgEvtDeviceAdd;
 EVT_WDF_DEVICE_PREPARE_HARDWARE EgEvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE EgEvtReleaseHardware;
+EVT_WDF_DEVICE_D0_ENTRY_POST_INTERRUPTS_ENABLED EgEvtD0EntryPostInterruptsEnabled;
+EVT_WDF_DEVICE_D0_EXIT_PRE_INTERRUPTS_DISABLED EgEvtD0ExitPreInterruptsDisabled;
+EVT_WDF_INTERRUPT_ISR EgEvtControlInterrupt;
+EVT_WDF_INTERRUPT_DPC EgEvtControlCompletion;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL EgEvtIoDeviceControl;
 EVT_WDF_IO_QUEUE_IO_STOP EgEvtIoStop;
 EVT_WDF_TIMER EgEvtControlTimer;
@@ -357,6 +371,70 @@ static void W64(volatile UCHAR *p, ULONG o, UINT64 v)
 {
     W32(p, o, (UINT32)v);
     W32(p, o + 4, (UINT32)(v >> 32));
+}
+
+static BOOLEAN ControlMsixEnabled(const DEVICE_CONTEXT *ctx)
+{
+    return ReadAcquire(&ctx->ControlMsixEnabled) != 0;
+}
+
+static USHORT SelectControlVector(DEVICE_CONTEXT *ctx, USHORT vector)
+{
+    W16(ctx->Common, COMMON_Q_SELECT, 0);
+    W16(ctx->Common, COMMON_Q_MSIX, vector);
+    return R16(ctx->Common, COMMON_Q_MSIX);
+}
+
+NTSTATUS EgEvtD0EntryPostInterruptsEnabled(WDFDEVICE Device, WDF_POWER_DEVICE_STATE Previous)
+{
+    DEVICE_CONTEXT *ctx = GetCtx(Device);
+    UNREFERENCED_PARAMETER(Previous);
+    if (ctx->ControlInterrupt != NULL) {
+        WDF_INTERRUPT_INFO info;
+        WDF_INTERRUPT_INFO_INIT(&info);
+        WdfInterruptGetInfo(ctx->ControlInterrupt, &info);
+        if (info.MessageSignaled && info.MessageNumber < VIRTIO_MSI_NO_VECTOR) {
+            const USHORT vector = (USHORT)info.MessageNumber;
+            const BOOLEAN enabled = SelectControlVector(ctx, vector) == vector;
+            InterlockedExchange(&ctx->ControlMsixEnabled, enabled);
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS EgEvtD0ExitPreInterruptsDisabled(WDFDEVICE Device, WDF_POWER_DEVICE_STATE Target)
+{
+    DEVICE_CONTEXT *ctx = GetCtx(Device);
+    UNREFERENCED_PARAMETER(Target);
+    if (InterlockedExchange(&ctx->ControlMsixEnabled, FALSE)) {
+        SelectControlVector(ctx, VIRTIO_MSI_NO_VECTOR);
+    }
+    return STATUS_SUCCESS;
+}
+
+BOOLEAN EgEvtControlInterrupt(WDFINTERRUPT Interrupt, ULONG MessageID)
+{
+    DEVICE_CONTEXT *ctx = GetCtx(WdfInterruptGetDevice(Interrupt));
+    UNREFERENCED_PARAMETER(MessageID);
+    if (ControlMsixEnabled(ctx)) {
+        WdfInterruptQueueDpcForIsr(Interrupt);
+        return TRUE;
+    }
+    /* A line interrupt shares its ISR status with the rest of the function. */
+    return ctx->Isr != NULL && R8(ctx->Isr, 0) != 0;
+}
+
+static BOOLEAN ControlPollOnly(WDFDRIVER Driver)
+{
+    WDFKEY key;
+    ULONG value = 0;
+    DECLARE_CONST_UNICODE_STRING(name, L"ControlPollOnly");
+    if (NT_SUCCESS(WdfDriverOpenParametersRegistryKey(Driver, KEY_READ,
+                                                       WDF_NO_OBJECT_ATTRIBUTES, &key))) {
+        WdfRegistryQueryULong(key, &name, &value);
+        WdfRegistryClose(key);
+    }
+    return value != 0;
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
@@ -376,11 +454,14 @@ NTSTATUS EgEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     DEVICE_CONTEXT *ctx;
     NTSTATUS status;
     DECLARE_CONST_UNICODE_STRING(link, L"\\DosDevices\\EntangledGpu");
-    UNREFERENCED_PARAMETER(Driver);
 
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp);
     pnp.EvtDevicePrepareHardware = EgEvtPrepareHardware;
     pnp.EvtDeviceReleaseHardware = EgEvtReleaseHardware;
+    if (ENTANGLED_GPU_PARALLEL_CONTROL) {
+        pnp.EvtDeviceD0EntryPostInterruptsEnabled = EgEvtD0EntryPostInterruptsEnabled;
+        pnp.EvtDeviceD0ExitPreInterruptsDisabled = EgEvtD0ExitPreInterruptsDisabled;
+    }
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnp);
     {
         WDF_FILEOBJECT_CONFIG files;
@@ -420,6 +501,15 @@ NTSTATUS EgEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     status = WdfSpinLockCreate(&attributes, &ctx->ControlLock);
     if (!NT_SUCCESS(status)) {
         return status;
+    }
+    if (!ControlPollOnly(Driver)) {
+        WDF_INTERRUPT_CONFIG irq;
+        WDF_INTERRUPT_CONFIG_INIT(&irq, EgEvtControlInterrupt, EgEvtControlCompletion);
+        irq.AutomaticSerialization = FALSE;
+        status = WdfInterruptCreate(device, &irq, WDF_NO_OBJECT_ATTRIBUTES, &ctx->ControlInterrupt);
+        if (!NT_SUCCESS(status)) {
+            ctx->ControlInterrupt = NULL;
+        }
     }
     WDF_TIMER_CONFIG_INIT(&timer, EgEvtControlTimer);
     timer.AutomaticSerialization = FALSE;
@@ -529,6 +619,8 @@ NTSTATUS EgEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST T
                     } else if (type == VIRTIO_PCI_CAP_NOTIFY && at + 20 <= 256) {
                         ctx->NotifyBase = va;
                         ctx->NotifyMultiplier = Cfg32(config, at + 16);
+                    } else if (type == VIRTIO_PCI_CAP_ISR && length != 0) {
+                        ctx->Isr = va;
                     } else if (type == VIRTIO_PCI_CAP_DEVICE) {
                         ctx->DeviceCfg = va;
                     }
@@ -615,6 +707,12 @@ NTSTATUS EgEvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST T
     ctx->LastUsed = 0;
     ctx->SlotCount = min(CONTROL_SLOTS, (ULONG)ctx->QueueSize / 2);
     RtlZeroMemory(ctx->Slots, sizeof(ctx->Slots));
+    ctx->PendingWaits = 0;
+    ctx->InterruptCompletions = 0;
+    ctx->TimerCompletions = 0;
+    if (ctx->ParallelControl) {
+        *(volatile UINT16 *)(ctx->Ring + 1024) = VIRTQ_AVAIL_F_NO_INTERRUPT;
+    }
     W16(ctx->Common, COMMON_Q_SIZE, ctx->QueueSize);
     W16(ctx->Common, COMMON_Q_MSIX, VIRTIO_MSI_NO_VECTOR);
     W64(ctx->Common, COMMON_Q_DESC, ctx->RingPa.QuadPart);
@@ -692,7 +790,7 @@ NTSTATUS EgEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated)
         MmFreeContiguousMemory(ctx->WaitDma);
         ctx->WaitDma = NULL;
     }
-    ctx->Common = ctx->NotifyBase = ctx->DeviceCfg = NULL;
+    ctx->Common = ctx->NotifyBase = ctx->DeviceCfg = ctx->Isr = NULL;
     if (ctx->ParallelControl) {
         WdfWaitLockRelease(ctx->Lock);
     }
@@ -1082,13 +1180,14 @@ static void ArmControlTimerLocked(DEVICE_CONTEXT *ctx)
 {
     if (!ctx->TimerArmed) {
         ctx->TimerArmed = TRUE;
-        WdfTimerStart(ctx->ControlTimer, -10 * 1000); /* 1 ms, only while busy */
+        const LONGLONG ticks = ControlMsixEnabled(ctx) ? CONTROL_WATCHDOG_TICKS : CONTROL_POLL_TICKS;
+        WdfTimerStart(ctx->ControlTimer, -ticks);
     }
 }
 
 /* The caller holds the legacy lock. Before publishing, copy METHOD_BUFFERED
- * input to this slot's own DMA area. After publication the timer owns the
- * request; the dispatch callback must leave without waiting. */
+ * input to this slot's own DMA area. After publication the completion path
+ * owns the request and the dispatch callback leaves without waiting. */
 static BOOLEAN DeferFencedWait(DEVICE_CONTEXT *ctx, WDFREQUEST request, FILE_CONTEXT *file,
                                const ENTANGLED_GPU_SUBMIT *in, size_t length,
                                ENTANGLED_GPU_RESPONSE *out)
@@ -1128,6 +1227,11 @@ static BOOLEAN DeferFencedWait(DEVICE_CONTEXT *ctx, WDFREQUEST request, FILE_CON
         slot->Output = out;
         slot->File = file;
         file->PendingWait = TRUE;
+        if (ctx->PendingWaits++ == 0 && ControlMsixEnabled(ctx)) {
+            /* Publish the interrupt request before exposing the descriptor.
+             * PublishControlLocked orders this store before avail.idx. */
+            *(volatile UINT16 *)(ctx->Ring + 1024) = 0;
+        }
         const UINT64 pa = (UINT64)ctx->WaitDmaPa.QuadPart + offset;
         PublishControlLocked(ctx, index, pa, sizeof(*wire) + VENUS_WAIT_RING_SEQNO_BYTES,
                              pa + WAIT_RESPONSE_OFFSET, sizeof(GPU_CTRL_HDR));
@@ -1142,7 +1246,7 @@ static BOOLEAN DeferFencedWait(DEVICE_CONTEXT *ctx, WDFREQUEST request, FILE_CON
 
 /* A timeout or cancellation transfers only the WDF request. DMA ownership
  * stays with the device until ReapControlLocked sees this exact used ID. */
-static WDFREQUEST DetachWaitLocked(CONTROL_SLOT *slot)
+static WDFREQUEST DetachWaitLocked(DEVICE_CONTEXT *ctx, CONTROL_SLOT *slot)
 {
     WDFREQUEST request = slot->Request;
     slot->File->PendingWait = FALSE;
@@ -1150,17 +1254,21 @@ static WDFREQUEST DetachWaitLocked(CONTROL_SLOT *slot)
     slot->Output = NULL;
     slot->File = NULL;
     slot->State = slot->State == SlotReturned ? SlotFree : SlotAbandoned;
+    if (--ctx->PendingWaits == 0) {
+        *(volatile UINT16 *)(ctx->Ring + 1024) = VIRTQ_AVAIL_F_NO_INTERRUPT;
+    }
     return request;
 }
 
-VOID EgEvtControlTimer(WDFTIMER Timer)
+static void CompleteControlRequests(DEVICE_CONTEXT *ctx, BOOLEAN interrupt)
 {
-    DEVICE_CONTEXT *ctx = GetCtx(WdfTimerGetParentObject(Timer));
     struct { WDFREQUEST Request; NTSTATUS Status; } done[CONTROL_SLOTS - 1];
     ULONG count = 0;
     WdfSpinLockAcquire(ctx->ControlLock);
-    ctx->TimerArmed = FALSE;
-    if (ctx->Ready) {
+    if (!interrupt) {
+        ctx->TimerArmed = FALSE;
+    }
+    if (ctx->Ready && (!interrupt || ControlMsixEnabled(ctx))) {
         ReapControlLocked(ctx);
         const UINT64 now = KeQueryInterruptTime();
         for (ULONG index = 1; index < ctx->SlotCount; index++) {
@@ -1183,7 +1291,12 @@ VOID EgEvtControlTimer(WDFTIMER Timer)
                 continue;
             }
             done[count].Status = status;
-            done[count++].Request = DetachWaitLocked(slot);
+            done[count++].Request = DetachWaitLocked(ctx, slot);
+        }
+        if (interrupt) {
+            ctx->InterruptCompletions += count;
+        } else {
+            ctx->TimerCompletions += count;
         }
     }
     WdfSpinLockRelease(ctx->ControlLock);
@@ -1191,6 +1304,17 @@ VOID EgEvtControlTimer(WDFTIMER Timer)
         WdfRequestCompleteWithInformation(done[i].Request, done[i].Status,
             NT_SUCCESS(done[i].Status) ? sizeof(ENTANGLED_GPU_RESPONSE) : 0);
     }
+}
+
+VOID EgEvtControlTimer(WDFTIMER Timer)
+{
+    CompleteControlRequests(GetCtx(WdfTimerGetParentObject(Timer)), FALSE);
+}
+
+VOID EgEvtControlCompletion(WDFINTERRUPT Interrupt, WDFOBJECT Device)
+{
+    UNREFERENCED_PARAMETER(Interrupt);
+    CompleteControlRequests(GetCtx((WDFDEVICE)Device), TRUE);
 }
 
 VOID EgEvtIoStop(WDFQUEUE Queue, WDFREQUEST Request, ULONG ActionFlags)
@@ -1201,7 +1325,7 @@ VOID EgEvtIoStop(WDFQUEUE Queue, WDFREQUEST Request, ULONG ActionFlags)
     WdfSpinLockAcquire(ctx->ControlLock);
     for (ULONG i = 1; i < ctx->SlotCount; i++) {
         if (ctx->Slots[i].Request == Request) {
-            canceled = DetachWaitLocked(&ctx->Slots[i]);
+            canceled = DetachWaitLocked(ctx, &ctx->Slots[i]);
             break;
         }
     }
@@ -1492,7 +1616,7 @@ VOID EgEvtFileCleanup(WDFFILEOBJECT FileObject)
         file->Closing = TRUE;
         for (ULONG index = 1; index < ctx->SlotCount; index++) {
             if (ctx->Slots[index].File == file) {
-                canceled = DetachWaitLocked(&ctx->Slots[index]);
+                canceled = DetachWaitLocked(ctx, &ctx->Slots[index]);
                 break;
             }
         }
@@ -1536,6 +1660,23 @@ VOID EgEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLengt
         }
     }
     switch (IoControlCode) {
+    case IOCTL_ENTANGLED_GPU_CONTROL_STATS: {
+        ENTANGLED_GPU_CONTROL_STATS *out = NULL;
+        if (!ctx->ParallelControl) {
+            break;
+        }
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, NULL);
+        if (NT_SUCCESS(status)) {
+            WdfSpinLockAcquire(ctx->ControlLock);
+            out->MsixEnabled = ControlMsixEnabled(ctx);
+            out->PendingWaits = ctx->PendingWaits;
+            out->InterruptCompletions = ctx->InterruptCompletions;
+            out->TimerCompletions = ctx->TimerCompletions;
+            WdfSpinLockRelease(ctx->ControlLock);
+            written = sizeof(*out);
+        }
+        break;
+    }
     case IOCTL_ENTANGLED_GPU_INFO: {
         ENTANGLED_GPU_INFO *out = NULL;
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, NULL);

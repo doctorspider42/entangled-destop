@@ -2076,6 +2076,53 @@ the polled lab path before deciding on a driver default.
 The raw host log is `physical-wheel/run-venus-parallel-control.log` and the
 guest QPC samples are `share/parallel-control/*.out`.
 
+#### MSI-X completion for parallel waits
+
+The parallel lab build binds one MSI-X message to the control queue in
+D0. It requests notifications while a fenced wait is outstanding. The
+interrupt schedules a DPC which matches used entries to the same slots
+as the timer. The two paths take the same slot lock and detach each
+request once. The timer remains a 16 ms watchdog when MSI-X is active
+and uses the 1 ms interval when Windows or the device supplies no usable
+message. The [KMDF interrupt lifecycle](https://learn.microsoft.com/windows-hardware/drivers/wdf/enabling-and-disabling-interrupts)
+defines the D0 callbacks used to bind and release the queue vector.
+
+The guest service parameter `ControlPollOnly` is a DWORD under
+`Services\EntangledGpu\Parameters`. Setting it to 1 and restarting
+selects the timer path in the same lab binary. The `gpu-test control-stats`
+command reports the negotiated route and the number of requests completed
+by each path. Normal packages still build with the parallel dispatcher
+disabled.
+
+Two boots of the same signed render driver `16.14.39.639` exercised
+both routes on the four-vCPU Windows lab and RTX 2070. The host used
+the same deferred-wait engine and each route ran six D3D11 pixel
+readback tests and twelve Notepad minimize/restore pairs.
+
+| Measurement | Timer | MSI-X |
+| --- | ---: | ---: |
+| D3D11 median, frames/s | 361.05 | 457.10 |
+| Host fence retirement to next request, median | 1.083 ms | 0.668 ms |
+| Minimize to pixels, median / maximum | 62.0 / 107.2 ms | 56.9 / 81.7 ms |
+| Restore to pixels, median / maximum | 137.9 / 155.5 ms | 144.0 / 165.7 ms |
+| Restore window event to scanout flush, median | 111.3 ms | 105.4 ms |
+| Restore scanout flush to pixels, median | 7.0 ms | 10.8 ms |
+
+During the D3D11 sampling window the timer-only boot completed 2,368
+requests from the timer. The MSI-X boot counted 2,353 interrupt and 20
+timer completions. Median host ring waits were 0.924 and 0.937 ms,
+respectively. Median GPU fence retirement was near 0.06 ms in both
+boots. The shorter interval after host completion coincided with the
+higher D3D11 throughput. The Notepad restore measurements still spend
+most of their time before scanout flush.
+
+In all three held-ring runs with MSI-X, the D3D11 client completed 300
+waits on descriptor 4 while the private dependency occupied descriptor 2.
+The client verified the final RGB value 1.31–1.92 seconds before the
+other request returned its expected five-second timeout. The trace is
+`physical-wheel/run-venus-parallel-msix.log`. The guest counters and
+held-client logs are in `share/parallel-msix/`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared

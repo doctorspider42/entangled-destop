@@ -2,8 +2,7 @@
  * entangled-gpu: the IOCTL interface of our render-only virtio-gpu driver
  * (ADR-0009). Shared by the driver and user mode.
  *
- * The device is \\.\EntangledGpu. Every IOCTL is METHOD_BUFFERED and
- * synchronous; the driver serialises them.
+ * The device is \\.\EntangledGpu. Every IOCTL is METHOD_BUFFERED.
  */
 #pragma once
 
@@ -25,6 +24,16 @@ typedef struct _ENTANGLED_GPU_INFO {
     unsigned long NumCapsets;
     unsigned long QueueSize;
 } ENTANGLED_GPU_INFO;
+
+/* Cumulative completions from the experimental parallel dispatcher. */
+#define IOCTL_ENTANGLED_GPU_CONTROL_STATS CTL_CODE(ENTANGLED_GPU_TYPE, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _ENTANGLED_GPU_CONTROL_STATS {
+    unsigned long MsixEnabled;
+    unsigned long PendingWaits;
+    unsigned long long InterruptCompletions;
+    unsigned long long TimerCompletions;
+} ENTANGLED_GPU_CONTROL_STATS;
 
 typedef struct _ENTANGLED_GPU_CAPSET_INFO_IN {
     unsigned long Index;

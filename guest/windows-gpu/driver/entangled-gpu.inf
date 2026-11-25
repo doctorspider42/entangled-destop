@@ -33,14 +33,14 @@ CopyFiles = EntangledGpu.CopyFiles
 [EntangledGpu.CopyFiles]
 entangled-gpu.sys
 
-; MSI: the driver polls and takes no interrupt, but without this the PnP
-; manager asks for a line interrupt, which this machine cannot route (no
-; _PRT), and the function fails with code 12.
+; Use message signaling even for builds that poll the used queues. The
+; control queue needs one message. The cursor queue is polled.
 [EntangledGpu.NT.HW]
 AddReg = EntangledGpu.MsiReg, EntangledGpu.Security
 
 [EntangledGpu.MsiReg]
 HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 1
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, 0x00010001, 1
 
 ; Who may open the device: the system and administrators everything, every
 ; user and every app container (AC) read and write, at low integrity too (the

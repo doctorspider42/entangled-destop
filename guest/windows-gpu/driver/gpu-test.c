@@ -55,6 +55,27 @@ static BOOL call(HANDLE dev, DWORD code, void *in, DWORD inLen, void *out, DWORD
     return DeviceIoControl(dev, code, in, inLen, out, outLen, &got, NULL);
 }
 
+static int control_stats(void)
+{
+    HANDLE dev = CreateFileW(ENTANGLED_GPU_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (dev == INVALID_HANDLE_VALUE) {
+        printf("CONTROL-STATS FAIL open %lu\n", GetLastError());
+        return 1;
+    }
+    ENTANGLED_GPU_CONTROL_STATS stats;
+    const BOOL ok = call(dev, IOCTL_ENTANGLED_GPU_CONTROL_STATS, NULL, 0, &stats, sizeof(stats));
+    const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(dev);
+    if (!ok) {
+        printf("CONTROL-STATS FAIL IOCTL %lu\n", error);
+        return 1;
+    }
+    printf("msix=%lu pending=%lu irq=%llu timer=%llu\n", stats.MsixEnabled, stats.PendingWaits,
+           stats.InterruptCompletions, stats.TimerCompletions);
+    return 0;
+}
+
 static int context_cleanup(void)
 {
     ENTANGLED_GPU_CTX_CREATE request = {(GetCurrentProcessId() & 0xffffffu) << 8 | 1u, 4};
@@ -293,6 +314,9 @@ int wmain(int argc, wchar_t **argv)
     }
     if (argc == 2 && lstrcmpiW(argv[1], L"hold-venus-ring") == 0) {
         return hold_venus_ring();
+    }
+    if (argc == 2 && lstrcmpiW(argv[1], L"control-stats") == 0) {
+        return control_stats();
     }
     dev = CreateFileW(ENTANGLED_GPU_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE, 0, NULL,
                       OPEN_EXISTING, 0, NULL);
