@@ -65,8 +65,9 @@ pub mod arena;
 pub mod calls;
 pub mod convert;
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ash::vk::{self, Handle};
 
@@ -101,6 +102,7 @@ const API_1_3: u32 = vk::API_VERSION_1_3;
 /// RTX 2070 says 4 KiB; anything past 2 MiB is a driver the probe does not
 /// trust with a real allocation.
 const MAX_IMPORT_ALIGNMENT: u64 = 2 << 20;
+const MAX_HOST_IMPORT_PROBES: usize = 32;
 
 /// The handle type every guest-visible allocation is imported as.
 const HOST_ALLOCATION: vk::ExternalMemoryHandleTypeFlags =
@@ -174,8 +176,18 @@ impl Drop for SharedMemoryHandle {
 /// The host's Vulkan loader. See the module docs.
 pub struct AshVulkan {
     entry: ash::Entry,
+    host_import_probes: Mutex<HashMap<HostImportProbeKey, (u32, u64)>>,
     #[cfg(windows)]
     wddm_clock: Option<wddm_clock::ClockRegistry>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct HostImportProbeKey {
+    device: [u8; vk::UUID_SIZE],
+    driver: [u8; vk::UUID_SIZE],
+    alignment: u64,
+    queue_family: u32,
+    memory_types: Vec<(u32, u32)>,
 }
 
 impl std::fmt::Debug for AshVulkan {
@@ -199,6 +211,7 @@ impl AshVulkan {
             .map_err(|e| format!("the host has no usable Vulkan loader: {e}"))?;
         Ok(Self {
             entry,
+            host_import_probes: Mutex::default(),
             #[cfg(windows)]
             wddm_clock: (std::env::var_os("ENTANGLED_WDDM2_GPU_CLOCK").as_deref()
                 == Some("1".as_ref()))
@@ -229,17 +242,23 @@ impl AshVulkan {
     /// A throwaway device with `VK_EXT_external_memory_host` enabled is made
     /// for the question, because the query is device-level; the memory
     /// asked about is a [`RingPages`] allocation, the same kind of pages the
-    /// next stage imports for real.
+    /// next stage imports for real. Reuse a successful capability probe from
+    /// startup across instances using the same adapter, driver and memory
+    /// type layout. Real imports still query the types of their own pointers.
     fn probe_host_import(
         &self,
         instance: &ash::Instance,
         device: vk::PhysicalDevice,
         families: &[VkQueueFamilyProperties],
+        memory: &vk::PhysicalDeviceMemoryProperties,
     ) -> Option<(u32, u64)> {
         let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
-        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host_props);
-        // SAFETY: `device` is ours; `props2` and the one structure chained on
-        // it are locals that outlive the call.
+        let mut id = vk::PhysicalDeviceIDProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut host_props)
+            .push_next(&mut id);
+        // SAFETY: `device` is ours; `props2` and both structures chained on
+        // it are locals that outlive the call. The caller checked Vulkan 1.1.
         unsafe { instance.get_physical_device_properties2(device, &mut props2) };
         let align = host_props.min_imported_host_pointer_alignment;
         if !align.is_power_of_two() || align > MAX_IMPORT_ALIGNMENT {
@@ -247,6 +266,28 @@ impl AshVulkan {
         }
         let family = families.iter().position(|f| f.queue_count > 0)?;
         let family = u32::try_from(family).ok()?;
+        let key = (id.device_uuid != [0; vk::UUID_SIZE] && id.driver_uuid != [0; vk::UUID_SIZE])
+            .then(|| HostImportProbeKey {
+                device: id.device_uuid,
+                driver: id.driver_uuid,
+                alignment: align,
+                queue_family: family,
+                memory_types: memory
+                    .memory_types_as_slice()
+                    .iter()
+                    .map(|ty| (ty.property_flags.as_raw(), ty.heap_index))
+                    .collect(),
+            });
+        if let Some(cached) = key.as_ref().and_then(|key| {
+            self.host_import_probes
+                .lock()
+                .expect("host import probe cache lock poisoned")
+                .get(key)
+                .copied()
+        }) {
+            tracing::debug!("reusing a Vulkan host-memory import probe");
+            return Some(cached);
+        }
         let priorities = [1.0f32];
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
@@ -324,6 +365,17 @@ impl AshVulkan {
             importable = answer.is_some(),
             "Vulkan host-memory import probe complete"
         );
+        if let (Some(key), Some(answer)) = (key, answer) {
+            // The probe needs a Vulkan device creation. Never hold the cache
+            // lock through that call or retain an unsuccessful probe.
+            let mut cache = self
+                .host_import_probes
+                .lock()
+                .expect("host import probe cache lock poisoned");
+            if cache.len() < MAX_HOST_IMPORT_PROBES {
+                cache.entry(key).or_insert(answer);
+            }
+        }
         answer
     }
 }
@@ -490,7 +542,7 @@ impl HostVulkan for AshVulkan {
             .collect();
         let host_import = (api >= vk::API_VERSION_1_1
             && has_extension(&extensions, EXTERNAL_MEMORY_HOST))
-        .then(|| self.probe_host_import(instance, device, &queue_families))
+        .then(|| self.probe_host_import(instance, device, &queue_families, &memory))
         .flatten();
         HostDeviceInfo {
             properties,

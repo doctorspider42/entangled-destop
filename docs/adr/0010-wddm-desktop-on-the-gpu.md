@@ -1849,6 +1849,31 @@ The capture prefixes are `stock-dwm-msix` and `stock-dwm-fenced-msix` in
 `physical-wheel` and `share/animation-etw`. The `-worst.txt`,
 `-longest-present.txt` and `-waker.txt` extracts record the 345 ms case.
 
+#### Reuse the startup host-memory capability probe
+
+The timed cold boots used the released `gpu3d-14` render miniport and the
+same 4-vCPU Windows lab on the RTX 2070. Among the first 14 guest contexts,
+the physical-device description took 124.37 ms at the median and 655.90 ms
+at the maximum. Enumerating devices was about 1.6 ms at the median. Reading
+the memory types of a sample host pointer took less than 0.13 ms in the
+first 14 probes. The cost was in creating and destroying the temporary
+logical device that performs the query.
+
+The host now retains a successful `RingPages` capability probe from the
+startup adapter check for the lifetime of the Vulkan loader. The cache key
+includes device and driver UUIDs, alignment, queue family, and ordered
+memory types. A failed probe can be retried. The cache lock is released
+before opening a device, and actual memory imports still query each
+allocation's pointer. The device and driver identifiers come from Vulkan's
+[physical device ID properties](https://docs.vulkan.org/spec/latest/chapters/devsandqueues.html#VkPhysicalDeviceIDProperties).
+
+With this change, the first 14 guest descriptions took 3.42 ms at the
+median and 4.62 ms at the maximum. The existing startup check created and
+destroyed one probe device for the RTX 2070. The guest contexts reused
+that result. These timings measure adapter discovery during a cold boot.
+The host logs are `run-init-trace.log` and `run-init-cache.log` in
+`physical-wheel`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
