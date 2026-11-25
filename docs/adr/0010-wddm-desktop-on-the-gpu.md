@@ -1874,6 +1874,60 @@ that result. These timings measure adapter discovery during a cold boot.
 The host logs are `run-init-trace.log` and `run-init-cache.log` in
 `physical-wheel`.
 
+#### Trial of waiting on the Windows client's ring before taking the control slot
+
+The host dispatches `vkWaitRingSeqnoMESA` inline on the shared control
+queue. While it waits for one context's ring worker, the Windows render
+miniport's single command slot remains occupied. Every other Windows
+Venus client that needs the control queue waits behind it. This includes
+fence submissions and other clients' notifications for idle rings.
+
+The experimental Windows Mesa client checked its own shared ring head
+before sending a fenced submission or a blob operation that depended on
+an earlier ring allocation. It used Mesa's existing polling and relax
+logic before entering the renderer. After roughly 500 ms it fell back to
+the original wait command, preserving the host wakeup and timeout path.
+A queue submission still used its normal renderer fence after the ring
+issued the Vulkan work.
+
+The first 38 seconds after a guest reset were measured on the same 4-vCPU
+Windows guest and RTX 2070. Both builds came from the same prepared Mesa
+26.2.6 tree and used the same Windows display miniport and Entangled host.
+The local test replaced the x64 Venus ICD and verified its SHA-256 after
+reboot. Profile windows that began before the reset were excluded.
+
+| Windows x64 ICD | Control submits | Ring waits in the host | Total ring wait | Longest ring wait | GPU ring fences |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Rebuilt control | 3,730 | 1,320 | 3,294.97 ms | 157.39 ms | 1,268 |
+| Client-side ring wait | 4,226 | 0 | 0 ms | 0 ms | 1,566 |
+
+In a warm 12-pair Notepad run, the DWM context went from 487 waits with
+1,721.50 ms on the shared queue to zero. DWM still registered 491 GPU ring
+fences in the same profiled windows with the trial, compared with 475
+for the control. Input-to-pixels for a restore was 157.8 ms median and
+175.8 ms maximum in the control, then 156.0 ms median and 199.5 ms maximum
+in the trial. Repeating the control after another boot gave 155.4 ms
+median and 184.7 ms maximum.
+
+Six runs of the 300-frame D3D11 smoke on each ICD used the hardware
+Entangled adapter and the same copy swap chain. Each verified the final
+RGB value `(252, 127, 2)`. The rebuilt control reached a median of
+418.4 frames/s (321.5–426.1). The client wait reached 336.8 frames/s
+(294.2–345.9). Moving the wait released the shared queue in these samples
+at the cost of roughly 20% of this workload's throughput. The trial was
+kept as a lab patch. The production Windows ICD keeps renderer-side waits.
+
+An asynchronous transport needs both halves of the dependency. The
+renderer must defer an incomplete ring wait without occupying the device
+worker, then execute the ordered work and issue its fence. The Windows
+miniport must let independent requests make progress while that response
+is outstanding. Deferring only the host response leaves the miniport's
+single command slot occupied.
+
+The Windows lab report is `venus-guest-ring-wait-results.md` in
+`physical-wheel`. Raw A/B captures use `stock-dwm-ring-*`, and the reboot
+and per-context records are in `run-init-cache-live.log`.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
