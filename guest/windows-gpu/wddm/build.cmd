@@ -27,7 +27,7 @@ rem Upstream includes one WPP trace header per source file. We build without
 rem WPP (ENTANGLED_NO_WPP, added by our patch), so they are empty.
 for %%n in (bitops viogpu_idr viogpu_pci viogpu_queue driver viogpudo) do type nul > "%OBJ%\%%n.tmh"
 
-set "INC=/I"%OBJ%" /I"%TREE%\viogpu\common" /I"%TREE%\viogpu\shared" /I"%TREE%\VirtIO" /I"%TREE%\viogpu\viogpu3d" /I"%WDK%\Include\%V%\km" /I"%WDK%\Include\%V%\km\crt" /I"%WDK%\Include\%V%\shared" /I"%WDK%\Include\%V%\um""
+set "INC=/I"%OBJ%" /I"%SRC%..\driver" /I"%TREE%\viogpu\common" /I"%TREE%\viogpu\shared" /I"%TREE%\VirtIO" /I"%TREE%\viogpu\viogpu3d" /I"%WDK%\Include\%V%\km" /I"%WDK%\Include\%V%\km\crt" /I"%WDK%\Include\%V%\shared" /I"%WDK%\Include\%V%\um""
 set "DEF=/D_AMD64_ /DAMD64 /D_WIN64 /DWINNT=1 /DNTDDI_VERSION=0x0A000000 /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 /DPOOL_NX_OPTIN=1 /DVIOGPU_3D=1 /DENTANGLED_NO_WPP=1"
 rem A diagnostic build: set ENTANGLED_SERIAL_TRACE to a trace level (2 errors,
 rem 3 warnings, 4 information, 5 everything) and the driver's messages go to

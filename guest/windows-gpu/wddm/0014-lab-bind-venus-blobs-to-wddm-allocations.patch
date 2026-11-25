@@ -1,0 +1,262 @@
+diff --git a/viogpu/viogpu3d/viogpu_adapter.cpp b/viogpu/viogpu3d/viogpu_adapter.cpp
+index 93553f7..5807b44 100644
+--- a/viogpu/viogpu3d/viogpu_adapter.cpp
++++ b/viogpu/viogpu3d/viogpu_adapter.cpp
+@@ -34,6 +34,8 @@
+ #include "bitops.h"
+ #include "viogpum.h"
+ #include "viogpu_device.h"
++#include "public.h"
++#include "wddm-share.h"
+ #include "entangled_wddm2.h"
+ #if !DBG
+ #include "viogpudo.tmh"
+@@ -648,6 +650,68 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
+     }
+ #endif
+ 
++
++#ifdef ENTANGLED_WDDM2_LAB
++    if (pVioGpuEscape->Type == ENTANGLED_WDDM_BIND_BLOB ||
++        pVioGpuEscape->Type == ENTANGLED_WDDM_OPEN_BLOB)
++    {
++        if (size != sizeof(ENTANGLED_WDDM_BLOB_ESCAPE))
++        {
++            return STATUS_INVALID_BUFFER_SIZE;
++        }
++        auto *share = static_cast<ENTANGLED_WDDM_BLOB_ESCAPE *>(pEscape->pPrivateDriverData);
++        if (share->Version != ENTANGLED_WDDM_SHARE_VERSION || pEscape->hDevice == NULL ||
++            ExGetPreviousMode() != UserMode)
++        {
++            return STATUS_INVALID_PARAMETER;
++        }
++        if (!m_DxgkInterface.DxgkCbAcquireHandleData || !m_DxgkInterface.DxgkCbReleaseHandleData)
++        {
++            return STATUS_NOT_SUPPORTED;
++        }
++
++        const bool bind = share->Type == ENTANGLED_WDDM_BIND_BLOB;
++        DXGKARGCB_GETHANDLEDATA lookup = {};
++        lookup.hObject = share->Allocation;
++        lookup.Type = DXGK_HANDLE_ALLOCATION;
++        DXGKARGCB_RELEASEHANDLEDATA reference = {};
++        reference.Type = DXGK_HANDLE_ALLOCATION;
++        auto *allocation = static_cast<VioGpuAllocation *>(
++            m_DxgkInterface.DxgkCbAcquireHandleData(&lookup, &reference.ReleaseHandle));
++        if (allocation == NULL)
++        {
++            return STATUS_INVALID_HANDLE;
++        }
++        if (bind)
++        {
++            status = allocation->BindGpuShare(reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(share->Token)));
++        }
++        else
++        {
++            // The device-specific object verifies the open on this device.
++            // DXGK returns the allocation itself through the reference above.
++            lookup.Flags.DeviceSpecific = 1;
++            DXGKARGCB_RELEASEHANDLEDATA openedReference = {};
++            openedReference.Type = DXGK_HANDLE_ALLOCATION;
++            auto *opened = static_cast<VioGpuDeviceAllocation *>(
++                m_DxgkInterface.DxgkCbAcquireHandleData(&lookup, &openedReference.ReleaseHandle));
++            status = STATUS_INVALID_HANDLE;
++            if (opened != NULL)
++            {
++                if (opened->GetDevice() == static_cast<VioGpuDevice *>(pEscape->hDevice))
++                {
++                    HANDLE token = NULL;
++                    status = allocation->OpenGpuShare(&token);
++                    share->Token = reinterpret_cast<ULONG_PTR>(token);
++                }
++                m_DxgkInterface.DxgkCbReleaseHandleData(openedReference);
++            }
++        }
++        m_DxgkInterface.DxgkCbReleaseHandleData(reference);
++        return status;
++    }
++#endif
++
+     if ((pVioGpuEscape->Type == 0x902 || pVioGpuEscape->Type == 0x903 || pVioGpuEscape->Type == 0x904) && size >= 24)
+     {
+         // Type and DataLength (two bytes each), the allocation's handle, a
+diff --git a/viogpu/viogpu3d/viogpu_allocation.cpp b/viogpu/viogpu3d/viogpu_allocation.cpp
+index a8afbdb..58783b6 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.cpp
++++ b/viogpu/viogpu3d/viogpu_allocation.cpp
+@@ -1,4 +1,7 @@
++#include <ntifs.h>
+ #include "baseobj.h"
++#include "public.h"
++#include "wddm-share.h"
+ #include "bitops.h"
+ #include "viogpum.h"
+ #include "viogpu_allocation.h"
+@@ -42,6 +45,19 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_OPTIO
+ VioGpuAllocation::~VioGpuAllocation(void)
+ {
+     DbgPrint(TRACE_LEVEL_INFORMATION, ("---> %s res_id=%d\n", __FUNCTION__, m_Id));
++#ifdef ENTANGLED_WDDM2_LAB
++    if (m_gpuShare != NULL)
++    {
++        auto *share = static_cast<GpuShare *>(m_gpuShare);
++        ZwClose(share->RenderFile);
++        ZwClose(share->Token);
++        delete share;
++    }
++    if (m_shareOwner != NULL)
++    {
++        ObDereferenceObject(m_shareOwner);
++    }
++#endif
+     if (m_pMapVa != NULL)
+     {
+         MmUnmapLockedPages(m_pMapVa, m_pMapMdl);
+@@ -60,6 +76,85 @@ VioGpuAllocation::~VioGpuAllocation(void)
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+ }
+ 
++
++#ifdef ENTANGLED_WDDM2_LAB
++// Called in the process carrying the token, with the DXGK allocation pinned.
++NTSTATUS VioGpuAllocation::BindGpuShare(HANDLE userToken)
++{
++    PAGED_CODE();
++    if (m_shareOwner != PsGetCurrentProcess())
++    {
++        return STATUS_ACCESS_DENIED;
++    }
++    if (InterlockedCompareExchangePointer(&m_gpuShare, NULL, NULL) != NULL)
++    {
++        return STATUS_ALREADY_COMMITTED;
++    }
++
++    PKEVENT event;
++    NTSTATUS status = ObReferenceObjectByHandle(userToken, SYNCHRONIZE, *ExEventObjectType,
++                                               UserMode, reinterpret_cast<PVOID *>(&event), NULL);
++    if (!NT_SUCCESS(status))
++    {
++        return status;
++    }
++
++    auto *share = new (NonPagedPoolNx) GpuShare{};
++    if (share == NULL)
++    {
++        ObDereferenceObject(event);
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
++
++    status = ObOpenObjectByPointer(event, OBJ_KERNEL_HANDLE, NULL, SYNCHRONIZE,
++                                   *ExEventObjectType, KernelMode, &share->Token);
++    ObDereferenceObject(event);
++    if (NT_SUCCESS(status))
++    {
++        UNICODE_STRING name = RTL_CONSTANT_STRING(ENTANGLED_GPU_KERNEL_NAME);
++        OBJECT_ATTRIBUTES attributes;
++        InitializeObjectAttributes(&attributes, &name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
++        IO_STATUS_BLOCK io = {};
++        status = ZwOpenFile(&share->RenderFile, FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE,
++                            &attributes, &io, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                            FILE_SYNCHRONOUS_IO_NONALERT);
++        if (NT_SUCCESS(status))
++        {
++            ENTANGLED_GPU_BLOB_TOKEN request = {reinterpret_cast<ULONG_PTR>(share->Token)};
++            status = ZwDeviceIoControlFile(share->RenderFile, NULL, NULL, NULL, &io,
++                                           IOCTL_ENTANGLED_GPU_PIN_WDDM_BLOB,
++                                           &request, sizeof(request), NULL, 0);
++            if (NT_SUCCESS(status))
++            {
++                if (InterlockedCompareExchangePointer(&m_gpuShare, share, NULL) == NULL)
++                {
++                    return STATUS_SUCCESS;
++                }
++                status = STATUS_ALREADY_COMMITTED;
++            }
++            ZwClose(share->RenderFile);
++        }
++        ZwClose(share->Token);
++    }
++    delete share;
++    return status;
++}
++
++NTSTATUS VioGpuAllocation::OpenGpuShare(HANDLE *userToken)
++{
++    PAGED_CODE();
++    auto *share = static_cast<GpuShare *>(InterlockedCompareExchangePointer(&m_gpuShare, NULL, NULL));
++    if (share == NULL)
++    {
++        return STATUS_NOT_FOUND;
++    }
++    // The caller's DXGK allocation reference authorizes this duplicate into
++    // its process. The source remains a private kernel handle.
++    return ZwDuplicateObject(NtCurrentProcess(), share->Token, NtCurrentProcess(),
++                             userToken, SYNCHRONIZE, 0, 0);
++}
++#endif
++
+ void VioGpuAllocation::AttachBacking(MDL *pMDL, size_t pageCount, size_t pageOffset)
+ {
+     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d\n", __FUNCTION__, m_Id));
+@@ -581,6 +676,17 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
+     }
+ 
+     VioGpuAllocation *allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &resourceExchange->ResourceOptions);
++    if (allocation == NULL)
++    {
++        return STATUS_INSUFFICIENT_RESOURCES;
++    }
++#ifdef ENTANGLED_WDDM2_LAB
++    if (pCreateAllocation->Flags.Resource && !adapter->IsVirglHost())
++    {
++        allocation->m_shareOwner = PsGetCurrentProcess();
++        ObReferenceObject(allocation->m_shareOwner);
++    }
++#endif
+     allocationInfo->hAllocation = allocation;
+ 
+     if (pCreateAllocation->Flags.Resource)
+diff --git a/viogpu/viogpu3d/viogpu_allocation.h b/viogpu/viogpu3d/viogpu_allocation.h
+index dbab43b..ba46fba 100644
+--- a/viogpu/viogpu3d/viogpu_allocation.h
++++ b/viogpu/viogpu3d/viogpu_allocation.h
+@@ -16,6 +16,10 @@ class VioGpuAllocation
+   public:
+     VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_OPTIONS *options);
+     ~VioGpuAllocation(void);
++#ifdef ENTANGLED_WDDM2_LAB
++    NTSTATUS BindGpuShare(HANDLE userToken);
++    NTSTATUS OpenGpuShare(HANDLE *userToken);
++#endif
+ 
+     UINT GetId(void)
+     {
+@@ -71,6 +75,16 @@ class VioGpuAllocation
+     VioGpuAdapter *m_adapter;
+ 
+     VIOGPU_RESOURCE_OPTIONS m_options;
++#ifdef ENTANGLED_WDDM2_LAB
++    struct GpuShare
++    {
++        HANDLE Token;
++        HANDLE RenderFile;
++    };
++    // The allocation may outlive both the original device and process.
++    PEPROCESS m_shareOwner = NULL;
++    PVOID volatile m_gpuShare = NULL;
++#endif
+     UINT m_Id;
+ 
+     MDL *m_pMDL;
+diff --git a/viogpu/viogpu3d/viogpu_device.h b/viogpu/viogpu3d/viogpu_device.h
+index 0b002ca..d534674 100644
+--- a/viogpu/viogpu3d/viogpu_device.h
++++ b/viogpu/viogpu3d/viogpu_device.h
+@@ -77,6 +77,7 @@ class VioGpuDeviceAllocation
+     ~VioGpuDeviceAllocation();
+ 
+     VioGpuAllocation *GetAllocation();
++    const VioGpuDevice *GetDevice() const { return m_pDevice; }
+ 
+   private:
+     VioGpuAllocation *m_pAllocation;

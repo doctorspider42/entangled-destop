@@ -2320,6 +2320,31 @@ must control the blob's lifetime and surface generations. The probe uses
 queue-idle waits for ordering. The DWM path needs producer completion
 and consumer release without putting a global wait on either UI thread.
 
+#### A WDDM allocation keeps its Venus publication alive
+
+The Windows x64 WDDM 2.0 lab miniport binds one render publication to
+the allocating process's DXGK allocation. A kernel-only render file
+holds the publication while WDDM keeps the allocation. An authorized
+opener receives a freshly duplicated event after its DXGK device is
+checked. Its attachment then holds the blob independently of the WDDM
+allocation.
+
+The first lab package hit a `0x3B` fault opening the publication. The
+device-specific open returned a wrapper with a null allocation pointer.
+The fix retains the allocation via the DXGK allocation reference and
+uses the device-specific reference for the device check. The corrected
+package passed both close orders on Windows x64 and the RTX 2070. In the
+owner-first case the test confirmed producer process exit before opening
+the WDDM allocation, then dropped its WDDM reference after attachment
+and before Vulkan import. It still verified all 65,536 BGRA pixels from
+the original unmapped texture. The two lab drivers and the test fixtures
+are recorded in `share/wddm-share`.
+
+The display UMD still uses CPU-backed WDDM surfaces. The lab probe
+uses queue-idle waits and staging readback to verify continuity. The
+DWM integration needs a GPU producer, a consumer copy or sample, and
+ordering for repeated surface generations before the animation comparison.
+
 ## Risks, in the order they are likely to bite
 
 - **DWM is the strictest Direct3D client there is.** It needs shared
